@@ -69,7 +69,7 @@ export class GameClock {
 }
 
 // ---------------------------------------------------------------------------
-// Title-screen attract camera: arc-length-parameterised fly-through of the live sector.
+// Title-screen attract camera: arc-length-parameterised fly-through of the live district.
 // ---------------------------------------------------------------------------
 const _a = new THREE.Vector3();
 const _b = new THREE.Vector3();
@@ -85,36 +85,10 @@ class AttractCamera {
   readonly speed = 15.5;
   private roll = 0;
 
+  /** Uses the district's collision-free cinematic loop (low along the avenue, under the expressway, then over the roofs). */
   rebuild(layout: SectorLayout): void {
-    const towers = layout.buildings.filter((b) => !b.isGateTower);
-    // Nearest-neighbour tour starting at the spawn tower.
-    const order = [towers[0]];
-    const left = towers.slice(1);
-    while (left.length) {
-      const last = order[order.length - 1];
-      let bi = 0;
-      let bd = Infinity;
-      left.forEach((b, i) => {
-        const d = Math.hypot(b.cx - last.cx, b.cz - last.cz);
-        if (d < bd) {
-          bd = d;
-          bi = i;
-        }
-      });
-      order.push(left.splice(bi, 1)[0]);
-    }
-    const pts: THREE.Vector3[] = [];
-    order.forEach((b, i) => {
-      const next = order[(i + 1) % order.length];
-      // Skim low across the wet roof (puddle reflections), then dive through the gap past the panels.
-      pts.push(new THREE.Vector3(b.cx - b.halfW * 0.4, b.roofY + 2.4, b.cz - b.halfD * 0.2));
-      pts.push(new THREE.Vector3(b.cx + b.halfW * 0.35, b.roofY + 3.2, b.cz + b.halfD * 0.3));
-      const mx = (b.cx + next.cx) / 2;
-      const mz = (b.cz + next.cz) / 2;
-      pts.push(new THREE.Vector3(mx, Math.min(b.roofY, next.roofY) - 7, mz));
-    });
-    this.curve = new THREE.CatmullRomCurve3(pts, true, 'centripetal', 0.5);
-    this.curve.arcLengthDivisions = 600;
+    this.curve = new THREE.CatmullRomCurve3(layout.cinematicPath.map((p) => p.clone()), true, 'centripetal', 0.5);
+    this.curve.arcLengthDivisions = 800;
     this.length = this.curve.getLength();
     this.u = 0;
     this.prevU = 0;
@@ -183,7 +157,7 @@ class App {
 
     const sectorParam = clamp(parseInt(params.get('sector') ?? '1', 10) || 1, 1, SECTORS.length);
     this.layout = this.city.buildSector(sectorParam, 0);
-    this.city.setGateActive(params.get('gate') === '1');
+    this.city.setGateOpen(params.get('gate') === '1');
     this.attract.rebuild(this.layout);
 
     const viewParam = params.get('view');
@@ -278,12 +252,16 @@ class App {
       this.fpsFrames = 0;
       this.fpsTime = 0;
       const info = this.renderer.renderer.info;
+      const st = this.layout.stats;
       if (this.debugEl) {
         this.debugEl.textContent =
           `FPS ${this.fps.toFixed(0)}  |  CALLS ${this.renderer.drawCalls}  |  TRIS ${(this.renderer.triangles / 1000).toFixed(1)}k  |  ` +
           `GEO ${info.memory.geometries}  TEX ${info.memory.textures}  |  ${this.renderer.getQuality()}  |  ` +
-          `${this.layout.sector.name} TOWERS ${this.layout.buildings.length} COLLIDERS ${this.layout.colliders.length} ` +
-          `WALLRUN ${this.layout.wallRunSurfaces.length} ANCHORS ${this.layout.anchors.length}`;
+          `${this.layout.sector.name}\n` +
+          `TOWERS ${st.towers}  CARS ${st.cars}  HIGHWAYS ${st.highways}  RAMPS ${st.ramps}  BRIDGES ${st.bridges}  SKYBRIDGES ${st.skybridges}  ` +
+          `LAMPS ${st.lamps}  CITY-LIGHTS ${st.cityLights}\n` +
+          `COLLIDERS ${this.layout.colliders.length}  WALLRUN ${this.layout.wallRunSurfaces.length}  ANCHORS ${this.layout.anchors.length}  ` +
+          `SPAWNS G${this.layout.groundSpawns.length}/H${this.layout.highwaySpawns.length}/S${this.layout.skybridgeSpawns.length}/R${this.layout.roofSpawns.length}/P${this.layout.perchSpawns.length}/A${this.layout.airSpawns.length}`;
       }
     }
   }

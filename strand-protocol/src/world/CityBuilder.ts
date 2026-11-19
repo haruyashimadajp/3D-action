@@ -1,56 +1,78 @@
 /**
- * STRAND // PROTOCOL — Supertall neon city builder (§6.1, §6.2-2, §8.1, §9.2).
+ * STRAND // PROTOCOL — Multi-layer cyberpunk district builder (spec v1.1: §1.1, §6.1, §6.2-2, §8.1, §9.2).
  *
- * Persistent (built once):  sky dome · cloud deck · 80 instanced far-field towers
- * Per sector (rebuilt):     4–7 playable towers (merged, world-space window PBR) · wet roofs with
- *                           puddle rain ripples · cyan wall-run panels · cranes / steel / gold anchors ·
- *                           instanced rooftop details (AC units, fences, ducts, antennas, aviation
- *                           lights @1.2 Hz, hologram neon signs, volumetric searchlights, machine rooms)
- *                           · jade gate tower + light pillar · colliders / wall-run surfaces / anchors.
+ *  Layer 0  (Y −2.4 … 0)  wet avenues / streets / alleys (road atlas: lanes, centre line, dashes, crosswalks,
+ *                          manholes, puddles), parked cyber-cars (3 variants), canal with ripple/flow water,
+ *                          towpaths, guard-rails and neon truss bridges (gold anchors on truss apexes)
+ *  Layer 1  (Y 9.5)        elevated expressway: 2+2 lanes, median, guard walls (outer face wall-runnable),
+ *                          piers every 24–28 m, underside industrial light strips, ground on-ramps,
+ *                          clearance ≥ 7.8 m so it can be slid / swung under freely
+ *  Layer 2  (Y 18–35)      sky-bridges between towers, projecting neon blade signs, gold anchors
+ *  Layer 3  (Y 30–95)      high rooftops with AC units, ducts, fences, antennas, aviation lights, searchlights
+ *  Boundary                hologram lockdown barrier (+ emerald gate) · 100 far supertalls · 40 hover-car trails
  *
- * Draw-call budget: every repeated element is one InstancedMesh or one merged geometry.
+ * Draw calls: every repeated element is ONE InstancedMesh or ONE merged geometry (≈ 36 scene calls).
+ * Wet ground, roads, canal water and expressway concrete also receive analytic reflections of the nearest
+ * 24 city lights (street lamps, bridge neon, expressway strips), selected allocation-free each frame.
  */
 import * as THREE from 'three';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
-import {
-  COLORS,
-  LEVEL,
-  LIMITS,
-  MATERIALS,
-  RENDER,
-  createRng,
-  clamp,
-} from '../config/constants';
+import { COLORS, LEVEL, LIMITS, MATERIALS, RENDER, createRng, clamp } from '../config/constants';
 import { SECTORS, type SectorDef } from '../config/skills';
-import type { ProceduralTextureLibrary } from '../engine/ProceduralTextures';
+import { ROAD_ATLAS, type AtlasRegion, type ProceduralTextureLibrary } from '../engine/ProceduralTextures';
 
-// ---------------------------------------------------------------------------
-// Public layout data consumed by PhysicsWorld / EnemyManager / PlayerController
-// ---------------------------------------------------------------------------
-export type ColliderKind = 'BUILDING' | 'PROP' | 'STEEL';
+// =============================================================================================
+// Public layout data (consumed by PhysicsWorld / PlayerController / EnemyManager / HUD)
+// =============================================================================================
+export type ColliderKind =
+  | 'GROUND'
+  | 'BUILDING'
+  | 'PROP'
+  | 'STEEL'
+  | 'CAR'
+  | 'HIGHWAY'
+  | 'BRIDGE'
+  | 'WATER'
+  | 'TOWPATH'
+  | 'SKYBRIDGE'
+  | 'BARRIER';
 
 export interface BoxCollider {
   readonly min: THREE.Vector3;
   readonly max: THREE.Vector3;
   readonly kind: ColliderKind;
-  /** Index of the owning building (-1 for free-standing steel). */
+  /** Owning building index (-1 when not part of a building). */
   readonly building: number;
+  /** The district gate section of the lockdown barrier (passable once the gate opens). */
+  readonly gate?: boolean;
+}
+
+/** Sloped on-ramp: surface height interpolates linearly along `axis` from (alongStart, yStart) to (alongEnd, yEnd). */
+export interface RampCollider {
+  readonly axis: 'x' | 'z';
+  readonly lateralMin: number;
+  readonly lateralMax: number;
+  readonly alongStart: number;
+  readonly alongEnd: number;
+  readonly yStart: number;
+  readonly yEnd: number;
+  readonly thickness: number;
 }
 
 export interface WallRunSurface {
-  /** Axis-aligned rectangle lying on the building face. */
+  /** Axis-aligned rectangle lying on the wall face. */
   readonly min: THREE.Vector3;
   readonly max: THREE.Vector3;
   /** Outward unit normal (±X or ±Z). */
   readonly normal: THREE.Vector3;
+  /** Building index, or -1 for expressway guard walls. */
   readonly building: number;
 }
 
-export type AnchorKind = 'CRANE' | 'EDGE_BEAM' | 'NODE' | 'GATE';
+export type AnchorKind = 'HIGHWAY_EDGE' | 'BRIDGE_TRUSS' | 'BUILDING_CORNER' | 'SKYBRIDGE' | 'SIGN';
 export interface GrappleAnchor {
   readonly position: THREE.Vector3;
   readonly kind: AnchorKind;
-  /** Gate anchor is only usable once the sector gate opens. */
   enabled: boolean;
 }
 
@@ -61,13 +83,31 @@ export interface BuildingInfo {
   readonly halfW: number;
   readonly halfD: number;
   readonly roofY: number;
-  readonly isSpawn: boolean;
-  readonly isGateTower: boolean;
 }
 
+export type CityLayer = 0 | 1 | 2 | 3;
 export interface SpawnPoint {
   readonly position: THREE.Vector3;
+  readonly layer: CityLayer;
+  /** Building index for roof / perch spawns, -1 otherwise. */
   readonly building: number;
+}
+
+export interface RectXZ {
+  readonly x0: number;
+  readonly z0: number;
+  readonly x1: number;
+  readonly z1: number;
+}
+
+export interface GateInfo {
+  /** Centre of the gate opening at street level. */
+  readonly position: THREE.Vector3;
+  /** Outward normal of the barrier at the gate. */
+  readonly normal: THREE.Vector3;
+  readonly halfWidth: number;
+  readonly height: number;
+  open: boolean;
 }
 
 export interface SectorLayout {
@@ -75,26 +115,221 @@ export interface SectorLayout {
   readonly loop: number;
   readonly buildings: readonly BuildingInfo[];
   readonly colliders: readonly BoxCollider[];
+  readonly ramps: readonly RampCollider[];
   readonly wallRunSurfaces: readonly WallRunSurface[];
   readonly anchors: readonly GrappleAnchor[];
+  /** Canal water rectangles (water surface Y = −2.4 m): grounded here ⇒ shallow-water speed × 0.55. */
+  readonly canalWater: readonly RectXZ[];
   readonly playerSpawn: THREE.Vector3;
   readonly playerSpawnYaw: number;
-  /** Standing positions on roofs for humanoids (excluding the spawn roof). */
+  /** Layer 0: street / plaza positions near cover. */
+  readonly groundSpawns: readonly SpawnPoint[];
+  /** Layer 1: expressway deck positions. */
+  readonly highwaySpawns: readonly SpawnPoint[];
+  /** Layer 2: sky-bridge roofs. */
+  readonly skybridgeSpawns: readonly SpawnPoint[];
+  /** Layer 3: rooftops (Y ≥ 30 m). */
   readonly roofSpawns: readonly SpawnPoint[];
-  /** Elevated sniper perches near roof edges of the highest towers. */
+  /** Layer 3: sniper perches on roof edges of the highest towers, facing the spawn. */
   readonly perchSpawns: readonly SpawnPoint[];
-  /** Free-air points for drones (6–22 m above reference). */
+  /** Free air above streets for drones (6–22 m, clear of expressway decks). */
   readonly airSpawns: readonly THREE.Vector3[];
-  /** Gate pillar base on the gate tower roof. */
-  readonly gatePosition: THREE.Vector3;
-  readonly gateAnchor: GrappleAnchor;
-  /** Center of the play area. */
+  readonly gate: GateInfo;
   readonly center: THREE.Vector3;
+  /** Closed collision-free camera loop used by the title-screen attract mode. */
+  readonly cinematicPath: readonly THREE.Vector3[];
+  readonly stats: {
+    readonly towers: number;
+    readonly cars: number;
+    readonly highways: number;
+    readonly ramps: number;
+    readonly bridges: number;
+    readonly skybridges: number;
+    readonly lamps: number;
+    readonly cityLights: number;
+  };
 }
 
-// ---------------------------------------------------------------------------
-// Module-scope temporaries (no per-frame allocation)
-// ---------------------------------------------------------------------------
+// =============================================================================================
+// District plans
+// =============================================================================================
+type Axis = 'x' | 'z';
+type StreetKind = 'AVENUE' | 'STREET';
+
+/** A street running along `axis` at the perpendicular coordinate `coord`, between `from` and `to` along its axis. */
+interface StreetPlan {
+  readonly axis: Axis;
+  readonly coord: number;
+  readonly kind: StreetKind;
+  readonly from: number;
+  readonly to: number;
+}
+interface CanalPlan {
+  readonly axis: Axis;
+  readonly coord: number;
+  readonly width: number;
+  readonly from: number;
+  readonly to: number;
+}
+interface HighwayPlan {
+  readonly axis: Axis;
+  readonly coord: number;
+  readonly from: number;
+  readonly to: number;
+  /** Underside strip colours: side −1 / side +1. */
+  readonly lightNeg: number;
+  readonly lightPos: number;
+}
+interface RampPlan {
+  readonly highway: number;
+  /** Street (perpendicular to the highway) the ramp descends along. */
+  readonly street: number;
+  /** Descending direction along the ramp street. */
+  readonly dir: 1 | -1;
+  /** Which half of the ramp street the ramp occupies. */
+  readonly side: 1 | -1;
+}
+interface DistrictPlan {
+  readonly streets: readonly StreetPlan[];
+  readonly canals: readonly CanalPlan[];
+  readonly highways: readonly HighwayPlan[];
+  readonly ramps: readonly RampPlan[];
+  /** Streets that cross the canal on a truss bridge (others dead-end at the promenade). */
+  readonly bridgeStreets: readonly number[];
+  /** Main avenue (spawn → gate). */
+  readonly avenue: number;
+  readonly gateDir: 1 | -1;
+  readonly spawnAlong: number;
+  /** Explicit building footprints (ring layout). */
+  readonly explicitLots?: readonly RectXZ[];
+  /** Scramble-crossing plaza (ring layout). */
+  readonly plaza?: RectXZ;
+}
+
+const VIS = LEVEL.VISUAL_EXTENT_M;
+const H = LEVEL.HALF_EXTENT_M;
+const CYAN = COLORS.HIGHWAY_LIGHT_CYAN;
+const AMBER = COLORS.HIGHWAY_LIGHT_AMBER;
+
+function st(axis: Axis, coord: number, kind: StreetKind, from: number = -VIS, to: number = VIS): StreetPlan {
+  return { axis, coord, kind, from, to };
+}
+
+function makePlan(sector: SectorDef): DistrictPlan {
+  switch (sector.index) {
+    case 1:
+      // Main avenue (x = 0) under one expressway (z = 0) with an on-ramp down toward the spawn.
+      return {
+        streets: [st('z', 0, 'AVENUE'), st('z', -52, 'STREET'), st('z', 52, 'STREET'), st('x', -50, 'STREET'), st('x', 0, 'STREET'), st('x', 50, 'STREET')],
+        canals: [],
+        highways: [{ axis: 'x', coord: 0, from: -VIS, to: VIS, lightNeg: CYAN, lightPos: AMBER }],
+        ramps: [{ highway: 0, street: 0, dir: -1, side: 1 }],
+        bridgeStreets: [],
+        avenue: 0,
+        gateDir: 1,
+        spawnAlong: -76,
+      };
+    case 2:
+      // Canal along z (x = 24, 16 m) crossed by two neon truss bridges; one expressway over the canal.
+      return {
+        streets: [st('z', -12, 'AVENUE'), st('z', -56, 'STREET'), st('z', 62, 'STREET'), st('x', -48, 'STREET'), st('x', 6, 'STREET'), st('x', 52, 'STREET')],
+        canals: [{ axis: 'z', coord: 24, width: 16, from: -VIS, to: VIS }],
+        highways: [{ axis: 'x', coord: 6, from: -VIS, to: VIS, lightNeg: AMBER, lightPos: CYAN }],
+        ramps: [{ highway: 0, street: 0, dir: -1, side: 1 }],
+        bridgeStreets: [3, 5],
+        avenue: 0,
+        gateDir: 1,
+        spawnAlong: -76,
+      };
+    case 3:
+      // Two expressways crossing at grade (x = −4 / z = 4), narrow wall-run alleys, sky-bridges.
+      return {
+        streets: [st('z', 46, 'AVENUE'), st('z', -48, 'STREET'), st('z', -4, 'STREET'), st('x', -46, 'STREET'), st('x', 4, 'STREET'), st('x', 50, 'STREET')],
+        canals: [],
+        highways: [
+          { axis: 'z', coord: -4, from: -VIS, to: VIS, lightNeg: CYAN, lightPos: CYAN },
+          { axis: 'x', coord: 4, from: -VIS, to: VIS, lightNeg: AMBER, lightPos: AMBER },
+        ],
+        ramps: [
+          { highway: 1, street: 0, dir: -1, side: 1 },
+          { highway: 0, street: 3, dir: -1, side: 1 },
+        ],
+        bridgeStreets: [],
+        avenue: 0,
+        gateDir: 1,
+        spawnAlong: -76,
+      };
+    case 4:
+      // Neon canal (z = −12, 18 m) with three truss bridges under twin expressways (x = −26 / x = 50).
+      return {
+        streets: [st('z', 10, 'AVENUE'), st('z', -64, 'STREET'), st('z', -26, 'STREET'), st('z', 50, 'STREET'), st('x', -58, 'STREET'), st('x', 38, 'STREET')],
+        canals: [{ axis: 'x', coord: -12, width: 18, from: -VIS, to: VIS }],
+        highways: [
+          { axis: 'z', coord: -26, from: -VIS, to: VIS, lightNeg: CYAN, lightPos: AMBER },
+          { axis: 'z', coord: 50, from: -VIS, to: VIS, lightNeg: AMBER, lightPos: CYAN },
+        ],
+        ramps: [
+          { highway: 0, street: 5, dir: -1, side: 1 },
+          { highway: 1, street: 4, dir: -1, side: 1 },
+        ],
+        bridgeStreets: [0, 1, 3],
+        avenue: 0,
+        gateDir: 1,
+        spawnAlong: -76,
+      };
+    default: {
+      // Sector 5: central scramble plaza, ring road under a ring expressway, 16 supertalls, outer canal ring.
+      const lots: RectXZ[] = [];
+      for (const sx of [-1, 1]) {
+        for (const sz of [-1, 1]) {
+          // Corner pair split by a 6 m alley.
+          lots.push(rectFrom(sx * 38, sz * 38, sx * 49, sz * 66));
+          lots.push(rectFrom(sx * 55, sz * 38, sx * 66, sz * 66));
+        }
+      }
+      for (const s of [-1, 1]) {
+        // Side towers either side of the axial avenues.
+        lots.push(rectFrom(-32, s * 41, -14, s * 63), rectFrom(14, s * 41, 32, s * 63));
+        lots.push(rectFrom(s * 41, -32, s * 63, -14), rectFrom(s * 41, 14, s * 63, 32));
+      }
+      return {
+        streets: [
+          st('x', 27, 'AVENUE', -34, 34),
+          st('x', -27, 'AVENUE', -34, 34),
+          st('z', 27, 'AVENUE', -20, 20),
+          st('z', -27, 'AVENUE', -20, 20),
+          st('z', 0, 'AVENUE', 34, VIS),
+          st('z', 0, 'AVENUE', -VIS, -34),
+          st('x', 0, 'AVENUE', 34, VIS),
+          st('x', 0, 'AVENUE', -VIS, -34),
+        ],
+        canals: [
+          { axis: 'x', coord: 78, width: 16, from: -86, to: 86 },
+          { axis: 'x', coord: -78, width: 16, from: -86, to: 86 },
+          { axis: 'z', coord: 78, width: 16, from: -70, to: 70 },
+          { axis: 'z', coord: -78, width: 16, from: -70, to: 70 },
+        ],
+        highways: [
+          { axis: 'x', coord: 27, from: -34, to: 34, lightNeg: CYAN, lightPos: AMBER },
+          { axis: 'x', coord: -27, from: -34, to: 34, lightNeg: AMBER, lightPos: CYAN },
+          { axis: 'z', coord: 27, from: -34, to: 34, lightNeg: CYAN, lightPos: AMBER },
+          { axis: 'z', coord: -27, from: -34, to: 34, lightNeg: AMBER, lightPos: CYAN },
+        ],
+        ramps: [{ highway: 0, street: 4, dir: 1, side: 1 }],
+        bridgeStreets: [4, 5, 6, 7],
+        avenue: 5,
+        gateDir: 1,
+        spawnAlong: -60,
+        explicitLots: lots,
+        plaza: { x0: -20, z0: -20, x1: 20, z1: 20 },
+      };
+    }
+  }
+}
+
+// =============================================================================================
+// Small helpers
+// =============================================================================================
 const _m4 = new THREE.Matrix4();
 const _pos = new THREE.Vector3();
 const _quat = new THREE.Quaternion();
@@ -102,35 +337,46 @@ const _scl = new THREE.Vector3();
 const _up = new THREE.Vector3(0, 1, 0);
 const _dir = new THREE.Vector3();
 const _euler = new THREE.Euler();
+const _col = new THREE.Color();
 
-// Instance capacities (pre-allocated once)
-const CAP = {
-  AC: 72,
-  DUCT: 36,
-  FENCE: 110,
-  ANTENNA: 28,
-  AVIATION: 140,
-  NEON: 56,
-  SEARCH: 18,
-  MACHINE_ROOM: 18,
-  BEACON: 72,
-} as const;
-
-interface RoofRect {
-  x0: number;
-  z0: number;
-  x1: number;
-  z1: number;
+function rectFrom(ax: number, az: number, bx: number, bz: number): RectXZ {
+  return { x0: Math.min(ax, bx), z0: Math.min(az, bz), x1: Math.max(ax, bx), z1: Math.max(az, bz) };
 }
 
-// ---------------------------------------------------------------------------
-// Geometry helpers
-// ---------------------------------------------------------------------------
+function laneHalf(kind: StreetKind): number {
+  return (kind === 'AVENUE' ? LEVEL.AVENUE_WIDTH_M : LEVEL.STREET_WIDTH_M) / 2;
+}
+function sidewalk(kind: StreetKind): number {
+  return kind === 'AVENUE' ? LEVEL.AVENUE_SIDEWALK_M : LEVEL.STREET_SIDEWALK_M;
+}
+function corridorHalf(s: StreetPlan): number {
+  return laneHalf(s.kind) + sidewalk(s.kind);
+}
+function canalCorridorHalf(c: CanalPlan): number {
+  return c.width / 2 + LEVEL.CANAL_PROMENADE_M;
+}
+
+/** World point from (along, lateral) coordinates of an axis-aligned feature. */
+function pt(axis: Axis, along: number, y: number, lateral: number, out = new THREE.Vector3()): THREE.Vector3 {
+  return axis === 'z' ? out.set(lateral, y, along) : out.set(along, y, lateral);
+}
+
+function colliderAL(axis: Axis, a0: number, a1: number, l0: number, l1: number, y0: number, y1: number, kind: ColliderKind, building = -1, gate = false): BoxCollider {
+  const p = pt(axis, Math.min(a0, a1), y0, Math.min(l0, l1));
+  const q = pt(axis, Math.max(a0, a1), y1, Math.max(l0, l1));
+  return { min: p, max: q, kind, building, gate };
+}
+
+function boxAt(w: number, h: number, d: number, x: number, y: number, z: number): THREE.BufferGeometry {
+  const g = new THREE.BoxGeometry(w, h, d);
+  g.translate(x, y, z);
+  return g;
+}
+
 /** Box with UVs scaled to world size (tile metres) so textures keep constant texel density. */
 function worldUvBox(w: number, h: number, d: number, cx: number, cy: number, cz: number, tile: number): THREE.BufferGeometry {
   const g = new THREE.BoxGeometry(w, h, d);
   const uv = g.getAttribute('uv') as THREE.BufferAttribute;
-  // Face order: +x, -x, +y, -y, +z, -z (4 vertices each)
   const dims: Array<[number, number, number, number]> = [
     [d, h, cz, cy],
     [d, h, cz, cy],
@@ -150,10 +396,20 @@ function worldUvBox(w: number, h: number, d: number, cx: number, cy: number, cz:
   return g;
 }
 
-/** Thin box spanning a → b (lattice members, cables). */
-function beam(a: THREE.Vector3, b: THREE.Vector3, thickness: number): THREE.BufferGeometry {
+/** World-UV axis-aligned box from (along, lateral, y) extents. */
+function boxGeoWorld(axis: Axis, a0: number, a1: number, l0: number, l1: number, y0: number, y1: number): THREE.BufferGeometry {
+  const along = Math.abs(a1 - a0);
+  const lat = Math.abs(l1 - l0);
+  const c = pt(axis, (a0 + a1) / 2, (y0 + y1) / 2, (l0 + l1) / 2, new THREE.Vector3());
+  return axis === 'z'
+    ? worldUvBox(lat, y1 - y0, along, c.x, c.y, c.z, RENDER.ROOF_TILE_M)
+    : worldUvBox(along, y1 - y0, lat, c.x, c.y, c.z, RENDER.ROOF_TILE_M);
+}
+
+/** Thin box spanning a → b (lattice members, sloped parapets). */
+function beam(a: THREE.Vector3, b: THREE.Vector3, thickness: number, depth = thickness): THREE.BufferGeometry {
   const len = a.distanceTo(b);
-  const g = new THREE.BoxGeometry(thickness, len, thickness);
+  const g = new THREE.BoxGeometry(thickness, len, depth);
   _dir.subVectors(b, a).normalize();
   _quat.setFromUnitVectors(_up, _dir);
   g.applyQuaternion(_quat);
@@ -161,88 +417,286 @@ function beam(a: THREE.Vector3, b: THREE.Vector3, thickness: number): THREE.Buff
   return g;
 }
 
-function boxAt(w: number, h: number, d: number, x: number, y: number, z: number): THREE.BufferGeometry {
-  const g = new THREE.BoxGeometry(w, h, d);
-  g.translate(x, y, z);
+/**
+ * Indexed quad from 4 corners (in order around the perimeter) facing `normalHint`.
+ * `extra` adds per-vertex attributes (same value on all 4 vertices).
+ */
+function quad(
+  p: readonly [THREE.Vector3, THREE.Vector3, THREE.Vector3, THREE.Vector3],
+  uv: readonly [number, number, number, number, number, number, number, number],
+  normalHint: THREE.Vector3,
+  extra?: Record<string, readonly number[]>,
+): THREE.BufferGeometry {
+  const g = new THREE.BufferGeometry();
+  const pos = new Float32Array(12);
+  p.forEach((v, i) => v.toArray(pos, i * 3));
+  const e1 = new THREE.Vector3().subVectors(p[2], p[0]);
+  const e2 = new THREE.Vector3().subVectors(p[1], p[0]);
+  const n = new THREE.Vector3().crossVectors(e1, e2).normalize();
+  const flip = n.dot(normalHint) < 0;
+  if (flip) n.negate();
+  const nor = new Float32Array(12);
+  for (let i = 0; i < 4; i++) n.toArray(nor, i * 3);
+  g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  g.setAttribute('normal', new THREE.BufferAttribute(nor, 3));
+  g.setAttribute('uv', new THREE.BufferAttribute(new Float32Array(uv), 2));
+  if (extra) {
+    for (const [name, val] of Object.entries(extra)) {
+      const arr = new Float32Array(val.length * 4);
+      for (let i = 0; i < 4; i++) arr.set(val, i * val.length);
+      g.setAttribute(name, new THREE.BufferAttribute(arr, val.length));
+    }
+  }
+  g.setIndex(flip ? [0, 1, 2, 0, 2, 3] : [0, 2, 1, 0, 3, 2]);
   return g;
 }
 
-function addSeed(g: THREE.BufferGeometry, seed: number): THREE.BufferGeometry {
+function withColor(g: THREE.BufferGeometry, hex: number, intensity: number): THREE.BufferGeometry {
+  _col.setHex(hex);
   const n = g.getAttribute('position').count;
-  const arr = new Float32Array(n).fill(seed);
-  g.setAttribute('aSeed', new THREE.BufferAttribute(arr, 1));
+  const arr = new Float32Array(n * 3);
+  for (let i = 0; i < n; i++) {
+    arr[i * 3] = _col.r * intensity;
+    arr[i * 3 + 1] = _col.g * intensity;
+    arr[i * 3 + 2] = _col.b * intensity;
+  }
+  g.setAttribute('color', new THREE.BufferAttribute(arr, 3));
   return g;
 }
 
-function rectsOverlap(a: RoofRect, b: RoofRect): boolean {
-  return a.x0 < b.x1 && a.x1 > b.x0 && a.z0 < b.z1 && a.z1 > b.z0;
+function withAttr1(g: THREE.BufferGeometry, name: string, value: number): THREE.BufferGeometry {
+  const n = g.getAttribute('position').count;
+  g.setAttribute(name, new THREE.BufferAttribute(new Float32Array(n).fill(value), 1));
+  return g;
 }
 
-/** Edge-to-edge distance between two axis-aligned footprints. */
-function footprintGap(a: BuildingInfo, b: BuildingInfo): number {
-  const gx = Math.abs(a.cx - b.cx) - (a.halfW + b.halfW);
-  const gz = Math.abs(a.cz - b.cz) - (a.halfD + b.halfD);
-  if (gx > 0 && gz > 0) return Math.hypot(gx, gz);
-  return Math.max(gx, gz);
+function stripUv(g: THREE.BufferGeometry): THREE.BufferGeometry {
+  if (g.getAttribute('uv')) g.deleteAttribute('uv');
+  return g;
 }
 
-// ---------------------------------------------------------------------------
-// Shared shader snippets
-// ---------------------------------------------------------------------------
-const FOG_FADE_GLSL = /* glsl */ `
+function mergeOrEmpty(list: THREE.BufferGeometry[]): THREE.BufferGeometry {
+  if (list.length === 0) return new THREE.BufferGeometry();
+  const merged = mergeGeometries(list);
+  if (!merged) throw new Error('mergeGeometries failed: incompatible attributes');
+  return merged;
+}
+
+/** Subtract closed intervals from [a, b]. */
+function subtractIntervals(a: number, b: number, cuts: ReadonlyArray<readonly [number, number]>): Array<[number, number]> {
+  let parts: Array<[number, number]> = [[a, b]];
+  for (const [c0, c1] of cuts) {
+    const next: Array<[number, number]> = [];
+    for (const [p0, p1] of parts) {
+      if (c1 <= p0 || c0 >= p1) {
+        next.push([p0, p1]);
+        continue;
+      }
+      if (c0 > p0) next.push([p0, c0]);
+      if (c1 < p1) next.push([c1, p1]);
+    }
+    parts = next;
+  }
+  return parts.filter(([p0, p1]) => p1 - p0 > 0.05);
+}
+
+function rectsOverlap(a: RectXZ, b: RectXZ, margin = 0): boolean {
+  return a.x0 < b.x1 + margin && a.x1 > b.x0 - margin && a.z0 < b.z1 + margin && a.z1 > b.z0 - margin;
+}
+
+function insideRect(x: number, z: number, r: RectXZ, margin = 0): boolean {
+  return x > r.x0 - margin && x < r.x1 + margin && z > r.z0 - margin && z < r.z1 + margin;
+}
+
+// =============================================================================================
+// Shared GLSL
+// =============================================================================================
+const GLSL_HASH = /* glsl */ `
+  float sHash12(vec2 p) { vec3 p3 = fract(vec3(p.xyx) * 0.1031); p3 += dot(p3, p3.yzx + 33.33); return fract((p3.x + p3.y) * p3.z); }
+  float sNoise(vec2 p) {
+    vec2 i = floor(p); vec2 f = fract(p); vec2 u = f * f * (3.0 - 2.0 * f);
+    return mix(mix(sHash12(i), sHash12(i + vec2(1.0, 0.0)), u.x), mix(sHash12(i + vec2(0.0, 1.0)), sHash12(i + vec2(1.0, 1.0)), u.x), u.y);
+  }
+`;
+
+const GLSL_FOG_FADE = /* glsl */ `
   float strandFogFade(float dist, float density) {
     float f = 1.0 - exp(-density * density * dist * dist);
     return 1.0 - clamp(f, 0.0, 1.0);
   }
 `;
 
-// ---------------------------------------------------------------------------
+/** Expanding rain-drop rings (gradient), used in puddles and canal water. */
+const GLSL_RIPPLES = /* glsl */ `
+  vec2 strandRipples(vec2 p, float t) {
+    vec2 cell = floor(p);
+    vec2 grad = vec2(0.0);
+    for (int j = -1; j <= 1; j++) {
+      for (int i = -1; i <= 1; i++) {
+        vec2 c = cell + vec2(float(i), float(j));
+        float h = sHash12(c);
+        vec2 center = c + vec2(sHash12(c + 7.1), sHash12(c + 3.7));
+        float life = fract(t * (0.9 + h * 0.6) + h);
+        vec2 d = p - center;
+        float dist = length(d);
+        float x = (dist - life * 0.75) * 22.0;
+        float ring = sin(clamp(x, -3.14159, 3.14159)) * (1.0 - life) * (1.0 - life) * step(abs(x), 3.14159);
+        grad += (dist > 1e-4 ? d / dist : vec2(0.0)) * ring;
+      }
+    }
+    return grad;
+  }
+`;
+
+const MAX_LIGHTS = RENDER.CITY_LIGHTS_MAX;
+
+/** Analytic GGX reflections of the nearest city lights (wet streets, puddles, canal water). */
+const GLSL_CITY_LIGHTS = /* glsl */ `
+  uniform vec3 uCityLightPos[${MAX_LIGHTS}];
+  uniform vec3 uCityLightCol[${MAX_LIGHTS}];
+  uniform int uCityLightCount;
+  varying vec3 vCityWorld;
+  vec3 strandCityLights(vec3 P, vec3 N, vec3 V, vec3 albedo, float rough, float metal) {
+    vec3 acc = vec3(0.0);
+    float a = max(rough * rough, 0.0025);
+    float a2 = a * a;
+    vec3 F0 = mix(vec3(0.04), albedo, metal);
+    float NdV = max(dot(N, V), 1e-3);
+    for (int i = 0; i < ${MAX_LIGHTS}; i++) {
+      if (i >= uCityLightCount) break;
+      vec3 Lv = uCityLightPos[i] - P;
+      float d = length(Lv);
+      vec3 L = Lv / max(d, 1e-3);
+      float att = (1.0 / (1.0 + d * d * 0.045)) * (1.0 - smoothstep(${(RENDER.CITY_LIGHT_RANGE_M * 0.6).toFixed(1)}, ${RENDER.CITY_LIGHT_RANGE_M.toFixed(1)}, d));
+      float NdL = max(dot(N, L), 0.0);
+      if (att * NdL <= 0.0) continue;
+      vec3 Hh = normalize(L + V);
+      float NdH = max(dot(N, Hh), 0.0);
+      float dn = NdH * NdH * (a2 - 1.0) + 1.0;
+      float D = min(a2 / (3.14159 * dn * dn), 120.0);
+      vec3 F = F0 + (1.0 - F0) * pow(1.0 - max(dot(V, Hh), 0.0), 5.0);
+      float Vis = 0.25 / max(NdL * NdV, 0.06);
+      vec3 spec = F * D * Vis;
+      vec3 diff = albedo * (1.0 - metal) * 0.31831;
+      acc += uCityLightCol[i] * att * NdL * (diff + spec);
+    }
+    return acc;
+  }
+`;
+
+const GLSL_CITY_LIGHTS_APPLY = /* glsl */ `
+  {
+    vec3 strandNw = transformNormalByInverseViewMatrix(normal, viewMatrix);
+    vec3 strandV = normalize(cameraPosition - vCityWorld);
+    outgoingLight += strandCityLights(vCityWorld, strandNw, strandV, diffuseColor.rgb, roughnessFactor, metalnessFactor);
+  }
+  #include <opaque_fragment>
+`;
+
+/** Puddle ripple normals: puddles are detected from the sampled roughness (< ~0.2). */
+const GLSL_PUDDLE_RIPPLES = /* glsl */ `
+  {
+    float strandPuddle = 1.0 - smoothstep(0.08, 0.22, roughnessFactor);
+    vec3 strandNwUp = transformNormalByInverseViewMatrix(normal, viewMatrix);
+    if (strandPuddle > 0.001 && strandNwUp.y > 0.5) {
+      vec2 g = strandRipples(vCityWorld.xz * 2.2, uTime) * 0.32 + strandRipples(vCityWorld.xz * 3.7 + 11.0, uTime * 1.21) * 0.22;
+      normal = normalize(normal + mat3(viewMatrix) * (vec3(g.x, 0.0, g.y) * strandPuddle));
+    }
+  }
+`;
+
+// =============================================================================================
+// Capacities (pre-allocated once; counts set per sector)
+// =============================================================================================
+const CAP = {
+  AC: 150,
+  DUCT: 60,
+  FENCE: 240,
+  ANTENNA: 44,
+  AVIATION: 280,
+  NEON: 170,
+  SEARCH: 20,
+  MACHINE_ROOM: 26,
+  BEACON: 220,
+  LAMP: 170,
+  VENDING: 90,
+  GUARDRAIL: 220,
+  CITY_LIGHTS: 420,
+} as const;
+
+interface Building extends BuildingInfo {
+  readonly rect: RectXZ;
+  readonly seed: number;
+}
+
+interface CarSlot {
+  readonly x: number;
+  readonly z: number;
+  readonly y: number;
+  readonly yaw: number;
+  readonly onHighway: boolean;
+}
+
+// =============================================================================================
 // CityBuilder
-// ---------------------------------------------------------------------------
+// =============================================================================================
 export class CityBuilder {
   readonly root = new THREE.Group();
   private readonly persistent = new THREE.Group();
   private readonly sectorGroup = new THREE.Group();
   private sectorDisposables: Array<{ dispose(): void }> = [];
 
-  // Materials (created once)
-  private readonly buildingMat: THREE.MeshStandardMaterial;
-  private readonly roofMat: THREE.MeshStandardMaterial;
-  private readonly panelMat: THREE.MeshStandardMaterial;
-  private readonly steelMat: THREE.MeshStandardMaterial;
-  private readonly beaconMat: THREE.MeshStandardMaterial;
-  private readonly machineryMat: THREE.MeshStandardMaterial;
-  private readonly housingMat: THREE.MeshStandardMaterial;
-  private readonly ductMat: THREE.MeshStandardMaterial;
-  private readonly fenceMat: THREE.MeshStandardMaterial;
-
-  // Shader uniforms shared across animated materials
+  // Shared uniforms
   private readonly uTime = { value: 0 };
   private readonly uNeonBoost = { value: 1.0 };
   private readonly uSearchPulse = { value: 0.0 };
-  private readonly uGateActive = { value: 0.0 };
+  private readonly uGateOpen = { value: 0.0 };
   private readonly uFogDensity = { value: RENDER.FOG_DENSITY };
-  private readonly uFogColor = { value: new THREE.Color(COLORS.FOG_ABYSS) };
+  private readonly uCityLightPos = { value: Array.from({ length: MAX_LIGHTS }, () => new THREE.Vector3()) };
+  private readonly uCityLightCol = { value: Array.from({ length: MAX_LIGHTS }, () => new THREE.Vector3()) };
+  private readonly uCityLightCount = { value: 0 };
+
+  // City light pool (per sector)
+  private readonly lightPos = new Float32Array(CAP.CITY_LIGHTS * 3);
+  private readonly lightCol = new Float32Array(CAP.CITY_LIGHTS * 3);
+  private readonly lightDist = new Float32Array(CAP.CITY_LIGHTS);
+  private lightCount = 0;
+
+  // Materials
+  private readonly buildingMat: THREE.MeshStandardMaterial;
+  private readonly concreteMat: THREE.MeshStandardMaterial;
+  private readonly roadMat: THREE.MeshStandardMaterial;
+  private readonly waterMat: THREE.MeshStandardMaterial;
+  private readonly hwConcreteMat: THREE.MeshStandardMaterial;
+  private readonly stripMat: THREE.MeshBasicMaterial;
+  private readonly panelMat: THREE.MeshStandardMaterial;
+  private readonly steelMat: THREE.MeshStandardMaterial;
+  private readonly glassMat: THREE.MeshStandardMaterial;
+  private readonly beaconMat: THREE.MeshStandardMaterial;
+  private readonly barrierMat: THREE.ShaderMaterial;
 
   // Persistent meshes
   private readonly sky: THREE.Mesh;
-  private readonly clouds: THREE.Mesh;
   private readonly farTowers: THREE.InstancedMesh;
-  private readonly farTowerInfo: Array<{ x: number; z: number; w: number; d: number; top: number }> = [];
+  private readonly farInfo: Array<{ x: number; z: number; w: number; d: number; top: number }> = [];
+  private readonly hoverTrails: THREE.InstancedMesh;
 
-  // Instanced rooftop detail meshes (pre-allocated, counts set per sector)
+  // Instanced detail meshes
+  private readonly cars: THREE.InstancedMesh[];
+  private readonly lamps: THREE.InstancedMesh;
+  private readonly vending: THREE.InstancedMesh;
+  private readonly guardrails: THREE.InstancedMesh;
   private readonly acUnits: THREE.InstancedMesh;
   private readonly ducts: THREE.InstancedMesh;
   private readonly fences: THREE.InstancedMesh;
   private readonly antennas: THREE.InstancedMesh;
+  private readonly machineRooms: THREE.InstancedMesh;
   private readonly aviation: THREE.InstancedMesh;
   private readonly neonSigns: THREE.InstancedMesh;
   private readonly searchlights: THREE.InstancedMesh;
-  private readonly machineRooms: THREE.InstancedMesh;
   private readonly beacons: THREE.InstancedMesh;
   private readonly halos: THREE.InstancedMesh;
   private readonly gatePillar: THREE.Mesh;
-  private readonly gateBeacon: THREE.Mesh;
 
   private layout: SectorLayout | null = null;
 
@@ -250,9 +704,12 @@ export class CityBuilder {
     this.root.name = 'City';
     this.root.add(this.persistent, this.sectorGroup);
 
-    // ---------------- Materials ----------------
     this.buildingMat = this.createBuildingMaterial();
-    this.roofMat = this.createRoofMaterial();
+    this.concreteMat = this.createConcreteMaterial();
+    this.roadMat = this.createRoadMaterial();
+    this.waterMat = this.createWaterMaterial();
+    this.hwConcreteMat = this.createHighwayConcreteMaterial();
+    this.stripMat = new THREE.MeshBasicMaterial({ vertexColors: true, toneMapped: true });
     this.panelMat = new THREE.MeshStandardMaterial({
       color: 0xffffff,
       map: tex.wallPanel.map,
@@ -265,8 +722,20 @@ export class CityBuilder {
       emissiveIntensity: MATERIALS.WALLRUN_PANEL.emissive,
     });
     this.steelMat = new THREE.MeshStandardMaterial({ color: 0x2a303b, roughness: 0.42, metalness: 0.85 });
+    this.glassMat = new THREE.MeshStandardMaterial({ color: 0x0a1018, roughness: 0.06, metalness: 0.9 });
     this.beaconMat = this.createBeaconMaterial();
-    this.machineryMat = new THREE.MeshStandardMaterial({
+    this.barrierMat = this.createBarrierMaterial();
+
+    // ---------------- Persistent backdrop ----------------
+    this.sky = this.createSky();
+    this.farTowers = new THREE.InstancedMesh(new THREE.BoxGeometry(1, 1, 1), this.buildingMat, LIMITS.FAR_BUILDINGS);
+    this.farTowers.geometry.setAttribute('aSeed', new THREE.InstancedBufferAttribute(new Float32Array(LIMITS.FAR_BUILDINGS), 1));
+    this.farTowers.name = 'FarTowers';
+    this.hoverTrails = this.createHoverTrails();
+    this.persistent.add(this.sky, this.farTowers, this.hoverTrails);
+
+    // ---------------- Instanced details ----------------
+    const machinery = new THREE.MeshStandardMaterial({
       color: 0xffffff,
       map: tex.machinery.map,
       roughness: 1.0,
@@ -274,39 +743,33 @@ export class CityBuilder {
       normalMap: tex.machinery.normalMap,
       metalness: 0.55,
     });
-    this.housingMat = new THREE.MeshStandardMaterial({ color: 0x232934, roughness: 0.5, metalness: 0.55 });
-    this.ductMat = new THREE.MeshStandardMaterial({ color: 0x4a525e, roughness: 0.3, metalness: 0.9 });
-    this.fenceMat = new THREE.MeshStandardMaterial({ color: 0x3a414d, roughness: 0.38, metalness: 0.88 });
-
-    // ---------------- Persistent backdrop ----------------
-    this.sky = this.createSky();
-    this.clouds = this.createCloudDeck();
-    this.farTowers = new THREE.InstancedMesh(new THREE.BoxGeometry(1, 1, 1), this.buildingMat, LIMITS.FAR_BUILDINGS);
-    this.farTowers.geometry.setAttribute(
-      'aSeed',
-      new THREE.InstancedBufferAttribute(new Float32Array(LIMITS.FAR_BUILDINGS), 1),
-    );
-    this.farTowers.name = 'FarTowers';
-    this.persistent.add(this.sky, this.clouds, this.farTowers);
-    this.layoutFarTowers(0xfa77);
-
-    // ---------------- Instanced rooftop details ----------------
-    this.acUnits = this.makeInstanced(this.createAcGeometry(), this.machineryMat, CAP.AC, 'ACUnits');
-    this.ducts = this.makeInstanced(this.createDuctGeometry(), this.ductMat, CAP.DUCT, 'Ducts');
-    this.fences = this.makeInstanced(this.createFenceGeometry(), this.fenceMat, CAP.FENCE, 'Fences');
+    const carMat = this.createCarMaterial();
+    this.cars = ([0, 1, 2] as const).map((v) => {
+      const g = this.createCarGeometry(v);
+      g.setAttribute('aCar', new THREE.InstancedBufferAttribute(new Float32Array(LIMITS.PARKED_CARS * 4), 4));
+      return this.makeInstanced(g, carMat, LIMITS.PARKED_CARS, `ParkedCars_${['Coupe', 'Sedan', 'Van'][v]}`);
+    });
+    const lampGeo = this.createLampGeometry();
+    lampGeo.setAttribute('aTint', new THREE.InstancedBufferAttribute(new Float32Array(CAP.LAMP * 3), 3));
+    this.lamps = this.makeInstanced(lampGeo, this.createLampMaterial(), CAP.LAMP, 'StreetLamps');
+    const vendGeo = this.createVendingGeometry();
+    vendGeo.setAttribute('aTint', new THREE.InstancedBufferAttribute(new Float32Array(CAP.VENDING * 3), 3));
+    this.vending = this.makeInstanced(vendGeo, this.createVendingMaterial(), CAP.VENDING, 'VendingKiosks');
+    this.guardrails = this.makeInstanced(this.createGuardrailGeometry(), this.steelMat, CAP.GUARDRAIL, 'Guardrails');
+    this.acUnits = this.makeInstanced(this.createAcGeometry(), machinery, CAP.AC, 'ACUnits');
+    this.ducts = this.makeInstanced(this.createDuctGeometry(), new THREE.MeshStandardMaterial({ color: 0x4a525e, roughness: 0.3, metalness: 0.9 }), CAP.DUCT, 'Ducts');
+    this.fences = this.makeInstanced(this.createFenceGeometry(), new THREE.MeshStandardMaterial({ color: 0x3a414d, roughness: 0.38, metalness: 0.88 }), CAP.FENCE, 'RoofFences');
     this.antennas = this.makeInstanced(this.createAntennaGeometry(), this.steelMat, CAP.ANTENNA, 'Antennas');
-    this.machineRooms = this.makeInstanced(this.createMachineRoomGeometry(), this.housingMat, CAP.MACHINE_ROOM, 'MachineRooms');
+    this.machineRooms = this.makeInstanced(this.createMachineRoomGeometry(), new THREE.MeshStandardMaterial({ color: 0x232934, roughness: 0.5, metalness: 0.55 }), CAP.MACHINE_ROOM, 'MachineRooms');
     this.aviation = this.createAviationLights();
     this.neonSigns = this.createNeonSigns();
     this.searchlights = this.createSearchlights();
     this.beacons = this.makeInstanced(this.createBeaconGeometry(), this.beaconMat, CAP.BEACON, 'GoldAnchors');
     this.halos = this.createAnchorHalos();
-    const gate = this.createGate();
-    this.gatePillar = gate.pillar;
-    this.gateBeacon = gate.beacon;
+    this.gatePillar = this.createGatePillar();
     this.persistent.add(
-      this.acUnits, this.ducts, this.fences, this.antennas, this.machineRooms, this.aviation,
-      this.neonSigns, this.searchlights, this.beacons, this.halos, this.gatePillar, this.gateBeacon,
+      ...this.cars, this.lamps, this.vending, this.guardrails, this.acUnits, this.ducts, this.fences, this.antennas,
+      this.machineRooms, this.aviation, this.neonSigns, this.searchlights, this.beacons, this.halos, this.gatePillar,
     );
   }
 
@@ -314,10 +777,26 @@ export class CityBuilder {
     return this.layout;
   }
 
-  // =========================================================================================
+  // ===========================================================================================
   // Materials
-  // =========================================================================================
-  /** Glass tower material: world-space window mapping, per-building seed, roof-face override. */
+  // ===========================================================================================
+  /** Shared city-light uniforms + world-position varying, injected into a MeshStandardMaterial shader. */
+  private injectCityLights(shader: THREE.WebGLProgramParametersWithUniforms): void {
+    shader.uniforms.uCityLightPos = this.uCityLightPos;
+    shader.uniforms.uCityLightCol = this.uCityLightCol;
+    shader.uniforms.uCityLightCount = this.uCityLightCount;
+    shader.vertexShader = shader.vertexShader
+      .replace('#include <common>', '#include <common>\nvarying vec3 vCityWorld;')
+      .replace('#include <worldpos_vertex>', '#include <worldpos_vertex>\nvCityWorld = (modelMatrix * vec4(transformed, 1.0)).xyz;');
+    shader.fragmentShader = shader.fragmentShader
+      .replace('#include <common>', `#include <common>\n${GLSL_CITY_LIGHTS}`)
+      .replace('#include <opaque_fragment>', GLSL_CITY_LIGHTS_APPLY);
+  }
+
+  /**
+   * Glass tower material: world-space window atlas. Rows 0–4 (office) repeat every 20 m above Y 12 m;
+   * rows 5–7 (shops 3F/2F/1F) cover Y 0–12 m. textureGrad on the continuous UV avoids mip seams at wraps.
+   */
   private createBuildingMaterial(): THREE.MeshStandardMaterial {
     const w = this.tex.windows;
     const mat = new THREE.MeshStandardMaterial({
@@ -333,20 +812,23 @@ export class CityBuilder {
       emissiveIntensity: MATERIALS.BUILDING_GLASS.emissive,
     });
     const tileW = RENDER.WINDOW_TILE_WIDTH_M.toFixed(2);
-    const tileH = RENDER.WINDOW_TILE_HEIGHT_M.toFixed(2);
+    const rowH = RENDER.WINDOW_FLOOR_HEIGHT_M;
+    const texH = (rowH * RENDER.WINDOW_ROWS).toFixed(2); // 32 m of texture height
+    const shopTop = (rowH * RENDER.WINDOW_SHOP_ROWS).toFixed(2); // 12 m
+    const officeH = (rowH * RENDER.WINDOW_OFFICE_ROWS).toFixed(2); // 20 m
+    const shopFrac = (RENDER.WINDOW_SHOP_ROWS / RENDER.WINDOW_ROWS).toFixed(4); // 0.375
+    const officeFrac = (RENDER.WINDOW_OFFICE_ROWS / RENDER.WINDOW_ROWS).toFixed(4); // 0.625
+    const officeRows = RENDER.WINDOW_OFFICE_ROWS.toFixed(1);
     const roofCol = new THREE.Color(COLORS.ROOF_WET);
     mat.onBeforeCompile = (shader) => {
       shader.vertexShader = shader.vertexShader
-        .replace(
-          '#include <common>',
-          /* glsl */ `#include <common>
+        .replace('#include <common>', `#include <common>
           attribute float aSeed;
+          varying vec2 vStrandUv;
+          varying float vStrandY;
           varying float vTop;
-          varying float vSeed;`,
-        )
-        .replace(
-          '#include <uv_vertex>',
-          /* glsl */ `#include <uv_vertex>
+          varying float vSeed;`)
+        .replace('#include <uv_vertex>', `#include <uv_vertex>
           {
             #ifdef USE_INSTANCING
               mat4 strandWm = modelMatrix * instanceMatrix;
@@ -355,47 +837,54 @@ export class CityBuilder {
             #endif
             vec4 strandWp = strandWm * vec4(position, 1.0);
             vec3 strandWn = normalize(mat3(strandWm) * normal);
-            vec2 strandUv;
             if (abs(strandWn.y) > 0.5) {
               vTop = 1.0;
-              strandUv = strandWp.xz / ${tileW};
+              vStrandUv = strandWp.xz / ${tileW};
             } else {
               vTop = 0.0;
               float along = abs(strandWn.x) > abs(strandWn.z) ? -strandWp.z * sign(strandWn.x) : strandWp.x * sign(strandWn.z);
-              strandUv = vec2(along / ${tileW}, strandWp.y / ${tileH});
+              vStrandUv = vec2(along / ${tileW} + floor(aSeed * 8.0) / 8.0, strandWp.y / ${texH});
             }
-            strandUv += vec2(floor(aSeed * 8.0) / 8.0, floor(fract(aSeed * 13.7) * 8.0) / 8.0);
+            vStrandY = strandWp.y;
             vSeed = aSeed;
-            vMapUv = strandUv;
-            vEmissiveMapUv = strandUv;
-            vRoughnessMapUv = strandUv;
-            vNormalMapUv = strandUv;
-          }`,
-        );
+            vNormalMapUv = vStrandUv;
+          }`);
       shader.fragmentShader = shader.fragmentShader
-        .replace(
-          '#include <common>',
-          /* glsl */ `#include <common>
+        .replace('#include <common>', `#include <common>
+          varying vec2 vStrandUv;
+          varying float vStrandY;
           varying float vTop;
-          varying float vSeed;`,
-        )
-        .replace(
-          '#include <map_fragment>',
-          /* glsl */ `#include <map_fragment>
-          diffuseColor.rgb = mix(diffuseColor.rgb, vec3(${roofCol.r.toFixed(4)}, ${roofCol.g.toFixed(4)}, ${roofCol.b.toFixed(4)}), vTop);`,
-        )
-        .replace(
-          '#include <emissivemap_fragment>',
-          /* glsl */ `#include <emissivemap_fragment>
-          totalEmissiveRadiance *= (1.0 - vTop) * (0.72 + 0.28 * fract(vSeed * 91.7));`,
-        );
+          varying float vSeed;
+          vec2 strandWindowUv() {
+            if (vTop > 0.5) return vStrandUv;
+            if (vStrandY < ${shopTop}) return vec2(vStrandUv.x, clamp(vStrandY / ${texH}, 0.002, ${shopFrac} - 0.002));
+            float floorsOff = floor(fract(vSeed * 13.7) * ${officeRows}) / ${officeRows};
+            return vec2(vStrandUv.x, ${shopFrac} + 0.002 + fract((vStrandY - ${shopTop}) / ${officeH} + floorsOff) * (${officeFrac} - 0.004));
+          }`)
+        .replace('#include <map_fragment>', `
+          vec2 sWUv = strandWindowUv();
+          vec2 sWGX = dFdx(vStrandUv);
+          vec2 sWGY = dFdy(vStrandUv);
+          diffuseColor *= textureGrad(map, sWUv, sWGX, sWGY);
+          diffuseColor.rgb = mix(diffuseColor.rgb, vec3(${roofCol.r.toFixed(4)}, ${roofCol.g.toFixed(4)}, ${roofCol.b.toFixed(4)}), vTop);`)
+        .replace('#include <roughnessmap_fragment>', `
+          float roughnessFactor = roughness * textureGrad(roughnessMap, sWUv, sWGX, sWGY).g;`)
+        .replace('#include <normal_fragment_maps>', `
+          {
+            vec3 mapN = textureGrad(normalMap, sWUv, sWGX, sWGY).xyz * 2.0 - 1.0;
+            mapN.xy *= normalScale;
+            normal = normalize(tbn * mapN);
+          }`)
+        .replace('#include <emissivemap_fragment>', `
+          totalEmissiveRadiance *= textureGrad(emissiveMap, sWUv, sWGX, sWGY).rgb;
+          totalEmissiveRadiance *= (1.0 - vTop) * (0.72 + 0.28 * fract(vSeed * 91.7));`);
     };
-    mat.customProgramCacheKey = () => 'strand-building-v1';
+    mat.customProgramCacheKey = () => 'strand-building-v11';
     return mat;
   }
 
-  /** Wet rooftop concrete with puddle mirror roughness and animated rain ripples inside puddles. */
-  private createRoofMaterial(): THREE.MeshStandardMaterial {
+  /** Wet concrete (sidewalks, plazas, promenades, rooftops, towpaths): puddle ripples + city lights. */
+  private createConcreteMaterial(): THREE.MeshStandardMaterial {
     const r = this.tex.roof;
     const mat = new THREE.MeshStandardMaterial({
       color: 0xffffff,
@@ -406,65 +895,104 @@ export class CityBuilder {
       normalMap: r.normalMap,
       normalScale: new THREE.Vector2(0.6, 0.6),
     });
-    const uTime = this.uTime;
     mat.onBeforeCompile = (shader) => {
-      shader.uniforms.uTime = uTime;
-      shader.vertexShader = shader.vertexShader
-        .replace('#include <common>', '#include <common>\nvarying vec3 vRoofWorld;\nvarying float vRoofUp;')
-        .replace(
-          '#include <worldpos_vertex>',
-          `#include <worldpos_vertex>
-          vRoofWorld = (modelMatrix * vec4(transformed, 1.0)).xyz;
-          vRoofUp = normalize(mat3(modelMatrix) * objectNormal).y;`,
-        );
+      shader.uniforms.uTime = this.uTime;
+      this.injectCityLights(shader);
       shader.fragmentShader = shader.fragmentShader
-        .replace(
-          '#include <common>',
-          /* glsl */ `#include <common>
-          uniform float uTime;
-          varying vec3 vRoofWorld;
-          varying float vRoofUp;
-          float rHash(vec2 p) { vec3 p3 = fract(vec3(p.xyx) * 0.1031); p3 += dot(p3, p3.yzx + 33.33); return fract((p3.x + p3.y) * p3.z); }
-          vec2 rainRipples(vec2 p, float t) {
-            vec2 cell = floor(p);
-            vec2 grad = vec2(0.0);
-            for (int j = -1; j <= 1; j++) {
-              for (int i = -1; i <= 1; i++) {
-                vec2 c = cell + vec2(float(i), float(j));
-                float h = rHash(c);
-                vec2 center = c + vec2(rHash(c + 7.1), rHash(c + 3.7));
-                float life = fract(t * (0.9 + h * 0.6) + h);
-                vec2 d = p - center;
-                float dist = length(d);
-                float radius = life * 0.75;
-                float x = (dist - radius) * 22.0;
-                float ring = sin(clamp(x, -3.14159, 3.14159)) * (1.0 - life) * (1.0 - life);
-                ring *= step(abs(x), 3.14159);
-                grad += (dist > 1e-4 ? d / dist : vec2(0.0)) * ring;
-              }
-            }
-            return grad;
-          }`,
-        )
-        .replace(
-          '#include <normal_fragment_maps>',
-          /* glsl */ `#include <normal_fragment_maps>
-          {
-            #ifdef USE_ROUGHNESSMAP
-              float rr = texture2D(roughnessMap, vRoughnessMapUv).g;
-              float puddle = 1.0 - smoothstep(0.08, 0.22, rr);
-            #else
-              float puddle = 0.0;
-            #endif
-            if (puddle > 0.001 && vRoofUp > 0.5) {
-              vec2 g = rainRipples(vRoofWorld.xz * 2.2, uTime) * 0.32 + rainRipples(vRoofWorld.xz * 3.7 + 11.0, uTime * 1.21) * 0.22;
-              vec3 rippleWorld = vec3(g.x, 0.0, g.y) * puddle;
-              normal = normalize(normal + mat3(viewMatrix) * rippleWorld);
-            }
-          }`,
-        );
+        .replace('#include <common>', `#include <common>\nuniform float uTime;\n${GLSL_HASH}\n${GLSL_RIPPLES}`)
+        .replace('#include <normal_fragment_maps>', `#include <normal_fragment_maps>\n${GLSL_PUDDLE_RIPPLES}`);
     };
-    mat.customProgramCacheKey = () => 'strand-roof-v1';
+    mat.customProgramCacheKey = () => 'strand-concrete-v11';
+    return mat;
+  }
+
+  /** Wet road atlas: per-vertex atlas rect + continuous tile UV, sampled with textureGrad(fract()). */
+  private createRoadMaterial(): THREE.MeshStandardMaterial {
+    const r = this.tex.roads;
+    const mat = new THREE.MeshStandardMaterial({
+      color: 0xffffff,
+      map: r.map,
+      roughness: 1.0,
+      roughnessMap: r.roughnessMap,
+      metalness: MATERIALS.ROOF_WET.metalness,
+      normalMap: r.normalMap,
+      normalScale: new THREE.Vector2(0.7, 0.7),
+      polygonOffset: true,
+      polygonOffsetFactor: -2,
+      polygonOffsetUnits: -4,
+    });
+    mat.onBeforeCompile = (shader) => {
+      shader.uniforms.uTime = this.uTime;
+      this.injectCityLights(shader);
+      shader.vertexShader = shader.vertexShader
+        .replace('#include <common>', '#include <common>\nattribute vec4 aAtlas;\nvarying vec4 vAtlas;\nvarying vec2 vTileUv;')
+        .replace('#include <uv_vertex>', '#include <uv_vertex>\nvAtlas = aAtlas;\nvTileUv = uv;');
+      shader.fragmentShader = shader.fragmentShader
+        .replace('#include <common>', `#include <common>\nuniform float uTime;\nvarying vec4 vAtlas;\nvarying vec2 vTileUv;\n${GLSL_HASH}\n${GLSL_RIPPLES}`)
+        .replace('#include <map_fragment>', `
+          vec2 sRSize = vAtlas.zw - vAtlas.xy;
+          vec2 sRUv = vAtlas.xy + sRSize * fract(vTileUv);
+          vec2 sRGX = dFdx(vTileUv) * sRSize;
+          vec2 sRGY = dFdy(vTileUv) * sRSize;
+          diffuseColor *= textureGrad(map, sRUv, sRGX, sRGY);`)
+        .replace('#include <roughnessmap_fragment>', `
+          float roughnessFactor = roughness * textureGrad(roughnessMap, sRUv, sRGX, sRGY).g;`)
+        .replace('#include <normal_fragment_maps>', `
+          {
+            vec3 mapN = textureGrad(normalMap, sRUv, sRGX, sRGY).xyz * 2.0 - 1.0;
+            mapN.xy *= normalScale;
+            normal = normalize(tbn * mapN);
+          }
+          ${GLSL_PUDDLE_RIPPLES}`);
+    };
+    mat.customProgramCacheKey = () => 'strand-road-v11';
+    return mat;
+  }
+
+  /** Canal water (§6.2-2): slow UV flow + spreading rain-ring normals + Fresnel PBR reflection + city lights. */
+  private createWaterMaterial(): THREE.MeshStandardMaterial {
+    const mat = new THREE.MeshStandardMaterial({
+      color: new THREE.Color(COLORS.CANAL_WATER),
+      roughness: MATERIALS.CANAL_WATER.roughness,
+      metalness: MATERIALS.CANAL_WATER.metalness,
+    });
+    mat.onBeforeCompile = (shader) => {
+      shader.uniforms.uTime = this.uTime;
+      this.injectCityLights(shader);
+      shader.vertexShader = shader.vertexShader
+        .replace('#include <common>', '#include <common>\nattribute vec2 aFlow;\nvarying vec2 vFlow;')
+        .replace('#include <uv_vertex>', '#include <uv_vertex>\nvFlow = aFlow;');
+      shader.fragmentShader = shader.fragmentShader
+        .replace('#include <common>', `#include <common>\nuniform float uTime;\nvarying vec2 vFlow;\n${GLSL_HASH}\n${GLSL_RIPPLES}`)
+        .replace('#include <normal_fragment_maps>', `
+          {
+            // Flow: scrolling two-octave noise height field differentiated into a normal.
+            vec2 p = vCityWorld.xz * 0.32 - vFlow * uTime * 0.45;
+            float e = 0.35;
+            float h0 = sNoise(p) + 0.5 * sNoise(p * 2.3 + 5.1);
+            float hx = sNoise(p + vec2(e, 0.0)) + 0.5 * sNoise((p + vec2(e, 0.0)) * 2.3 + 5.1);
+            float hz = sNoise(p + vec2(0.0, e)) + 0.5 * sNoise((p + vec2(0.0, e)) * 2.3 + 5.1);
+            vec2 flowGrad = vec2(hx - h0, hz - h0) * 0.55;
+            vec2 rip = strandRipples(vCityWorld.xz * 1.6, uTime) * 0.42 + strandRipples(vCityWorld.xz * 2.9 + 3.0, uTime * 1.3) * 0.25;
+            vec3 nW = normalize(vec3(-(flowGrad.x + rip.x), 1.0, -(flowGrad.y + rip.y)));
+            normal = normalize(mat3(viewMatrix) * nW);
+          }`);
+    };
+    mat.customProgramCacheKey = () => 'strand-water-v11';
+    return mat;
+  }
+
+  /** Expressway / bridge / canal-wall / pier concrete (#1A202C, R 0.48, M 0.30) + city lights. */
+  private createHighwayConcreteMaterial(): THREE.MeshStandardMaterial {
+    const mat = new THREE.MeshStandardMaterial({
+      color: new THREE.Color(COLORS.HIGHWAY_CONCRETE),
+      roughness: MATERIALS.HIGHWAY_CONCRETE.roughness,
+      metalness: MATERIALS.HIGHWAY_CONCRETE.metalness,
+      normalMap: this.tex.roof.normalMap,
+      normalScale: new THREE.Vector2(0.45, 0.45),
+    });
+    mat.onBeforeCompile = (shader) => this.injectCityLights(shader);
+    mat.customProgramCacheKey = () => 'strand-hwconcrete-v11';
     return mat;
   }
 
@@ -477,34 +1005,186 @@ export class CityBuilder {
       emissive: new THREE.Color(COLORS.GRAPPLE_GOLD),
       emissiveIntensity: MATERIALS.GRAPPLE_ANCHOR.emissive,
     });
-    const uTime = this.uTime;
     mat.onBeforeCompile = (shader) => {
-      shader.uniforms.uTime = uTime;
+      shader.uniforms.uTime = this.uTime;
       shader.vertexShader = shader.vertexShader
-        .replace(
-          '#include <common>',
-          `#include <common>
+        .replace('#include <common>', `#include <common>
           uniform float uTime;
-          mat3 strandRotY(float a) { float c = cos(a), s = sin(a); return mat3(c, 0.0, -s, 0.0, 1.0, 0.0, s, 0.0, c); }`,
-        )
-        .replace(
-          '#include <beginnormal_vertex>',
-          `#include <beginnormal_vertex>
-          objectNormal = strandRotY(uTime * 1.6) * objectNormal;`,
-        )
-        .replace(
-          '#include <begin_vertex>',
-          `#include <begin_vertex>
-          transformed = strandRotY(uTime * 1.6) * transformed;`,
-        );
+          mat3 strandRotY(float a) { float c = cos(a), s = sin(a); return mat3(c, 0.0, -s, 0.0, 1.0, 0.0, s, 0.0, c); }`)
+        .replace('#include <beginnormal_vertex>', '#include <beginnormal_vertex>\nobjectNormal = strandRotY(uTime * 1.6) * objectNormal;')
+        .replace('#include <begin_vertex>', '#include <begin_vertex>\ntransformed = strandRotY(uTime * 1.6) * transformed;');
     };
     mat.customProgramCacheKey = () => 'strand-beacon-v1';
     return mat;
   }
 
-  // =========================================================================================
+  /**
+   * Parked cyber-car material (#171D28, R 0.22, M 0.78). Per-vertex aPart: 0 body · 1 glass · 2 front LED ·
+   * 3 rear LED · 4 tyres/trim. Per-instance aCar: (frontCyan 0|1, LED intensity 2.2–2.8, hazard 0|1, phase).
+   */
+  private createCarMaterial(): THREE.MeshStandardMaterial {
+    const mat = new THREE.MeshStandardMaterial({
+      color: new THREE.Color(COLORS.CAR_BODY),
+      roughness: MATERIALS.CAR_BODY.roughness,
+      metalness: MATERIALS.CAR_BODY.metalness,
+      emissive: new THREE.Color(0xffffff),
+    });
+    const v3 = (hex: number): string => {
+      const c = new THREE.Color(hex);
+      return `vec3(${c.r.toFixed(4)}, ${c.g.toFixed(4)}, ${c.b.toFixed(4)})`;
+    };
+    mat.onBeforeCompile = (shader) => {
+      shader.uniforms.uTime = this.uTime;
+      shader.vertexShader = shader.vertexShader
+        .replace('#include <common>', '#include <common>\nattribute float aPart;\nattribute vec4 aCar;\nvarying float vPart;\nvarying vec4 vCar;')
+        .replace('#include <uv_vertex>', '#include <uv_vertex>\nvPart = aPart;\nvCar = aCar;');
+      shader.fragmentShader = shader.fragmentShader
+        .replace('#include <common>', '#include <common>\nuniform float uTime;\nvarying float vPart;\nvarying vec4 vCar;')
+        .replace('#include <map_fragment>', `#include <map_fragment>
+          float sPart = floor(vPart + 0.5);
+          if (sPart == 1.0) diffuseColor.rgb = vec3(0.006, 0.008, 0.012);
+          else if (sPart == 4.0) diffuseColor.rgb = vec3(0.012, 0.012, 0.014);
+          else if (sPart >= 2.0) diffuseColor.rgb = vec3(0.05);`)
+        .replace('#include <roughnessmap_fragment>', `#include <roughnessmap_fragment>
+          if (sPart == 1.0) roughnessFactor = 0.05;
+          else if (sPart == 4.0) roughnessFactor = 0.78;`)
+        .replace('#include <metalnessmap_fragment>', `#include <metalnessmap_fragment>
+          if (sPart == 1.0) metalnessFactor = 0.9;
+          else if (sPart == 4.0) metalnessFactor = 0.1;`)
+        .replace('#include <emissivemap_fragment>', `#include <emissivemap_fragment>
+          {
+            float blink = step(0.5, fract(uTime * 1.5 + vCar.w));
+            vec3 led = vec3(0.0);
+            if (sPart == 2.0) led = vCar.z > 0.5 ? ${v3(COLORS.CAR_HAZARD)} * blink : mix(${v3(COLORS.CAR_LED_WHITE)}, ${v3(COLORS.CAR_LED_CYAN)}, vCar.x);
+            else if (sPart == 3.0) led = ${v3(COLORS.CAR_LED_REAR)} * (vCar.z > 0.5 ? (0.25 + 0.75 * blink) : 1.0);
+            totalEmissiveRadiance = led * vCar.y;
+          }`);
+    };
+    mat.customProgramCacheKey = () => 'strand-car-v11';
+    return mat;
+  }
+
+  /** Neon street lamps: aPart 1 = lamp head (cool white), 2 = neon accent ring (per-instance tint). */
+  private createLampMaterial(): THREE.MeshStandardMaterial {
+    const mat = new THREE.MeshStandardMaterial({ color: 0x252a33, roughness: 0.4, metalness: 0.85, emissive: new THREE.Color(0xffffff) });
+    const lamp = new THREE.Color(COLORS.STREET_LAMP);
+    mat.onBeforeCompile = (shader) => {
+      shader.vertexShader = shader.vertexShader
+        .replace('#include <common>', '#include <common>\nattribute float aPart;\nattribute vec3 aTint;\nvarying float vPart;\nvarying vec3 vTint;')
+        .replace('#include <uv_vertex>', '#include <uv_vertex>\nvPart = aPart;\nvTint = aTint;');
+      shader.fragmentShader = shader.fragmentShader
+        .replace('#include <common>', '#include <common>\nvarying float vPart;\nvarying vec3 vTint;')
+        .replace('#include <emissivemap_fragment>', `#include <emissivemap_fragment>
+          {
+            float p = floor(vPart + 0.5);
+            // Background fixtures stay below the 0.92 bloom threshold.
+            totalEmissiveRadiance = p == 1.0 ? vec3(${lamp.r.toFixed(3)}, ${lamp.g.toFixed(3)}, ${lamp.b.toFixed(3)}) * 0.9 : (p == 2.0 ? vTint * 0.85 : vec3(0.0));
+          }`);
+    };
+    mat.customProgramCacheKey = () => 'strand-lamp-v11';
+    return mat;
+  }
+
+  /** Vending machines / kiosks: aPart 1 = lit front panel, 2 = top sign (per-instance tint). */
+  private createVendingMaterial(): THREE.MeshStandardMaterial {
+    const mat = new THREE.MeshStandardMaterial({ color: 0x1c2230, roughness: 0.3, metalness: 0.6, emissive: new THREE.Color(0xffffff) });
+    mat.onBeforeCompile = (shader) => {
+      shader.vertexShader = shader.vertexShader
+        .replace('#include <common>', '#include <common>\nattribute float aPart;\nattribute vec3 aTint;\nvarying float vPart;\nvarying vec3 vTint;\nvarying vec2 vVUv;')
+        .replace('#include <uv_vertex>', '#include <uv_vertex>\nvPart = aPart;\nvTint = aTint;\nvVUv = uv;');
+      shader.fragmentShader = shader.fragmentShader
+        .replace('#include <common>', '#include <common>\nvarying float vPart;\nvarying vec3 vTint;\nvarying vec2 vVUv;')
+        .replace('#include <emissivemap_fragment>', `#include <emissivemap_fragment>
+          {
+            float p = floor(vPart + 0.5);
+            // Product rows on the panel: bright slots in a 4 × 6 grid.
+            float slots = step(0.18, fract(vVUv.x * 4.0)) * step(0.25, fract(vVUv.y * 6.0)) * step(0.35, vVUv.y);
+            vec3 panel = mix(vTint * 0.35, vec3(0.85), slots * 0.55);
+            totalEmissiveRadiance = p == 1.0 ? panel : (p == 2.0 ? vTint * 0.85 : vec3(0.0));
+          }`);
+    };
+    mat.customProgramCacheKey = () => 'strand-vending-v11';
+    return mat;
+  }
+
+  /** Lockdown barrier: aKind 0 faint hex wall (near the camera only), 1 street blockade, 2 district gate. */
+  private createBarrierMaterial(): THREE.ShaderMaterial {
+    return new THREE.ShaderMaterial({
+      transparent: true,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+      side: THREE.DoubleSide,
+      uniforms: {
+        uTime: this.uTime,
+        uGateOpen: this.uGateOpen,
+        uRed: { value: new THREE.Color(COLORS.BARRIER_RED) },
+        uAmber: { value: new THREE.Color(COLORS.SHIELD_AMBER) },
+        uJade: { value: new THREE.Color(COLORS.GATE_JADE) },
+        uCyan: { value: new THREE.Color(COLORS.WALLRUN_CYAN) },
+        uJadeI: { value: MATERIALS.GATE_JADE.emissive },
+        uFogDensity: this.uFogDensity,
+      },
+      vertexShader: /* glsl */ `
+        attribute float aKind;
+        varying float vKind; varying vec3 vWorld; varying vec2 vUv; varying vec3 vN;
+        void main() {
+          vKind = aKind;
+          vUv = uv;
+          vN = normal;
+          vec4 wp = modelMatrix * vec4(position, 1.0);
+          vWorld = wp.xyz;
+          gl_Position = projectionMatrix * viewMatrix * wp;
+        }
+      `,
+      fragmentShader: /* glsl */ `
+        uniform float uTime; uniform float uGateOpen; uniform vec3 uRed; uniform vec3 uAmber; uniform vec3 uJade; uniform vec3 uCyan;
+        uniform float uJadeI; uniform float uFogDensity;
+        varying float vKind; varying vec3 vWorld; varying vec2 vUv; varying vec3 vN;
+        ${GLSL_FOG_FADE}
+        float hexLine(vec2 p) {
+          vec2 h = vec2(1.0, 1.7320508);
+          vec2 a = mod(p, h) - h * 0.5;
+          vec2 b = mod(p - h * 0.5, h) - h * 0.5;
+          vec2 g = dot(a, a) < dot(b, b) ? a : b;
+          float hd = max(dot(abs(g), vec2(0.5, 0.8660254)), abs(g.x));
+          return smoothstep(0.44, 0.5, hd);
+        }
+        void main() {
+          float along = abs(vN.x) > 0.5 ? vWorld.z : vWorld.x;
+          float hex = hexLine(vec2(along, vWorld.y) / 1.6);
+          float dist = length(vWorld - cameraPosition);
+          float scan = 0.65 + 0.35 * sin(vWorld.y * 1.4 - uTime * 3.0);
+          float k = floor(vKind + 0.5);
+          vec3 c;
+          if (k < 0.5) {
+            // Faint wall: only reveals itself near the player.
+            float near = 1.0 - smoothstep(10.0, 34.0, dist);
+            c = uCyan * (hex * 0.55 + 0.03) * near * scan * (1.0 - smoothstep(6.0, 40.0, vWorld.y - cameraPosition.y));
+          } else {
+            float frame = max(smoothstep(0.03, 0.0, min(vUv.x, 1.0 - vUv.x)), smoothstep(0.04, 0.0, 1.0 - vUv.y));
+            float stripes = step(0.5, fract((along + vWorld.y) * 0.35 - uTime * 0.8));
+            float topFade = 1.0 - smoothstep(0.55, 1.0, vUv.y);
+            vec3 locked = uRed * (hex * 0.9 + 0.12 + frame * 1.6) * scan + uAmber * stripes * 0.18 * topFade;
+            if (k > 1.5) {
+              float chev = step(0.5, fract(vWorld.y * 0.25 - abs(vUv.x - 0.5) * 2.0 - uTime * 1.2));
+              vec3 open = uJade * (frame * uJadeI + hex * 0.35 + chev * 0.25 * topFade);
+              c = mix(locked, open, uGateOpen);
+            } else {
+              c = locked;
+            }
+            c *= strandFogFade(dist, uFogDensity * 0.6);
+          }
+          gl_FragColor = vec4(c, 1.0);
+          #include <tonemapping_fragment>
+          #include <colorspace_fragment>
+        }
+      `,
+    });
+  }
+
+  // ===========================================================================================
   // Persistent backdrop
-  // =========================================================================================
+  // ===========================================================================================
   private createSky(): THREE.Mesh {
     const geo = new THREE.SphereGeometry(2400, 64, 32);
     const moonDir = new THREE.Vector3(-0.45, 0.62, -0.64).normalize();
@@ -530,25 +1210,21 @@ export class CityBuilder {
       fragmentShader: /* glsl */ `
         uniform vec3 uZenith; uniform vec3 uHorizon; uniform vec3 uMoonDir; uniform vec3 uMoonColor; uniform float uTime;
         varying vec3 vDir;
-        float h12(vec2 p) { vec3 p3 = fract(vec3(p.xyx) * 0.1031); p3 += dot(p3, p3.yzx + 33.33); return fract((p3.x + p3.y) * p3.z); }
-        float vn(vec2 p) { vec2 i = floor(p); vec2 f = fract(p); vec2 u = f*f*(3.0-2.0*f);
-          return mix(mix(h12(i), h12(i+vec2(1,0)), u.x), mix(h12(i+vec2(0,1)), h12(i+vec2(1,1)), u.x), u.y); }
+        ${GLSL_HASH}
         void main() {
           vec3 d = normalize(vDir);
           float y = d.y;
-          // Below & at the horizon = exact fog colour so fogged towers dissolve seamlessly.
+          // At / below the horizon = exact fog colour so fogged towers dissolve seamlessly.
           vec3 col = mix(uHorizon, uZenith, smoothstep(0.0, 0.42, y));
-          // City light pollution: magenta / violet haze just above the horizon.
-          col += vec3(0.020, 0.008, 0.034) * exp(-max(y, 0.0) * 9.0) * smoothstep(-0.06, 0.05, y);
-          // High storm-cloud streaks lit from below.
+          // City light pollution: magenta / violet haze above the skyline.
+          col += vec3(0.022, 0.009, 0.036) * exp(-max(y, 0.0) * 7.0) * smoothstep(-0.06, 0.05, y);
+          // Storm-cloud streaks lit from below.
           vec2 cp = d.xz / max(y + 0.15, 0.05) * 1.6 + vec2(uTime * 0.004, uTime * 0.002);
-          float cloud = smoothstep(0.55, 0.85, vn(cp) * 0.65 + vn(cp * 2.7) * 0.35);
-          col = mix(col, vec3(0.018, 0.014, 0.03), cloud * smoothstep(0.02, 0.25, y) * 0.8);
-          // Stars (sparse, faint, hidden by clouds).
+          float cloud = smoothstep(0.55, 0.85, sNoise(cp) * 0.65 + sNoise(cp * 2.7) * 0.35);
+          col = mix(col, vec3(0.02, 0.015, 0.032), cloud * smoothstep(0.02, 0.25, y) * 0.8);
           vec2 sp = vec2(atan(d.z, d.x) * 180.0, y * 260.0);
-          float star = step(0.9965, h12(floor(sp))) * smoothstep(0.12, 0.5, y) * (1.0 - cloud);
-          col += vec3(0.16, 0.18, 0.24) * star * (0.6 + 0.4 * sin(uTime * 3.0 + h12(floor(sp)) * 40.0));
-          // Moon disc & halo.
+          float star = step(0.9965, sHash12(floor(sp))) * smoothstep(0.12, 0.5, y) * (1.0 - cloud);
+          col += vec3(0.16, 0.18, 0.24) * star * (0.6 + 0.4 * sin(uTime * 3.0 + sHash12(floor(sp)) * 40.0));
           float md = dot(d, normalize(uMoonDir));
           col += uMoonColor * smoothstep(0.99935, 0.9996, md) * 0.9;
           col += uMoonColor * pow(max(md, 0.0), 220.0) * 0.12 + uMoonColor * pow(max(md, 0.0), 18.0) * 0.015;
@@ -565,109 +1241,79 @@ export class CityBuilder {
     return mesh;
   }
 
-  /** Cloud deck ~300 m below the sector reference with city glow bleeding up through it. */
-  private createCloudDeck(): THREE.Mesh {
-    const geo = new THREE.PlaneGeometry(6000, 6000, 1, 1);
-    geo.rotateX(-Math.PI / 2);
+  /** 40 red / white hover-car light trails threading the far skyline (animated fully on the GPU). */
+  private createHoverTrails(): THREE.InstancedMesh {
+    const n = LIMITS.HOVER_TRAILS;
+    const geo = new THREE.PlaneGeometry(1, 1);
+    const a = new Float32Array(n * 4);
+    const b = new Float32Array(n * 4);
+    const c = new Float32Array(n * 4);
+    const rng = createRng(0x40e7);
+    for (let i = 0; i < n; i++) {
+      const ang = rng() * Math.PI * 2;
+      const r = 230 + rng() * 300;
+      const tangent = ang + Math.PI / 2 + (rng() - 0.5) * 0.6;
+      const len = 320 + rng() * 260;
+      const sx = Math.cos(ang) * r - Math.cos(tangent) * len * 0.5;
+      const sz = Math.sin(ang) * r - Math.sin(tangent) * len * 0.5;
+      const y = 35 + rng() * 150;
+      a.set([sx, y, sz, rng()], i * 4);
+      b.set([Math.cos(tangent), (rng() - 0.5) * 0.04, Math.sin(tangent), 28 + rng() * 34], i * 4);
+      c.set([len, 22 + rng() * 26, rng() < 0.55 ? 0 : 1, 0.45 + rng() * 0.35], i * 4);
+    }
+    geo.setAttribute('aA', new THREE.InstancedBufferAttribute(a, 4));
+    geo.setAttribute('aB', new THREE.InstancedBufferAttribute(b, 4));
+    geo.setAttribute('aC', new THREE.InstancedBufferAttribute(c, 4));
     const mat = new THREE.ShaderMaterial({
-      fog: false,
+      transparent: true,
       depthWrite: false,
-      transparent: false,
-      uniforms: {
-        uTime: this.uTime,
-        uAbyss: { value: new THREE.Color(COLORS.FOG_ABYSS) },
-        uMagenta: { value: new THREE.Color(COLORS.NEON_MAGENTA) },
-        uAmber: { value: new THREE.Color(COLORS.NEON_AMBER) },
-        uCyan: { value: new THREE.Color(COLORS.WINDOW_COOL) },
-        uFogColor: this.uFogColor,
-      },
+      blending: THREE.AdditiveBlending,
+      side: THREE.DoubleSide,
+      uniforms: { uTime: this.uTime, uFogDensity: this.uFogDensity },
       vertexShader: /* glsl */ `
-        varying vec3 vWorld;
+        attribute vec4 aA; attribute vec4 aB; attribute vec4 aC;
+        uniform float uTime;
+        varying float vAlong; varying float vAcross; varying float vSel; varying float vFade; varying float vDist;
         void main() {
-          vec4 wp = modelMatrix * vec4(position, 1.0);
-          vWorld = wp.xyz;
-          gl_Position = projectionMatrix * viewMatrix * wp;
+          vec3 dir = normalize(aB.xyz);
+          float s = fract(aA.w + uTime * aB.w / aC.x);
+          vec3 head = aA.xyz + dir * s * aC.x;
+          vec3 p = head - dir * (0.5 - position.y) * aC.y;
+          vec3 toCam = normalize(cameraPosition - p);
+          vec3 side = normalize(cross(dir, toCam));
+          p += side * position.x * aC.w;
+          vAlong = position.y + 0.5;
+          vAcross = position.x * 2.0;
+          vSel = aC.z;
+          vFade = smoothstep(0.0, 0.08, s) * (1.0 - smoothstep(0.9, 1.0, s));
+          vDist = length(p - cameraPosition);
+          gl_Position = projectionMatrix * viewMatrix * vec4(p, 1.0);
         }
       `,
       fragmentShader: /* glsl */ `
-        uniform float uTime; uniform vec3 uAbyss; uniform vec3 uMagenta; uniform vec3 uAmber; uniform vec3 uCyan; uniform vec3 uFogColor;
-        varying vec3 vWorld;
-        float h12(vec2 p) { vec3 p3 = fract(vec3(p.xyx) * 0.1031); p3 += dot(p3, p3.yzx + 33.33); return fract((p3.x + p3.y) * p3.z); }
-        float vn(vec2 p) { vec2 i = floor(p); vec2 f = fract(p); vec2 u = f*f*(3.0-2.0*f);
-          return mix(mix(h12(i), h12(i+vec2(1,0)), u.x), mix(h12(i+vec2(0,1)), h12(i+vec2(1,1)), u.x), u.y); }
-        float fbm(vec2 p) { float s = 0.0; float a = 0.5; for (int i = 0; i < 5; i++) { s += vn(p) * a; p = p * 2.03 + 17.1; a *= 0.5; } return s; }
+        uniform float uFogDensity;
+        varying float vAlong; varying float vAcross; varying float vSel; varying float vFade; varying float vDist;
+        ${GLSL_FOG_FADE}
         void main() {
-          vec2 p = vWorld.xz * 0.006 + vec2(uTime * 0.006, uTime * 0.0035);
-          float dens = fbm(p);
-          float billow = fbm(p * 2.6 - uTime * 0.01);
-          vec3 col = uAbyss * (0.55 + dens * 1.25 + billow * 0.35);
-          // City light pockets glowing up through gaps in the deck.
-          float pocket = smoothstep(0.62, 0.8, fbm(vWorld.xz * 0.0021 + 3.3)) * (1.0 - dens * 0.6);
-          float hueSel = vn(vWorld.xz * 0.0013 + 9.0);
-          vec3 glow = hueSel < 0.38 ? uMagenta : (hueSel < 0.7 ? uAmber : uCyan);
-          col += glow * pocket * 0.07;
-          float dist = length(vWorld - cameraPosition);
-          float fade = 1.0 - exp(-pow(dist * 0.0016, 2.0));
-          col = mix(col, uFogColor, clamp(fade, 0.0, 1.0));
-          gl_FragColor = vec4(col, 1.0);
+          float core = 1.0 - abs(vAcross);
+          float a = core * core * pow(vAlong, 1.6) * vFade * strandFogFade(vDist, uFogDensity * 0.45);
+          vec3 c = mix(vec3(1.0, 0.1, 0.16), vec3(1.0, 0.95, 0.88), vSel) * 0.9;
+          gl_FragColor = vec4(c * a, 1.0);
           #include <tonemapping_fragment>
           #include <colorspace_fragment>
         }
       `,
     });
-    const mesh = new THREE.Mesh(geo, mat);
-    mesh.name = 'CloudDeck';
-    mesh.position.y = LEVEL.CLOUD_DECK_Y;
-    mesh.frustumCulled = false;
-    mesh.renderOrder = -9;
-    return mesh;
+    const m = new THREE.InstancedMesh(geo, mat, n);
+    m.name = 'HoverCarTrails';
+    m.frustumCulled = false;
+    m.renderOrder = 4;
+    return m;
   }
 
-  /** Far-field ring of up to 80 instanced towers (150–620 m). */
-  private layoutFarTowers(seed: number): void {
-    const rng = createRng(seed);
-    const seedAttr = this.farTowers.geometry.getAttribute('aSeed') as THREE.InstancedBufferAttribute;
-    this.farTowerInfo.length = 0;
-    let placed = 0;
-    let guard = 0;
-    while (placed < LIMITS.FAR_BUILDINGS && guard < 4000) {
-      guard++;
-      const ang = rng() * Math.PI * 2;
-      const t = rng();
-      const dist = LEVEL.FAR_RING_INNER_M + Math.pow(t, 0.8) * (LEVEL.FAR_RING_OUTER_M - LEVEL.FAR_RING_INNER_M);
-      const x = Math.cos(ang) * dist;
-      const z = Math.sin(ang) * dist;
-      const w = 22 + rng() * 40;
-      const d = 22 + rng() * 40;
-      let ok = true;
-      for (const o of this.farTowerInfo) {
-        if (Math.abs(o.x - x) < (o.w + w) / 2 + 10 && Math.abs(o.z - z) < (o.d + d) / 2 + 10) {
-          ok = false;
-          break;
-        }
-      }
-      if (!ok) continue;
-      // Taller towers further out so the skyline layers; some drop far below into the clouds.
-      const top = -140 + rng() * 260 + (dist - LEVEL.FAR_RING_INNER_M) * 0.12;
-      const h = top - LEVEL.BUILDING_BASE_Y;
-      _pos.set(x, LEVEL.BUILDING_BASE_Y + h / 2, z);
-      _quat.identity();
-      _scl.set(w, h, d);
-      _m4.compose(_pos, _quat, _scl);
-      this.farTowers.setMatrixAt(placed, _m4);
-      seedAttr.setX(placed, rng());
-      this.farTowerInfo.push({ x, z, w, d, top });
-      placed++;
-    }
-    this.farTowers.count = placed;
-    this.farTowers.instanceMatrix.needsUpdate = true;
-    seedAttr.needsUpdate = true;
-    this.farTowers.computeBoundingSphere();
-  }
-
-  // =========================================================================================
-  // Instanced detail geometry & materials
-  // =========================================================================================
+  // ===========================================================================================
+  // Instanced detail geometry
+  // ===========================================================================================
   private makeInstanced(geo: THREE.BufferGeometry, mat: THREE.Material, cap: number, name: string): THREE.InstancedMesh {
     const m = new THREE.InstancedMesh(geo, mat, cap);
     m.count = 0;
@@ -676,46 +1322,136 @@ export class CityBuilder {
     return m;
   }
 
+  /**
+   * Cyber-car variants (side profiles extruded across the width, forward = +Z):
+   * 0 wedge coupe (≈4.5 × 1.2 m), 1 sedan (≈4.6 × 1.4 m), 2 van (≈4.8 × 1.95 m).
+   */
+  private createCarGeometry(variant: 0 | 1 | 2): THREE.BufferGeometry {
+    const profiles: Array<{ body: number[][]; glass: number[][]; roof?: number[][]; len: number; width: number; ledF: number; ledR: number }> = [
+      {
+        body: [[2.25, 0.3], [2.25, 0.5], [2.0, 0.62], [0.6, 0.86], [-1.8, 0.92], [-2.25, 0.85], [-2.25, 0.3]],
+        glass: [[0.6, 0.86], [-0.25, 1.18], [-1.45, 1.14], [-1.85, 0.92]],
+        len: 4.5, width: 1.95, ledF: 0.52, ledR: 0.8,
+      },
+      {
+        body: [[2.3, 0.3], [2.3, 0.62], [1.6, 0.78], [0.8, 0.82], [-1.6, 0.86], [-2.3, 0.82], [-2.3, 0.3]],
+        glass: [[0.8, 0.82], [0.05, 1.38], [-1.2, 1.4], [-1.75, 0.86]],
+        len: 4.6, width: 1.95, ledF: 0.6, ledR: 0.74,
+      },
+      {
+        body: [[2.4, 0.32], [2.4, 1.0], [1.75, 1.12], [-2.4, 1.12], [-2.4, 0.32]],
+        glass: [[1.75, 1.12], [1.2, 1.62], [-2.35, 1.62], [-2.4, 1.12]],
+        roof: [[1.2, 1.62], [1.05, 1.92], [-2.35, 1.94], [-2.35, 1.62]],
+        len: 4.8, width: 2.0, ledF: 0.85, ledR: 1.0,
+      },
+    ];
+    const p = profiles[variant];
+    const part = (g: THREE.BufferGeometry, id: number): THREE.BufferGeometry => withAttr1(stripUv(g.index ? g.toNonIndexed() : g), 'aPart', id);
+    const extrude = (pts: number[][], width: number, id: number): THREE.BufferGeometry => {
+      const shape = new THREE.Shape(pts.map(([x, y]) => new THREE.Vector2(x, y)));
+      const g = new THREE.ExtrudeGeometry(shape, { depth: width, bevelEnabled: true, bevelThickness: 0.04, bevelSize: 0.03, bevelSegments: 2, curveSegments: 1 });
+      g.translate(0, 0, -width / 2);
+      g.rotateY(-Math.PI / 2);
+      return part(g, id);
+    };
+    const parts: THREE.BufferGeometry[] = [];
+    parts.push(extrude(p.body, p.width - 0.08, 0));
+    parts.push(extrude(p.glass, p.width - 0.3, 1));
+    if (p.roof) parts.push(extrude(p.roof, p.width - 0.3, 0));
+    parts.push(part(boxAt(p.width - 0.25, 0.07, 0.06, 0, p.ledF, p.len / 2 + 0.02), 2));
+    parts.push(part(boxAt(p.width - 0.2, 0.08, 0.06, 0, p.ledR, -p.len / 2 - 0.02), 3));
+    for (const sx of [-1, 1]) {
+      for (const sz of [-1, 1]) {
+        const w = new THREE.CylinderGeometry(0.34, 0.34, 0.26, 14);
+        w.rotateZ(Math.PI / 2);
+        w.translate(sx * (p.width / 2 - 0.12), 0.34, sz * (p.len / 2 - 0.85));
+        parts.push(part(w, 4));
+      }
+    }
+    const merged = mergeOrEmpty(parts);
+    merged.computeBoundingSphere();
+    return merged;
+  }
+
+  private createLampGeometry(): THREE.BufferGeometry {
+    // Pole along +Y, arm reaching +Z over the road, head at the arm tip, neon accent ring on the pole.
+    const parts: THREE.BufferGeometry[] = [];
+    const add = (g: THREE.BufferGeometry, id: number): void => {
+      parts.push(withAttr1(stripUv(g.index ? g.toNonIndexed() : g), 'aPart', id));
+    };
+    const pole = new THREE.CylinderGeometry(0.09, 0.13, 6.6, 10);
+    pole.translate(0, 3.3, 0);
+    add(pole, 0);
+    add(boxAt(0.1, 0.1, 2.0, 0, 6.5, 1.0), 0);
+    add(boxAt(0.42, 0.14, 0.95, 0, 6.42, 2.05), 0);
+    add(boxAt(0.34, 0.03, 0.82, 0, 6.34, 2.05), 1);
+    const ring = new THREE.TorusGeometry(0.16, 0.035, 6, 18);
+    ring.rotateX(Math.PI / 2);
+    ring.translate(0, 3.2, 0);
+    add(ring, 2);
+    add(boxAt(0.36, 0.25, 0.36, 0, 0.125, 0), 0);
+    return mergeOrEmpty(parts);
+  }
+
+  private createVendingGeometry(): THREE.BufferGeometry {
+    // 1.0 × 1.9 × 0.8 machine facing +Z; front panel and top sign glow.
+    const parts: THREE.BufferGeometry[] = [];
+    const add = (g: THREE.BufferGeometry, id: number): void => {
+      parts.push(withAttr1(g.index ? g.toNonIndexed() : g, 'aPart', id));
+    };
+    add(boxAt(1.0, 1.9, 0.8, 0, 0.95, 0), 0);
+    const panel = new THREE.PlaneGeometry(0.82, 1.35);
+    panel.translate(0, 1.05, 0.405);
+    add(panel, 1);
+    const sign = new THREE.PlaneGeometry(0.9, 0.22);
+    sign.translate(0, 1.79, 0.405);
+    add(sign, 2);
+    return mergeOrEmpty(parts);
+  }
+
+  private createGuardrailGeometry(): THREE.BufferGeometry {
+    // 3 m W-beam segment along X with two posts (1.0 m tall).
+    return mergeOrEmpty([
+      boxAt(0.1, 1.0, 0.1, -1.45, 0.5, 0),
+      boxAt(0.1, 1.0, 0.1, 1.45, 0.5, 0),
+      boxAt(3.0, 0.32, 0.06, 0, 0.78, 0.07),
+      boxAt(3.0, 0.06, 0.08, 0, 0.98, 0.04),
+    ].map(stripUv));
+  }
+
   private createAcGeometry(): THREE.BufferGeometry {
-    // Unit footprint 2.2 × 1.3 × 1.2 with fan grille on top face via machinery map.
     const body = new THREE.BoxGeometry(2.2, 1.3, 1.2);
     body.translate(0, 0.65 + 0.12, 0);
-    const feet = boxAt(2.0, 0.12, 1.0, 0, 0.06, 0);
-    return mergeGeometries([body, feet]) as THREE.BufferGeometry;
+    return mergeOrEmpty([body, boxAt(2.0, 0.12, 1.0, 0, 0.06, 0)]);
   }
 
   private createDuctGeometry(): THREE.BufferGeometry {
-    // Horizontal exhaust duct (unit length along X) on two saddles; scaled in X per instance.
     const pipe = new THREE.CylinderGeometry(0.45, 0.45, 1, 16, 1, false);
     pipe.rotateZ(Math.PI / 2);
     pipe.translate(0, 1.05, 0);
-    const s1 = boxAt(0.12, 0.6, 0.8, -0.38, 0.3, 0);
-    const s2 = boxAt(0.12, 0.6, 0.8, 0.38, 0.3, 0);
-    return mergeGeometries([pipe, s1, s2]) as THREE.BufferGeometry;
+    return mergeOrEmpty([pipe, boxAt(0.12, 0.6, 0.8, -0.38, 0.3, 0), boxAt(0.12, 0.6, 0.8, 0.38, 0.3, 0)]);
   }
 
   private createFenceGeometry(): THREE.BufferGeometry {
-    // 3 m segment along X: posts, rails, vertical pickets (1.2 m tall).
     const parts: THREE.BufferGeometry[] = [];
     parts.push(boxAt(0.08, 1.2, 0.08, -1.5, 0.6, 0), boxAt(0.08, 1.2, 0.08, 1.5, 0.6, 0));
     parts.push(boxAt(3.0, 0.06, 0.06, 0, 1.17, 0), boxAt(3.0, 0.05, 0.05, 0, 0.12, 0), boxAt(3.0, 0.04, 0.04, 0, 0.64, 0));
     for (let i = 1; i < 15; i++) parts.push(boxAt(0.025, 1.08, 0.025, -1.5 + i * 0.2, 0.62, 0));
-    return mergeGeometries(parts) as THREE.BufferGeometry;
+    return mergeOrEmpty(parts);
   }
 
   private createAntennaGeometry(): THREE.BufferGeometry {
-    // Unit-height mast (scaled in Y) with cross arms.
-    const parts: THREE.BufferGeometry[] = [];
-    parts.push(boxAt(0.14, 1.0, 0.14, 0, 0.5, 0));
-    parts.push(boxAt(0.9, 0.02, 0.04, 0, 0.72, 0), boxAt(0.04, 0.02, 0.9, 0, 0.82, 0), boxAt(0.6, 0.02, 0.04, 0, 0.92, 0));
-    parts.push(boxAt(0.7, 0.04, 0.7, 0, 0.02, 0));
-    return mergeGeometries(parts) as THREE.BufferGeometry;
+    return mergeOrEmpty([
+      boxAt(0.14, 1.0, 0.14, 0, 0.5, 0),
+      boxAt(0.9, 0.02, 0.04, 0, 0.72, 0),
+      boxAt(0.04, 0.02, 0.9, 0, 0.82, 0),
+      boxAt(0.6, 0.02, 0.04, 0, 0.92, 0),
+      boxAt(0.7, 0.04, 0.7, 0, 0.02, 0),
+    ]);
   }
 
   private createMachineRoomGeometry(): THREE.BufferGeometry {
-    const body = boxAt(1, 1, 1, 0, 0.5, 0);
-    const cap = boxAt(1.06, 0.06, 1.06, 0, 1.0, 0);
-    return mergeGeometries([body, cap]) as THREE.BufferGeometry;
+    return mergeOrEmpty([boxAt(1, 1, 1, 0, 0.5, 0), boxAt(1.06, 0.06, 1.06, 0, 1.0, 0)]);
   }
 
   private createBeaconGeometry(): THREE.BufferGeometry {
@@ -724,7 +1460,7 @@ export class CityBuilder {
     const ring = new THREE.TorusGeometry(0.62, 0.05, 6, 24);
     ring.deleteAttribute('uv');
     ring.rotateX(Math.PI / 2);
-    const merged = mergeGeometries([core, ring.toNonIndexed()]) as THREE.BufferGeometry;
+    const merged = mergeOrEmpty([core, ring.toNonIndexed()]);
     merged.computeVertexNormals();
     return merged;
   }
@@ -753,14 +1489,13 @@ export class CityBuilder {
       fragmentShader: /* glsl */ `
         uniform float uTime; uniform vec3 uColor; uniform float uHz; uniform float uFogDensity;
         varying float vPhase; varying float vDist;
-        ${FOG_FADE_GLSL}
+        ${GLSL_FOG_FADE}
         void main() {
           float cyc = fract(uTime * uHz + vPhase);
           float on = smoothstep(0.0, 0.04, cyc) * (1.0 - smoothstep(0.32, 0.4, cyc));
           // Background element: peak 0.9 keeps it below the 0.92 bloom threshold.
           vec3 c = uColor * (0.06 + 0.84 * on);
-          float f = strandFogFade(vDist, uFogDensity * 0.55);
-          gl_FragColor = vec4(c * f, 1.0);
+          gl_FragColor = vec4(c * strandFogFade(vDist, uFogDensity * 0.55), 1.0);
           #include <tonemapping_fragment>
           #include <colorspace_fragment>
         }
@@ -803,16 +1538,14 @@ export class CityBuilder {
       fragmentShader: /* glsl */ `
         uniform float uTime; uniform sampler2D uAtlas; uniform float uStrips; uniform float uBoost; uniform float uFogDensity;
         varying vec2 vUv; varying float vStrip; varying float vDist;
-        ${FOG_FADE_GLSL}
+        ${GLSL_FOG_FADE}
         float h11(float p) { p = fract(p * 0.1031); p *= p + 33.33; p *= p + p; return fract(p); }
         void main() {
           float strip = floor(vStrip + 0.5);
-          // Hologram jitter: rare horizontal tears.
           float tearRow = floor(vUv.y * 48.0);
           float tear = step(0.985, h11(tearRow + floor(uTime * 12.0) * 7.0 + strip * 3.0)) * 0.03;
           vec2 auv = vec2((strip + clamp(vUv.x + tear, 0.0, 1.0)) / uStrips, vUv.y);
           vec4 t = texture2D(uAtlas, auv);
-          // Flicker: brief dropouts unique per sign.
           float fl = h11(floor(uTime * 9.0) + strip * 17.0);
           float flicker = fl < 0.04 ? 0.25 : 1.0;
           float scan = 0.82 + 0.18 * sin(vUv.y * 420.0 - uTime * 6.0);
@@ -834,7 +1567,7 @@ export class CityBuilder {
 
   /** Additive translucent cones; sweep animated entirely in the vertex shader. */
   private createSearchlights(): THREE.InstancedMesh {
-    const length = 160;
+    const length = 170;
     const geo = new THREE.CylinderGeometry(0.35, 9, length, 24, 1, true);
     geo.translate(0, length / 2, 0);
     geo.setAttribute('aBase', new THREE.InstancedBufferAttribute(new Float32Array(CAP.SEARCH * 3), 3));
@@ -853,7 +1586,7 @@ export class CityBuilder {
       },
       vertexShader: /* glsl */ `
         attribute vec3 aBase;
-        attribute vec4 aParams; // phase, speed, sweepAmplitude, baseTilt
+        attribute vec4 aParams;
         uniform float uTime; uniform float uLength;
         varying float vAlong; varying float vEdge; varying float vDist;
         void main() {
@@ -865,8 +1598,7 @@ export class CityBuilder {
           mat3 r = ry * rz;
           vec3 wp = aBase + r * position;
           vec3 wn = normalize(r * normal);
-          vec3 v = normalize(cameraPosition - wp);
-          vEdge = abs(dot(wn, v));
+          vEdge = abs(dot(wn, normalize(cameraPosition - wp)));
           vAlong = position.y / uLength;
           vDist = length(wp - cameraPosition);
           gl_Position = projectionMatrix * viewMatrix * vec4(wp, 1.0);
@@ -875,13 +1607,12 @@ export class CityBuilder {
       fragmentShader: /* glsl */ `
         uniform vec3 uColor; uniform float uPulse; uniform float uFogDensity;
         varying float vAlong; varying float vEdge; varying float vDist;
-        ${FOG_FADE_GLSL}
+        ${GLSL_FOG_FADE}
         void main() {
           float core = pow(vEdge, 2.2);
           float falloff = pow(1.0 - clamp(vAlong, 0.0, 1.0), 1.7);
           float a = core * falloff * 0.16 * (1.0 + uPulse * 0.9);
-          float f = strandFogFade(vDist, uFogDensity * 0.45);
-          gl_FragColor = vec4(uColor * a * f, 1.0);
+          gl_FragColor = vec4(uColor * a * strandFogFade(vDist, uFogDensity * 0.45), 1.0);
           #include <tonemapping_fragment>
           #include <colorspace_fragment>
         }
@@ -895,18 +1626,13 @@ export class CityBuilder {
     return m;
   }
 
-  /** Camera-facing additive halos around gold anchors (pulsing, interactive → HDR). */
   private createAnchorHalos(): THREE.InstancedMesh {
     const geo = new THREE.PlaneGeometry(1, 1);
     const mat = new THREE.ShaderMaterial({
       transparent: true,
       depthWrite: false,
       blending: THREE.AdditiveBlending,
-      uniforms: {
-        uTime: this.uTime,
-        uColor: { value: new THREE.Color(COLORS.GRAPPLE_GOLD) },
-        uFogDensity: this.uFogDensity,
-      },
+      uniforms: { uTime: this.uTime, uColor: { value: new THREE.Color(COLORS.GRAPPLE_GOLD) }, uFogDensity: this.uFogDensity },
       vertexShader: /* glsl */ `
         varying vec2 vUv; varying float vDist; varying float vSeed;
         void main() {
@@ -915,8 +1641,7 @@ export class CityBuilder {
           vSeed = fract(center.x * 0.173 + center.z * 0.311);
           vec3 right = vec3(viewMatrix[0][0], viewMatrix[1][0], viewMatrix[2][0]);
           vec3 up = vec3(viewMatrix[0][1], viewMatrix[1][1], viewMatrix[2][1]);
-          float size = 3.2;
-          vec3 wp = center + (right * position.x + up * position.y) * size;
+          vec3 wp = center + (right * position.x + up * position.y) * 3.2;
           vDist = length(center - cameraPosition);
           gl_Position = projectionMatrix * viewMatrix * vec4(wp, 1.0);
         }
@@ -924,10 +1649,9 @@ export class CityBuilder {
       fragmentShader: /* glsl */ `
         uniform float uTime; uniform vec3 uColor; uniform float uFogDensity;
         varying vec2 vUv; varying float vDist; varying float vSeed;
-        ${FOG_FADE_GLSL}
+        ${GLSL_FOG_FADE}
         void main() {
-          vec2 p = vUv - 0.5;
-          float r = length(p) * 2.0;
+          float r = length(vUv - 0.5) * 2.0;
           float pulse = fract(uTime * 0.8 + vSeed);
           float ring = smoothstep(0.06, 0.0, abs(r - pulse)) * (1.0 - pulse);
           float glow = exp(-r * 5.5) * 0.9;
@@ -946,11 +1670,11 @@ export class CityBuilder {
     return m;
   }
 
-  /** Jade gate: volumetric light pillar + high-altitude jade anchor (hidden until the sector clears). */
-  private createGate(): { pillar: THREE.Mesh; beacon: THREE.Mesh } {
-    const h = 900;
+  /** Emerald light pillar rising from the opened district gate. */
+  private createGatePillar(): THREE.Mesh {
+    const h = 600;
     const geo = new THREE.CylinderGeometry(3.2, 3.2, h, 32, 1, true);
-    geo.translate(0, h / 2 - 300, 0);
+    geo.translate(0, h / 2, 0);
     const mat = new THREE.ShaderMaterial({
       transparent: true,
       depthWrite: false,
@@ -960,7 +1684,7 @@ export class CityBuilder {
         uTime: this.uTime,
         uColor: { value: new THREE.Color(COLORS.GATE_JADE) },
         uIntensity: { value: MATERIALS.GATE_JADE.emissive },
-        uActive: this.uGateActive,
+        uActive: this.uGateOpen,
       },
       vertexShader: /* glsl */ `
         varying vec3 vN; varying vec3 vV; varying float vY;
@@ -980,7 +1704,7 @@ export class CityBuilder {
           float edge = pow(abs(dot(normalize(vN), normalize(vV))), 2.4);
           float flow = 0.75 + 0.25 * sin(vY * 0.35 - uTime * 7.0) + 0.15 * sin(vY * 1.3 - uTime * 13.0);
           float spark = step(0.992, h11(floor(vY * 2.0) + floor(uTime * 20.0)));
-          float fadeY = smoothstep(-300.0, -120.0, vY) * (1.0 - smoothstep(320.0, 600.0, vY));
+          float fadeY = smoothstep(0.0, 6.0, vY) * (1.0 - smoothstep(260.0, 560.0, vY));
           float a = (edge * flow + spark * 0.6) * fadeY * uActive;
           gl_FragColor = vec4(uColor * uIntensity * a, 1.0);
           #include <tonemapping_fragment>
@@ -988,168 +1712,750 @@ export class CityBuilder {
         }
       `,
     });
-    const pillar = new THREE.Mesh(geo, mat);
-    pillar.name = 'GatePillar';
-    pillar.frustumCulled = false;
-    pillar.visible = false;
-    pillar.renderOrder = 7;
-
-    const bGeo = new THREE.OctahedronGeometry(0.75, 0);
-    const bMat = new THREE.MeshStandardMaterial({
-      color: new THREE.Color(COLORS.GATE_JADE),
-      emissive: new THREE.Color(COLORS.GATE_JADE),
-      emissiveIntensity: MATERIALS.GATE_JADE.emissive,
-      roughness: 0.2,
-      metalness: 0.6,
-    });
-    const beacon = new THREE.Mesh(bGeo, bMat);
-    beacon.name = 'GateAnchor';
-    beacon.visible = false;
-    return { pillar, beacon };
+    const m = new THREE.Mesh(geo, mat);
+    m.name = 'GatePillar';
+    m.frustumCulled = false;
+    m.visible = false;
+    m.renderOrder = 7;
+    return m;
   }
 
-  // =========================================================================================
+  // ===========================================================================================
   // Sector construction
-  // =========================================================================================
+  // ===========================================================================================
   /**
-   * Builds the playable tower cluster for sector `sectorIndex` (1..5) of endless loop `loop`.
+   * Builds district `sectorIndex` (1..5) of endless loop `loop`.
    * Deterministic: identical inputs always produce the identical layout (instant retries).
    */
   buildSector(sectorIndex: number, loop: number): SectorLayout {
     const sector = SECTORS[clamp(sectorIndex, 1, SECTORS.length) - 1];
+    const plan = makePlan(sector);
     const rng = createRng(0x5eed + sector.index * 7919 + loop * 104729);
     this.clearSector();
-
-    const buildings = sector.layout === 'RING' ? this.layoutRing(sector, rng) : this.layoutGrid(sector, rng);
-    const gateTower = this.placeGateTower(buildings, rng);
-    const allBuildings = [...buildings, gateTower];
+    this.lightCount = 0;
 
     const colliders: BoxCollider[] = [];
+    const rampColliders: RampCollider[] = [];
     const wallRun: WallRunSurface[] = [];
     const anchors: GrappleAnchor[] = [];
-    const roofRects: RoofRect[][] = allBuildings.map(() => []);
+    const canalWater: RectXZ[] = [];
+    const groundSpawns: SpawnPoint[] = [];
+    const highwaySpawns: SpawnPoint[] = [];
+    const skybridgeSpawns: SpawnPoint[] = [];
+    const roofSpawns: SpawnPoint[] = [];
+    const perchSpawns: SpawnPoint[] = [];
+    const airSpawns: THREE.Vector3[] = [];
 
-    const bodyGeos: THREE.BufferGeometry[] = [];
-    const roofGeos: THREE.BufferGeometry[] = [];
-    const panelGeos: THREE.BufferGeometry[] = [];
-    const steelGeos: THREE.BufferGeometry[] = [];
+    // Merged geometry buckets (one draw call each)
+    const G = {
+      concrete: [] as THREE.BufferGeometry[],
+      road: [] as THREE.BufferGeometry[],
+      water: [] as THREE.BufferGeometry[],
+      hw: [] as THREE.BufferGeometry[],
+      strips: [] as THREE.BufferGeometry[],
+      panels: [] as THREE.BufferGeometry[],
+      steel: [] as THREE.BufferGeometry[],
+      glass: [] as THREE.BufferGeometry[],
+      bodies: [] as THREE.BufferGeometry[],
+      barrier: [] as THREE.BufferGeometry[],
+    };
 
-    // Instance writers
-    let acN = 0, ductN = 0, fenceN = 0, antN = 0, aviN = 0, neonN = 0, searchN = 0, roomN = 0, beaconN = 0;
+    // Instance counters & attributes
+    const counts = { ac: 0, duct: 0, fence: 0, ant: 0, room: 0, avi: 0, neon: 0, search: 0, beacon: 0, lamp: 0, vend: 0, rail: 0 };
+    const carCounts = [0, 0, 0];
     const aviPhase = this.aviation.geometry.getAttribute('aPhase') as THREE.InstancedBufferAttribute;
     const neonStrip = this.neonSigns.geometry.getAttribute('aStrip') as THREE.InstancedBufferAttribute;
     const searchBase = this.searchlights.geometry.getAttribute('aBase') as THREE.InstancedBufferAttribute;
     const searchParams = this.searchlights.geometry.getAttribute('aParams') as THREE.InstancedBufferAttribute;
+    const lampTint = this.lamps.geometry.getAttribute('aTint') as THREE.InstancedBufferAttribute;
+    const vendTint = this.vending.geometry.getAttribute('aTint') as THREE.InstancedBufferAttribute;
 
+    const inArea = (x: number, z: number, m = 0): boolean => Math.abs(x) <= H - m && Math.abs(z) <= H - m;
+
+    // ------------------------------------------------------------------ writers
+    const addLight = (x: number, y: number, z: number, hex: number, intensity: number): void => {
+      if (this.lightCount >= CAP.CITY_LIGHTS) return;
+      _col.setHex(hex);
+      const i = this.lightCount++;
+      this.lightPos[i * 3] = x;
+      this.lightPos[i * 3 + 1] = y;
+      this.lightPos[i * 3 + 2] = z;
+      this.lightCol[i * 3] = _col.r * intensity;
+      this.lightCol[i * 3 + 1] = _col.g * intensity;
+      this.lightCol[i * 3 + 2] = _col.b * intensity;
+    };
     const addAviation = (x: number, y: number, z: number): void => {
-      if (aviN >= CAP.AVIATION) return;
+      if (counts.avi >= CAP.AVIATION) return;
       _m4.makeTranslation(x, y, z);
-      this.aviation.setMatrixAt(aviN, _m4);
-      aviPhase.setX(aviN, (Math.abs(x * 0.013 + z * 0.007)) % 0.12);
-      aviN++;
+      this.aviation.setMatrixAt(counts.avi, _m4);
+      aviPhase.setX(counts.avi, Math.abs(x * 0.013 + z * 0.007) % 0.12);
+      counts.avi++;
     };
     const addBeacon = (p: THREE.Vector3, kind: AnchorKind): void => {
       anchors.push({ position: p.clone(), kind, enabled: true });
-      if (beaconN >= CAP.BEACON) return;
+      if (counts.beacon >= CAP.BEACON) return;
       _m4.makeTranslation(p.x, p.y, p.z);
-      this.beacons.setMatrixAt(beaconN, _m4);
-      this.halos.setMatrixAt(beaconN, _m4);
-      beaconN++;
+      this.beacons.setMatrixAt(counts.beacon, _m4);
+      this.halos.setMatrixAt(counts.beacon, _m4);
+      counts.beacon++;
     };
+    /** Neon sign plane: centre, plane normal (nx, nz), size, atlas strip. */
     const addNeon = (x: number, y: number, z: number, nx: number, nz: number, w: number, h: number, strip: number): void => {
-      if (neonN >= CAP.NEON) return;
+      if (counts.neon >= CAP.NEON) return;
       _pos.set(x, y, z);
       _euler.set(0, Math.atan2(nx, nz), 0);
       _quat.setFromEuler(_euler);
       _scl.set(w, h, 1);
       _m4.compose(_pos, _quat, _scl);
-      this.neonSigns.setMatrixAt(neonN, _m4);
-      neonStrip.setX(neonN, strip % this.tex.neonAtlasStrips);
-      neonN++;
+      this.neonSigns.setMatrixAt(counts.neon, _m4);
+      neonStrip.setX(counts.neon, strip % this.tex.neonAtlasStrips);
+      counts.neon++;
     };
     const addSearch = (x: number, y: number, z: number): void => {
-      if (searchN >= CAP.SEARCH) return;
-      searchBase.setXYZ(searchN, x, y, z);
-      searchParams.setXYZW(searchN, rng() * Math.PI * 2, 0.18 + rng() * 0.25, 0.6 + rng() * 0.9, 0.25 + rng() * 0.35);
-      searchN++;
+      if (counts.search >= CAP.SEARCH) return;
+      searchBase.setXYZ(counts.search, x, y, z);
+      searchParams.setXYZW(counts.search, rng() * Math.PI * 2, 0.18 + rng() * 0.25, 0.6 + rng() * 0.9, 0.25 + rng() * 0.35);
+      counts.search++;
+    };
+    const placeInstance = (mesh: THREE.InstancedMesh, idx: number, x: number, y: number, z: number, yaw: number, sx = 1, sy = 1, sz = 1): void => {
+      _pos.set(x, y, z);
+      _euler.set(0, yaw, 0);
+      _quat.setFromEuler(_euler);
+      _scl.set(sx, sy, sz);
+      _m4.compose(_pos, _quat, _scl);
+      mesh.setMatrixAt(idx, _m4);
+    };
+    const addRail = (x: number, z: number, alongX: boolean): void => {
+      if (counts.rail >= CAP.GUARDRAIL) return;
+      placeInstance(this.guardrails, counts.rail++, x, 0, z, alongX ? 0 : Math.PI / 2);
+    };
+    const NEON_TINTS = [0xff2bd6, 0x00f0ff, 0xffa21f, 0x39ff88, 0xb44bff];
+    const addLamp = (x: number, z: number, yaw: number): void => {
+      if (counts.lamp >= CAP.LAMP) return;
+      placeInstance(this.lamps, counts.lamp, x, 0, z, yaw);
+      _col.setHex(NEON_TINTS[Math.floor(rng() * NEON_TINTS.length)]);
+      lampTint.setXYZ(counts.lamp, _col.r, _col.g, _col.b);
+      counts.lamp++;
+      // Lamp head sits 2.05 m out along the arm (+Z rotated by yaw).
+      addLight(x + Math.sin(yaw) * 2.05, 6.2, z + Math.cos(yaw) * 2.05, COLORS.STREET_LAMP, 4.0);
+    };
+    const addVending = (x: number, z: number, yaw: number, scale = 1): void => {
+      if (counts.vend >= CAP.VENDING) return;
+      placeInstance(this.vending, counts.vend, x, 0, z, yaw, scale, scale, scale);
+      _col.setHex(NEON_TINTS[Math.floor(rng() * NEON_TINTS.length)]);
+      vendTint.setXYZ(counts.vend, _col.r, _col.g, _col.b);
+      counts.vend++;
+      const hw = 0.5 * scale + 0.05;
+      const hd = 0.4 * scale + 0.05;
+      const ax = Math.abs(Math.sin(yaw)) > 0.5;
+      colliders.push({
+        min: new THREE.Vector3(x - (ax ? hd : hw), 0, z - (ax ? hw : hd)),
+        max: new THREE.Vector3(x + (ax ? hd : hw), 1.9 * scale, z + (ax ? hw : hd)),
+        kind: 'PROP',
+        building: -1,
+      });
     };
 
-    // ---------------- Towers, roofs, colliders ----------------
-    allBuildings.forEach((b) => {
-      const w = b.halfW * 2;
-      const d = b.halfD * 2;
-      const bodyTop = b.roofY - 0.45;
-      const bodyH = bodyTop - LEVEL.BUILDING_BASE_Y;
-      const body = new THREE.BoxGeometry(w, bodyH, d);
-      body.translate(b.cx, LEVEL.BUILDING_BASE_Y + bodyH / 2, b.cz);
-      bodyGeos.push(addSeed(body, rng()));
-      // Roof slab with slight overhang + metal flashing edge.
-      roofGeos.push(worldUvBox(w + 0.3, 0.5, d + 0.3, b.cx, b.roofY - 0.25, b.cz, RENDER.ROOF_TILE_M));
-      steelGeos.push(
-        boxAt(w + 0.42, 0.08, 0.22, b.cx, b.roofY + 0.02, b.cz + b.halfD + 0.1),
-        boxAt(w + 0.42, 0.08, 0.22, b.cx, b.roofY + 0.02, b.cz - b.halfD - 0.1),
-        boxAt(0.22, 0.08, d + 0.2, b.cx + b.halfW + 0.1, b.roofY + 0.02, b.cz),
-        boxAt(0.22, 0.08, d + 0.2, b.cx - b.halfW - 0.1, b.roofY + 0.02, b.cz),
-      );
-      colliders.push({
-        min: new THREE.Vector3(b.cx - b.halfW, LEVEL.BUILDING_BASE_Y, b.cz - b.halfD),
-        max: new THREE.Vector3(b.cx + b.halfW, b.roofY, b.cz + b.halfD),
-        kind: 'BUILDING',
-        building: b.index,
-      });
-      // Roof-corner steel beam stubs with gold beacons (grapple-able building edges).
-      for (const sx of [-1, 1]) {
-        for (const sz of [-1, 1]) {
-          const ex = b.cx + sx * (b.halfW + 0.6);
-          const ez = b.cz + sz * (b.halfD + 0.6);
-          const base = new THREE.Vector3(b.cx + sx * (b.halfW - 0.6), b.roofY, b.cz + sz * (b.halfD - 0.6));
-          const tip = new THREE.Vector3(ex, b.roofY + 2.4, ez);
-          steelGeos.push(beam(base, tip, 0.22), beam(new THREE.Vector3(base.x, b.roofY, base.z), new THREE.Vector3(base.x, b.roofY + 2.6, base.z), 0.26));
-          addBeacon(new THREE.Vector3(ex, b.roofY + 2.9, ez), 'EDGE_BEAM');
-          roofRects[b.index].push({ x0: base.x - 1, z0: base.z - 1, x1: base.x + 1, z1: base.z + 1 });
+    // ------------------------------------------------------------------ 1. streets
+    const streets = plan.streets;
+    const canals = plan.canals;
+    const bridgeSet = new Set(plan.bridgeStreets);
+
+    // Canal along-range cuts for each street (non-bridge streets stop at the promenade).
+    const streetRanges = streets.map((s, si) => {
+      const cuts: Array<[number, number]> = [];
+      for (const c of canals) {
+        if (c.axis === s.axis || s.coord < c.from || s.coord > c.to || bridgeSet.has(si)) continue;
+        const ch = canalCorridorHalf(c);
+        cuts.push([c.coord - ch, c.coord + ch]);
+      }
+      return subtractIntervals(s.from, s.to, cuts);
+    });
+
+    /** Lane band of street p crossing street s (in s's along coordinate) if p actually reaches s. */
+    const crossingBand = (s: StreetPlan, si: number, p: StreetPlan, pi: number): [number, number] | null => {
+      if (p.axis === s.axis) return null;
+      const pl = laneHalf(p.kind);
+      const sl = laneHalf(s.kind);
+      const reaches = streetRanges[pi].some(([r0, r1]) => r0 < s.coord + sl - 0.01 && r1 > s.coord - sl + 0.01);
+      if (!reaches) return null;
+      const inS = streetRanges[si].some(([r0, r1]) => p.coord > r0 - pl && p.coord < r1 + pl);
+      if (!inS) return null;
+      return [p.coord - pl, p.coord + pl];
+    };
+
+    const atlasAttr = (r: AtlasRegion): number[] => {
+      const inset = 1.5 / RENDER.ROAD_TEX_SIZE;
+      return [r.u0 + inset, r.v0 + inset, r.u1 - inset, r.v1 - inset];
+    };
+    /** Flat (or sloped) road quad along `axis`: lateral [l0,l1], along [a0,a1], heights y0 → y1 along. */
+    const roadQuad = (axis: Axis, l0: number, l1: number, a0: number, a1: number, y0: number, y1: number, region: AtlasRegion, uAcross: number, vStart: number, vEnd: number): void => {
+      const p0 = pt(axis, a0, y0, l0);
+      const p1 = pt(axis, a0, y0, l1);
+      const p2 = pt(axis, a1, y1, l1);
+      const p3 = pt(axis, a1, y1, l0);
+      G.road.push(quad([p0, p1, p2, p3], [0, vStart, uAcross, vStart, uAcross, vEnd, 0, vEnd], _up, { aAtlas: atlasAttr(region) }));
+    };
+    const flatRect = (r: RectXZ, y: number, reg: AtlasRegion): void => {
+      G.road.push(quad(
+        [new THREE.Vector3(r.x0, y, r.z0), new THREE.Vector3(r.x1, y, r.z0), new THREE.Vector3(r.x1, y, r.z1), new THREE.Vector3(r.x0, y, r.z1)],
+        [r.x0 / reg.tileAcross, r.z0 / reg.tileAlong, r.x1 / reg.tileAcross, r.z0 / reg.tileAlong, r.x1 / reg.tileAcross, r.z1 / reg.tileAlong, r.x0 / reg.tileAcross, r.z1 / reg.tileAlong],
+        _up,
+        { aAtlas: atlasAttr(reg) },
+      ));
+    };
+
+    const intersectionSquares: RectXZ[] = [];
+    const crosswalkZones: RectXZ[] = [];
+    const segmentsByStreet: Array<Array<[number, number]>> = streets.map(() => []);
+    const ROAD_Y = 0.02;
+
+    streets.forEach((s, si) => {
+      const lh = laneHalf(s.kind);
+      const region = s.kind === 'AVENUE' ? ROAD_ATLAS.LANES4 : ROAD_ATLAS.LANES2;
+      for (const [r0, r1] of streetRanges[si]) {
+        const bands: Array<[number, number]> = [];
+        streets.forEach((p, pi) => {
+          const b = crossingBand(s, si, p, pi);
+          if (b && b[1] > r0 && b[0] < r1) bands.push([Math.max(b[0], r0), Math.min(b[1], r1)]);
+        });
+        bands.sort((a, b) => a[0] - b[0]);
+        if (s.axis === 'z') {
+          for (const [b0, b1] of bands) {
+            const rect = rectFrom(s.coord - lh, b0, s.coord + lh, b1);
+            intersectionSquares.push(rect);
+            flatRect(rect, ROAD_Y, ROAD_ATLAS.ASPHALT);
+          }
+        }
+        for (const [a0, a1] of subtractIntervals(r0, r1, bands)) {
+          segmentsByStreet[si].push([a0, a1]);
+          const startsAtJunction = bands.some(([, b1]) => Math.abs(b1 - a0) < 0.02);
+          const endsAtJunction = bands.some(([b0]) => Math.abs(b0 - a1) < 0.02);
+          let la0 = a0;
+          let la1 = a1;
+          const cw = 4;
+          const xing = (c0: number, c1: number): void => {
+            const reg = ROAD_ATLAS.CROSSWALK;
+            roadQuad(s.axis, s.coord - lh, s.coord + lh, c0, c1, ROAD_Y, ROAD_Y, reg, (lh * 2) / reg.tileAcross, 0, 1);
+            const p0 = pt(s.axis, c0, 0, s.coord - lh);
+            const p1 = pt(s.axis, c1, 0, s.coord + lh);
+            crosswalkZones.push(rectFrom(p0.x, p0.z, p1.x, p1.z));
+          };
+          if (a1 - a0 > cw * 2 + 2) {
+            if (startsAtJunction) {
+              xing(a0, a0 + cw);
+              la0 = a0 + cw;
+            }
+            if (endsAtJunction) {
+              xing(a1 - cw, a1);
+              la1 = a1 - cw;
+            }
+          }
+          roadQuad(s.axis, s.coord - lh, s.coord + lh, la0, la1, ROAD_Y, ROAD_Y, region, (lh * 2) / region.tileAcross, la0 / region.tileAlong, la1 / region.tileAlong);
+          // Curbs (visual, 0.12 m) along both lane edges.
+          for (const side of [-1, 1]) {
+            G.concrete.push(boxGeoWorld(s.axis, a0, a1, s.coord + side * lh, s.coord + side * (lh + 0.16), 0, 0.12));
+          }
         }
       }
     });
 
-    // ---------------- Neighbour analysis: wall-run panels, cranes, floating nodes ----------------
-    const pairs: Array<[BuildingInfo, BuildingInfo, number]> = [];
-    for (let i = 0; i < buildings.length; i++) {
-      for (let j = i + 1; j < buildings.length; j++) {
-        const gap = footprintGap(buildings[i], buildings[j]);
-        if (gap >= LEVEL.GAP_MIN_M - 0.01 && gap <= LEVEL.GAP_MAX_M + 0.01) pairs.push([buildings[i], buildings[j], gap]);
-      }
-    }
-    // Gate tower links to its nearest playable building.
-    {
-      let best = buildings[0];
-      let bestGap = Infinity;
-      for (const b of buildings) {
-        const g = footprintGap(b, gateTower);
-        if (g < bestGap) {
-          bestGap = g;
-          best = b;
-        }
-      }
-      pairs.push([best, gateTower, bestGap]);
+    // Scramble plaza (sector 5): unmarked asphalt + edge and diagonal zebra crossings.
+    if (plan.plaza) {
+      const r = plan.plaza;
+      flatRect(r, ROAD_Y, ROAD_ATLAS.ASPHALT);
+      const cwReg = ROAD_ATLAS.CROSSWALK;
+      const zebra = (ax: number, az: number, bx: number, bz: number, y: number): void => {
+        const len = Math.hypot(bx - ax, bz - az);
+        const dx = (bx - ax) / len;
+        const dz = (bz - az) / len;
+        const nx = -dz * 2;
+        const nz = dx * 2;
+        const p0 = new THREE.Vector3(ax - nx, y, az - nz);
+        const p1 = new THREE.Vector3(bx - nx, y, bz - nz);
+        const p2 = new THREE.Vector3(bx + nx, y, bz + nz);
+        const p3 = new THREE.Vector3(ax + nx, y, az + nz);
+        // u = along A→B in 2 m tiles (bars repeat across the walking direction), v = 4 m band depth.
+        G.road.push(quad([p0, p1, p2, p3], [0, 0, len / cwReg.tileAcross, 0, len / cwReg.tileAcross, 1, 0, 1], _up, { aAtlas: atlasAttr(cwReg) }));
+      };
+      const e = r.x1 - 3;
+      zebra(-e, r.z0 + 2.5, e, r.z0 + 2.5, ROAD_Y + 0.004);
+      zebra(-e, r.z1 - 2.5, e, r.z1 - 2.5, ROAD_Y + 0.004);
+      zebra(r.x0 + 2.5, -e, r.x0 + 2.5, e, ROAD_Y + 0.004);
+      zebra(r.x1 - 2.5, -e, r.x1 - 2.5, e, ROAD_Y + 0.004);
+      zebra(-e + 2, -e + 2, e - 2, e - 2, ROAD_Y + 0.008);
+      zebra(-e + 2, e - 2, e - 2, -e + 2, ROAD_Y + 0.012);
+      // Plaza light masts at the corners.
+      for (const sx of [-1, 1]) for (const sz of [-1, 1]) addLamp(sx * (r.x1 + 1), sz * (r.z1 + 1), Math.atan2(-sx, -sz));
     }
 
-    const panelSides = new Map<string, true>();
-    const addPanel = (b: BuildingInfo, axis: 'x' | 'z', sign: number, rngW: number): void => {
-      const key = `${b.index}:${axis}:${sign}`;
-      if (panelSides.has(key)) return;
-      panelSides.set(key, true);
+    // ------------------------------------------------------------------ 2. canals
+    const bridgeSpans: Array<{ canal: number; street: number; along0: number; along1: number; lat0: number; lat1: number }> = [];
+    canals.forEach((c, ci) => {
+      const hw = c.width / 2;
+      const a0 = Math.max(c.from, -VIS);
+      const a1 = Math.min(c.to, VIS);
+      const spans: Array<[number, number]> = [];
+      streets.forEach((s, si) => {
+        if (!bridgeSet.has(si) || s.axis === c.axis || s.coord < c.from || s.coord > c.to) return;
+        if (!streetRanges[si].some(([r0, r1]) => r0 < c.coord - hw && r1 > c.coord + hw)) return;
+        const half = laneHalf(s.kind) + 1.6;
+        spans.push([s.coord - half - 0.3, s.coord + half + 0.3]);
+        bridgeSpans.push({ canal: ci, street: si, along0: c.coord - hw - 0.8, along1: c.coord + hw + 0.8, lat0: s.coord - half, lat1: s.coord + half });
+      });
+      // Water surface.
+      const flow = c.axis === 'z' ? [0, 1] : [1, 0];
+      G.water.push(quad(
+        [pt(c.axis, a0, LEVEL.CANAL_WATER_Y, c.coord - hw), pt(c.axis, a0, LEVEL.CANAL_WATER_Y, c.coord + hw), pt(c.axis, a1, LEVEL.CANAL_WATER_Y, c.coord + hw), pt(c.axis, a1, LEVEL.CANAL_WATER_Y, c.coord - hw)],
+        [0, 0, 1, 0, 1, 1, 0, 1],
+        _up,
+        { aFlow: flow },
+      ));
+      const wr0 = pt(c.axis, Math.max(a0, -H), 0, c.coord - hw);
+      const wr1 = pt(c.axis, Math.min(a1, H), 0, c.coord + hw);
+      canalWater.push(rectFrom(wr0.x, wr0.z, wr1.x, wr1.z));
+      colliders.push(colliderAL(c.axis, Math.max(a0, -H), Math.min(a1, H), c.coord - hw, c.coord + hw, -4, LEVEL.CANAL_WATER_Y, 'WATER'));
+      for (const side of [-1, 1]) {
+        const wallLat = c.coord + side * hw;
+        const inward = pt(c.axis, 0, 0, -side, new THREE.Vector3());
+        G.hw.push(quad(
+          [pt(c.axis, a0, LEVEL.CANAL_BED_Y, wallLat), pt(c.axis, a1, LEVEL.CANAL_BED_Y, wallLat), pt(c.axis, a1, 0, wallLat), pt(c.axis, a0, 0, wallLat)],
+          [a0 / 6, LEVEL.CANAL_BED_Y / 6, a1 / 6, LEVEL.CANAL_BED_Y / 6, a1 / 6, 0, a0 / 6, 0],
+          inward,
+        ));
+        // Towpath ledge (−1.1 m) so a jump can climb out: −2.4 → −1.1 → 0.
+        const tpLat = wallLat - side * LEVEL.CANAL_TOWPATH_WIDTH_M;
+        for (const [t0, t1] of subtractIntervals(a0, a1, spans)) {
+          G.concrete.push(boxGeoWorld(c.axis, t0, t1, Math.min(wallLat, tpLat), Math.max(wallLat, tpLat), LEVEL.CANAL_BED_Y, LEVEL.CANAL_TOWPATH_Y));
+          const c0 = Math.max(t0, -H);
+          const c1 = Math.min(t1, H);
+          if (c1 > c0) colliders.push(colliderAL(c.axis, c0, c1, wallLat, tpLat, -4, LEVEL.CANAL_TOWPATH_Y, 'TOWPATH'));
+        }
+        // Guard-rails on the promenade edge (gaps at bridges) + promenade lamps over the water.
+        for (const [g0, g1] of subtractIntervals(Math.max(a0, -H + 1), Math.min(a1, H - 1), spans)) {
+          for (let a = g0 + 1.5; a + 1.5 <= g1; a += 3) {
+            const p = pt(c.axis, a, 0, wallLat + side * 0.25);
+            addRail(p.x, p.z, c.axis === 'x');
+          }
+          if (g1 - g0 > 1) colliders.push(colliderAL(c.axis, g0, g1, wallLat + side * 0.2, wallLat + side * 0.32, 0, 1.0, 'PROP'));
+          for (let a = g0 + 8; a < g1 - 4; a += 16) {
+            const p = pt(c.axis, a, 0, wallLat + side * (LEVEL.CANAL_PROMENADE_M - 0.6));
+            const yaw = c.axis === 'z' ? (side > 0 ? -Math.PI / 2 : Math.PI / 2) : side > 0 ? Math.PI : 0;
+            addLamp(p.x, p.z, yaw);
+          }
+        }
+      }
+    });
+
+    // ------------------------------------------------------------------ 3. ground concrete (everything except water)
+    {
+      const water: RectXZ[] = canals.map((c) => {
+        const p0 = pt(c.axis, Math.max(c.from, -VIS), 0, c.coord - c.width / 2);
+        const p1 = pt(c.axis, Math.min(c.to, VIS), 0, c.coord + c.width / 2);
+        return rectFrom(p0.x, p0.z, p1.x, p1.z);
+      });
+      const O = LEVEL.OUTER_GROUND_M;
+      const xs = new Set<number>([-O, -H, H, O]);
+      const zs = new Set<number>([-O, -H, H, O]);
+      for (const r of water) {
+        xs.add(r.x0).add(r.x1);
+        zs.add(r.z0).add(r.z1);
+      }
+      const xa = [...xs].sort((a, b) => a - b);
+      const za = [...zs].sort((a, b) => a - b);
+      const t = RENDER.ROOF_TILE_M;
+      for (let i = 0; i < xa.length - 1; i++) {
+        for (let j = 0; j < za.length - 1; j++) {
+          const cx = (xa[i] + xa[i + 1]) / 2;
+          const cz = (za[j] + za[j + 1]) / 2;
+          if (water.some((r) => insideRect(cx, cz, r))) continue;
+          G.concrete.push(quad(
+            [new THREE.Vector3(xa[i], 0, za[j]), new THREE.Vector3(xa[i + 1], 0, za[j]), new THREE.Vector3(xa[i + 1], 0, za[j + 1]), new THREE.Vector3(xa[i], 0, za[j + 1])],
+            [xa[i] / t, za[j] / t, xa[i + 1] / t, za[j] / t, xa[i + 1] / t, za[j + 1] / t, xa[i] / t, za[j + 1] / t],
+            _up,
+          ));
+          const x0 = Math.max(xa[i], -H);
+          const x1 = Math.min(xa[i + 1], H);
+          const z0 = Math.max(za[j], -H);
+          const z1 = Math.min(za[j + 1], H);
+          if (x1 > x0 && z1 > z0) colliders.push({ min: new THREE.Vector3(x0, -4, z0), max: new THREE.Vector3(x1, 0, z1), kind: 'GROUND', building: -1 });
+        }
+      }
+    }
+
+    // ------------------------------------------------------------------ 4. neon truss bridges
+    const BRIDGE_NEON = [COLORS.NEON_MAGENTA, COLORS.WALLRUN_CYAN, COLORS.NEON_AMBER];
+    bridgeSpans.forEach((b, bi) => {
+      const c = canals[b.canal];
+      const s = streets[b.street];
+      const axis = s.axis;
+      const L = b.along1 - b.along0;
+      G.hw.push(boxGeoWorld(axis, b.along0, b.along1, b.lat0, b.lat1, -LEVEL.BRIDGE_DECK_THICKNESS_M, LEVEL.BRIDGE_DECK_Y - 0.005));
+      colliders.push(colliderAL(axis, c.coord - c.width / 2, c.coord + c.width / 2, b.lat0, b.lat1, -LEVEL.BRIDGE_DECK_THICKNESS_M, LEVEL.BRIDGE_DECK_Y, 'BRIDGE'));
+      const neon = BRIDGE_NEON[bi % BRIDGE_NEON.length];
+      const tops = [3.5, 5.6, 6.5, 5.6, 3.5];
+      for (const side of [-1, 1]) {
+        const lat = side < 0 ? b.lat0 - 0.25 : b.lat1 + 0.25;
+        const node = (i: number, top: boolean): THREE.Vector3 => pt(axis, b.along0 + (L * i) / 4, top ? tops[i] : 0.15, lat);
+        const out = pt(axis, 0, 0, side * 0.2, new THREE.Vector3());
+        for (let i = 0; i < 4; i++) {
+          G.steel.push(beam(node(i, false), node(i + 1, false), 0.32));
+          G.steel.push(beam(node(i, true), node(i + 1, true), 0.3));
+          G.steel.push(i % 2 === 0 ? beam(node(i, false), node(i + 1, true), 0.2) : beam(node(i, true), node(i + 1, false), 0.2));
+          G.strips.push(withColor(beam(node(i, true).add(out).setY(tops[i] + 0.2), node(i + 1, true).add(out).setY(tops[i + 1] + 0.2), 0.08), neon, 1.4));
+        }
+        for (let i = 0; i <= 4; i++) G.steel.push(beam(node(i, false), node(i, true), 0.22));
+        G.strips.push(withColor(beam(pt(axis, b.along0, 0.42, lat + side * 0.2), pt(axis, b.along1, 0.42, lat + side * 0.2), 0.07), neon, 1.4));
+        // Gold anchors on the truss apexes (centre + quarter nodes).
+        for (const i of [1, 2, 3]) {
+          const n = node(i, true);
+          addBeacon(n.clone().setY(tops[i] + 0.75), 'BRIDGE_TRUSS');
+          addLight(n.x, tops[i], n.z, neon, 2.6);
+        }
+        colliders.push(colliderAL(axis, b.along0, b.along1, lat - 0.18, lat + 0.18, 0, 3.5, 'BRIDGE'));
+      }
+      // Overhead lateral bracing at the three middle nodes (clear of traffic: ≥ 5.6 m).
+      for (const i of [1, 2, 3]) {
+        const a = b.along0 + (L * i) / 4;
+        G.steel.push(beam(pt(axis, a, tops[i], b.lat0 - 0.25), pt(axis, a, tops[i], b.lat1 + 0.25), 0.22));
+        colliders.push(colliderAL(axis, a - 0.15, a + 0.15, b.lat0, b.lat1, tops[i] - 0.15, tops[i] + 0.15, 'STEEL'));
+      }
+      G.steel.push(beam(pt(axis, b.along0 + L / 4, tops[1], b.lat0 - 0.25), pt(axis, b.along0 + (3 * L) / 4, tops[3], b.lat1 + 0.25), 0.12));
+      G.steel.push(beam(pt(axis, b.along0 + L / 4, tops[1], b.lat1 + 0.25), pt(axis, b.along0 + (3 * L) / 4, tops[3], b.lat0 - 0.25), 0.12));
+    });
+
+    // ------------------------------------------------------------------ 5. expressways, piers, on-ramps
+    const decks: Array<{ hi: number; axis: Axis; coord: number; a0: number; a1: number }> = [];
+    const pierRects: RectXZ[] = [];
+    const highwayRects: RectXZ[] = [];
+    const rampRects: RectXZ[] = [];
+    const HW = LEVEL.HIGHWAY_WIDTH_M / 2;
+    const DECK = LEVEL.HIGHWAY_DECK_Y;
+    const UNDER = LEVEL.HIGHWAY_UNDERSIDE_Y;
+    const GUARD_TOP = DECK + LEVEL.HIGHWAY_GUARD_HEIGHT_M;
+    const GT = LEVEL.HIGHWAY_GUARD_THICKNESS_M;
+
+    const rampInfo = plan.ramps.map((r) => {
+      const h = plan.highways[r.highway];
+      const s = streets[r.street];
+      const lh = laneHalf(s.kind);
+      const top = h.coord + r.dir * HW;
+      // Run available until the next perpendicular street centre, canal corridor or street end.
+      let limit = r.dir > 0 ? s.to : s.from;
+      streets.forEach((p) => {
+        if (p.axis === s.axis || Math.abs(p.coord - h.coord) <= HW + 0.5) return;
+        if ((p.coord - top) * r.dir > 1) limit = r.dir > 0 ? Math.min(limit, p.coord) : Math.max(limit, p.coord);
+      });
+      canals.forEach((c) => {
+        if (c.axis === s.axis) return;
+        const edge = c.coord - r.dir * canalCorridorHalf(c);
+        if ((edge - top) * r.dir > 0) limit = r.dir > 0 ? Math.min(limit, edge) : Math.max(limit, edge);
+      });
+      const avail = Math.abs(limit - top) - 2;
+      if (avail < LEVEL.RAMP_MIN_LENGTH_M) throw new Error(`Ramp ${r.highway}/${r.street}: only ${avail.toFixed(1)} m available`);
+      const len = Math.min(avail, LEVEL.RAMP_MAX_LENGTH_M);
+      const latC = s.coord + r.side * (lh - LEVEL.RAMP_WIDTH_M / 2);
+      return { r, s, top, bottom: top + r.dir * len, lat0: latC - LEVEL.RAMP_WIDTH_M / 2, lat1: latC + LEVEL.RAMP_WIDTH_M / 2, len };
+    });
+
+    plan.highways.forEach((h, hi) => {
+      const a0 = Math.max(h.from, -VIS);
+      const a1 = Math.min(h.to, VIS);
+      const junctions: Array<[number, number]> = [];
+      for (const d of decks) {
+        if (d.axis === h.axis) continue;
+        if (h.coord + HW > d.a0 && h.coord - HW < d.a1 && d.coord + HW > a0 && d.coord - HW < a1) junctions.push([d.coord - HW, d.coord + HW]);
+      }
+      const ownedJunctions: Array<[number, number]> = [];
+      plan.highways.forEach((o, oi) => {
+        if (oi <= hi || o.axis === h.axis) return;
+        if (h.coord + HW > o.from && h.coord - HW < o.to && o.coord + HW > a0 && o.coord - HW < a1) ownedJunctions.push([o.coord - HW, o.coord + HW]);
+      });
+      const pieces = subtractIntervals(a0, a1, junctions);
+      for (const [p0, p1] of pieces) decks.push({ hi, axis: h.axis, coord: h.coord, a0: p0, a1: p1 });
+      const hr0 = pt(h.axis, a0, 0, h.coord - HW);
+      const hr1 = pt(h.axis, a1, 0, h.coord + HW);
+      highwayRects.push(rectFrom(hr0.x, hr0.z, hr1.x, hr1.z));
+
+      for (const [d0, d1] of pieces) {
+        G.hw.push(boxGeoWorld(h.axis, d0, d1, h.coord - HW, h.coord + HW, DECK - 0.45, DECK));
+        for (const g of [-4.6, 0, 4.6]) G.hw.push(boxGeoWorld(h.axis, d0, d1, h.coord + g - 0.8, h.coord + g + 0.8, UNDER, DECK - 0.45));
+        G.hw.push(boxGeoWorld(h.axis, d0, d1, h.coord - HW, h.coord - HW + 0.3, UNDER, DECK));
+        G.hw.push(boxGeoWorld(h.axis, d0, d1, h.coord + HW - 0.3, h.coord + HW, UNDER, DECK));
+        const reg = ROAD_ATLAS.LANES4;
+        for (const [l0, l1] of subtractIntervals(d0, d1, ownedJunctions)) {
+          roadQuad(h.axis, h.coord - HW, h.coord + HW, l0, l1, DECK + ROAD_Y, DECK + ROAD_Y, reg, 1, l0 / reg.tileAlong, l1 / reg.tileAlong);
+        }
+        for (const [j0, j1] of ownedJunctions) {
+          if (j1 <= d0 || j0 >= d1) continue;
+          const ar = ROAD_ATLAS.ASPHALT;
+          roadQuad(h.axis, h.coord - HW, h.coord + HW, j0, j1, DECK + ROAD_Y, DECK + ROAD_Y, ar, (HW * 2) / ar.tileAcross, j0 / ar.tileAlong, j1 / ar.tileAlong);
+        }
+        // Underside industrial light strips (emissive 1.6) + their glow on the street below.
+        for (const side of [-1, 1]) {
+          const color = side < 0 ? h.lightNeg : h.lightPos;
+          const lat = h.coord + side * (HW - 1.6);
+          G.strips.push(withColor(boxGeoWorld(h.axis, d0, d1, lat - 0.14, lat + 0.14, UNDER - 0.07, UNDER), color, MATERIALS.HIGHWAY_CONCRETE.emissive));
+          for (let a = d0 + 6; a < d1; a += 12) {
+            const q = pt(h.axis, a, UNDER - 0.3, lat);
+            if (inArea(q.x, q.z, -20)) addLight(q.x, q.y, q.z, color, 2.2);
+          }
+        }
+        const c0 = Math.max(d0, -H);
+        const c1 = Math.min(d1, H);
+        if (c1 > c0) colliders.push(colliderAL(h.axis, c0, c1, h.coord - HW, h.coord + HW, UNDER, DECK, 'HIGHWAY'));
+      }
+
+      // Guard walls with openings (junctions, ramps); outer faces are cyan wall-run cladding.
+      for (const side of [-1, 1]) {
+        const openings: Array<[number, number]> = [];
+        plan.highways.forEach((o, oi) => {
+          if (oi === hi || o.axis === h.axis) return;
+          const wallLat = h.coord + side * HW;
+          const beyond = side > 0 ? o.to > h.coord + HW + 0.5 : o.from < h.coord - HW - 0.5;
+          if (o.from < wallLat && o.to > wallLat && beyond && o.coord + HW > a0 && o.coord - HW < a1) openings.push([o.coord - HW, o.coord + HW]);
+        });
+        for (const ri of rampInfo) {
+          if (ri.r.highway === hi && Math.sign(ri.top - h.coord) === side) openings.push([ri.lat0, ri.lat1]);
+        }
+        const wallOuter = h.coord + side * HW;
+        const wallInner = wallOuter - side * GT;
+        for (const [w0, w1] of subtractIntervals(a0, a1, openings)) {
+          G.hw.push(boxGeoWorld(h.axis, w0, w1, Math.min(wallOuter, wallInner), Math.max(wallOuter, wallInner), DECK, GUARD_TOP));
+          const o = 0.03 * side;
+          const n = pt(h.axis, 0, 0, side, new THREE.Vector3());
+          const tile = RENDER.WALLRUN_CHEVRON_TILE_M;
+          G.panels.push(quad(
+            [pt(h.axis, w0, UNDER, wallOuter + o), pt(h.axis, w1, UNDER, wallOuter + o), pt(h.axis, w1, GUARD_TOP, wallOuter + o), pt(h.axis, w0, GUARD_TOP, wallOuter + o)],
+            [w0 / tile, 0, w1 / tile, 0, w1 / tile, 1, w0 / tile, 1],
+            n,
+          ));
+          const c0 = Math.max(w0, -H);
+          const c1 = Math.min(w1, H);
+          if (c1 > c0 + 1) {
+            colliders.push(colliderAL(h.axis, c0, c1, wallOuter, wallInner, DECK, GUARD_TOP, 'HIGHWAY'));
+            const mn = pt(h.axis, c0, UNDER, wallOuter);
+            const mx = pt(h.axis, c1, GUARD_TOP, wallOuter);
+            wallRun.push({ min: new THREE.Vector3(Math.min(mn.x, mx.x), UNDER, Math.min(mn.z, mx.z)), max: new THREE.Vector3(Math.max(mn.x, mx.x), GUARD_TOP, Math.max(mn.z, mx.z)), normal: n, building: -1 });
+          }
+          // Gold anchors on wall-top posts every 24 m (highway edges).
+          const sp = LEVEL.HIGHWAY_ANCHOR_SPACING_M;
+          for (let a = Math.ceil((w0 + 4) / sp) * sp; a < w1 - 2; a += sp) {
+            const q = pt(h.axis, a, GUARD_TOP, wallOuter - (side * GT) / 2);
+            if (!inArea(q.x, q.z, -4)) continue;
+            G.steel.push(boxAt(0.22, 0.6, 0.22, q.x, GUARD_TOP + 0.3, q.z));
+            addBeacon(q.clone().setY(GUARD_TOP + 0.95), 'HIGHWAY_EDGE');
+          }
+        }
+      }
+      // Median barrier (opens at junctions).
+      for (const [m0, m1] of subtractIntervals(a0, a1, [...junctions, ...ownedJunctions])) {
+        G.hw.push(boxGeoWorld(h.axis, m0, m1, h.coord - 0.25, h.coord + 0.25, DECK, DECK + LEVEL.HIGHWAY_MEDIAN_HEIGHT_M));
+        const c0 = Math.max(m0, -H);
+        const c1 = Math.min(m1, H);
+        if (c1 > c0) colliders.push(colliderAL(h.axis, c0, c1, h.coord - 0.25, h.coord + 0.25, DECK, DECK + LEVEL.HIGHWAY_MEDIAN_HEIGHT_M, 'HIGHWAY'));
+      }
+
+      // Piers every 24–28 m — never inside crossing street lanes, canal water or bridge spans.
+      const blocked: Array<[number, number]> = [];
+      streets.forEach((p) => {
+        if (p.axis === h.axis || h.coord + HW < p.from || h.coord - HW > p.to) return;
+        const pl = laneHalf(p.kind) + 1.5;
+        blocked.push([p.coord - pl, p.coord + pl]);
+      });
+      canals.forEach((c) => {
+        if (c.axis === h.axis || h.coord + HW < c.from || h.coord - HW > c.to) return;
+        blocked.push([c.coord - c.width / 2 - 1.2, c.coord + c.width / 2 + 1.2]);
+      });
+      const crossAxisIsX = pt(h.axis, 0, 0, 1, new THREE.Vector3()).x !== 0;
+      let a = a0 + 6 + rng() * 6;
+      while (a < a1 - 4) {
+        if (blocked.some(([b0, b1]) => a > b0 && a < b1)) {
+          a += 1;
+          continue;
+        }
+        const qp = pt(h.axis, a, 0, h.coord);
+        G.hw.push(boxAt(1.4, UNDER, 1.4, qp.x, UNDER / 2, qp.z));
+        G.hw.push(boxAt(crossAxisIsX ? 3.2 : 1.9, 0.7, crossAxisIsX ? 1.9 : 3.2, qp.x, UNDER - 0.35, qp.z));
+        const pr = rectFrom(qp.x - 0.7, qp.z - 0.7, qp.x + 0.7, qp.z + 0.7);
+        pierRects.push(pr);
+        if (inArea(qp.x, qp.z)) colliders.push({ min: new THREE.Vector3(pr.x0, 0, pr.z0), max: new THREE.Vector3(pr.x1, UNDER, pr.z1), kind: 'HIGHWAY', building: -1 });
+        a += LEVEL.HIGHWAY_PIER_SPACING_MIN_M + rng() * (LEVEL.HIGHWAY_PIER_SPACING_MAX_M - LEVEL.HIGHWAY_PIER_SPACING_MIN_M);
+      }
+    });
+
+    // On-ramps: sloped slab + asphalt + parapets + supports; RampCollider for physics.
+    rampInfo.forEach((ri) => {
+      const axis = ri.s.axis;
+      const len = ri.len;
+      const slope = Math.atan2(DECK, len);
+      const slabLen = len / Math.cos(slope);
+      const slab = axis === 'z' ? new THREE.BoxGeometry(LEVEL.RAMP_WIDTH_M, 0.5, slabLen) : new THREE.BoxGeometry(slabLen, 0.5, LEVEL.RAMP_WIDTH_M);
+      // Rising toward `top` (opposite of the descending dir).
+      if (axis === 'z') slab.rotateX(ri.r.dir > 0 ? slope : -slope);
+      else slab.rotateZ(ri.r.dir > 0 ? -slope : slope);
+      const mid = pt(axis, (ri.top + ri.bottom) / 2, DECK / 2 - 0.25 / Math.cos(slope), (ri.lat0 + ri.lat1) / 2);
+      slab.translate(mid.x, mid.y, mid.z);
+      G.hw.push(slab);
+      const ar = ROAD_ATLAS.ASPHALT;
+      roadQuad(axis, ri.lat0, ri.lat1, ri.top, ri.bottom, DECK + ROAD_Y, ROAD_Y, ar, LEVEL.RAMP_WIDTH_M / ar.tileAcross, 0, len / ar.tileAlong);
+      for (const lat of [ri.lat0 + 0.15, ri.lat1 - 0.15]) G.hw.push(beam(pt(axis, ri.top, DECK + 0.45, lat), pt(axis, ri.bottom, 0.45, lat), 0.3, 0.9));
+      for (let d = 10; d < len - 6; d += 10) {
+        const al = ri.top + ri.r.dir * d;
+        const y = DECK * (1 - d / len) - 0.5;
+        if (y < 1.2) continue;
+        const qp = pt(axis, al, 0, (ri.lat0 + ri.lat1) / 2);
+        G.hw.push(boxAt(1.0, y, 1.0, qp.x, y / 2, qp.z));
+        if (inArea(qp.x, qp.z)) colliders.push({ min: new THREE.Vector3(qp.x - 0.5, 0, qp.z - 0.5), max: new THREE.Vector3(qp.x + 0.5, y, qp.z + 0.5), kind: 'HIGHWAY', building: -1 });
+      }
+      rampColliders.push({ axis, lateralMin: ri.lat0, lateralMax: ri.lat1, alongStart: ri.top, alongEnd: ri.bottom, yStart: DECK, yEnd: 0, thickness: 0.5 });
+      const r0 = pt(axis, ri.top, 0, ri.lat0);
+      const r1 = pt(axis, ri.bottom, 0, ri.lat1);
+      rampRects.push(rectFrom(r0.x, r0.z, r1.x, r1.z));
+    });
+
+    // ------------------------------------------------------------------ 6. building lots, alleys & heights
+    const lotList = plan.explicitLots ? plan.explicitLots.map((r) => ({ r, pair: -1 })) : this.computeLots(plan, sector, rng);
+    const N = sector.buildingCount;
+    const isPerimeter = (r: RectXZ): boolean => Math.max(Math.abs(r.x0), Math.abs(r.x1), Math.abs(r.z0), Math.abs(r.z1)) > H - 6;
+    // Whole alley-split groups first (keeps both sides of each wall-run alley), perimeter wall preferred,
+    // then single lots; spare lots become plazas.
+    const groups = new Map<number, RectXZ[]>();
+    const singles: RectXZ[] = [];
+    for (const l of lotList) {
+      if (l.pair < 0) singles.push(l.r);
+      else groups.set(l.pair, [...(groups.get(l.pair) ?? []), l.r]);
+    }
+    const groupOrder = [...groups.values()]
+      .map((g) => ({ g, perim: g.some(isPerimeter) ? 1 : 0, roll: rng() }))
+      .sort((p, o) => o.perim - p.perim || p.roll - o.roll);
+    const chosen: RectXZ[] = [];
+    const rest: RectXZ[] = [...singles];
+    for (const { g } of groupOrder) {
+      if (chosen.length + g.length <= N) chosen.push(...g);
+      else rest.push(...g);
+    }
+    const restOrder = rest.map((r) => ({ r, perim: isPerimeter(r) ? 1 : 0, roll: rng() })).sort((p, o) => o.perim - p.perim || p.roll - o.roll);
+    while (chosen.length < N && restOrder.length) chosen.push((restOrder.shift() as { r: RectXZ }).r);
+    const plazas = restOrder.map((o) => o.r);
+    if (chosen.length !== N) throw new Error(`Sector ${sector.index}: only ${chosen.length}/${N} building lots`);
+
+    // Alley detection: footprints facing each other across a 4–10 m gap with ≥ 5 m overlap.
+    type AlleyRec = { a: number; b: number; axis: Axis; gap0: number; gap1: number; ov0: number; ov1: number };
+    const alleyRecs: AlleyRec[] = [];
+    for (let i = 0; i < chosen.length; i++) {
+      for (let j = i + 1; j < chosen.length; j++) {
+        const A = chosen[i];
+        const B = chosen[j];
+        const ovZ0 = Math.max(A.z0, B.z0);
+        const ovZ1 = Math.min(A.z1, B.z1);
+        if (ovZ1 - ovZ0 >= 5) {
+          const [l, r] = A.x1 <= B.x0 ? [i, j] : B.x1 <= A.x0 ? [j, i] : [-1, -1];
+          if (l >= 0) {
+            const g0 = chosen[l].x1;
+            const g1 = chosen[r].x0;
+            if (g1 - g0 >= 4 && g1 - g0 <= 10) alleyRecs.push({ a: l, b: r, axis: 'x', gap0: g0, gap1: g1, ov0: ovZ0, ov1: ovZ1 });
+          }
+        }
+        const ovX0 = Math.max(A.x0, B.x0);
+        const ovX1 = Math.min(A.x1, B.x1);
+        if (ovX1 - ovX0 >= 5) {
+          const [n, f] = A.z1 <= B.z0 ? [i, j] : B.z1 <= A.z0 ? [j, i] : [-1, -1];
+          if (n >= 0) {
+            const g0 = chosen[n].z1;
+            const g1 = chosen[f].z0;
+            if (g1 - g0 >= 4 && g1 - g0 <= 10) alleyRecs.push({ a: n, b: f, axis: 'z', gap0: g0, gap1: g1, ov0: ovX0, ov1: ovX1 });
+          }
+        }
+      }
+    }
+    // Sky-bridge alleys: exactly sector.skyBridges, preferring distinct tower pairs.
+    const skyAlleys: AlleyRec[] = [];
+    const bridged = new Set<number>();
+    const shuffledAlleys = alleyRecs.map((al) => ({ al, roll: rng() })).sort((p, o) => p.roll - o.roll).map((x) => x.al);
+    for (const pass of [0, 1]) {
+      for (const al of shuffledAlleys) {
+        if (skyAlleys.length >= sector.skyBridges) break;
+        if (skyAlleys.includes(al)) continue;
+        if (pass === 0 && (bridged.has(al.a) || bridged.has(al.b))) continue;
+        skyAlleys.push(al);
+        bridged.add(al.a).add(al.b);
+      }
+    }
+    if (skyAlleys.length !== sector.skyBridges) throw new Error(`Sector ${sector.index}: ${skyAlleys.length}/${sector.skyBridges} sky-bridge alleys`);
+
+    // Heights inside the sector band; perimeter towers lean tall; sky-bridge towers tall enough for Layer 2.
+    const q2 = (v: number): number => Math.round(v * 2) / 2;
+    const heights = chosen.map((r) => {
+      const t = isPerimeter(r) ? 0.45 + rng() * 0.55 : rng();
+      return q2(sector.heightMin + t * (sector.heightMax - sector.heightMin));
+    });
+    for (const i of bridged) heights[i] = Math.min(sector.heightMax, Math.max(heights[i], q2(LEVEL.SKYBRIDGE_Y_MIN + 12 + rng() * 14)));
+    let iMax = 0;
+    heights.forEach((hgt, i) => {
+      if (hgt > heights[iMax]) iMax = i;
+    });
+    heights[iMax] = sector.heightMax;
+    let iMin = -1;
+    heights.forEach((hgt, i) => {
+      if (i !== iMax && !bridged.has(i) && (iMin < 0 || hgt < heights[iMin])) iMin = i;
+    });
+    if (iMin >= 0) heights[iMin] = sector.heightMin;
+
+    const buildings: Building[] = chosen.map((r, i) => ({
+      index: i,
+      cx: (r.x0 + r.x1) / 2,
+      cz: (r.z0 + r.z1) / 2,
+      halfW: (r.x1 - r.x0) / 2,
+      halfD: (r.z1 - r.z0) / 2,
+      roofY: heights[i],
+      rect: r,
+      seed: rng(),
+    }));
+
+    // ------------------------------------------------------------------ 7. towers, alleys, panels, sky-bridges
+    const roofRects: RectXZ[][] = buildings.map(() => []);
+    const panelFaces = new Set<string>();
+    const alleyFaces = new Set<string>();
+    for (const al of alleyRecs) alleyFaces.add(`${al.a}:${al.axis}:1`).add(`${al.b}:${al.axis}:-1`);
+
+    buildings.forEach((b) => {
+      const body = new THREE.BoxGeometry(b.halfW * 2, b.roofY - 0.45, b.halfD * 2);
+      body.translate(b.cx, (b.roofY - 0.45) / 2, b.cz);
+      G.bodies.push(withAttr1(body, 'aSeed', b.seed));
+      G.concrete.push(worldUvBox(b.halfW * 2 + 0.3, 0.5, b.halfD * 2 + 0.3, b.cx, b.roofY - 0.25, b.cz, RENDER.ROOF_TILE_M));
+      G.steel.push(
+        boxAt(b.halfW * 2 + 0.42, 0.08, 0.22, b.cx, b.roofY + 0.02, b.cz + b.halfD + 0.1),
+        boxAt(b.halfW * 2 + 0.42, 0.08, 0.22, b.cx, b.roofY + 0.02, b.cz - b.halfD - 0.1),
+        boxAt(0.22, 0.08, b.halfD * 2 + 0.2, b.cx + b.halfW + 0.1, b.roofY + 0.02, b.cz),
+        boxAt(0.22, 0.08, b.halfD * 2 + 0.2, b.cx - b.halfW - 0.1, b.roofY + 0.02, b.cz),
+      );
+      colliders.push({ min: new THREE.Vector3(b.rect.x0, 0, b.rect.z0), max: new THREE.Vector3(b.rect.x1, b.roofY, b.rect.z1), kind: 'BUILDING', building: b.index });
+      // Two diagonal roof corners carry gold anchors on steel stubs (grapple-able building corners).
+      const diag = rng() < 0.5 ? 1 : -1;
+      for (const [sx, sz] of [[1, diag], [-1, -diag]]) {
+        const ex = b.cx + sx * (b.halfW + 0.6);
+        const ez = b.cz + sz * (b.halfD + 0.6);
+        const base = new THREE.Vector3(b.cx + sx * (b.halfW - 0.6), b.roofY, b.cz + sz * (b.halfD - 0.6));
+        G.steel.push(beam(base, new THREE.Vector3(ex, b.roofY + 2.4, ez), 0.22), beam(base, base.clone().setY(b.roofY + 2.6), 0.26));
+        addBeacon(new THREE.Vector3(ex, b.roofY + 2.9, ez), 'BUILDING_CORNER');
+        roofRects[b.index].push(rectFrom(base.x - 1, base.z - 1, base.x + 1, base.z + 1));
+      }
+    });
+
+    /** Wall-run panel on face (axis, sign) of building b between y0 and y1. */
+    const addPanel = (b: Building, axis: Axis, sign: number, y0: number, y1: number, frac: number): void => {
+      if (y1 - y0 < 3) return;
       const sideLen = axis === 'x' ? b.halfD * 2 : b.halfW * 2;
-      const pw = Math.min(22, sideLen * (0.64 + rngW * 0.16));
-      const ph = 10 + rngW * 2.5;
-      const top = b.roofY - 1.4;
-      const bottom = top - ph;
-      const cy = (top + bottom) / 2;
-      const off = 0.06;
+      const pw = Math.min(24, sideLen * frac);
+      const ph = y1 - y0;
       const plane = new THREE.PlaneGeometry(pw, ph);
       const uv = plane.getAttribute('uv') as THREE.BufferAttribute;
       for (let i = 0; i < uv.count; i++) uv.setX(i, (uv.getX(i) * pw) / RENDER.WALLRUN_CHEVRON_TILE_M);
-      let px: number, pz: number;
+      const off = 0.06;
       const normal = new THREE.Vector3();
+      let px: number;
+      let pz: number;
       if (axis === 'x') {
         plane.rotateY(sign > 0 ? Math.PI / 2 : -Math.PI / 2);
         px = b.cx + sign * (b.halfW + off);
@@ -1161,400 +2467,623 @@ export class CityBuilder {
         pz = b.cz + sign * (b.halfD + off);
         normal.set(0, 0, sign);
       }
+      const cy = (y0 + y1) / 2;
       plane.translate(px, cy, pz);
-      panelGeos.push(plane);
-      // Steel frame around the panel for depth.
+      G.panels.push(plane);
       const fr = 0.18;
       if (axis === 'x') {
-        steelGeos.push(
-          boxAt(0.2, fr, pw + fr * 2, px, top + fr / 2, pz),
-          boxAt(0.2, fr, pw + fr * 2, px, bottom - fr / 2, pz),
-          boxAt(0.2, ph, fr, px, cy, pz - pw / 2 - fr / 2),
-          boxAt(0.2, ph, fr, px, cy, pz + pw / 2 + fr / 2),
-        );
+        G.steel.push(boxAt(0.2, fr, pw + fr * 2, px, y1 + fr / 2, pz), boxAt(0.2, fr, pw + fr * 2, px, y0 - fr / 2, pz), boxAt(0.2, ph, fr, px, cy, pz - pw / 2 - fr / 2), boxAt(0.2, ph, fr, px, cy, pz + pw / 2 + fr / 2));
       } else {
-        steelGeos.push(
-          boxAt(pw + fr * 2, fr, 0.2, px, top + fr / 2, pz),
-          boxAt(pw + fr * 2, fr, 0.2, px, bottom - fr / 2, pz),
-          boxAt(fr, ph, 0.2, px - pw / 2 - fr / 2, cy, pz),
-          boxAt(fr, ph, 0.2, px + pw / 2 + fr / 2, cy, pz),
-        );
+        G.steel.push(boxAt(pw + fr * 2, fr, 0.2, px, y1 + fr / 2, pz), boxAt(pw + fr * 2, fr, 0.2, px, y0 - fr / 2, pz), boxAt(fr, ph, 0.2, px - pw / 2 - fr / 2, cy, pz), boxAt(fr, ph, 0.2, px + pw / 2 + fr / 2, cy, pz));
       }
-      const faceCoord = axis === 'x' ? b.cx + sign * b.halfW : b.cz + sign * b.halfD;
+      const face = axis === 'x' ? b.cx + sign * b.halfW : b.cz + sign * b.halfD;
       wallRun.push({
-        min: new THREE.Vector3(axis === 'x' ? faceCoord : b.cx - pw / 2, bottom, axis === 'x' ? b.cz - pw / 2 : faceCoord),
-        max: new THREE.Vector3(axis === 'x' ? faceCoord : b.cx + pw / 2, top, axis === 'x' ? b.cz + pw / 2 : faceCoord),
+        min: new THREE.Vector3(axis === 'x' ? face : b.cx - pw / 2, y0, axis === 'x' ? b.cz - pw / 2 : face),
+        max: new THREE.Vector3(axis === 'x' ? face : b.cx + pw / 2, y1, axis === 'x' ? b.cz + pw / 2 : face),
         normal,
         building: b.index,
       });
+      panelFaces.add(`${b.index}:${axis}:${sign}`);
     };
 
-    const craneSides = new Set<string>();
-    pairs.forEach(([a, b, gap], pi) => {
-      const dx = b.cx - a.cx;
-      const dz = b.cz - a.cz;
-      const axis: 'x' | 'z' = Math.abs(dx) >= Math.abs(dz) ? 'x' : 'z';
-      const sA = axis === 'x' ? Math.sign(dx) : Math.sign(dz);
-      // Wall-run panels on both facing sides.
-      addPanel(a, axis, sA, rng());
-      addPanel(b, axis, -sA, rng());
-
-      // Anchor in the gap: crane from the higher roof on even pairs / gate link, floating node otherwise.
-      const hi = a.roofY >= b.roofY ? a : b;
-      const lo = hi === a ? b : a;
-      const dirSign = axis === 'x' ? Math.sign(lo.cx - hi.cx) : Math.sign(lo.cz - hi.cz);
-      // Lateral coordinate: overlap centre of the two footprints on the other axis.
-      const latMin = axis === 'x' ? Math.max(a.cz - a.halfD, b.cz - b.halfD) : Math.max(a.cx - a.halfW, b.cx - b.halfW);
-      const latMax = axis === 'x' ? Math.min(a.cz + a.halfD, b.cz + b.halfD) : Math.min(a.cx + a.halfW, b.cx + b.halfW);
-      const hiLatMin = axis === 'x' ? hi.cz - hi.halfD + 3 : hi.cx - hi.halfW + 3;
-      const hiLatMax = axis === 'x' ? hi.cz + hi.halfD - 3 : hi.cx + hi.halfW - 3;
-      const lat = clamp(latMin < latMax ? (latMin + latMax) / 2 : axis === 'x' ? (a.cz + b.cz) / 2 : (a.cx + b.cx) / 2, hiLatMin, hiLatMax);
-      const hiEdge = axis === 'x' ? hi.cx + dirSign * hi.halfW : hi.cz + dirSign * hi.halfD;
-      const isGateLink = b.isGateTower || a.isGateTower;
-
-      const craneKey = `${hi.index}:${axis}:${dirSign}`;
-      if ((pi % 2 === 0 || isGateLink) && !craneSides.has(craneKey)) {
-        craneSides.add(craneKey);
-        // ---- Tower crane on the higher roof ----
-        const mastH = 14 + rng() * 5;
-        const mastAlong = hiEdge - dirSign * 2.6;
-        const mx = axis === 'x' ? mastAlong : lat;
-        const mz = axis === 'x' ? lat : mastAlong;
-        const base = hi.roofY;
-        const top = base + mastH;
-        const c = 0.6; // mast half-width
-        const corners: Array<[number, number]> = [[-c, -c], [c, -c], [c, c], [-c, c]];
-        for (const [ox, oz] of corners) {
-          steelGeos.push(beam(new THREE.Vector3(mx + ox, base, mz + oz), new THREE.Vector3(mx + ox, top, mz + oz), 0.14));
+    const faces: Array<[Axis, number]> = [['x', 1], ['x', -1], ['z', 1], ['z', -1]];
+    buildings.forEach((b) => {
+      let count = 0;
+      // Alley faces: low + mid-level panels (wall-run alleys).
+      for (const [ax, sg] of faces) {
+        if (!alleyFaces.has(`${b.index}:${ax}:${sg}`)) continue;
+        addPanel(b, ax, sg, 1.6, 11.5, 0.72);
+        count++;
+        if (b.roofY >= 36) {
+          addPanel(b, ax, sg, LEVEL.SKYBRIDGE_Y_MIN + 1, Math.min(LEVEL.SKYBRIDGE_Y_MAX - 3, b.roofY - 6), 0.6);
+          count++;
         }
-        const seg = 1.6;
-        for (let y = base; y < top - 0.01; y += seg) {
-          const y2 = Math.min(y + seg, top);
-          for (let k = 0; k < 4; k++) {
-            const [ax, az] = corners[k];
-            const [bx, bz] = corners[(k + 1) % 4];
-            steelGeos.push(beam(new THREE.Vector3(mx + ax, y, mz + az), new THREE.Vector3(mx + bx, y2, mz + bz), 0.07));
-            steelGeos.push(beam(new THREE.Vector3(mx + ax, y2, mz + az), new THREE.Vector3(mx + bx, y2, mz + bz), 0.07));
-          }
-        }
-        // Jib over the gap and counter-jib with counterweight.
-        const jibLen = gap / 2 + 2.6 + 3.5;
-        const jibEnd = mastAlong + dirSign * jibLen;
-        const cjEnd = mastAlong - dirSign * 7;
-        const jy = top - 0.4;
-        const P = (along: number, y: number, latOff = 0): THREE.Vector3 =>
-          axis === 'x' ? new THREE.Vector3(along, y, lat + latOff) : new THREE.Vector3(lat + latOff, y, along);
-        steelGeos.push(
-          beam(P(cjEnd, jy, -0.45), P(jibEnd, jy, -0.45), 0.16),
-          beam(P(cjEnd, jy, 0.45), P(jibEnd, jy, 0.45), 0.16),
-          beam(P(mastAlong, top + 3.2), P(jibEnd, jy + 0.6), 0.08),
-          beam(P(mastAlong, top + 3.2), P(cjEnd, jy + 0.6), 0.08),
-          beam(P(mastAlong, top), P(mastAlong, top + 3.2), 0.18),
-        );
-        for (let t = 0; t <= 1.0001; t += 1 / 8) {
-          const al = cjEnd + (jibEnd - cjEnd) * t;
-          steelGeos.push(beam(P(al, jy, -0.45), P(al, jy, 0.45), 0.06));
-        }
-        const cw = P(cjEnd + dirSign * 1.4, jy - 1.0);
-        steelGeos.push(boxAt(axis === 'x' ? 2.2 : 1.8, 1.8, axis === 'x' ? 1.8 : 2.2, cw.x, cw.y, cw.z));
-        // Hook cable & block; anchor at the jib tip underside.
-        const tip = P(jibEnd - dirSign * 0.6, jy - 0.4);
-        const hook = P(jibEnd - dirSign * 0.6, jy - 4.5);
-        steelGeos.push(beam(tip, hook, 0.04), boxAt(0.6, 0.8, 0.6, hook.x, hook.y - 0.4, hook.z));
-        addBeacon(P(jibEnd - dirSign * 0.6, jy - 1.1), 'CRANE');
-        addAviation(P(mastAlong, top + 3.4).x, top + 3.5, P(mastAlong, top + 3.4).z);
-        addAviation(P(jibEnd, jy).x, jy + 0.3, P(jibEnd, jy).z);
-        colliders.push({
-          min: new THREE.Vector3(mx - c, base, mz - c),
-          max: new THREE.Vector3(mx + c, top + 3.2, mz + c),
-          kind: 'STEEL',
-          building: hi.index,
-        });
-        const jA = P(Math.min(cjEnd, jibEnd), jy - 0.12, -0.55);
-        const jB = P(Math.max(cjEnd, jibEnd), jy + 0.12, 0.55);
-        colliders.push({
-          min: new THREE.Vector3(Math.min(jA.x, jB.x), jy - 0.12, Math.min(jA.z, jB.z)),
-          max: new THREE.Vector3(Math.max(jA.x, jB.x), jy + 0.12, Math.max(jA.z, jB.z)),
-          kind: 'STEEL',
-          building: -1,
-        });
-        roofRects[hi.index].push({ x0: mx - 2.5, z0: mz - 2.5, x1: mx + 2.5, z1: mz + 2.5 });
-      } else {
-        // ---- Floating drone anchor node in mid-gap ----
-        const midAlong = hiEdge + dirSign * (gap / 2);
-        const ny = Math.max(a.roofY, b.roofY) + 9 + rng() * 4;
-        const p = axis === 'x' ? new THREE.Vector3(midAlong, ny, lat) : new THREE.Vector3(lat, ny, midAlong);
-        // Rotor housing ring drawn in steel.
-        steelGeos.push(
-          boxAt(1.6, 0.12, 0.18, p.x, p.y + 0.85, p.z),
-          boxAt(0.18, 0.12, 1.6, p.x, p.y + 0.85, p.z),
-          boxAt(0.3, 0.5, 0.3, p.x, p.y + 0.55, p.z),
-        );
-        addBeacon(p, 'NODE');
-        addAviation(p.x, p.y + 1.05, p.z);
       }
-    });
-    // Every tower must carry wall-run panels: guarantee at least two per building.
-    allBuildings.forEach((b) => {
-      const count = wallRun.filter((s) => s.building === b.index).length;
-      const sides: Array<['x' | 'z', number]> = [['x', 1], ['x', -1], ['z', 1], ['z', -1]];
+      // Street faces: guarantee at least two panels per tower.
       let k = Math.floor(rng() * 4);
-      for (let need = Math.max(0, 2 - count); need > 0; k++) {
-        const [ax, sg] = sides[k % 4];
-        const key = `${b.index}:${ax}:${sg}`;
-        if (!panelSides.has(key)) {
-          addPanel(b, ax, sg, rng());
-          need--;
-        }
-        if (k > 12) break;
+      let guard = 0;
+      while (count < 2 && guard++ < 8) {
+        const [ax, sg] = faces[k++ % 4];
+        if (panelFaces.has(`${b.index}:${ax}:${sg}`)) continue;
+        addPanel(b, ax, sg, 2.0, Math.min(12.5, b.roofY - 2), 0.66);
+        count++;
       }
     });
 
-    // ---------------- Rooftop details per building ----------------
-    const tryPlace = (bi: number, b: BuildingInfo, hw: number, hd: number, margin: number): RoofRect | null => {
+    // Sky-bridges (Layer 2) across the selected alleys.
+    let skybridgeCount = 0;
+    for (const rec of skyAlleys) {
+      const al = { a: buildings[rec.a], b: buildings[rec.b], axis: rec.axis, gap0: rec.gap0, gap1: rec.gap1, ov0: rec.ov0, ov1: rec.ov1 };
+      const minRoof = Math.min(al.a.roofY, al.b.roofY);
+      if (minRoof < LEVEL.SKYBRIDGE_Y_MIN + 9) continue;
+      const yMax = Math.min(LEVEL.SKYBRIDGE_Y_MAX - 3.2, minRoof - 6);
+      const y = q2(LEVEL.SKYBRIDGE_Y_MIN + rng() * Math.max(0, yMax - LEVEL.SKYBRIDGE_Y_MIN));
+      const lat = (al.ov0 + al.ov1) / 2;
+      const axis = al.axis;
+      const a0 = al.gap0;
+      const a1 = al.gap1;
+      const half = 2.0;
+      G.hw.push(boxGeoWorld(axis, a0, a1, lat - half, lat + half, y - 0.35, y));
+      G.hw.push(boxGeoWorld(axis, a0, a1, lat - half - 0.1, lat + half + 0.1, y + 2.9, y + 3.2));
+      for (const side of [-1, 1]) {
+        const l = lat + side * half;
+        G.glass.push(stripUv(boxGeoWorld(axis, a0, a1, l - 0.04, l + 0.04, y, y + 2.9)));
+        G.steel.push(boxGeoWorld(axis, a0, a1, l - 0.1, l + 0.1, y + 1.0, y + 1.12));
+        for (let a = a0; a <= a1 + 0.01; a += (a1 - a0) / 3) G.steel.push(boxGeoWorld(axis, a - 0.08, a + 0.08, l - 0.1, l + 0.1, y, y + 2.9));
+      }
+      G.strips.push(withColor(boxGeoWorld(axis, a0, a1, lat - 0.15, lat + 0.15, y + 2.82, y + 2.88), COLORS.WALLRUN_CYAN, 1.2));
+      colliders.push(colliderAL(axis, a0, a1, lat - half - 0.1, lat + half + 0.1, y - 0.35, y + 3.2, 'SKYBRIDGE'));
+      const top = pt(axis, (a0 + a1) / 2, y + 3.2, lat);
+      addBeacon(top.clone().setY(y + 4.0), 'SKYBRIDGE');
+      skybridgeSpawns.push({ position: top.clone(), layer: 2, building: -1 });
+      skybridgeCount++;
+    }
+
+    // ------------------------------------------------------------------ 8. rooftop details, signs, vending
+    const tryPlace = (b: Building, hw: number, hd: number, margin: number): RectXZ | null => {
       for (let attempt = 0; attempt < 24; attempt++) {
-        const x = b.cx + (rng() * 2 - 1) * (b.halfW - hw - margin);
-        const z = b.cz + (rng() * 2 - 1) * (b.halfD - hd - margin);
-        const r: RoofRect = { x0: x - hw, z0: z - hd, x1: x + hw, z1: z + hd };
-        let ok = true;
-        for (const o of roofRects[bi]) {
-          if (rectsOverlap({ x0: r.x0 - 0.9, z0: r.z0 - 0.9, x1: r.x1 + 0.9, z1: r.z1 + 0.9 }, o)) {
-            ok = false;
-            break;
-          }
-        }
-        if (ok) {
-          roofRects[bi].push(r);
+        const x = b.cx + (rng() * 2 - 1) * Math.max(0, b.halfW - hw - margin);
+        const z = b.cz + (rng() * 2 - 1) * Math.max(0, b.halfD - hd - margin);
+        const r = rectFrom(x - hw, z - hd, x + hw, z + hd);
+        if (!roofRects[b.index].some((o) => rectsOverlap(r, o, 0.9))) {
+          roofRects[b.index].push(r);
           return r;
         }
       }
       return null;
     };
+    const facePoint = (b: Building, axis: Axis, sign: number, along01: number, out: THREE.Vector3): THREE.Vector3 =>
+      axis === 'x'
+        ? out.set(b.cx + sign * b.halfW, 0, b.cz + (along01 - 0.5) * b.halfD * 2)
+        : out.set(b.cx + (along01 - 0.5) * b.halfW * 2, 0, b.cz + sign * b.halfD);
 
-    const spawnB = allBuildings[0];
-    // Keep the player spawn pad clear.
-    roofRects[spawnB.index].push({ x0: spawnB.cx - 4, z0: spawnB.cz - 4, x1: spawnB.cx + 4, z1: spawnB.cz + 4 });
-
-    allBuildings.forEach((b) => {
-      const bi = b.index;
-      // Machine room (penthouse).
-      if (roomN < CAP.MACHINE_ROOM) {
-        const rw = 4 + rng() * 3;
-        const rd = 3.5 + rng() * 2.5;
-        const rh = 3.2 + rng() * 1.6;
-        const r = tryPlace(bi, b, rw / 2, rd / 2, 2.5);
+    buildings.forEach((b) => {
+      const area = b.halfW * b.halfD * 4;
+      // Machine room + antenna.
+      if (counts.room < CAP.MACHINE_ROOM) {
+        const rw = 3.5 + rng() * 2.5;
+        const rd = 3 + rng() * 2;
+        const rh = 3 + rng() * 1.4;
+        const r = tryPlace(b, rw / 2, rd / 2, 2);
         if (r) {
-          _pos.set((r.x0 + r.x1) / 2, b.roofY, (r.z0 + r.z1) / 2);
-          _quat.identity();
-          _scl.set(rw, rh, rd);
-          _m4.compose(_pos, _quat, _scl);
-          this.machineRooms.setMatrixAt(roomN++, _m4);
-          colliders.push({ min: new THREE.Vector3(r.x0, b.roofY, r.z0), max: new THREE.Vector3(r.x1, b.roofY + rh + 0.06, r.z1), kind: 'PROP', building: bi });
-          // Antenna on the machine room.
-          if (antN < CAP.ANTENNA) {
+          placeInstance(this.machineRooms, counts.room++, (r.x0 + r.x1) / 2, b.roofY, (r.z0 + r.z1) / 2, 0, rw, rh, rd);
+          colliders.push({ min: new THREE.Vector3(r.x0, b.roofY, r.z0), max: new THREE.Vector3(r.x1, b.roofY + rh + 0.06, r.z1), kind: 'PROP', building: b.index });
+          if (counts.ant < CAP.ANTENNA) {
             const ah = 6 + rng() * 8;
-            _pos.set(r.x0 + 0.8, b.roofY + rh, r.z0 + 0.8);
-            _scl.set(1, ah, 1);
-            _m4.compose(_pos, _quat, _scl);
-            this.antennas.setMatrixAt(antN++, _m4);
+            placeInstance(this.antennas, counts.ant++, r.x0 + 0.8, b.roofY + rh, r.z0 + 0.8, 0, 1, ah, 1);
             addAviation(r.x0 + 0.8, b.roofY + rh + ah + 0.15, r.z0 + 0.8);
           }
         }
       }
-      // AC unit clusters.
-      const acCount = 3 + Math.floor(rng() * 5);
-      for (let i = 0; i < acCount && acN < CAP.AC; i++) {
+      // AC units (count scales with roof area).
+      const acN = Math.min(8, 2 + Math.floor(area / 120));
+      for (let i = 0; i < acN && counts.ac < CAP.AC; i++) {
         const rot = rng() < 0.5 ? 0 : Math.PI / 2;
-        const hw = rot === 0 ? 1.1 : 0.6;
-        const hd = rot === 0 ? 0.6 : 1.1;
-        const r = tryPlace(bi, b, hw, hd, 1.4);
+        const r = tryPlace(b, rot === 0 ? 1.1 : 0.6, rot === 0 ? 0.6 : 1.1, 1.3);
         if (!r) continue;
-        _pos.set((r.x0 + r.x1) / 2, b.roofY, (r.z0 + r.z1) / 2);
-        _euler.set(0, rot, 0);
-        _quat.setFromEuler(_euler);
-        _scl.set(1, 1, 1);
-        _m4.compose(_pos, _quat, _scl);
-        this.acUnits.setMatrixAt(acN++, _m4);
-        colliders.push({ min: new THREE.Vector3(r.x0, b.roofY, r.z0), max: new THREE.Vector3(r.x1, b.roofY + 1.42, r.z1), kind: 'PROP', building: bi });
+        placeInstance(this.acUnits, counts.ac++, (r.x0 + r.x1) / 2, b.roofY, (r.z0 + r.z1) / 2, rot);
+        colliders.push({ min: new THREE.Vector3(r.x0, b.roofY, r.z0), max: new THREE.Vector3(r.x1, b.roofY + 1.42, r.z1), kind: 'PROP', building: b.index });
       }
-      // Exhaust ducts.
-      const ductCount = 1 + Math.floor(rng() * 2);
-      for (let i = 0; i < ductCount && ductN < CAP.DUCT; i++) {
-        const len = 4 + rng() * 4;
+      // Exhaust duct.
+      if (counts.duct < CAP.DUCT && b.halfW > 6 && b.halfD > 6) {
+        const len = 4 + rng() * 3;
         const alongX = rng() < 0.5;
-        const r = tryPlace(bi, b, alongX ? len / 2 : 0.5, alongX ? 0.5 : len / 2, 1.6);
-        if (!r) continue;
-        _pos.set((r.x0 + r.x1) / 2, b.roofY, (r.z0 + r.z1) / 2);
-        _euler.set(0, alongX ? 0 : Math.PI / 2, 0);
-        _quat.setFromEuler(_euler);
-        _scl.set(len, 1, 1);
-        _m4.compose(_pos, _quat, _scl);
-        this.ducts.setMatrixAt(ductN++, _m4);
-        colliders.push({ min: new THREE.Vector3(r.x0, b.roofY, r.z0), max: new THREE.Vector3(r.x1, b.roofY + 1.5, r.z1), kind: 'PROP', building: bi });
+        const r = tryPlace(b, alongX ? len / 2 : 0.5, alongX ? 0.5 : len / 2, 1.4);
+        if (r) {
+          placeInstance(this.ducts, counts.duct++, (r.x0 + r.x1) / 2, b.roofY, (r.z0 + r.z1) / 2, alongX ? 0 : Math.PI / 2, len, 1, 1);
+          colliders.push({ min: new THREE.Vector3(r.x0, b.roofY, r.z0), max: new THREE.Vector3(r.x1, b.roofY + 1.5, r.z1), kind: 'PROP', building: b.index });
+        }
       }
-      // Fences along edges that do NOT face a neighbour (keep traversal routes open).
-      const edges: Array<['x' | 'z', number]> = [['x', 1], ['x', -1], ['z', 1], ['z', -1]];
-      for (const [ax, sg] of edges) {
-        if (panelSides.has(`${bi}:${ax}:${sg}`) || rng() < 0.35) continue;
+      // Roof fences on edges that are not alley sides (alley edges stay open for jumps).
+      for (const [ax, sg] of faces) {
+        if (alleyFaces.has(`${b.index}:${ax}:${sg}`) || rng() < 0.4) continue;
         const len = ax === 'x' ? b.halfD * 2 : b.halfW * 2;
-        const segs = Math.floor((len - 6) / 3);
+        const segs = Math.floor((len - 5) / 3);
+        if (segs <= 0) continue;
         const start = -((segs - 1) * 3) / 2;
-        for (let s = 0; s < segs && fenceN < CAP.FENCE; s++) {
-          const along = start + s * 3;
+        for (let sI = 0; sI < segs && counts.fence < CAP.FENCE; sI++) {
+          const along = start + sI * 3;
           const fx = ax === 'x' ? b.cx + sg * (b.halfW - 0.5) : b.cx + along;
           const fz = ax === 'x' ? b.cz + along : b.cz + sg * (b.halfD - 0.5);
-          _pos.set(fx, b.roofY, fz);
-          _euler.set(0, ax === 'x' ? Math.PI / 2 : 0, 0);
-          _quat.setFromEuler(_euler);
-          _scl.set(1, 1, 1);
-          _m4.compose(_pos, _quat, _scl);
-          this.fences.setMatrixAt(fenceN++, _m4);
+          placeInstance(this.fences, counts.fence++, fx, b.roofY, fz, ax === 'x' ? Math.PI / 2 : 0);
         }
-        if (segs > 0) {
-          const half = (segs * 3) / 2;
-          colliders.push(
-            ax === 'x'
-              ? { min: new THREE.Vector3(b.cx + sg * (b.halfW - 0.5) - 0.05, b.roofY, b.cz - half), max: new THREE.Vector3(b.cx + sg * (b.halfW - 0.5) + 0.05, b.roofY + 1.2, b.cz + half), kind: 'PROP', building: bi }
-              : { min: new THREE.Vector3(b.cx - half, b.roofY, b.cz + sg * (b.halfD - 0.5) - 0.05), max: new THREE.Vector3(b.cx + half, b.roofY + 1.2, b.cz + sg * (b.halfD - 0.5) + 0.05), kind: 'PROP', building: bi },
-          );
+        const half = (segs * 3) / 2;
+        colliders.push(ax === 'x'
+          ? { min: new THREE.Vector3(b.cx + sg * (b.halfW - 0.5) - 0.05, b.roofY, b.cz - half), max: new THREE.Vector3(b.cx + sg * (b.halfW - 0.5) + 0.05, b.roofY + 1.2, b.cz + half), kind: 'PROP', building: b.index }
+          : { min: new THREE.Vector3(b.cx - half, b.roofY, b.cz + sg * (b.halfD - 0.5) - 0.05), max: new THREE.Vector3(b.cx + half, b.roofY + 1.2, b.cz + sg * (b.halfD - 0.5) + 0.05), kind: 'PROP', building: b.index });
+      }
+      if (b.roofY >= 45) {
+        addAviation(b.cx + b.halfW - 0.3, b.roofY + 0.4, b.cz + b.halfD - 0.3);
+        addAviation(b.cx - b.halfW + 0.3, b.roofY + 0.4, b.cz - b.halfD + 0.3);
+      }
+
+      // Street-facing faces: low-rise shop blade signs, Layer-2 projecting signs, vending machines.
+      const streetFaces = faces.filter(([ax, sg]) => !alleyFaces.has(`${b.index}:${ax}:${sg}`));
+      const shopSigns = sector.denseNeon ? 3 + Math.floor(rng() * 3) : 1 + Math.floor(rng() * 2);
+      const fp = new THREE.Vector3();
+      for (let s = 0; s < shopSigns && streetFaces.length; s++) {
+        const [ax, sg] = streetFaces[Math.floor(rng() * streetFaces.length)];
+        facePoint(b, ax, sg, 0.12 + rng() * 0.76, fp);
+        const w = 1.7;
+        const hgt = 5 + rng() * 4;
+        const y = 3.2 + hgt / 2 + rng() * 1.5;
+        const nx = ax === 'x' ? sg : 0;
+        const nz = ax === 'z' ? sg : 0;
+        addNeon(fp.x + nx * (w / 2 + 0.3), y, fp.z + nz * (w / 2 + 0.3), ax === 'x' ? 0 : 1, ax === 'x' ? 1 : 0, w, hgt, Math.floor(rng() * 8));
+        for (const yy of [y + hgt / 2 - 0.2, y - hgt / 2 + 0.2]) {
+          G.steel.push(boxAt(Math.abs(nx) * (w + 0.3) + 0.08, 0.08, Math.abs(nz) * (w + 0.3) + 0.08, fp.x + (nx * (w + 0.3)) / 2, yy, fp.z + (nz * (w + 0.3)) / 2));
         }
       }
-      // Hologram neon signs on faces without wall-run panels, hung below the traversal band.
-      const signs = 1 + Math.floor(rng() * 2);
-      for (let s = 0; s < signs; s++) {
-        const [ax, sg] = edges[Math.floor(rng() * 4)];
-        const hasPanel = panelSides.has(`${bi}:${ax}:${sg}`);
-        const sh = 14 + rng() * 10;
-        const sw = sh / 6.5;
-        const topY = hasPanel ? b.roofY - 16 : b.roofY - 2.5;
-        const sy = topY - sh / 2;
-        const lateral = (rng() * 2 - 1) * ((ax === 'x' ? b.halfD : b.halfW) - sw);
-        const sx = ax === 'x' ? b.cx + sg * (b.halfW + 1.2) : b.cx + lateral;
-        const sz = ax === 'x' ? b.cz + lateral : b.cz + sg * (b.halfD + 1.2);
-        addNeon(sx, sy, sz, ax === 'x' ? sg : 0, ax === 'z' ? sg : 0, sw, sh, Math.floor(rng() * 8));
+      if (b.roofY >= 36 && streetFaces.length) {
+        const [ax, sg] = streetFaces[Math.floor(rng() * streetFaces.length)];
+        facePoint(b, ax, sg, 0.2 + rng() * 0.6, fp);
+        const w = 2.6;
+        const hgt = 11 + rng() * 4;
+        const y = LEVEL.SKYBRIDGE_Y_MIN + hgt / 2 + rng() * Math.max(0, LEVEL.SKYBRIDGE_Y_MAX - LEVEL.SKYBRIDGE_Y_MIN - hgt);
+        const nx = ax === 'x' ? sg : 0;
+        const nz = ax === 'z' ? sg : 0;
+        const cx = fp.x + nx * (w / 2 + 0.4);
+        const cz = fp.z + nz * (w / 2 + 0.4);
+        addNeon(cx, y, cz, ax === 'x' ? 0 : 1, ax === 'x' ? 1 : 0, w, hgt, Math.floor(rng() * 8));
+        G.steel.push(boxAt(Math.abs(nx) * (w + 0.4) + 0.12, 0.12, Math.abs(nz) * (w + 0.4) + 0.12, fp.x + (nx * (w + 0.4)) / 2, y + hgt / 2 + 0.1, fp.z + (nz * (w + 0.4)) / 2));
+        if (rng() < 0.6) addBeacon(new THREE.Vector3(cx, y + hgt / 2 + 0.9, cz), 'SIGN');
+      }
+      if (streetFaces.length && rng() < 0.75) {
+        const [ax, sg] = streetFaces[Math.floor(rng() * streetFaces.length)];
+        facePoint(b, ax, sg, 0.2 + rng() * 0.5, fp);
+        const yaw = ax === 'x' ? (sg > 0 ? Math.PI / 2 : -Math.PI / 2) : sg > 0 ? 0 : Math.PI;
+        const n = 2 + Math.floor(rng() * 2);
+        for (let k = 0; k < n; k++) {
+          const x = fp.x + (ax === 'x' ? sg * 0.45 : k * 1.05);
+          const z = fp.z + (ax === 'z' ? sg * 0.45 : k * 1.05);
+          if (inArea(x, z, 2)) addVending(x, z, yaw);
+        }
       }
     });
 
-    // Searchlights: two on sector roofs, the rest on far towers.
-    for (let i = 0; i < 2; i++) {
-      const b = allBuildings[1 + Math.floor(rng() * (allBuildings.length - 1))];
-      addSearch(b.cx + (rng() - 0.5) * b.halfW, b.roofY + 0.6, b.cz + (rng() - 0.5) * b.halfD);
+    // Plazas (unbuilt lots): kiosk + parking rows.
+    const parkingSlots: CarSlot[] = [];
+    plazas.forEach((r) => {
+      const cx = (r.x0 + r.x1) / 2;
+      const cz = (r.z0 + r.z1) / 2;
+      if (inArea(cx, cz, 4)) addVending(cx + (r.x1 - r.x0) * 0.25, cz, 0, 1.6);
+      for (let x = r.x0 + 3; x < r.x1 - 3; x += 2.8) {
+        for (const z of [r.z0 + 3.2, r.z1 - 3.2]) parkingSlots.push({ x, z, y: 0, yaw: z < cz ? 0 : Math.PI, onHighway: false });
+      }
+    });
+
+    // ------------------------------------------------------------------ 9. street lamps + curbside slots
+    const carSlots: CarSlot[] = [];
+    const occupied = (x: number, z: number, m: number): boolean =>
+      intersectionSquares.some((r) => insideRect(x, z, r, m)) ||
+      crosswalkZones.some((r) => insideRect(x, z, r, m)) ||
+      rampRects.some((r) => insideRect(x, z, r, m)) ||
+      pierRects.some((r) => insideRect(x, z, r, m + 1));
+    streets.forEach((s, si) => {
+      const lh = laneHalf(s.kind);
+      for (const [a0, a1] of segmentsByStreet[si]) {
+        for (let a = a0 + 7; a < a1 - 5; a += 18) {
+          for (const side of [-1, 1]) {
+            const p = pt(s.axis, a, 0, s.coord + side * (lh + 0.75));
+            if (!inArea(p.x, p.z, 1)) continue;
+            const yaw = s.axis === 'z' ? (side > 0 ? -Math.PI / 2 : Math.PI / 2) : side > 0 ? Math.PI : 0;
+            addLamp(p.x, p.z, yaw);
+          }
+        }
+        for (let a = a0 + 6.5; a < a1 - 5; a += 6.4) {
+          for (const side of [-1, 1]) {
+            const p = pt(s.axis, a, 0, s.coord + side * (lh - 1.3));
+            if (!inArea(p.x, p.z, 4) || occupied(p.x, p.z, 2.5)) continue;
+            const yaw = s.axis === 'z' ? (side > 0 ? 0 : Math.PI) : side > 0 ? Math.PI / 2 : -Math.PI / 2;
+            carSlots.push({ x: p.x, z: p.z, y: 0, yaw, onHighway: false });
+          }
+        }
+      }
+    });
+    const hwSlots: CarSlot[] = [];
+    decks.forEach((d) => {
+      for (let a = Math.max(d.a0, -H + 8) + 5; a < Math.min(d.a1, H - 8) - 5; a += 9) {
+        for (const lat of [-5.25, 5.25]) {
+          const p = pt(d.axis, a, DECK, d.coord + lat);
+          if (highwayRects.some((r, ri) => ri !== d.hi && insideRect(p.x, p.z, r, 2))) continue;
+          hwSlots.push({ x: p.x, z: p.z, y: DECK, yaw: d.axis === 'z' ? (lat > 0 ? 0 : Math.PI) : lat > 0 ? Math.PI / 2 : -Math.PI / 2, onHighway: true });
+        }
+      }
+    });
+
+    // ------------------------------------------------------------------ 10. player spawn
+    const av = streets[plan.avenue];
+    const avRamp = rampInfo.find((ri) => ri.r.street === plan.avenue);
+    const spawnLane = avRamp ? -avRamp.r.side : -1;
+    const playerSpawn = pt(av.axis, plan.spawnAlong, 0, av.coord + spawnLane * laneHalf(av.kind) * 0.5);
+    const fwd = pt(av.axis, plan.gateDir, 0, 0, new THREE.Vector3());
+    const playerSpawnYaw = Math.atan2(-fwd.x, -fwd.z);
+
+    // ------------------------------------------------------------------ 11. parked cars (exact count)
+    const nCars = sector.parkedCars;
+    const shuffle = <T,>(arr: T[]): T[] => {
+      for (let i = arr.length - 1; i > 0; i--) {
+        const j = Math.floor(rng() * (i + 1));
+        [arr[i], arr[j]] = [arr[j], arr[i]];
+      }
+      return arr;
+    };
+    const farFromSpawn = (c: CarSlot): boolean => Math.hypot(c.x - playerSpawn.x, c.z - playerSpawn.z) > 7;
+    const pick: CarSlot[] = shuffle(hwSlots.filter(farFromSpawn)).slice(0, plan.highways.length * 3);
+    for (const c of shuffle([...carSlots, ...parkingSlots].filter(farFromSpawn))) {
+      if (pick.length >= nCars) break;
+      if (pick.some((o) => Math.abs(o.y - c.y) < 1 && Math.hypot(o.x - c.x, o.z - c.z) < 5.2)) continue;
+      pick.push(c);
     }
-    // Far-field dressing: aviation lights, neon, searchlights.
-    this.farTowerInfo.forEach((t, i) => {
+    if (pick.length !== nCars) throw new Error(`Sector ${sector.index}: placed ${pick.length}/${nCars} parked cars`);
+    const carDims: Array<[number, number, number]> = [[1.95, 1.2, 4.5], [1.95, 1.4, 4.6], [2.0, 1.95, 4.8]];
+    for (const c of pick) {
+      const variant = Math.floor(rng() * 3) as 0 | 1 | 2;
+      const mesh = this.cars[variant];
+      const idx = carCounts[variant]++;
+      placeInstance(mesh, idx, c.x, c.y, c.z, c.yaw);
+      (mesh.geometry.getAttribute('aCar') as THREE.InstancedBufferAttribute).setXYZW(
+        idx,
+        rng() < 0.5 ? 1 : 0,
+        MATERIALS.CAR_BODY.emissive + rng() * (MATERIALS.CAR_BODY.emissiveMax - MATERIALS.CAR_BODY.emissive),
+        rng() < 0.2 ? 1 : 0,
+        rng(),
+      );
+      const [w, hgt, l] = carDims[variant];
+      const alongZ = Math.abs(Math.cos(c.yaw)) > 0.5;
+      const hx = (alongZ ? w : l) / 2;
+      const hz = (alongZ ? l : w) / 2;
+      colliders.push({ min: new THREE.Vector3(c.x - hx, c.y, c.z - hz), max: new THREE.Vector3(c.x + hx, c.y + hgt, c.z + hz), kind: 'CAR', building: -1 });
+      if (!c.onHighway) {
+        // Cover position beside the car (toward the district centre).
+        const ox = alongZ ? -Math.sign(c.x || 1) * 2.2 : 0;
+        const oz = alongZ ? 0 : -Math.sign(c.z || 1) * 2.2;
+        groundSpawns.push({ position: new THREE.Vector3(c.x + ox, 0, c.z + oz), layer: 0, building: -1 });
+      }
+    }
+
+    // ------------------------------------------------------------------ 12. lockdown barrier + emerald gate
+    const gateHalf = corridorHalf(av);
+    const gatePos = pt(av.axis, plan.gateDir * H, 0, av.coord);
+    const sides: Array<{ axis: Axis; at: number }> = [{ axis: 'x', at: H }, { axis: 'x', at: -H }, { axis: 'z', at: H }, { axis: 'z', at: -H }];
+    for (const side of sides) {
+      // Barrier plane perpendicular to `side.axis` at `side.at`, running along the other axis.
+      const runAxis: Axis = side.axis === 'x' ? 'z' : 'x';
+      const openings: Array<{ l0: number; l1: number; y0: number; y1: number; kind: number }> = [];
+      streets.forEach((s, si) => {
+        if (s.axis !== side.axis || !streetRanges[si].some(([r0, r1]) => r0 < side.at && r1 > side.at)) return;
+        const ch = corridorHalf(s);
+        const isGate = si === plan.avenue && Math.sign(side.at) === plan.gateDir;
+        openings.push({ l0: s.coord - ch, l1: s.coord + ch, y0: 0, y1: isGate ? 16 : 8, kind: isGate ? 2 : 1 });
+      });
+      canals.forEach((c) => {
+        if (c.axis === side.axis && c.from < side.at && c.to > side.at) openings.push({ l0: c.coord - c.width / 2, l1: c.coord + c.width / 2, y0: LEVEL.CANAL_WATER_Y, y1: 4, kind: 1 });
+      });
+      plan.highways.forEach((h) => {
+        if (h.axis === side.axis && h.from < side.at && h.to > side.at) openings.push({ l0: h.coord - HW, l1: h.coord + HW, y0: UNDER, y1: DECK + 4, kind: 1 });
+      });
+      const n = pt(runAxis, 0, 0, -Math.sign(side.at), new THREE.Vector3());
+      const seg = (l0: number, l1: number, y0: number, y1: number, kind: number, inset: number): void => {
+        const at = side.at - Math.sign(side.at) * inset;
+        G.barrier.push(quad([pt(runAxis, l0, y0, at), pt(runAxis, l1, y0, at), pt(runAxis, l1, y1, at), pt(runAxis, l0, y1, at)], [0, 0, 1, 0, 1, 1, 0, 1], n, { aKind: [kind] }));
+      };
+      seg(-H, H, LEVEL.CANAL_WATER_Y, LEVEL.BOUNDARY_HEIGHT_M, 0, 0);
+      for (const o of openings) seg(o.l0, o.l1, o.y0, o.y1, o.kind, 0.05);
+      const gateOpening = openings.find((o) => o.kind === 2);
+      const wall = (l0: number, l1: number, gate: boolean): void => {
+        const p0 = pt(runAxis, l0, -5, side.at - 0.5);
+        const p1 = pt(runAxis, l1, LEVEL.BOUNDARY_HEIGHT_M, side.at + 0.5);
+        colliders.push({ min: new THREE.Vector3(Math.min(p0.x, p1.x), -5, Math.min(p0.z, p1.z)), max: new THREE.Vector3(Math.max(p0.x, p1.x), LEVEL.BOUNDARY_HEIGHT_M, Math.max(p0.z, p1.z)), kind: 'BARRIER', building: -1, gate });
+      };
+      if (gateOpening) {
+        wall(-H, gateOpening.l0, false);
+        wall(gateOpening.l0, gateOpening.l1, true);
+        wall(gateOpening.l1, H, false);
+      } else {
+        wall(-H, H, false);
+      }
+    }
+
+    // ------------------------------------------------------------------ 13. far field
+    this.layoutFarTowers(createRng(0xfa77 + sector.index * 31), plan);
+    this.farInfo.forEach((t, i) => {
       if (i % 2 === 0) addAviation(t.x, t.top + 0.4, t.z);
-      if (i % 5 === 0) addSearch(t.x, t.top + 0.5, t.z);
+      if (i % 6 === 0) addSearch(t.x, t.top + 0.5, t.z);
       if (i % 3 === 0) {
         const toC = Math.atan2(-t.x, -t.z);
         const nx = Math.sin(toC);
         const nz = Math.cos(toC);
         const sh = 26 + (i % 7) * 5;
-        addNeon(t.x + nx * (t.w / 2 + 1.5), t.top - 10 - sh / 2, t.z + nz * (t.d / 2 + 1.5), nx, nz, sh / 6.5, sh, i);
+        const y = Math.min(t.top - sh / 2 - 6, 70 + (i % 5) * 18);
+        addNeon(t.x + nx * (Math.min(t.w, t.d) / 2 + 1.5), y, t.z + nz * (Math.min(t.w, t.d) / 2 + 1.5), nx, nz, sh / 6.5, sh, i);
       }
     });
+    [...buildings].sort((p, o) => o.roofY - p.roofY).slice(0, 2).forEach((b) => addSearch(b.cx, b.roofY + 0.6, b.cz));
 
-    // ---------------- Merge sector geometry (4 draw calls) ----------------
-    const bodies = new THREE.Mesh(mergeGeometries(bodyGeos) as THREE.BufferGeometry, this.buildingMat);
-    bodies.name = 'SectorTowers';
-    const roofs = new THREE.Mesh(mergeGeometries(roofGeos) as THREE.BufferGeometry, this.roofMat);
-    roofs.name = 'SectorRoofs';
-    const panels = new THREE.Mesh(mergeGeometries(panelGeos) as THREE.BufferGeometry, this.panelMat);
-    panels.name = 'WallRunPanels';
-    const steel = new THREE.Mesh(mergeGeometries(steelGeos.map(stripToPosNormal)) as THREE.BufferGeometry, this.steelMat);
-    steel.name = 'SteelStructures';
-    for (const g of [...bodyGeos, ...roofGeos, ...panelGeos, ...steelGeos]) g.dispose();
-    this.sectorGroup.add(bodies, roofs, panels, steel);
-    this.sectorDisposables.push(bodies.geometry, roofs.geometry, panels.geometry, steel.geometry);
+    // ------------------------------------------------------------------ 14. enemy spawn points by layer
+    buildings.forEach((b) => {
+      if (b.roofY < LEVEL.ROOF_LAYER_Y_MIN) return;
+      for (let i = 0; i < 4; i++) {
+        const r = tryPlace(b, 0.6, 0.6, 1.8);
+        if (r) roofSpawns.push({ position: new THREE.Vector3((r.x0 + r.x1) / 2, b.roofY, (r.z0 + r.z1) / 2), layer: 3, building: b.index });
+      }
+    });
+    [...buildings].sort((p, o) => o.roofY - p.roofY).slice(0, Math.max(3, Math.ceil(buildings.length / 4))).forEach((b) => {
+      const dx = playerSpawn.x - b.cx;
+      const dz = playerSpawn.z - b.cz;
+      const alongX = Math.abs(dx) >= Math.abs(dz);
+      for (const lat of [-0.4, 0.4]) {
+        const px = alongX ? b.cx + Math.sign(dx) * (b.halfW - 1.4) : b.cx + lat * b.halfW;
+        const pz = alongX ? b.cz + lat * b.halfD : b.cz + Math.sign(dz) * (b.halfD - 1.4);
+        perchSpawns.push({ position: new THREE.Vector3(px, b.roofY, pz), layer: 3, building: b.index });
+      }
+    });
+    decks.forEach((d) => {
+      for (let a = Math.max(d.a0, -H + 10); a < Math.min(d.a1, H - 10); a += 18) {
+        const p = pt(d.axis, a, DECK, d.coord + (rng() < 0.5 ? -2.5 : 2.5));
+        if (Math.hypot(p.x - playerSpawn.x, p.z - playerSpawn.z) > 25) highwaySpawns.push({ position: p, layer: 1, building: -1 });
+      }
+    });
+    const airCandidates: Array<[number, number]> = intersectionSquares.map((r) => [(r.x0 + r.x1) / 2, (r.z0 + r.z1) / 2]);
+    streets.forEach((s, si) => segmentsByStreet[si].forEach(([a0, a1]) => {
+      for (let a = a0 + 8; a < a1 - 4; a += 20) {
+        const p = pt(s.axis, a, 0, s.coord);
+        airCandidates.push([p.x, p.z]);
+      }
+    }));
+    if (plan.plaza) airCandidates.push([0, 0], [plan.plaza.x0 + 6, plan.plaza.z0 + 6], [plan.plaza.x1 - 6, plan.plaza.z1 - 6]);
+    for (const [x, z] of airCandidates) {
+      if (!inArea(x, z, 6)) continue;
+      const underDeck = highwayRects.some((r) => insideRect(x, z, r, 2));
+      airSpawns.push(new THREE.Vector3(x, underDeck ? 13 + rng() * 9 : 6 + rng() * 16, z));
+    }
+    plazas.forEach((r) => groundSpawns.push({ position: new THREE.Vector3((r.x0 + r.x1) / 2, 0, (r.z0 + r.z1) / 2), layer: 0, building: -1 }));
+    const keptGround = groundSpawns.filter((s) => Math.hypot(s.position.x - playerSpawn.x, s.position.z - playerSpawn.z) > 30 && inArea(s.position.x, s.position.z, 3));
+    groundSpawns.length = 0;
+    groundSpawns.push(...keptGround);
 
-    // ---------------- Commit instance counts ----------------
+    // ------------------------------------------------------------------ 15. cinematic loop (title attract)
+    const lane = av.coord + spawnLane * 3.5;
+    const g = plan.gateDir;
+    const cp = (along: number, y: number): THREE.Vector3 => pt(av.axis, along, y, lane);
+    const cinematicPath = [
+      cp(-g * 76, 3.4), cp(-g * 40, 3.4), cp(0, 3.6), cp(g * 40, 3.4), cp(g * 72, 4.2),
+      cp(g * 84, 30), cp(g * 80, 82), cp(g * 50, 112), cp(0, 114), cp(-g * 50, 112), cp(-g * 80, 82), cp(-g * 86, 30),
+    ];
+
+    // ------------------------------------------------------------------ 16. commit merged geometry & instances
+    const mk = (geos: THREE.BufferGeometry[], mat: THREE.Material, name: string, renderOrder = 0): THREE.Mesh => {
+      const geo = mergeOrEmpty(geos);
+      for (const gg of geos) gg.dispose();
+      const m = new THREE.Mesh(geo, mat);
+      m.name = name;
+      m.renderOrder = renderOrder;
+      this.sectorGroup.add(m);
+      this.sectorDisposables.push(geo);
+      return m;
+    };
+    mk(G.concrete, this.concreteMat, 'GroundConcreteRoofs');
+    mk(G.road, this.roadMat, 'Roads');
+    mk(G.water, this.waterMat, 'CanalWater');
+    mk(G.hw, this.hwConcreteMat, 'ExpresswayBridgeConcrete');
+    mk(G.strips, this.stripMat, 'LightStrips');
+    mk(G.panels, this.panelMat, 'WallRunPanels');
+    mk(G.steel.map(stripUv), this.steelMat, 'Steel');
+    mk(G.glass, this.glassMat, 'SkybridgeGlass');
+    mk(G.bodies, this.buildingMat, 'Towers');
+    mk(G.barrier, this.barrierMat, 'LockdownBarrier', 8).frustumCulled = false;
+
     const commit = (m: THREE.InstancedMesh, n: number): void => {
       m.count = n;
       m.instanceMatrix.needsUpdate = true;
     };
-    commit(this.acUnits, acN);
-    commit(this.ducts, ductN);
-    commit(this.fences, fenceN);
-    commit(this.antennas, antN);
-    commit(this.machineRooms, roomN);
-    commit(this.aviation, aviN);
+    this.cars.forEach((m, i) => {
+      commit(m, carCounts[i]);
+      (m.geometry.getAttribute('aCar') as THREE.InstancedBufferAttribute).needsUpdate = true;
+    });
+    commit(this.lamps, counts.lamp);
+    lampTint.needsUpdate = true;
+    commit(this.vending, counts.vend);
+    vendTint.needsUpdate = true;
+    commit(this.guardrails, counts.rail);
+    commit(this.acUnits, counts.ac);
+    commit(this.ducts, counts.duct);
+    commit(this.fences, counts.fence);
+    commit(this.antennas, counts.ant);
+    commit(this.machineRooms, counts.room);
+    commit(this.aviation, counts.avi);
     aviPhase.needsUpdate = true;
-    commit(this.neonSigns, neonN);
+    commit(this.neonSigns, counts.neon);
     neonStrip.needsUpdate = true;
-    this.searchlights.count = searchN;
+    this.searchlights.count = counts.search;
     searchBase.needsUpdate = true;
     searchParams.needsUpdate = true;
-    commit(this.beacons, beaconN);
-    commit(this.halos, beaconN);
+    commit(this.beacons, counts.beacon);
+    commit(this.halos, counts.beacon);
+    this.gatePillar.position.copy(gatePos).addScaledVector(fwd, 6);
 
-    // ---------------- Gate ----------------
-    const gatePos = new THREE.Vector3(gateTower.cx, gateTower.roofY, gateTower.cz);
-    this.gatePillar.position.set(gatePos.x, gatePos.y, gatePos.z);
-    const nearest = pairs[pairs.length - 1][0];
-    const gx = clamp(nearest.cx, gateTower.cx - gateTower.halfW, gateTower.cx + gateTower.halfW);
-    const gz = clamp(nearest.cz, gateTower.cz - gateTower.halfD, gateTower.cz + gateTower.halfD);
-    const gateAnchor: GrappleAnchor = {
-      position: new THREE.Vector3((gx + gateTower.cx) / 2, gateTower.roofY + 16, (gz + gateTower.cz) / 2),
-      kind: 'GATE',
-      enabled: false,
-    };
-    anchors.push(gateAnchor);
-    this.gateBeacon.position.copy(gateAnchor.position);
-    this.setGateActive(false);
-
-    // ---------------- Spawns ----------------
     const center = new THREE.Vector3();
-    buildings.forEach((b) => center.add(_pos.set(b.cx, b.roofY, b.cz)));
-    center.divideScalar(buildings.length);
-    const playerSpawn = new THREE.Vector3(spawnB.cx, spawnB.roofY, spawnB.cz);
-    const toCenter = _dir.set(center.x - spawnB.cx, 0, center.z - spawnB.cz);
-    const playerSpawnYaw = Math.atan2(-toCenter.x, -toCenter.z);
-
-    const roofSpawns: SpawnPoint[] = [];
-    const perchSpawns: SpawnPoint[] = [];
-    buildings.forEach((b) => {
-      if (b.isSpawn) return;
-      for (let i = 0; i < 8; i++) {
-        const r = tryPlace(b.index, b, 0.6, 0.6, 2.0);
-        if (r) roofSpawns.push({ position: new THREE.Vector3((r.x0 + r.x1) / 2, b.roofY, (r.z0 + r.z1) / 2), building: b.index });
-      }
-    });
-    const byHeight = [...buildings].filter((b) => !b.isSpawn).sort((p, q) => q.roofY - p.roofY);
-    byHeight.slice(0, Math.max(2, Math.ceil(byHeight.length / 2))).forEach((b) => {
-      // Perches on the edge facing the spawn roof.
-      const dx = spawnB.cx - b.cx;
-      const dz = spawnB.cz - b.cz;
-      const alongX = Math.abs(dx) >= Math.abs(dz);
-      for (const lat of [-0.45, 0.45]) {
-        const px = alongX ? b.cx + Math.sign(dx) * (b.halfW - 1.4) : b.cx + lat * b.halfW;
-        const pz = alongX ? b.cz + lat * b.halfD : b.cz + Math.sign(dz) * (b.halfD - 1.4);
-        perchSpawns.push({ position: new THREE.Vector3(px, b.roofY, pz), building: b.index });
-      }
-    });
-    const airSpawns: THREE.Vector3[] = [];
-    pairs.forEach(([a, b]) => {
-      airSpawns.push(new THREE.Vector3((a.cx + b.cx) / 2, 6 + rng() * 16, (a.cz + b.cz) / 2));
-    });
-    while (airSpawns.length < 12) {
-      airSpawns.push(new THREE.Vector3(center.x + (rng() - 0.5) * 100, 6 + rng() * 16, center.z + (rng() - 0.5) * 100));
-    }
+    buildings.forEach((b) => center.add(_pos.set(b.cx, 0, b.cz)));
+    center.divideScalar(Math.max(1, buildings.length));
 
     this.layout = {
       sector,
       loop,
-      buildings: allBuildings,
+      buildings: buildings.map(({ index, cx, cz, halfW, halfD, roofY }) => ({ index, cx, cz, halfW, halfD, roofY })),
       colliders,
+      ramps: rampColliders,
       wallRunSurfaces: wallRun,
       anchors,
+      canalWater,
       playerSpawn,
       playerSpawnYaw,
+      groundSpawns,
+      highwaySpawns,
+      skybridgeSpawns,
       roofSpawns,
       perchSpawns,
       airSpawns,
-      gatePosition: gatePos,
-      gateAnchor,
+      gate: { position: gatePos, normal: fwd.clone(), halfWidth: gateHalf, height: 16, open: false },
       center,
+      cinematicPath,
+      stats: {
+        towers: buildings.length,
+        cars: pick.length,
+        highways: plan.highways.length,
+        ramps: rampColliders.length,
+        bridges: bridgeSpans.length,
+        skybridges: skybridgeCount,
+        lamps: counts.lamp,
+        cityLights: this.lightCount,
+      },
     };
+    this.setGateOpen(false);
     return this.layout;
+  }
+
+  /**
+   * Street-grid lots: blocks between corridors with a 1.2 m street setback, split by 6 m alleys.
+   * Narrow-alley sectors split every block; others split at random but always at least `skyBridges` blocks
+   * (each split creates a wall-run alley that can carry a Layer-2 sky-bridge). `pair` ≥ 0 marks split pieces.
+   */
+  private computeLots(plan: DistrictPlan, sector: SectorDef, rng: () => number): Array<{ r: RectXZ; pair: number }> {
+    const cutsX: Array<[number, number]> = [];
+    const cutsZ: Array<[number, number]> = [];
+    for (const s of plan.streets) {
+      const ch = corridorHalf(s);
+      (s.axis === 'z' ? cutsX : cutsZ).push([s.coord - ch, s.coord + ch]);
+    }
+    for (const c of plan.canals) {
+      const ch = canalCorridorHalf(c);
+      (c.axis === 'z' ? cutsX : cutsZ).push([c.coord - ch, c.coord + ch]);
+    }
+    const xs = subtractIntervals(-H, H, cutsX).filter(([a, b]) => b - a >= 12);
+    const zs = subtractIntervals(-H, H, cutsZ).filter(([a, b]) => b - a >= 12);
+    const setback = 1.2;
+    const alley = LEVEL.ALLEY_WIDTH_M;
+    const minSplitLong = 20 + alley;
+    const blocks: Array<{ r: RectXZ; long: number; split: boolean }> = [];
+    for (const [x0, x1] of xs) {
+      for (const [z0, z1] of zs) {
+        const r = rectFrom(x0 + setback, z0 + setback, x1 - setback, z1 - setback);
+        const long = Math.max(r.x1 - r.x0, r.z1 - r.z0);
+        blocks.push({ r, long, split: sector.narrowAlleys ? long >= minSplitLong : long >= 34 && rng() < 0.6 });
+      }
+    }
+    let splits = blocks.filter((b) => b.split).length;
+    for (const b of [...blocks].sort((p, o) => o.long - p.long)) {
+      if (splits >= sector.skyBridges + 1) break;
+      if (!b.split && b.long >= minSplitLong) {
+        b.split = true;
+        splits++;
+      }
+    }
+    const lots: Array<{ r: RectXZ; pair: number }> = [];
+    blocks.forEach((b, bi) => {
+      const r = b.r;
+      const w = r.x1 - r.x0;
+      const d = r.z1 - r.z0;
+      if (!b.split) {
+        lots.push({ r: rectFrom(r.x0, r.z0, Math.min(r.x1, r.x0 + 34), Math.min(r.z1, r.z0 + 34)), pair: -1 });
+        return;
+      }
+      const pieces = b.long >= 54 ? 3 : 2;
+      const each = (b.long - alley * (pieces - 1)) / pieces;
+      for (let i = 0; i < pieces; i++) {
+        const o = i * (each + alley);
+        const piece = w >= d ? rectFrom(r.x0 + o, r.z0, r.x0 + o + each, r.z1) : rectFrom(r.x0, r.z0 + o, r.x1, r.z0 + o + each);
+        lots.push({ r: rectFrom(piece.x0, piece.z0, Math.min(piece.x1, piece.x0 + 34), Math.min(piece.z1, piece.z0 + 34)), pair: bi });
+      }
+    });
+    // Ensure enough lots by splitting the largest remaining ones.
+    let guard = 0;
+    while (lots.length < sector.buildingCount && guard++ < 40) {
+      lots.sort((a, b) => (b.r.x1 - b.r.x0) * (b.r.z1 - b.r.z0) - (a.r.x1 - a.r.x0) * (a.r.z1 - a.r.z0));
+      const l = lots.shift();
+      if (!l) break;
+      const r = l.r;
+      const w = r.x1 - r.x0;
+      const d = r.z1 - r.z0;
+      if (Math.max(w, d) < minSplitLong) {
+        lots.push(l);
+        break;
+      }
+      const each = (Math.max(w, d) - alley) / 2;
+      const pair = 1000 + guard;
+      if (w >= d) lots.push({ r: rectFrom(r.x0, r.z0, r.x0 + each, r.z1), pair }, { r: rectFrom(r.x0 + each + alley, r.z0, r.x1, r.z1), pair });
+      else lots.push({ r: rectFrom(r.x0, r.z0, r.x1, r.z0 + each), pair }, { r: rectFrom(r.x0, r.z0 + each + alley, r.x1, r.z1), pair });
+    }
+    return lots.filter((l) => l.r.x1 - l.r.x0 >= 10 && l.r.z1 - l.r.z0 >= 10);
+  }
+
+  /** Far-field ring: towers capping every corridor that leaves the district, then up to 100 in total. */
+  private layoutFarTowers(rng: () => number, plan: DistrictPlan): void {
+    const seedAttr = this.farTowers.geometry.getAttribute('aSeed') as THREE.InstancedBufferAttribute;
+    this.farInfo.length = 0;
+    const corridors: Array<{ axis: Axis; l0: number; l1: number }> = [];
+    plan.streets.forEach((s) => corridors.push({ axis: s.axis, l0: s.coord - corridorHalf(s), l1: s.coord + corridorHalf(s) }));
+    plan.canals.forEach((c) => corridors.push({ axis: c.axis, l0: c.coord - canalCorridorHalf(c), l1: c.coord + canalCorridorHalf(c) }));
+    plan.highways.forEach((h) => corridors.push({ axis: h.axis, l0: h.coord - 9, l1: h.coord + 9 }));
+    const place = (x: number, z: number, w: number, d: number, top: number): void => {
+      if (this.farInfo.length >= LIMITS.FAR_BUILDINGS) return;
+      for (const o of this.farInfo) if (Math.abs(o.x - x) < (o.w + w) / 2 + 6 && Math.abs(o.z - z) < (o.d + d) / 2 + 6) return;
+      const i = this.farInfo.length;
+      _pos.set(x, top / 2, z);
+      _quat.identity();
+      _scl.set(w, top, d);
+      _m4.compose(_pos, _quat, _scl);
+      this.farTowers.setMatrixAt(i, _m4);
+      seedAttr.setX(i, rng());
+      this.farInfo.push({ x, z, w, d, top });
+    };
+    // Corridor caps just past the visual extent so no street / canal / expressway runs into the void.
+    for (const c of corridors) {
+      if (c.l1 < -H - 20 || c.l0 > H + 20) continue;
+      for (const end of [-1, 1]) {
+        const w = c.l1 - c.l0 + 14;
+        const p = pt(c.axis, end * (VIS + 16), 0, (c.l0 + c.l1) / 2);
+        place(p.x, p.z, c.axis === 'z' ? w : 30, c.axis === 'z' ? 30 : w, 90 + rng() * 140);
+      }
+    }
+    let guard = 0;
+    while (this.farInfo.length < LIMITS.FAR_BUILDINGS && guard++ < 6000) {
+      const ang = rng() * Math.PI * 2;
+      const dist = LEVEL.FAR_RING_INNER_M + Math.pow(rng(), 0.8) * (LEVEL.FAR_RING_OUTER_M - LEVEL.FAR_RING_INNER_M);
+      const x = Math.cos(ang) * dist;
+      const z = Math.sin(ang) * dist;
+      const w = 20 + rng() * 40;
+      const d = 20 + rng() * 40;
+      const hitsCorridor = corridors.some((c) => {
+        const lat = c.axis === 'z' ? x : z;
+        const along = c.axis === 'z' ? z : x;
+        return Math.abs(along) < VIS + 4 && lat + w / 2 > c.l0 - 2 && lat - w / 2 < c.l1 + 2;
+      });
+      if (!hitsCorridor) place(x, z, w, d, 50 + rng() * 210 + (dist - LEVEL.FAR_RING_INNER_M) * 0.08);
+    }
+    this.farTowers.count = this.farInfo.length;
+    this.farTowers.instanceMatrix.needsUpdate = true;
+    seedAttr.needsUpdate = true;
+    this.farTowers.computeBoundingSphere();
   }
 
   private clearSector(): void {
@@ -1563,159 +3092,14 @@ export class CityBuilder {
     this.sectorDisposables = [];
   }
 
-  /** 4–7 towers on a jittered 3×3 lattice with validated 18–42 m gaps (within ~140 m × 140 m). */
-  private layoutGrid(sector: SectorDef, rng: () => number): BuildingInfo[] {
-    const spacing = 52;
-    const n = sector.buildingCount;
-    const neighbours = (c: number): number[] => {
-      const x = c % 3;
-      const z = Math.floor(c / 3);
-      const out: number[] = [];
-      if (x > 0) out.push(c - 1);
-      if (x < 2) out.push(c + 1);
-      if (z > 0) out.push(c - 3);
-      if (z < 2) out.push(c + 3);
-      return out;
-    };
-    for (let attempt = 0; attempt < 400; attempt++) {
-      // Random connected growth from a corner-adjacent start cell (spawn).
-      const start = [1, 3, 5, 7][Math.floor(rng() * 4)];
-      const cells = [start];
-      while (cells.length < n) {
-        const frontier: number[] = [];
-        for (const c of cells) for (const nb of neighbours(c)) if (!cells.includes(nb) && !frontier.includes(nb)) frontier.push(nb);
-        cells.push(frontier[Math.floor(rng() * frontier.length)]);
-      }
-      const jitter = attempt < 300 ? 5 : 0;
-      const out: BuildingInfo[] = cells.map((c, i) => {
-        const gx = (c % 3) - 1;
-        const gz = Math.floor(c / 3) - 1;
-        const hw = attempt < 300 ? 10 + rng() * 5 : 12;
-        const hd = attempt < 300 ? 10 + rng() * 5 : 12;
-        return {
-          index: i,
-          cx: gx * spacing + (rng() * 2 - 1) * jitter,
-          cz: gz * spacing + (rng() * 2 - 1) * jitter,
-          halfW: hw,
-          halfD: hd,
-          roofY: 0,
-          isSpawn: i === 0,
-          isGateTower: false,
-        };
-      });
-      if (!this.validateGaps(out, (a, b) => {
-        const ca = cells[a.index];
-        const cb = cells[b.index];
-        return neighbours(ca).includes(cb);
-      })) continue;
-      if (!this.withinPlayArea(out)) continue;
-      return this.assignHeights(out, sector, rng);
-    }
-    throw new Error('Sector layout generation failed');
-  }
-
-  /** Sector 5: six towers in a ring around an open shaft (boss arena). */
-  private layoutRing(sector: SectorDef, rng: () => number): BuildingInfo[] {
-    const n = sector.buildingCount;
-    for (let attempt = 0; attempt < 200; attempt++) {
-      const radius = 54 + (attempt < 150 ? rng() * 4 : 0);
-      const rot = rng() * Math.PI * 2;
-      const out: BuildingInfo[] = [];
-      for (let i = 0; i < n; i++) {
-        const a = rot + (i / n) * Math.PI * 2;
-        const hw = attempt < 150 ? 10 + rng() * 3 : 11;
-        const hd = attempt < 150 ? 10 + rng() * 3 : 11;
-        out.push({ index: i, cx: Math.cos(a) * radius, cz: Math.sin(a) * radius, halfW: hw, halfD: hd, roofY: 0, isSpawn: i === 0, isGateTower: false });
-      }
-      if (!this.validateGaps(out, (a, b) => Math.abs(a.index - b.index) === 1 || Math.abs(a.index - b.index) === n - 1)) continue;
-      if (!this.withinPlayArea(out)) continue;
-      return this.assignHeights(out, sector, rng);
-    }
-    throw new Error('Ring layout generation failed');
-  }
-
-  private validateGaps(list: BuildingInfo[], isNeighbour: (a: BuildingInfo, b: BuildingInfo) => boolean): boolean {
-    for (let i = 0; i < list.length; i++) {
-      for (let j = i + 1; j < list.length; j++) {
-        const gap = footprintGap(list[i], list[j]);
-        if (gap < LEVEL.GAP_MIN_M) return false;
-        if (isNeighbour(list[i], list[j]) && gap > LEVEL.GAP_MAX_M) return false;
-      }
-    }
-    return true;
-  }
-
-  private withinPlayArea(list: BuildingInfo[]): boolean {
-    let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
-    for (const b of list) {
-      minX = Math.min(minX, b.cx - b.halfW);
-      maxX = Math.max(maxX, b.cx + b.halfW);
-      minZ = Math.min(minZ, b.cz - b.halfD);
-      maxZ = Math.max(maxZ, b.cz + b.halfD);
-    }
-    return maxX - minX <= LEVEL.PLAY_AREA_M && maxZ - minZ <= LEVEL.PLAY_AREA_M;
-  }
-
-  /** Spawn roof at 0 m; the sector's full height band is guaranteed to be used. */
-  private assignHeights(list: BuildingInfo[], sector: SectorDef, rng: () => number): BuildingInfo[] {
-    const q = (v: number): number => Math.round(v * 2) / 2;
-    const others = list.slice(1);
-    const heights: number[] = others.map(() => q(sector.heightMin + rng() * (sector.heightMax - sector.heightMin)));
-    if (heights.length > 0) heights[0] = sector.heightMax;
-    if (heights.length > 1 && sector.heightMin < 0) heights[1] = sector.heightMin;
-    // Shuffle so extremes land on random towers.
-    for (let i = heights.length - 1; i > 0; i--) {
-      const j = Math.floor(rng() * (i + 1));
-      [heights[i], heights[j]] = [heights[j], heights[i]];
-    }
-    return list.map((b, i) => ({ ...b, roofY: i === 0 ? 0 : heights[i - 1] }));
-  }
-
-  /**
-   * The next sector's entry tower: placed 24–30 m beyond the tower farthest from spawn, on the
-   * outward side first; every candidate is validated against the 18 m minimum gap to all towers.
-   */
-  private placeGateTower(list: BuildingInfo[], rng: () => number): BuildingInfo {
-    const spawn = list[0];
-    const byDist = [...list].sort(
-      (p, q) => Math.hypot(q.cx - spawn.cx, q.cz - spawn.cz) - Math.hypot(p.cx - spawn.cx, p.cz - spawn.cz),
-    );
-    const cxAvg = list.reduce((s, b) => s + b.cx, 0) / list.length;
-    const czAvg = list.reduce((s, b) => s + b.cz, 0) / list.length;
-    const gap = 24 + rng() * 6;
-    const half = 11;
-    for (const far of byDist) {
-      const ox = far.cx - cxAvg;
-      const oz = far.cz - czAvg;
-      // Candidate directions ordered by how "outward" they point.
-      const dirs: Array<[number, number]> = [[1, 0], [-1, 0], [0, 1], [0, -1]];
-      dirs.sort((p, q) => q[0] * ox + q[1] * oz - (p[0] * ox + p[1] * oz));
-      for (const [dx, dz] of dirs) {
-        const cand: BuildingInfo = {
-          index: list.length,
-          cx: dx !== 0 ? far.cx + dx * (far.halfW + gap + half) : far.cx,
-          cz: dz !== 0 ? far.cz + dz * (far.halfD + gap + half) : far.cz,
-          halfW: half,
-          halfD: half,
-          roofY: Math.round((far.roofY + 6) * 2) / 2,
-          isSpawn: false,
-          isGateTower: true,
-        };
-        if (list.every((b) => footprintGap(b, cand) >= LEVEL.GAP_MIN_M)) return cand;
-      }
-    }
-    throw new Error('Gate tower placement failed');
-  }
-
-  // =========================================================================================
+  // ===========================================================================================
   // Runtime
-  // =========================================================================================
-  /** Opens / closes the jade gate (pillar visibility + gate anchor usability). */
-  setGateActive(active: boolean): void {
-    this.uGateActive.value = active ? 1 : 0;
-    this.gatePillar.visible = active;
-    this.gateBeacon.visible = active;
-    if (this.layout) this.layout.gateAnchor.enabled = active;
+  // ===========================================================================================
+  /** Opens / closes the emerald district gate (barrier section turns jade + light pillar). */
+  setGateOpen(open: boolean): void {
+    this.uGateOpen.value = open ? 1 : 0;
+    this.gatePillar.visible = open;
+    if (this.layout) this.layout.gate.open = open;
   }
 
   /** FLOW Rank A+: building neon emissive +25 %. */
@@ -1729,19 +3113,38 @@ export class CityBuilder {
   }
 
   /**
-   * @param simTime scaled simulation time (bullet time slows rain ripples, hologram, beacons)
-   * @param cameraPos sky/cloud follow the camera
+   * @param simTime scaled simulation time (bullet time slows ripples, flow, holograms, traffic)
+   * @param cameraPos sky follows the camera; the nearest city lights are selected for reflections
    */
   update(simTime: number, cameraPos: THREE.Vector3): void {
     this.uTime.value = simTime;
     this.sky.position.copy(cameraPos);
-    this.clouds.position.set(cameraPos.x, LEVEL.CLOUD_DECK_Y, cameraPos.z);
-    this.gateBeacon.rotation.y = simTime * 1.6;
-  }
-}
 
-/** Steel merge: drop UVs so all members share the same attribute layout. */
-function stripToPosNormal(g: THREE.BufferGeometry): THREE.BufferGeometry {
-  if (g.getAttribute('uv')) g.deleteAttribute('uv');
-  return g;
+    // Nearest-N city light selection (allocation-free partial selection).
+    const n = this.lightCount;
+    for (let i = 0; i < n; i++) {
+      const dx = this.lightPos[i * 3] - cameraPos.x;
+      const dy = this.lightPos[i * 3 + 1] - cameraPos.y;
+      const dz = this.lightPos[i * 3 + 2] - cameraPos.z;
+      this.lightDist[i] = dx * dx + dy * dy + dz * dz;
+    }
+    const take = Math.min(MAX_LIGHTS, n);
+    const posU = this.uCityLightPos.value;
+    const colU = this.uCityLightCol.value;
+    for (let k = 0; k < take; k++) {
+      let best = -1;
+      let bestD = Infinity;
+      for (let i = 0; i < n; i++) {
+        if (this.lightDist[i] < bestD) {
+          bestD = this.lightDist[i];
+          best = i;
+        }
+      }
+      if (best < 0) break;
+      this.lightDist[best] = Infinity;
+      posU[k].set(this.lightPos[best * 3], this.lightPos[best * 3 + 1], this.lightPos[best * 3 + 2]);
+      colU[k].set(this.lightCol[best * 3], this.lightCol[best * 3 + 1], this.lightCol[best * 3 + 2]);
+    }
+    this.uCityLightCount.value = take;
+  }
 }

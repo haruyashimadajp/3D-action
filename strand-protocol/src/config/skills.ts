@@ -12,15 +12,41 @@ export interface SectorWave {
   readonly count: number;
 }
 
+/** District layout family: street grid (Sectors 1–4) or central scramble with a ring of supertalls (Sector 5). */
+export type DistrictLayout = 'GRID' | 'RING';
+
 export interface SectorDef {
   readonly index: number;
   readonly name: string;
   readonly subtitle: string;
+  readonly layout: DistrictLayout;
+  /** Number of low-rise … supertall towers in the district (14–22). */
   readonly buildingCount: number;
+  /** Building height band (m) inside 16 … 95 m. */
   readonly heightMin: number;
   readonly heightMax: number;
-  /** Layout arrangement: grid scatter or ring (sector 5). */
-  readonly layout: 'GRID' | 'RING';
+  /** Elevated expressways (Y = 9.5 m). */
+  readonly highways: number;
+  /** Two expressways crossing at grade (Sector 3). */
+  readonly highwayCrossing: boolean;
+  /** Ring expressway around the central plaza (Sector 5). */
+  readonly highwayRing: boolean;
+  /** Ground-connected on-ramps (one per expressway system). */
+  readonly onRamps: number;
+  /** Canal through (or around) the district. */
+  readonly canal: 'NONE' | 'THROUGH' | 'OUTER_RING';
+  /** Neon truss bridges over the canal. */
+  readonly bridges: number;
+  /** Narrow wall-run alleys between towers (Sector 3). */
+  readonly narrowAlleys: boolean;
+  /** Mid-level (Layer 2) sky-bridges between towers. */
+  readonly skyBridges: number;
+  /** Dense low-rise neon sign street (Sector 4). */
+  readonly denseNeon: boolean;
+  /** Central scramble crossing plaza (Sector 5). */
+  readonly scramblePlaza: boolean;
+  /** Parked cyber-cars on streets / expressways (25–45). */
+  readonly parkedCars: number;
   readonly waves: readonly SectorWave[];
   /** Total enemy composition (excluding boss summons). */
   readonly roster: Readonly<Partial<Record<EnemyKind, number>>>;
@@ -31,36 +57,52 @@ export interface SectorDef {
 
 export const SECTORS: readonly SectorDef[] = [
   {
-    index: 1, name: 'SECTOR 01', subtitle: 'INTRODUCTION // ROUTE TRAINING',
-    buildingCount: 4, heightMin: 0, heightMax: 16, layout: 'GRID',
+    index: 1, name: 'SECTOR 01', subtitle: 'MAIN AVENUE // EXPRESSWAY ENTRANCE',
+    layout: 'GRID', buildingCount: 14, heightMin: 18, heightMax: 65,
+    highways: 1, highwayCrossing: false, highwayRing: false, onRamps: 1,
+    canal: 'NONE', bridges: 0, narrowAlleys: false, skyBridges: 2, denseNeon: false, scramblePlaza: false,
+    parkedCars: 28,
     waves: [{ count: 4 }, { count: 5 }],
     roster: { ENFORCER: 7, VEIL: 2 },
     reward: 'SKILL',
   },
   {
-    index: 2, name: 'SECTOR 02', subtitle: 'VERTICALITY // SHIELD COUNTERPLAY',
-    buildingCount: 5, heightMin: -6, heightMax: 24, layout: 'GRID',
+    index: 2, name: 'SECTOR 02', subtitle: 'CANAL // TRUSS BRIDGE QUARTER',
+    layout: 'GRID', buildingCount: 16, heightMin: 18, heightMax: 75,
+    highways: 1, highwayCrossing: false, highwayRing: false, onRamps: 1,
+    canal: 'THROUGH', bridges: 2, narrowAlleys: false, skyBridges: 2, denseNeon: false, scramblePlaza: false,
+    parkedCars: 32,
     waves: [{ count: 6 }, { count: 7 }],
     roster: { ENFORCER: 5, AEGIS: 3, VEIL: 2, DRONE: 3 },
     reward: 'SKILL',
   },
   {
-    index: 3, name: 'SECTOR 03', subtitle: 'HIGH-MOBILITY ENGAGEMENT',
-    buildingCount: 6, heightMin: -10, heightMax: 30, layout: 'GRID',
+    index: 3, name: 'SECTOR 03', subtitle: 'EXPRESSWAY INTERCHANGE // HIGH-RISE ALLEYS',
+    layout: 'GRID', buildingCount: 18, heightMin: 22, heightMax: 85,
+    highways: 2, highwayCrossing: true, highwayRing: false, onRamps: 2,
+    canal: 'NONE', bridges: 0, narrowAlleys: true, skyBridges: 6, denseNeon: false, scramblePlaza: false,
+    parkedCars: 36,
     waves: [{ count: 8 }, { count: 8 }],
     roster: { ENFORCER: 5, AEGIS: 3, VEIL: 3, PHANTOM: 2, DRONE: 3 },
     reward: 'SKILL',
   },
   {
-    index: 4, name: 'SECTOR 04', subtitle: 'SUPERTALL SHAFT ARENA',
-    buildingCount: 7, heightMin: -15, heightMax: 38, layout: 'GRID',
+    index: 4, name: 'SECTOR 04', subtitle: 'NEON CANAL DISTRICT // TWIN EXPRESSWAYS',
+    layout: 'GRID', buildingCount: 22, heightMin: 24, heightMax: 95,
+    highways: 2, highwayCrossing: false, highwayRing: false, onRamps: 2,
+    canal: 'THROUGH', bridges: 3, narrowAlleys: false, skyBridges: 3, denseNeon: true, scramblePlaza: false,
+    parkedCars: 42,
     waves: [{ count: 9 }, { count: 11 }],
     roster: { ENFORCER: 5, AEGIS: 4, VEIL: 4, PHANTOM: 3, DRONE: 4 },
     reward: 'SKILL',
   },
   {
-    index: 5, name: 'SECTOR 05', subtitle: 'SUMMIT // VALKYRIE-09',
-    buildingCount: 6, heightMin: 0, heightMax: 34, layout: 'RING',
+    // Spec gives no car count for Sector 5; 34 sits inside the 25–45 global band.
+    index: 5, name: 'SECTOR 05', subtitle: 'CENTRAL SCRAMBLE // VALKYRIE-09',
+    layout: 'RING', buildingCount: 16, heightMin: 30, heightMax: 95,
+    highways: 1, highwayCrossing: false, highwayRing: true, onRamps: 1,
+    canal: 'OUTER_RING', bridges: 4, narrowAlleys: false, skyBridges: 4, denseNeon: false, scramblePlaza: true,
+    parkedCars: 34,
     waves: [{ count: 1 }],
     roster: { VALKYRIE: 1 },
     bossSummons: { DRONE: 3, VEIL: 2 },

@@ -2,8 +2,10 @@
  * STRAND // PROTOCOL — Procedural PBR texture factory (§6.2-2).
  * Everything is generated once at boot with Canvas2D and cached; no external assets.
  *
- *  - Supertall window set (1024²): Albedo / Emissive / Roughness / Normal (Sobel from height)
- *  - Wet rooftop concrete with puddles (512²): Albedo / Roughness (puddle 0.06, wet 0.42) / Normal
+ *  - Supertall window set (1024²): Albedo / Emissive / Roughness / Normal (Sobel from height),
+ *    office floors + low-rise (1F–3F) shop floors with neon shop frames
+ *  - Wet rooftop / sidewalk concrete with cracks & puddles (512²): Albedo / Roughness (puddle 0.06, wet 0.42) / Normal
+ *  - Wet road atlas (512²): lanes, centre line, white dashes, crosswalk, manholes, puddles
  *  - Cyan wall-run panel (512²): Albedo / Emissive (strips + chevrons) / Roughness / Normal
  *  - Hologram neon sign atlas (1024²): 8 vertical katakana / English-symbol strips
  *  - Rooftop machinery (256²): AC-unit fan grille Albedo / Roughness / Normal
@@ -32,6 +34,8 @@ export interface PbrTextureSet {
 export interface ProceduralTextureLibrary {
   windows: Required<PbrTextureSet>;
   roof: PbrTextureSet;
+  /** Wet road atlas (lanes / crosswalk / plain asphalt) — see ROAD_ATLAS. */
+  roads: PbrTextureSet;
   wallPanel: Required<PbrTextureSet>;
   machinery: PbrTextureSet;
   neonAtlas: THREE.Texture;
@@ -198,20 +202,25 @@ function normalTextureFromHeight(
 
 // ---------------------------------------------------------------------------
 // 1. Supertall window set (1024², 4 maps)
+//    Canvas rows 0–4  (uv v 0.375…1): office floors, sampled repeating every 20 m above Y 12 m.
+//    Canvas rows 5–7  (uv v 0…0.375): low-rise shop floors 3F/2F/1F (Y 0–12 m) with neon shop frames.
 // ---------------------------------------------------------------------------
+const SHOP_NEON = [0xff2bd6, 0x00f0ff, 0xffa21f, 0xff3b5c, 0x39ff88, 0xb44bff] as const;
+
 function generateWindowSet(anisotropy: number): Required<PbrTextureSet> {
   const S = RENDER.WINDOW_TEX_SIZE;
-  const floors = RENDER.WINDOW_FLOORS_PER_TILE;
+  const rows = RENDER.WINDOW_ROWS;
+  const officeRows = RENDER.WINDOW_OFFICE_ROWS;
   const bays = RENDER.WINDOW_BAYS_PER_TILE;
-  const floorPx = S / floors;
+  const floorPx = S / rows;
   const bayPx = S / bays;
+  const officePx = officeRows * floorPx;
   const rng = createRng(0x57a2d);
 
   const [albC, alb] = makeCanvas(S, S);
   const [emiC, emi] = makeCanvas(S, S);
   const [rghC, rgh] = makeCanvas(S, S);
-  const [hgtC, hgt] = makeCanvas(S, S);
-  void hgtC;
+  const [, hgt] = makeCanvas(S, S);
 
   // Background: spandrel/structure everywhere.
   alb.fillStyle = '#161b24';
@@ -225,35 +234,41 @@ function generateWindowSet(anisotropy: number): Required<PbrTextureSet> {
 
   const warm: [number, number, number] = [0, 0, 0];
   const cool: [number, number, number] = [0, 0, 0];
+  const tmp: [number, number, number] = [0, 0, 0];
   hexToLinearRgb(COLORS.WINDOW_WARM, warm);
   hexToLinearRgb(COLORS.WINDOW_COOL, cool);
   // Emissive is scaled by material.emissiveIntensity (0.45). Keep final linear luminance <= 0.28.
   const emissiveScale = MATERIALS.BUILDING_GLASS.emissive;
   const maxTexLum = BACKGROUND_MAX_LUMINANCE / emissiveScale;
+  /** CSS colour for a linear RGB scaled so its luminance equals `lum` (≤ maxTexLum). */
+  const capped = (lin: [number, number, number], lum: number): string => {
+    const k = Math.min(lum, maxTexLum) / Math.max(linLum(lin[0], lin[1], lin[2]), 1e-4);
+    return rgbCss(linearToSrgbByte(lin[0] * k), linearToSrgbByte(lin[1] * k), linearToSrgbByte(lin[2] * k));
+  };
 
   const glass = '#0c121d';
   const mullionAlb = '#2a3242';
-  const mechanicalFloor = 3; // louvred plant floor inside each 32 m tile (rooftop machine-room vents)
   const frame = 3;
   const mullion = 4;
   const spandrelPx = Math.round(floorPx * 0.16);
 
-  for (let f = 0; f < floors; f++) {
-    const fy = f * floorPx;
-    // Floor slab / spandrel band at the bottom of each floor.
+  const drawSpandrel = (fy: number): void => {
     alb.fillStyle = '#121720';
     alb.fillRect(0, fy + floorPx - spandrelPx, S, spandrelPx);
     rgh.fillStyle = grayCss(0.58);
     rgh.fillRect(0, fy + floorPx - spandrelPx, S, spandrelPx);
     hgt.fillStyle = grayCss(0.86);
     hgt.fillRect(0, fy + floorPx - spandrelPx, S, spandrelPx);
-    // Thin slab edge highlight line.
     alb.fillStyle = '#2b3445';
     alb.fillRect(0, fy + floorPx - spandrelPx, S, 2);
     hgt.fillStyle = grayCss(1.0);
     hgt.fillRect(0, fy + floorPx - spandrelPx, S, 2);
+  };
 
-    const isMechanical = f === mechanicalFloor;
+  // ----------------------------- Office floors (rows 0–4) -----------------------------
+  for (let f = 0; f < officeRows; f++) {
+    const fy = f * floorPx;
+    drawSpandrel(fy);
     // 2 AM occupancy: whole floors cluster dark or lit (tenants), giving realistic horizontal banding.
     const floorRoll = rng();
     const occupancy = floorRoll < 0.3 ? 0.06 : floorRoll < 0.75 ? 0.38 : 0.78;
@@ -265,36 +280,10 @@ function generateWindowSet(anisotropy: number): Required<PbrTextureSet> {
       const ww = bayPx - frame * 2;
       const wh = floorPx - spandrelPx - frame * 2;
 
-      if (isMechanical) {
-        // Louvred ventilation grille of the mechanical plant floor.
-        alb.fillStyle = '#1b212c';
-        alb.fillRect(wx, wy, ww, wh);
-        rgh.fillStyle = grayCss(0.5);
-        rgh.fillRect(wx, wy, ww, wh);
-        const slat = 6;
-        for (let y = wy; y < wy + wh; y += slat) {
-          const g = hgt.createLinearGradient(0, y, 0, y + slat);
-          g.addColorStop(0, grayCss(0.95));
-          g.addColorStop(1, grayCss(0.45));
-          hgt.fillStyle = g;
-          hgt.fillRect(wx, y, ww, slat);
-          alb.fillStyle = 'rgba(70,80,96,0.55)';
-          alb.fillRect(wx, y, ww, 1);
-        }
-        // A few exhaust fans glow very faintly amber through the louvres (maintenance lamps).
-        if (rng() < 0.18) {
-          const k = Math.min(maxTexLum * 0.35 / linLum(warm[0], warm[1], warm[2]), 1);
-          emi.fillStyle = rgbCss(linearToSrgbByte(warm[0] * k), linearToSrgbByte(warm[1] * k), linearToSrgbByte(warm[2] * k));
-          emi.fillRect(wx + ww * 0.3, wy + wh * 0.4, ww * 0.4, 3);
-        }
-        continue;
-      }
-
       // Two panes per bay split by a vertical mullion.
       const paneW = (ww - mullion) / 2;
       for (let p = 0; p < 2; p++) {
         const px = wx + p * (paneW + mullion);
-        // Glass base: dark reflective.
         alb.fillStyle = glass;
         alb.fillRect(px, wy, paneW, wh);
         rgh.fillStyle = grayCss(MATERIALS.BUILDING_GLASS.roughness);
@@ -302,8 +291,7 @@ function generateWindowSet(anisotropy: number): Required<PbrTextureSet> {
         hgt.fillStyle = grayCss(0.32);
         hgt.fillRect(px, wy, paneW, wh);
 
-        const lit = rng() < occupancy;
-        if (!lit) {
+        if (rng() >= occupancy) {
           // Unlit office: faint interior silhouettes barely visible through dark glass.
           alb.fillStyle = 'rgba(20,28,40,0.6)';
           alb.fillRect(px + paneW * 0.1, wy + wh * 0.62, paneW * 0.8, wh * 0.38);
@@ -311,35 +299,24 @@ function generateWindowSet(anisotropy: number): Required<PbrTextureSet> {
         }
 
         // Lit pane: warm : cool = 3 : 7, with colour-temperature drift.
-        const isWarm = rng() < WINDOW_WARM_RATIO;
-        const base = isWarm ? warm : cool;
+        const base = rng() < WINDOW_WARM_RATIO ? warm : cool;
         const drift = (rng() - 0.5) * 0.18;
-        let r = base[0] * (1 + drift);
-        let g = base[1] * (1 + drift * 0.4);
-        let bl = base[2] * (1 - drift);
-        const lum = linLum(r, g, bl);
+        tmp[0] = base[0] * (1 + drift);
+        tmp[1] = base[1] * (1 + drift * 0.4);
+        tmp[2] = base[2] * (1 - drift);
         const brightness = 0.32 + rng() * 0.68;
-        const k = (maxTexLum * brightness) / lum;
-        r *= k;
-        g *= k;
-        bl *= k;
+        const lum = maxTexLum * brightness;
 
         // Interior light falloff: ceiling brighter, floor darker.
         const grad = emi.createLinearGradient(0, wy, 0, wy + wh);
-        grad.addColorStop(0, rgbCss(linearToSrgbByte(r), linearToSrgbByte(g), linearToSrgbByte(bl)));
-        grad.addColorStop(0.55, rgbCss(linearToSrgbByte(r * 0.82), linearToSrgbByte(g * 0.82), linearToSrgbByte(bl * 0.82)));
-        grad.addColorStop(1, rgbCss(linearToSrgbByte(r * 0.45), linearToSrgbByte(g * 0.45), linearToSrgbByte(bl * 0.45)));
+        grad.addColorStop(0, capped(tmp, lum));
+        grad.addColorStop(0.55, capped(tmp, lum * 0.82));
+        grad.addColorStop(1, capped(tmp, lum * 0.45));
         emi.fillStyle = grad;
         emi.fillRect(px, wy, paneW, wh);
-
         // Ceiling light fixtures (brightest strip — still capped by maxTexLum).
-        emi.fillStyle = rgbCss(
-          linearToSrgbByte(Math.min(r * 1.0 / brightness, 1)),
-          linearToSrgbByte(Math.min(g * 1.0 / brightness, 1)),
-          linearToSrgbByte(Math.min(bl * 1.0 / brightness, 1)),
-        );
+        emi.fillStyle = capped(tmp, maxTexLum);
         if (rng() < 0.7) emi.fillRect(px + paneW * 0.15, wy + 3, paneW * 0.7, 2);
-
         // Interior silhouettes: desks, partitions, a column.
         emi.fillStyle = 'rgba(0,0,0,0.55)';
         emi.fillRect(px, wy + wh * 0.7, paneW, wh * 0.3);
@@ -349,21 +326,18 @@ function generateWindowSet(anisotropy: number): Required<PbrTextureSet> {
           const dw = paneW * (0.2 + rng() * 0.3);
           emi.fillRect(px + rng() * (paneW - dw), wy + wh * 0.55, dw, wh * 0.18);
         }
-
         // Random blinds: horizontal slats covering a random fraction from the top.
         if (rng() < 0.45) {
-          const cover = 0.15 + rng() * 0.8;
-          const slat = 4;
-          const blindH = wh * cover;
-          for (let y = 0; y < blindH; y += slat) {
+          const blindH = wh * (0.15 + rng() * 0.8);
+          for (let y = 0; y < blindH; y += 4) {
             emi.fillStyle = 'rgba(0,0,0,0.62)';
-            emi.fillRect(px, wy + y, paneW, slat - 1);
+            emi.fillRect(px, wy + y, paneW, 3);
             alb.fillStyle = 'rgba(48,54,64,0.85)';
-            alb.fillRect(px, wy + y, paneW, slat - 1);
+            alb.fillRect(px, wy + y, paneW, 3);
             rgh.fillStyle = grayCss(0.6);
-            rgh.fillRect(px, wy + y, paneW, slat - 1);
+            rgh.fillRect(px, wy + y, paneW, 3);
             hgt.fillStyle = grayCss(0.42);
-            hgt.fillRect(px, wy + y, paneW, slat - 1);
+            hgt.fillRect(px, wy + y, paneW, 3);
           }
         }
       }
@@ -385,16 +359,148 @@ function generateWindowSet(anisotropy: number): Required<PbrTextureSet> {
       hgt.fillRect(bx, fy, bayPx, frame);
     }
   }
-
-  // Subtle grime streaks on albedo / roughness (rain run-off).
-  for (let i = 0; i < 260; i++) {
+  // Rain run-off grime on the office band only (wrapped inside the band so it tiles vertically).
+  for (let i = 0; i < 220; i++) {
     const x = rng() * S;
-    const y = rng() * S;
+    const y = rng() * officePx;
     const len = 20 + rng() * 120;
-    alb.fillStyle = `rgba(0,0,0,${0.05 + rng() * 0.08})`;
-    alb.fillRect(x, y, 1 + rng() * 2, len);
-    rgh.fillStyle = `rgba(255,255,255,${0.03 + rng() * 0.05})`;
-    rgh.fillRect(x, y, 1, len);
+    const a = 0.05 + rng() * 0.08;
+    const w = 1 + rng() * 2;
+    for (const oy of [0, -officePx]) {
+      const y0 = Math.max(0, y + oy);
+      const y1 = Math.min(officePx, y + oy + len);
+      if (y1 <= y0) continue;
+      alb.fillStyle = `rgba(0,0,0,${a})`;
+      alb.fillRect(x, y0, w, y1 - y0);
+      rgh.fillStyle = `rgba(255,255,255,${a * 0.6})`;
+      rgh.fillRect(x, y0, 1, y1 - y0);
+    }
+  }
+
+  // ----------------------------- Shop floors (rows 5–7 = 3F, 2F, 1F) -----------------------------
+  const neonLin: Array<[number, number, number]> = SHOP_NEON.map((h) => hexToLinearRgb(h, [0, 0, 0]));
+  const shopFloors = RENDER.WINDOW_SHOP_ROWS;
+  for (let sf = 0; sf < shopFloors; sf++) {
+    const f = officeRows + sf;
+    const fy = f * floorPx;
+    const isGround = sf === shopFloors - 1;
+    drawSpandrel(fy);
+    let b = 0;
+    while (b < bays) {
+      // Each tenant spans 1–3 bays.
+      const span = Math.min(bays - b, 1 + Math.floor(rng() * 3));
+      const x0 = b * bayPx + frame;
+      const w = span * bayPx - frame * 2;
+      const y0 = fy + frame;
+      const h = floorPx - spandrelPx - frame * 2;
+      const neon = neonLin[Math.floor(rng() * neonLin.length)];
+      const open = rng() < (isGround ? 0.78 : 0.6);
+
+      if (isGround) {
+        // Fascia sign band across the top of the storefront.
+        const fasciaH = Math.round(h * 0.24);
+        alb.fillStyle = '#0f131a';
+        alb.fillRect(x0, y0, w, fasciaH);
+        hgt.fillStyle = grayCss(0.95);
+        hgt.fillRect(x0, y0, w, fasciaH);
+        if (open) {
+          emi.fillStyle = capped(neon, maxTexLum * 0.55);
+          emi.fillRect(x0 + 4, y0 + 4, w - 8, fasciaH - 8);
+          // Glyph-like dashes of the shop name.
+          emi.fillStyle = capped(neon, maxTexLum);
+          const glyphs = 3 + Math.floor(rng() * 6);
+          const gw = (w - 24) / glyphs;
+          for (let gI = 0; gI < glyphs; gI++) {
+            const gh = fasciaH * (0.35 + rng() * 0.3);
+            emi.fillRect(x0 + 12 + gI * gw + gw * 0.15, y0 + (fasciaH - gh) / 2, gw * 0.7, gh);
+          }
+        }
+        const sy = y0 + fasciaH + 4;
+        const sh = h - fasciaH - 4;
+        if (open) {
+          // Lit storefront glass with interior shelves / counter silhouettes.
+          alb.fillStyle = glass;
+          alb.fillRect(x0, sy, w, sh);
+          rgh.fillStyle = grayCss(0.1);
+          rgh.fillRect(x0, sy, w, sh);
+          hgt.fillStyle = grayCss(0.3);
+          hgt.fillRect(x0, sy, w, sh);
+          const interior = rng() < 0.5 ? warm : cool;
+          const grad = emi.createLinearGradient(0, sy, 0, sy + sh);
+          grad.addColorStop(0, capped(interior, maxTexLum * 0.95));
+          grad.addColorStop(1, capped(interior, maxTexLum * 0.5));
+          emi.fillStyle = grad;
+          emi.fillRect(x0, sy, w, sh);
+          emi.fillStyle = 'rgba(0,0,0,0.6)';
+          for (let k = 0; k < span * 2; k++) {
+            emi.fillRect(x0 + 6 + rng() * (w - 30), sy + sh * (0.3 + rng() * 0.4), 10 + rng() * 18, sh * 0.6);
+          }
+          // Door.
+          const dx = x0 + rng() * (w - 34);
+          alb.fillStyle = '#1d2430';
+          alb.fillRect(dx, sy + sh * 0.12, 30, sh * 0.88);
+          // Neon frame outline around the storefront.
+          emi.strokeStyle = capped(neon, maxTexLum);
+          emi.lineWidth = 3;
+          emi.strokeRect(x0 + 2, sy + 2, w - 4, sh - 4);
+        } else {
+          // Closed: ribbed roll-down shutter.
+          alb.fillStyle = '#2a3039';
+          alb.fillRect(x0, sy, w, sh);
+          rgh.fillStyle = grayCss(0.5);
+          rgh.fillRect(x0, sy, w, sh);
+          for (let yy = sy; yy < sy + sh; yy += 5) {
+            hgt.fillStyle = grayCss(0.9);
+            hgt.fillRect(x0, yy, w, 3);
+            hgt.fillStyle = grayCss(0.5);
+            hgt.fillRect(x0, yy + 3, w, 2);
+            alb.fillStyle = 'rgba(0,0,0,0.25)';
+            alb.fillRect(x0, yy + 3, w, 1);
+          }
+          // Graffiti-tag smear and a tiny status LED.
+          alb.fillStyle = `rgba(${80 + rng() * 120},${40 + rng() * 60},${120 + rng() * 120},0.25)`;
+          alb.fillRect(x0 + rng() * w * 0.5, sy + sh * 0.4, w * 0.3, sh * 0.25);
+          emi.fillStyle = capped(neon, maxTexLum * 0.6);
+          emi.fillRect(x0 + w - 10, sy + 6, 4, 4);
+        }
+      } else {
+        // Upper shop floors: bars / karaoke / salons — windows with neon frames or dark.
+        for (let k = 0; k < span; k++) {
+          const wx = b * bayPx + k * bayPx + frame + 6;
+          const ww = bayPx - frame * 2 - 12;
+          alb.fillStyle = glass;
+          alb.fillRect(wx, y0 + 4, ww, h - 8);
+          rgh.fillStyle = grayCss(0.12);
+          rgh.fillRect(wx, y0 + 4, ww, h - 8);
+          hgt.fillStyle = grayCss(0.3);
+          hgt.fillRect(wx, y0 + 4, ww, h - 8);
+          if (open) {
+            const tint = rng() < 0.5 ? neon : rng() < 0.5 ? warm : cool;
+            emi.fillStyle = capped(tint, maxTexLum * (0.45 + rng() * 0.4));
+            emi.fillRect(wx, y0 + 4, ww, h - 8);
+            emi.strokeStyle = capped(neon, maxTexLum);
+            emi.lineWidth = 2;
+            emi.strokeRect(wx + 1, y0 + 5, ww - 2, h - 10);
+            emi.fillStyle = 'rgba(0,0,0,0.5)';
+            emi.fillRect(wx, y0 + h * 0.62, ww, h * 0.34);
+          }
+        }
+        // Small vertical signboard between tenants.
+        if (open && rng() < 0.6) {
+          const sx = b * bayPx + span * bayPx - 10;
+          alb.fillStyle = '#10141b';
+          alb.fillRect(sx, y0, 12, h);
+          emi.fillStyle = capped(neon, maxTexLum);
+          for (let yy = y0 + 6; yy < y0 + h - 8; yy += 14) emi.fillRect(sx + 3, yy, 6, 8);
+        }
+      }
+      // Pilasters between tenants.
+      alb.fillStyle = mullionAlb;
+      alb.fillRect(b * bayPx, fy, frame, floorPx - spandrelPx);
+      hgt.fillStyle = grayCss(1.0);
+      hgt.fillRect(b * bayPx, fy, frame, floorPx - spandrelPx);
+      b += span;
+    }
   }
 
   return {
@@ -546,6 +652,238 @@ function generateRoofSet(anisotropy: number): PbrTextureSet {
     roughnessMap: finalizeTexture(rghC, THREE.NoColorSpace, anisotropy),
     normalMap: normalTextureFromHeight(hgt, S, S, 1.1, anisotropy),
   };
+}
+
+// ---------------------------------------------------------------------------
+// 2b. Wet road atlas (512²): Albedo / Roughness (puddle 0.06, wet 0.42) / Normal
+//     Four independently tileable regions, sampled via per-vertex atlas rects (textureGrad + fract):
+//       LANES4    u 0.00–0.50, v 0–1   : 4-lane avenue / expressway strip (14 m × 28 m tile)
+//       LANES2    u 0.50–0.75, v 0–0.5 : 2-lane street strip (10 m × 20 m tile)
+//       CROSSWALK u 0.50–0.75, v 0.5–1 : zebra crossing (2 m across × 4 m deep tile)
+//       ASPHALT   u 0.75–1.00, v 0–1   : unmarked asphalt for intersections / plazas (6 m × 24 m tile)
+// ---------------------------------------------------------------------------
+export interface AtlasRegion {
+  /** UV rect inside the atlas texture. */
+  readonly u0: number;
+  readonly v0: number;
+  readonly u1: number;
+  readonly v1: number;
+  /** World size of one tile of this region (m): across the road / along the road. */
+  readonly tileAcross: number;
+  readonly tileAlong: number;
+}
+
+export const ROAD_ATLAS = {
+  LANES4: { u0: 0.0, v0: 0.0, u1: 0.5, v1: 1.0, tileAcross: 14, tileAlong: 28 },
+  LANES2: { u0: 0.5, v0: 0.0, u1: 0.75, v1: 0.5, tileAcross: 10, tileAlong: 20 },
+  CROSSWALK: { u0: 0.5, v0: 0.5, u1: 0.75, v1: 1.0, tileAcross: 2, tileAlong: 4 },
+  ASPHALT: { u0: 0.75, v0: 0.0, u1: 1.0, v1: 1.0, tileAcross: 6, tileAlong: 24 },
+} as const satisfies Record<string, AtlasRegion>;
+
+function generateRoadAtlas(anisotropy: number): PbrTextureSet {
+  const S = RENDER.ROAD_TEX_SIZE;
+  const rng = createRng(0x40ad);
+  const [albC, alb] = makeCanvas(S, S);
+  const [rghC, rgh] = makeCanvas(S, S);
+  const [, hgt] = makeCanvas(S, S);
+  const albD = alb.createImageData(S, S);
+  const rghD = rgh.createImageData(S, S);
+  const hgtD = hgt.createImageData(S, S);
+  const puddle = new Float32Array(S * S);
+  const baseLin: [number, number, number] = [0, 0, 0];
+  hexToLinearRgb(COLORS.ROOF_WET, baseLin);
+
+  /** Canvas-space pixel rect of a region (canvas y grows downward; uv v grows upward). */
+  const px = (r: AtlasRegion): { x0: number; y0: number; w: number; h: number } => ({
+    x0: Math.round(r.u0 * S),
+    y0: Math.round((1 - r.v1) * S),
+    w: Math.round((r.u1 - r.u0) * S),
+    h: Math.round((r.v1 - r.v0) * S),
+  });
+
+  // --- Asphalt base + puddles, tileable inside each region ---
+  const regions: AtlasRegion[] = [ROAD_ATLAS.LANES4, ROAD_ATLAS.LANES2, ROAD_ATLAS.CROSSWALK, ROAD_ATLAS.ASPHALT];
+  for (const r of regions) {
+    const { x0, y0, w, h } = px(r);
+    const grain: TileableValueNoise[] = [];
+    const pud: TileableValueNoise[] = [];
+    for (let i = 0; i < 5; i++) {
+      grain.push(new TileableValueNoise(128, rng));
+      pud.push(new TileableValueNoise(128, rng));
+    }
+    // Puddle period scales with the tile's world size so puddles keep a ~3–6 m scale.
+    const pudPeriod = Math.max(1, Math.round(Math.max(r.tileAcross, r.tileAlong) / 7));
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        const u = x / w;
+        const v = y / h;
+        const g = fbm(grain, 8, u, v);
+        const speck = grain[4].sample(u * 128, v * 128);
+        const p = fbm(pud, pudPeriod, u, v);
+        const m = clamp((p - 0.55) / 0.06, 0, 1);
+        const pm = m * m * (3 - 2 * m);
+        const gi = (y0 + y) * S + (x0 + x);
+        puddle[gi] = pm;
+        const shade = 0.72 + g * 0.5 + (speck - 0.5) * 0.3;
+        const rr = baseLin[0] * shade;
+        const gg = baseLin[1] * shade;
+        const bb = baseLin[2] * shade;
+        const i = gi * 4;
+        albD.data[i] = linearToSrgbByte(rr);
+        albD.data[i + 1] = linearToSrgbByte(gg);
+        albD.data[i + 2] = linearToSrgbByte(bb);
+        albD.data[i + 3] = 255;
+        const rv = Math.round(ROOF_WET_ROUGHNESS * 255);
+        rghD.data[i] = rghD.data[i + 1] = rghD.data[i + 2] = rv;
+        rghD.data[i + 3] = 255;
+        const hv = Math.round(clamp(0.55 + (g - 0.5) * 0.3 + (speck - 0.5) * 0.15, 0, 1) * 255);
+        hgtD.data[i] = hgtD.data[i + 1] = hgtD.data[i + 2] = hv;
+        hgtD.data[i + 3] = 255;
+      }
+    }
+  }
+  alb.putImageData(albD, 0, 0);
+  rgh.putImageData(rghD, 0, 0);
+  hgt.putImageData(hgtD, 0, 0);
+
+  // --- Paint helpers (wet road paint: dull, slightly raised, roughness 0.3) ---
+  const WHITE = '#bfc5cc';
+  const AMBER = '#c79a3c';
+  const paint = (x: number, y: number, w: number, h: number, color: string): void => {
+    alb.fillStyle = color;
+    alb.fillRect(x, y, w, h);
+    rgh.fillStyle = grayCss(0.3);
+    rgh.fillRect(x, y, w, h);
+    hgt.fillStyle = grayCss(0.72);
+    hgt.fillRect(x, y, w, h);
+  };
+  const manhole = (cx: number, cy: number, rad: number): void => {
+    alb.fillStyle = '#15181d';
+    alb.beginPath();
+    alb.arc(cx, cy, rad, 0, Math.PI * 2);
+    alb.fill();
+    rgh.fillStyle = grayCss(0.28);
+    rgh.beginPath();
+    rgh.arc(cx, cy, rad, 0, Math.PI * 2);
+    rgh.fill();
+    hgt.fillStyle = grayCss(0.5);
+    hgt.beginPath();
+    hgt.arc(cx, cy, rad, 0, Math.PI * 2);
+    hgt.fill();
+    hgt.strokeStyle = grayCss(0.2);
+    hgt.lineWidth = 2;
+    for (let r = rad * 0.3; r < rad; r += rad * 0.22) {
+      hgt.beginPath();
+      hgt.arc(cx, cy, r, 0, Math.PI * 2);
+      hgt.stroke();
+    }
+    hgt.beginPath();
+    hgt.moveTo(cx - rad, cy);
+    hgt.lineTo(cx + rad, cy);
+    hgt.moveTo(cx, cy - rad);
+    hgt.lineTo(cx, cy + rad);
+    hgt.stroke();
+    hgt.strokeStyle = grayCss(0.85);
+    hgt.lineWidth = 2;
+    hgt.beginPath();
+    hgt.arc(cx, cy, rad, 0, Math.PI * 2);
+    hgt.stroke();
+  };
+
+  // LANES4: 14 m across (256 px → 18.3 px/m), 28 m along (512 px). Lanes at 0–3.5–7–10.5–14 m.
+  {
+    const { x0, y0, w, h } = px(ROAD_ATLAS.LANES4);
+    const ppm = w / 14;
+    const line = Math.max(2, Math.round(0.15 * ppm));
+    paint(x0 + Math.round(0.3 * ppm), y0, line, h, WHITE); // edge lines
+    paint(x0 + w - Math.round(0.3 * ppm) - line, y0, line, h, WHITE);
+    paint(x0 + Math.round((7 - 0.22) * ppm) - line / 2, y0, line, h, AMBER); // double centre line
+    paint(x0 + Math.round((7 + 0.22) * ppm) - line / 2, y0, line, h, AMBER);
+    const dashPeriod = h / 4; // 7 m
+    for (const lane of [3.5, 10.5]) {
+      for (let k = 0; k < 4; k++) paint(x0 + Math.round(lane * ppm) - line / 2, y0 + k * dashPeriod, line, dashPeriod * (3 / 7), WHITE);
+    }
+    manhole(x0 + Math.round(5.2 * ppm), y0 + h * 0.62, 0.55 * ppm);
+    manhole(x0 + Math.round(12.1 * ppm), y0 + h * 0.18, 0.5 * ppm);
+  }
+  // LANES2: 10 m across (128 px), 20 m along (256 px). Centre dashed line, edge lines.
+  {
+    const { x0, y0, w, h } = px(ROAD_ATLAS.LANES2);
+    const ppm = w / 10;
+    const line = Math.max(2, Math.round(0.15 * ppm));
+    paint(x0 + Math.round(0.3 * ppm), y0, line, h, WHITE);
+    paint(x0 + w - Math.round(0.3 * ppm) - line, y0, line, h, WHITE);
+    const dashPeriod = h / 4; // 5 m
+    for (let k = 0; k < 4; k++) paint(x0 + Math.round(5 * ppm) - line / 2, y0 + k * dashPeriod, line, dashPeriod * 0.6, WHITE);
+    manhole(x0 + Math.round(2.6 * ppm), y0 + h * 0.4, 0.5 * ppm);
+  }
+  // CROSSWALK: 2 m across (128 px), 4 m along (256 px): two 0.5 m bars per tile, parallel to traffic.
+  {
+    const { x0, y0, w, h } = px(ROAD_ATLAS.CROSSWALK);
+    const ppm = w / 2;
+    for (const off of [0.25, 1.25]) {
+      paint(x0 + Math.round(off * ppm), y0 + 2, Math.round(0.5 * ppm), h - 4, WHITE);
+      // Tyre-worn patches in the paint.
+      for (let k = 0; k < 6; k++) {
+        alb.fillStyle = `rgba(30,34,40,${0.25 + rng() * 0.35})`;
+        alb.fillRect(x0 + Math.round(off * ppm) + rng() * 0.4 * ppm, y0 + rng() * h, 4 + rng() * 10, 6 + rng() * 20);
+      }
+    }
+  }
+  // ASPHALT: patch repairs, oil stains, one manhole.
+  {
+    const { x0, y0, w, h } = px(ROAD_ATLAS.ASPHALT);
+    for (let k = 0; k < 5; k++) {
+      const pw = 14 + rng() * 40;
+      const ph = 14 + rng() * 60;
+      const xx = x0 + rng() * (w - pw);
+      const yy = y0 + rng() * (h - ph);
+      alb.fillStyle = 'rgba(8,10,14,0.35)';
+      alb.fillRect(xx, yy, pw, ph);
+      hgt.strokeStyle = grayCss(0.35);
+      hgt.lineWidth = 2;
+      hgt.strokeRect(xx, yy, pw, ph);
+    }
+    for (let k = 0; k < 8; k++) {
+      const g = alb.createRadialGradient(0, 0, 0, 0, 0, 1);
+      g.addColorStop(0, 'rgba(10,8,18,0.55)');
+      g.addColorStop(1, 'rgba(10,8,18,0)');
+      alb.save();
+      alb.translate(x0 + 8 + rng() * (w - 16), y0 + 8 + rng() * (h - 16));
+      alb.scale(6 + rng() * 10, 10 + rng() * 18);
+      alb.fillStyle = g;
+      alb.beginPath();
+      alb.arc(0, 0, 1, 0, Math.PI * 2);
+      alb.fill();
+      alb.restore();
+    }
+    manhole(x0 + w * 0.5, y0 + h * 0.3, 0.55 * (w / 6));
+  }
+
+  // --- Water over paint: re-apply puddles (darker albedo, mirror roughness, flat height) ---
+  const a2 = alb.getImageData(0, 0, S, S);
+  const r2 = rgh.getImageData(0, 0, S, S);
+  const h2 = hgt.getImageData(0, 0, S, S);
+  for (let i = 0; i < S * S; i++) {
+    const pm = puddle[i];
+    if (pm <= 0) continue;
+    const j = i * 4;
+    a2.data[j] = Math.round(a2.data[j] * (1 - pm * 0.45));
+    a2.data[j + 1] = Math.round(a2.data[j + 1] * (1 - pm * 0.4));
+    a2.data[j + 2] = Math.round(a2.data[j + 2] * (1 - pm * 0.3));
+    const rv = Math.round(((r2.data[j] / 255) * (1 - pm) + ROOF_PUDDLE_ROUGHNESS * pm) * 255);
+    r2.data[j] = r2.data[j + 1] = r2.data[j + 2] = rv;
+    const hv = Math.round(((h2.data[j] / 255) * (1 - pm) + 0.45 * pm) * 255);
+    h2.data[j] = h2.data[j + 1] = h2.data[j + 2] = hv;
+  }
+  alb.putImageData(a2, 0, 0);
+  rgh.putImageData(r2, 0, 0);
+  hgt.putImageData(h2, 0, 0);
+
+  const map = finalizeTexture(albC, THREE.SRGBColorSpace, anisotropy);
+  const roughnessMap = finalizeTexture(rghC, THREE.NoColorSpace, anisotropy);
+  const normalMap = normalTextureFromHeight(hgt, S, S, 1.2, anisotropy);
+  return { map, roughnessMap, normalMap };
 }
 
 // ---------------------------------------------------------------------------
@@ -794,6 +1132,7 @@ export function getProceduralTextures(renderer: THREE.WebGLRenderer): Procedural
   cache = {
     windows: generateWindowSet(aniso),
     roof: generateRoofSet(aniso),
+    roads: generateRoadAtlas(aniso),
     wallPanel: generateWallPanelSet(aniso),
     machinery: generateMachinerySet(aniso),
     neonAtlas: generateNeonAtlas(aniso),

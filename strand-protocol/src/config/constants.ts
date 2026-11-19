@@ -1,18 +1,15 @@
 /**
  * STRAND // PROTOCOL — Global constants.
  * Physics, camera, juice, durability, out-of-combat regen, color tokens,
- * render pipeline and performance limits. Every value is taken verbatim
- * from GAME_DESIGN_SPEC.md (v1.0); section references are noted per block.
+ * render pipeline, multi-layer city geometry and performance limits.
+ * Every value is taken verbatim from GAME_DESIGN_SPEC.md (v1.1); section references are noted per block.
  */
 
 // ---------------------------------------------------------------------------
 // §1.1 Concept
 // ---------------------------------------------------------------------------
 export const GAME_TITLE = 'STRAND // PROTOCOL';
-export const GAME_SUBTITLE = 'HIGH-ALTITUDE KINETIC GUNPLAY';
-/** Real-world altitude band of the playable upper district (m). Sector base roof (y = 0) maps to the low end. */
-export const WORLD_ALTITUDE_MIN_M = 320;
-export const WORLD_ALTITUDE_MAX_M = 480;
+export const GAME_SUBTITLE = 'CYBERNETIC KINETIC GUNPLAY';
 
 // ---------------------------------------------------------------------------
 // §1.3 Player durability, out-of-combat regen, instant retry
@@ -27,8 +24,7 @@ export const PLAYER = {
   CRITICAL_HEARTBEAT_BPM: 128,
   REGEN_DELAY_MS: 3000,
   REGEN_RATE_HP_PER_S: 18.0,
-  KILL_PLANE_Y: -45.0,
-  FALL_WARNING_Y: -20.0,
+  /** v1.1: no fall death — the street (Y = 0) exists; the canal is a shallow landing (see LEVEL / PHYSICS). */
   /** Death → automatic retry total (glitch blackout + respawn). */
   DEATH_RETRY_MS: 500,
   DEATH_GLITCH_MS: 250,
@@ -214,6 +210,8 @@ export const PHYSICS = {
   RUN_SPEED: 10.5,
   GROUND_ACCEL: 75,
   GROUND_FRICTION: 10.0,
+  /** Grounded on the canal water surface (Y = -2.4 m): ground speed × 0.55; jump / grapple exit instantly. */
+  CANAL_SPEED_MULT: 0.55,
   JUMP_VELOCITY: 10.8,
   AIR_ACCEL: 18.0,
   AIR_STRAFE_SPEED_LIMIT: 11.5,
@@ -323,6 +321,17 @@ export const COLORS = {
   ENEMY_AIM: 0xff7a00,
   SHIELD_AMBER: 0xff9500,
   GATE_JADE: 0x00ff9d,
+  CANAL_WATER: 0x06111b,
+  HIGHWAY_CONCRETE: 0x1a202c,
+  CAR_BODY: 0x171d28,
+  CAR_LED_WHITE: 0xf2f8ff,
+  CAR_LED_CYAN: 0x38f8ff,
+  CAR_LED_REAR: 0xff1a2e,
+  CAR_HAZARD: 0xff9a1a,
+  HIGHWAY_LIGHT_CYAN: 0x2ee8ff,
+  HIGHWAY_LIGHT_AMBER: 0xffa12e,
+  BARRIER_RED: 0xff2a3c,
+  STREET_LAMP: 0xd8ecff,
   HUMANOID_MATTE: 0x141821,
   BT_TINT: 0x0a2a40,
   CRITICAL_VIGNETTE: 0xcc0022,
@@ -337,9 +346,16 @@ export interface PbrToken {
   readonly roughnessMax?: number;
   readonly metalness: number;
   readonly emissive: number;
+  readonly emissiveMax?: number;
 }
 export const MATERIALS = {
-  ROOF_WET: { roughness: 0.12, roughnessMax: 0.45, metalness: 0.25, emissive: 0.0 },
+  /** Wet road & rooftop asphalt: roughness map 0.06 (puddle) … 0.42 (wet). */
+  ROOF_WET: { roughness: 0.06, roughnessMax: 0.42, metalness: 0.25, emissive: 0.0 },
+  CANAL_WATER: { roughness: 0.04, metalness: 0.85, emissive: 0.0 },
+  /** Elevated highway / bridge concrete; underside industrial light strips at emissive 1.6. */
+  HIGHWAY_CONCRETE: { roughness: 0.48, metalness: 0.3, emissive: 1.6 },
+  /** Parked cyber-car body; LED bands 2.2 … 2.8. */
+  CAR_BODY: { roughness: 0.22, metalness: 0.78, emissive: 2.2, emissiveMax: 2.8 },
   BUILDING_GLASS: { roughness: 0.15, metalness: 0.85, emissive: 0.45 },
   WALLRUN_PANEL: { roughness: 0.2, metalness: 0.6, emissive: 2.2 },
   GRAPPLE_ANCHOR: { roughness: 0.25, metalness: 0.8, emissive: 2.8 },
@@ -368,7 +384,8 @@ export const RENDER = {
   TONE_MAPPING_EXPOSURE: 1.15,
   MSAA_SAMPLES: 4,
   ENV_CUBE_SIZE: 256,
-  FOG_DENSITY: 0.0042,
+  /** v1.1: FogExp2(0x0D1628, 0.0036) — the cloud-deck mesh is abolished. */
+  FOG_DENSITY: 0.0036,
   BLOOM_THRESHOLD: 0.92,
   BLOOM_STRENGTH: 0.65,
   BLOOM_STRENGTH_SSS: 0.95,
@@ -382,12 +399,21 @@ export const RENDER = {
   DPR_CAP: 1.5,
   WINDOW_TEX_SIZE: 1024,
   ROOF_TEX_SIZE: 512,
-  /** World-space tiling of the window texture: 8 bays × 3 m, 8 floors × 4 m. */
+  ROAD_TEX_SIZE: 512,
+  /**
+   * Window atlas: 8 rows × 4 m. Rows 0–4 (top of canvas) = office floors, repeating every 20 m above 12 m.
+   * Rows 5–7 (bottom) = low-rise shop floors (1F–3F, Y 0–12 m) with neon shop frames. 8 bays × 3 m.
+   */
   WINDOW_TILE_WIDTH_M: 24,
-  WINDOW_TILE_HEIGHT_M: 32,
-  WINDOW_FLOORS_PER_TILE: 8,
+  WINDOW_FLOOR_HEIGHT_M: 4,
+  WINDOW_ROWS: 8,
+  WINDOW_OFFICE_ROWS: 5,
+  WINDOW_SHOP_ROWS: 3,
   WINDOW_BAYS_PER_TILE: 8,
   ROOF_TILE_M: 14,
+  /** City-light reflections (street lamps / bridge neon / highway strips) evaluated in ground, road & water shaders. */
+  CITY_LIGHTS_MAX: 24,
+  CITY_LIGHT_RANGE_M: 20,
   WALLRUN_CHEVRON_TILE_M: 4,
   AVIATION_BLINK_HZ: 1.2,
 } as const;
@@ -409,7 +435,9 @@ export const QUALITY_PRESETS: Readonly<Record<QualityPreset, QualityDef>> = {
 // ---------------------------------------------------------------------------
 export const LIMITS = {
   DRAW_CALLS_PER_FRAME: 120,
-  FAR_BUILDINGS: 80,
+  FAR_BUILDINGS: 100,
+  PARKED_CARS: 45,
+  HOVER_TRAILS: 40,
   RAIN_DROPS: 1800,
   RAIN_BOX_X: 45,
   RAIN_BOX_Y: 30,
@@ -423,19 +451,76 @@ export const LIMITS = {
 } as const;
 
 // ---------------------------------------------------------------------------
-// §8.1 Level geometry
+// §1.1 / §6.2-2 / §8.1 Multi-layer cyberpunk district geometry (v1.1)
 // ---------------------------------------------------------------------------
 export const LEVEL = {
-  PLAY_AREA_M: 140,
-  GAP_MIN_M: 18,
-  GAP_MAX_M: 42,
-  /** Building bodies extend far below the cloud deck so their bases are never visible. */
-  BUILDING_BASE_Y: -380,
-  /** Cloud deck sits ~300 m below the sector reference roof. */
-  CLOUD_DECK_Y: -300,
-  /** Far-field ring of background towers. */
-  FAR_RING_INNER_M: 150,
-  FAR_RING_OUTER_M: 620,
+  /** Playable district ≈ 180 m × 180 m centred on the origin. */
+  PLAY_AREA_M: 180,
+  HALF_EXTENT_M: 90,
+  /** Layer 0: wet avenue & alleys. */
+  GROUND_Y: 0.0,
+  /** Layer 0: canal water surface (shallow landing, no death). */
+  CANAL_WATER_Y: -2.4,
+  CANAL_WIDTH_MIN_M: 14,
+  CANAL_WIDTH_MAX_M: 18,
+  /** Visual canal bed below the water surface. */
+  CANAL_BED_Y: -3.4,
+  /** Canal-side towpath ledge (lets a jump escape the canal in two hops: −2.4 → −1.1 → 0). */
+  CANAL_TOWPATH_Y: -1.1,
+  CANAL_TOWPATH_WIDTH_M: 1.2,
+  CANAL_PROMENADE_M: 3,
+  /** Truss bridges: deck surface within Y 0.0 … +0.5 (flat at 0.0 here), truss height above deck. */
+  BRIDGE_DECK_Y: 0.0,
+  BRIDGE_DECK_THICKNESS_M: 0.6,
+  BRIDGE_TRUSS_HEIGHT_M: 6.0,
+  /** Layer 1: elevated expressway. */
+  HIGHWAY_DECK_Y: 9.5,
+  HIGHWAY_MIN_CLEARANCE_M: 7.8,
+  /** Underside of the girders (≥ 7.8 m clearance). */
+  HIGHWAY_UNDERSIDE_Y: 7.9,
+  /** 2 lanes each direction + central median. */
+  HIGHWAY_WIDTH_M: 14,
+  HIGHWAY_GUARD_HEIGHT_M: 1.1,
+  HIGHWAY_GUARD_THICKNESS_M: 0.4,
+  HIGHWAY_MEDIAN_HEIGHT_M: 0.8,
+  HIGHWAY_PIER_SPACING_MIN_M: 24,
+  HIGHWAY_PIER_SPACING_MAX_M: 28,
+  HIGHWAY_ANCHOR_SPACING_M: 24,
+  RAMP_WIDTH_M: 7,
+  RAMP_MAX_LENGTH_M: 38,
+  RAMP_MIN_LENGTH_M: 26,
+  /** Layer 2: mid-level sky-bridges & projecting neon signs. */
+  SKYBRIDGE_Y_MIN: 18,
+  SKYBRIDGE_Y_MAX: 35,
+  /** Layer 3: high rooftops (sniper nests). */
+  ROOF_LAYER_Y_MIN: 30,
+  ROOF_LAYER_Y_MAX: 95,
+  BUILDING_HEIGHT_MIN_M: 16,
+  BUILDING_HEIGHT_MAX_M: 95,
+  BUILDINGS_MIN: 14,
+  BUILDINGS_MAX: 22,
+  /** Street cross-sections. */
+  AVENUE_WIDTH_M: 14,
+  AVENUE_SIDEWALK_M: 4,
+  STREET_WIDTH_M: 10,
+  STREET_SIDEWALK_M: 3.5,
+  ALLEY_WIDTH_M: 6,
+  /** Parked cyber-cars. */
+  PARKED_CARS_MIN: 25,
+  PARKED_CARS_MAX: 45,
+  CAR_SIZE_X_M: 2.0,
+  CAR_SIZE_Y_M: 1.35,
+  CAR_SIZE_Z_M: 4.4,
+  /** City-lockdown barrier height (above the tallest tower so it cannot be grappled over). */
+  BOUNDARY_HEIGHT_M: 110,
+  /** Far-field ring of supertall towers + hover-car trails. */
+  FAR_RING_INNER_M: 160,
+  FAR_RING_OUTER_M: 650,
+  FAR_BUILDINGS_MIN: 80,
+  /** Streets / highways / canals are drawn past the barrier up to this distance for continuity. */
+  VISUAL_EXTENT_M: 175,
+  /** Ground plane drawn out to this radius under the far ring. */
+  OUTER_GROUND_M: 720,
 } as const;
 
 /** localStorage key (§8.3). */
