@@ -1,0 +1,318 @@
+/**
+ * STRAND // PROTOCOL — Entry point.
+ * Fixed-step simulation (120 Hz, frame clamp 0.05 s) + variable-rate rendering with interpolation,
+ * global game clock (bullet-time × hitstop time scaling), scene orchestration.
+ */
+import * as THREE from 'three';
+import {
+  FIXED_DT,
+  MAX_FRAME_DT,
+  GAME_TITLE,
+  GAME_SUBTITLE,
+  CAMERA,
+  PLAYER,
+  DEG2RAD,
+  type HitstopDef,
+  type QualityPreset,
+  QUALITY_PRESETS,
+  clamp,
+  lerpFactor,
+} from './config/constants';
+import { SECTORS } from './config/skills';
+import { Renderer } from './engine/Renderer';
+import { getProceduralTextures } from './engine/ProceduralTextures';
+import { CityBuilder, type SectorLayout } from './world/CityBuilder';
+import { EffectsPool } from './entities/EffectsPool';
+
+// ---------------------------------------------------------------------------
+// Game clock: simulation dt = real dt × min(bullet-time scale, hitstop scale).
+// Mouse look always uses real dt (handled by the input layer).
+// ---------------------------------------------------------------------------
+export class GameClock {
+  /** Bullet-time scale (1.0 or 0.25). */
+  bulletTimeScale = 1.0;
+  private hitstopRemainingMs = 0;
+  private hitstopScale = 1.0;
+  /** Accumulated scaled simulation time (s). */
+  simTime = 0;
+  /** Accumulated real time (s). */
+  realTime = 0;
+
+  /** Starts / extends a hitstop; the strongest (lowest scale) wins while overlapping. */
+  hitstop(def: HitstopDef): void {
+    if (def.durationMs <= 0) return;
+    if (this.hitstopRemainingMs <= 0 || def.timeScale <= this.hitstopScale) {
+      this.hitstopScale = def.timeScale;
+      this.hitstopRemainingMs = Math.max(this.hitstopRemainingMs, def.durationMs);
+    }
+  }
+
+  get timeScale(): number {
+    return Math.min(this.bulletTimeScale, this.hitstopRemainingMs > 0 ? this.hitstopScale : 1.0);
+  }
+
+  get inHitstop(): boolean {
+    return this.hitstopRemainingMs > 0;
+  }
+
+  /** Advances clocks; returns scaled simulation dt for this frame. */
+  advance(realDt: number): number {
+    const scaled = realDt * this.timeScale;
+    this.realTime += realDt;
+    this.simTime += scaled;
+    if (this.hitstopRemainingMs > 0) {
+      this.hitstopRemainingMs = Math.max(0, this.hitstopRemainingMs - realDt * 1000);
+      if (this.hitstopRemainingMs === 0) this.hitstopScale = 1.0;
+    }
+    return scaled;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Title-screen attract camera: arc-length-parameterised fly-through of the live sector.
+// ---------------------------------------------------------------------------
+const _a = new THREE.Vector3();
+const _b = new THREE.Vector3();
+const _look = new THREE.Vector3();
+const _t0 = new THREE.Vector3();
+const _t1 = new THREE.Vector3();
+
+class AttractCamera {
+  private curve: THREE.CatmullRomCurve3 | null = null;
+  private length = 1;
+  private u = 0;
+  private prevU = 0;
+  readonly speed = 15.5;
+  private roll = 0;
+
+  rebuild(layout: SectorLayout): void {
+    const towers = layout.buildings.filter((b) => !b.isGateTower);
+    // Nearest-neighbour tour starting at the spawn tower.
+    const order = [towers[0]];
+    const left = towers.slice(1);
+    while (left.length) {
+      const last = order[order.length - 1];
+      let bi = 0;
+      let bd = Infinity;
+      left.forEach((b, i) => {
+        const d = Math.hypot(b.cx - last.cx, b.cz - last.cz);
+        if (d < bd) {
+          bd = d;
+          bi = i;
+        }
+      });
+      order.push(left.splice(bi, 1)[0]);
+    }
+    const pts: THREE.Vector3[] = [];
+    order.forEach((b, i) => {
+      const next = order[(i + 1) % order.length];
+      // Skim low across the wet roof (puddle reflections), then dive through the gap past the panels.
+      pts.push(new THREE.Vector3(b.cx - b.halfW * 0.4, b.roofY + 2.4, b.cz - b.halfD * 0.2));
+      pts.push(new THREE.Vector3(b.cx + b.halfW * 0.35, b.roofY + 3.2, b.cz + b.halfD * 0.3));
+      const mx = (b.cx + next.cx) / 2;
+      const mz = (b.cz + next.cz) / 2;
+      pts.push(new THREE.Vector3(mx, Math.min(b.roofY, next.roofY) - 7, mz));
+    });
+    this.curve = new THREE.CatmullRomCurve3(pts, true, 'centripetal', 0.5);
+    this.curve.arcLengthDivisions = 600;
+    this.length = this.curve.getLength();
+    this.u = 0;
+    this.prevU = 0;
+  }
+
+  /** Fixed-step advance. */
+  step(dt: number): void {
+    this.prevU = this.u;
+    this.u = (this.u + (this.speed * dt) / this.length) % 1;
+  }
+
+  /** Interpolated pose → camera. Returns the camera world position. */
+  apply(camera: THREE.PerspectiveCamera, alpha: number, realDt: number): void {
+    if (!this.curve) return;
+    let u = this.prevU + (this.u - this.prevU) * alpha;
+    if (this.u < this.prevU) u = (this.prevU + (this.u + 1 - this.prevU) * alpha) % 1;
+    this.curve.getPointAt(u, _a);
+    this.curve.getPointAt((u + 18 / this.length) % 1, _b);
+    _look.copy(_b);
+    _look.y -= 1.5;
+    camera.position.copy(_a);
+    camera.lookAt(_look);
+    // Bank into turns from tangent change (≤ 9°, same cap as swing roll).
+    this.curve.getTangentAt(u, _t0);
+    this.curve.getTangentAt((u + 6 / this.length) % 1, _t1);
+    const turn = _t0.x * _t1.z - _t0.z * _t1.x;
+    const target = clamp(-turn * 2.2, -CAMERA.SWING_ROLL_MAX_DEG * DEG2RAD, CAMERA.SWING_ROLL_MAX_DEG * DEG2RAD);
+    this.roll += (target - this.roll) * lerpFactor(CAMERA.SWING_ROLL_LERP, realDt);
+    camera.rotateZ(this.roll);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Application
+// ---------------------------------------------------------------------------
+class App {
+  private readonly renderer: Renderer;
+  private readonly city: CityBuilder;
+  private readonly effects: EffectsPool;
+  private readonly clock = new GameClock();
+  private readonly attract = new AttractCamera();
+  private layout: SectorLayout;
+  private accumulator = 0;
+  private lastFrame = performance.now();
+  private readonly camVel = new THREE.Vector3();
+  private readonly prevCamPos = new THREE.Vector3();
+  private readonly debugEl: HTMLElement | null;
+  /** Debug-only frozen camera pose from `?view=x,y,z,yawDeg,pitchDeg` (visual verification). */
+  private readonly fixedView: { pos: THREE.Vector3; yaw: number; pitch: number } | null;
+  private fpsFrames = 0;
+  private fpsTime = 0;
+  private fps = 0;
+
+  constructor(container: HTMLElement) {
+    this.renderer = new Renderer(container);
+    const params = new URLSearchParams(window.location.search);
+    const q = params.get('quality')?.toUpperCase();
+    if (q && q in QUALITY_PRESETS) this.renderer.setQuality(q as QualityPreset);
+
+    const t0 = performance.now();
+    const textures = getProceduralTextures(this.renderer.renderer);
+    const t1 = performance.now();
+    this.city = new CityBuilder(textures);
+    this.renderer.scene.add(this.city.root);
+    this.effects = new EffectsPool(this.renderer.scene);
+
+    const sectorParam = clamp(parseInt(params.get('sector') ?? '1', 10) || 1, 1, SECTORS.length);
+    this.layout = this.city.buildSector(sectorParam, 0);
+    this.city.setGateActive(params.get('gate') === '1');
+    this.attract.rebuild(this.layout);
+
+    const viewParam = params.get('view');
+    const view = viewParam?.split(',').map(Number);
+    if (viewParam === 'spawn') {
+      // Player eye height on the spawn roof, facing the sector centre.
+      this.fixedView = {
+        pos: this.layout.playerSpawn.clone().setY(this.layout.playerSpawn.y + PLAYER.EYE_HEIGHT),
+        yaw: this.layout.playerSpawnYaw,
+        pitch: -10 * DEG2RAD,
+      };
+    } else {
+      this.fixedView =
+        view && view.length === 5 && view.every((v) => Number.isFinite(v))
+          ? { pos: new THREE.Vector3(view[0], view[1], view[2]), yaw: view[3] * DEG2RAD, pitch: view[4] * DEG2RAD }
+          : null;
+    }
+
+    this.debugEl = params.get('debug') === '1' ? document.getElementById('debug-stats') : null;
+    if (this.debugEl) console.info(`[STRAND] procedural textures ${(t1 - t0).toFixed(0)} ms, sector build ${(performance.now() - t1).toFixed(0)} ms`);
+    if (this.debugEl) this.debugEl.hidden = false;
+
+    const titleEl = document.getElementById('title-name');
+    const subEl = document.getElementById('title-sub');
+    const sectorEl = document.getElementById('title-sector');
+    if (titleEl) titleEl.textContent = GAME_TITLE;
+    if (subEl) subEl.textContent = GAME_SUBTITLE;
+    if (sectorEl) sectorEl.textContent = `${this.layout.sector.name} // ${this.layout.sector.subtitle}`;
+
+    this.attract.step(0);
+    this.attract.apply(this.renderer.camera, 1, 0);
+    this.prevCamPos.copy(this.renderer.camera.position);
+  }
+
+  start(): void {
+    const frame = (now: number): void => {
+      requestAnimationFrame(frame);
+      const realDt = Math.min((now - this.lastFrame) / 1000, MAX_FRAME_DT);
+      this.lastFrame = now;
+      this.tick(realDt);
+    };
+    requestAnimationFrame(frame);
+  }
+
+  private fixedUpdate(dt: number): void {
+    this.attract.step(dt);
+  }
+
+  private tick(realDt: number): void {
+    const simDt = this.clock.advance(realDt);
+
+    // Fixed-step simulation.
+    this.accumulator += simDt;
+    let steps = 0;
+    while (this.accumulator >= FIXED_DT && steps < 12) {
+      this.fixedUpdate(FIXED_DT);
+      this.accumulator -= FIXED_DT;
+      steps++;
+    }
+    if (steps === 12) this.accumulator = 0;
+    const alpha = this.accumulator / FIXED_DT;
+
+    // Camera pose (interpolated).
+    const cam = this.renderer.camera;
+    if (this.fixedView) {
+      cam.position.copy(this.fixedView.pos);
+      cam.rotation.set(this.fixedView.pitch, this.fixedView.yaw, 0, 'YXZ');
+    } else {
+      this.attract.apply(cam, alpha, realDt);
+    }
+    this.renderer.setFov(CAMERA.BASE_FOV);
+    if (simDt > 0) this.camVel.subVectors(cam.position, this.prevCamPos).divideScalar(simDt);
+    this.prevCamPos.copy(cam.position);
+
+    // World & effects.
+    this.city.update(this.clock.simTime, cam.position);
+    this.effects.update(simDt, cam.position, this.camVel);
+
+    const fx = this.renderer.postFx;
+    fx.speed = this.camVel.length();
+    this.renderer.update(realDt);
+    this.renderer.render();
+
+    if (this.debugEl) this.updateDebug(realDt);
+  }
+
+  private updateDebug(realDt: number): void {
+    this.fpsFrames++;
+    this.fpsTime += realDt;
+    if (this.fpsTime >= 0.5) {
+      this.fps = this.fpsFrames / this.fpsTime;
+      this.fpsFrames = 0;
+      this.fpsTime = 0;
+      const info = this.renderer.renderer.info;
+      if (this.debugEl) {
+        this.debugEl.textContent =
+          `FPS ${this.fps.toFixed(0)}  |  CALLS ${this.renderer.drawCalls}  |  TRIS ${(this.renderer.triangles / 1000).toFixed(1)}k  |  ` +
+          `GEO ${info.memory.geometries}  TEX ${info.memory.textures}  |  ${this.renderer.getQuality()}  |  ` +
+          `${this.layout.sector.name} TOWERS ${this.layout.buildings.length} COLLIDERS ${this.layout.colliders.length} ` +
+          `WALLRUN ${this.layout.wallRunSurfaces.length} ANCHORS ${this.layout.anchors.length}`;
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Boot
+// ---------------------------------------------------------------------------
+function boot(): void {
+  const container = document.getElementById('app');
+  const loading = document.getElementById('loading');
+  if (!container) throw new Error('#app container missing');
+  // Let the loading overlay paint before the synchronous texture generation.
+  requestAnimationFrame(() =>
+    requestAnimationFrame(() => {
+      try {
+        const app = new App(container);
+        app.start();
+        loading?.classList.add('hidden');
+        document.getElementById('title')?.classList.add('visible');
+      } catch (err) {
+        console.error(err);
+        if (loading) {
+          loading.textContent = `INITIALISATION FAILED — ${(err as Error).message}`;
+          loading.classList.add('error');
+        }
+      }
+    }),
+  );
+}
+
+boot();

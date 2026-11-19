@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>STRAND // PROTOCOL</title>
+    <style>
+      :root {
+        --sky-zenith: #05070e;
+        --fog-abyss: #0d1628;
+        --wallrun-cyan: #00f0ff;
+        --grapple-gold: #ffb800;
+        --player-strand: #38f8ff;
+        --enemy-danger: #ff1e42;
+        --gate-jade: #00ff9d;
+        --hud-font: 'Eurostile', 'Bank Gothic', 'Rajdhani', 'Segoe UI', 'Helvetica Neue', Arial, sans-serif;
+        --mono-font: 'JetBrains Mono', 'SFMono-Regular', 'Consolas', 'Menlo', monospace;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        overflow: hidden;
+        background: var(--sky-zenith);
+        color: #e8f6ff;
+        font-family: var(--hud-font);
+        user-select: none;
+        -webkit-user-select: none;
+      }
+      #app {
+        position: fixed;
+        inset: 0;
+      }
+      #app canvas {
+        display: block;
+        width: 100%;
+        height: 100%;
+      }
+
+      /* ---------------- Loading ---------------- */
+      #loading {
+        position: fixed;
+        inset: 0;
+        display: grid;
+        place-items: center;
+        background: var(--sky-zenith);
+        font-family: var(--mono-font);
+        letter-spacing: 0.32em;
+        font-size: 13px;
+        color: var(--wallrun-cyan);
+        transition: opacity 0.6s ease;
+        z-index: 50;
+      }
+      #loading.hidden {
+        opacity: 0;
+        pointer-events: none;
+      }
+      #loading.error {
+        color: var(--enemy-danger);
+        letter-spacing: 0.08em;
+        padding: 24px;
+        text-align: center;
+      }
+      #loading::after {
+        content: '';
+        display: inline-block;
+        width: 0.7em;
+        animation: dots 1.2s steps(4) infinite;
+      }
+      @keyframes dots {
+        0% { content: ''; }
+        25% { content: '.'; }
+        50% { content: '..'; }
+        75% { content: '...'; }
+      }
+
+      /* ---------------- Title ---------------- */
+      #title {
+        position: fixed;
+        left: 6vw;
+        bottom: 12vh;
+        opacity: 0;
+        transform: translateY(12px);
+        transition: opacity 1.2s ease 0.3s, transform 1.2s ease 0.3s;
+        pointer-events: none;
+        z-index: 10;
+      }
+      #title.visible {
+        opacity: 1;
+        transform: none;
+      }
+      #title-name {
+        font-size: clamp(36px, 6.4vw, 92px);
+        font-weight: 800;
+        font-style: italic;
+        letter-spacing: 0.04em;
+        line-height: 1;
+        color: #f4fdff;
+        text-shadow: 0 0 18px rgba(0, 240, 255, 0.55), 0 0 2px #fff;
+      }
+      #title-sub {
+        margin-top: 14px;
+        font-size: clamp(11px, 1.15vw, 16px);
+        letter-spacing: 0.62em;
+        color: var(--wallrun-cyan);
+      }
+      #title-sector {
+        margin-top: 26px;
+        font-family: var(--mono-font);
+        font-size: 12px;
+        letter-spacing: 0.24em;
+        color: rgba(232, 246, 255, 0.62);
+      }
+      #title .rule {
+        margin-top: 18px;
+        width: min(420px, 60vw);
+        height: 2px;
+        background: linear-gradient(90deg, var(--wallrun-cyan), rgba(255, 30, 66, 0.9) 60%, transparent);
+        box-shadow: 0 0 10px rgba(0, 240, 255, 0.6);
+      }
+
+      /* ---------------- Debug stats (?debug=1) ---------------- */
+      #debug-stats {
+        position: fixed;
+        left: 12px;
+        top: 10px;
+        font-family: var(--mono-font);
+        font-size: 11px;
+        letter-spacing: 0.06em;
+        color: #9ff7ff;
+        background: rgba(5, 7, 14, 0.62);
+        padding: 6px 10px;
+        border-left: 2px solid var(--wallrun-cyan);
+        z-index: 40;
+        white-space: pre;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="app"></div>
+    <div id="loading">GENERATING CITY</div>
+    <div id="title">
+      <div id="title-name"></div>
+      <div id="title-sub"></div>
+      <div class="rule"></div>
+      <div id="title-sector"></div>
+    </div>
+    <div id="debug-stats" hidden></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
