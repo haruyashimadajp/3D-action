@@ -5,6 +5,7 @@
  *  EffectComposer on a 4× MSAA HalfFloat target:
  *    Pass 1  RenderPass        — main 3D scene
  *    Pass 2  ViewModelPass     — clearDepth() then first-person scene with dedicated FOV 68°
+ *            HdrSanitize       — NaN → 0, Inf/fireflies capped (protects the bloom chain)
  *    Pass 3  UnrealBloomPass   — threshold 0.92 / strength 0.65 (SSS 0.95) / radius 0.48
  *    Pass 4  KineticPostFX     — RGB aberration · BT colour shift · speed lines · raindrop
  *                                 vignette · critical/damage vignette · overdrive border · glitch
@@ -52,6 +53,39 @@ class ViewModelPass extends Pass {
     renderer.autoClear = oldAutoClear;
   }
 }
+
+// ---------------------------------------------------------------------------
+// HDR sanitize (runs between Pass 2 and Pass 3): on real GPUs an extreme specular highlight can
+// exceed the HalfFloat range (65504) and be stored as Inf, or a shader can emit NaN. UnrealBloom's
+// blur chain then smears that single pixel into large black squares. NaN → 0, Inf/fireflies → cap.
+// ---------------------------------------------------------------------------
+const HDR_SANITIZE_MAX = 64.0;
+const HdrSanitizeShader = {
+  name: 'HdrSanitize',
+  uniforms: {
+    tDiffuse: { value: null as THREE.Texture | null },
+  },
+  vertexShader: /* glsl */ `
+    varying vec2 vUv;
+    void main() {
+      vUv = uv;
+      gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+    }
+  `,
+  fragmentShader: /* glsl */ `
+    uniform sampler2D tDiffuse;
+    varying vec2 vUv;
+    float sanitize(float x) {
+      // isnan + self-inequality: belt and braces against drivers that fold one of them away.
+      if (isnan(x) || x != x) return 0.0;
+      return clamp(x, 0.0, ${HDR_SANITIZE_MAX.toFixed(1)});
+    }
+    void main() {
+      vec4 c = texture2D(tDiffuse, vUv);
+      gl_FragColor = vec4(sanitize(c.r), sanitize(c.g), sanitize(c.b), 1.0);
+    }
+  `,
+};
 
 // ---------------------------------------------------------------------------
 // Pass 4: KineticPostFX (single fragment shader to save draw calls)
@@ -395,6 +429,9 @@ export class Renderer {
     this.composer.addPass(mainPass);
 
     this.composer.addPass(new ViewModelPass(this.viewModelScene, this.viewModelCamera));
+
+    // Guard against NaN / Inf before the bloom blur chain (prevents black-square artifacts).
+    this.composer.addPass(new ShaderPass(HdrSanitizeShader));
 
     this.bloomPass = new UnrealBloomPass(
       new THREE.Vector2(256, 256),
