@@ -9,9 +9,15 @@
  *    travel time (bullet-time trails). Rendered as stretched additive tracer boxes in ONE InstancedMesh;
  *    the tracer starts at the on-screen muzzle and blends onto the true eye-ray within 60 ms.
  *  - Particles: 600 sparks / visor shards / water-splash droplets in ONE InstancedMesh (ring buffer).
+ *  - Telegraph lines (§5.1): 32 camera-facing ribbon quads in ONE instanced draw (never THREE.Line — width and
+ *    bloom are real geometry). ACQUIRING = thin translucent dashed orange; LOCK = thick → thin red, 25 Hz blink.
+ *    A screen-space minimum width keeps a 0.015 m line visible at 100 m while fading it by its true coverage.
+ *  - Shock rings / ground prediction circles: 24 additive rings in ONE InstancedMesh.
+ *  - GRAZE (§5.1-3): every enemy round tracks its closest approach to the player's body axis; when it passes
+ *    the player without hitting and the closest distance was 0.45 m … 1.35 m, a single GRAZE fires.
  */
 import * as THREE from 'three';
-import { COLORS, LIMITS, RENDER, createRng } from '../config/constants';
+import { COLORS, JUICE, LIMITS, RENDER, TELEGRAPH, createRng } from '../config/constants';
 import {
   type HitboxTarget,
   type HitRegion,
@@ -32,6 +38,11 @@ const _c = new THREE.Color();
 const Z_AXIS = new THREE.Vector3(0, 0, 1);
 const _worldHit = createRayHit();
 const _targetHit = createTargetHit();
+const _chest = new THREE.Vector3();
+const _grazePt = new THREE.Vector3();
+const _segEnd = new THREE.Vector3();
+const _ringN = new THREE.Vector3();
+const Y_UP = new THREE.Vector3(0, 1, 0);
 
 export type ProjectileOwner = 'PLAYER' | 'ENEMY';
 
@@ -79,15 +90,50 @@ export interface ParticleBurst {
   readonly size: number;
 }
 
+const TELEGRAPH_VISOR_SHARDS = JUICE.HEADSHOT_VISOR_PARTICLES;
+
 export const BURST = {
   SPARK: { count: 10, color: 0xffc27a, intensity: 2.4, speed: 9, spread: 0.85, life: 0.35, gravity: -14, size: 0.035 },
   WATER: { count: 14, color: 0x9fdcff, intensity: 1.1, speed: 5.5, spread: 0.45, life: 0.6, gravity: -11, size: 0.05 },
   LAND_SPLASH: { count: 26, color: 0xb6e6ff, intensity: 1.0, speed: 6.5, spread: 0.7, life: 0.7, gravity: -12, size: 0.06 },
   MUZZLE: { count: 6, color: 0x7ffcff, intensity: 2.8, speed: 7, spread: 0.35, life: 0.12, gravity: 0, size: 0.03 },
   HOOK: { count: 12, color: 0xffd26a, intensity: 2.6, speed: 7, spread: 0.9, life: 0.3, gravity: -10, size: 0.04 },
+  /** Body hit: fine sparks only (no hitstop). */
+  HIT_SPARK: { count: 6, color: 0xfff0d0, intensity: 3.0, speed: 7, spread: 0.9, life: 0.22, gravity: -12, size: 0.028 },
+  /** Head-shot visor shatter: exactly 12 shards (§2.1), tinted with the visor colour. */
+  VISOR_SHARD: { count: TELEGRAPH_VISOR_SHARDS, color: 0xff3b5c, intensity: 3.6, speed: 8.5, spread: 1.0, life: 0.6, gravity: -16, size: 0.05 },
+  /** Kill: core rupture. */
+  CORE_BURST: { count: 22, color: 0xff6a3a, intensity: 3.2, speed: 11, spread: 1.0, life: 0.5, gravity: -9, size: 0.045 },
+  /** Head-shot kill: discharge from the top of the head (cyan + crimson bursts). */
+  DISCHARGE_CYAN: { count: 12, color: 0x38f8ff, intensity: 4.0, speed: 7.5, spread: 0.55, life: 0.42, gravity: 2, size: 0.03 },
+  DISCHARGE_CRIMSON: { count: 12, color: 0xff1e42, intensity: 4.0, speed: 7.5, spread: 0.55, life: 0.42, gravity: 2, size: 0.03 },
+  /** Shield / boss part break: 32 large shards (§2.1). */
+  BREAK_DEBRIS: { count: JUICE.BREAK_DEBRIS_COUNT, color: 0xff9500, intensity: 2.6, speed: 13, spread: 1.0, life: 1.1, gravity: -18, size: 0.08 },
+  EXPLOSION: { count: 40, color: 0xff7a2a, intensity: 3.4, speed: 14, spread: 1.0, life: 0.55, gravity: -6, size: 0.06 },
+  /** Enemy materialisation / digital dissolve glitch squares. */
+  GLITCH: { count: 10, color: 0x38f8ff, intensity: 2.2, speed: 2.5, spread: 1.0, life: 0.5, gravity: 1.5, size: 0.05 },
+  /** GRAZE: wind-cut streaks along the bullet path. */
+  GRAZE: { count: 8, color: 0x7ffcff, intensity: 3.0, speed: 6, spread: 0.3, life: 0.25, gravity: 0, size: 0.025 },
+  MISSILE_TRAIL: { count: 1, color: 0xff6a2a, intensity: 1.6, speed: 1.2, spread: 1.0, life: 0.45, gravity: 1.0, size: 0.09 },
+  /** Phantom dash-slash arc sparks. */
+  SLASH: { count: 14, color: 0xd04dff, intensity: 3.6, speed: 9, spread: 0.7, life: 0.3, gravity: -4, size: 0.035 },
 } as const satisfies Record<string, ParticleBurst>;
 
+/** Telegraph-line style (§5.1). */
+export type LineStyle = 'ACQUIRE' | 'LOCK' | 'SIGHT';
+
+/** Player body axis for GRAZE (closest-approach) tracking of enemy rounds. */
+export interface GrazeProbe {
+  active: boolean;
+  /** Bottom and top of the player's body axis. */
+  readonly a: THREE.Vector3;
+  readonly b: THREE.Vector3;
+  onGraze(point: THREE.Vector3, direction: THREE.Vector3, distance: number, tag: number): void;
+}
+
 const P_CAP = LIMITS.PROJECTILES;
+const L_CAP = LIMITS.TELEGRAPH_LINES;
+const R_CAP = LIMITS.SHOCK_RINGS;
 const S_CAP = LIMITS.VFX_PARTICLES;
 const MUZZLE_BLEND_S = 0.06;
 
@@ -150,6 +196,37 @@ export class EffectsPool {
   private readonly sColor = new Float32Array(S_CAP * 3);
   private sNext = 0;
   private readonly rng = createRng(0x5a4c);
+
+  // ---- GRAZE tracking per round ----
+  private readonly pGrazeMin = new Float32Array(P_CAP);
+  private readonly pGrazeDone = new Uint8Array(P_CAP);
+
+  // ---- telegraph lines (§5.1, 32-line pool) ----
+  readonly lines: THREE.Mesh;
+  private readonly lineGeo: THREE.InstancedBufferGeometry;
+  private readonly lineStart: THREE.InstancedBufferAttribute;
+  private readonly lineEnd: THREE.InstancedBufferAttribute;
+  private readonly lineWidth: THREE.InstancedBufferAttribute;
+  private readonly lineColor: THREE.InstancedBufferAttribute;
+  private readonly lineDash: THREE.InstancedBufferAttribute;
+  private readonly lineUniforms: { uViewportH: { value: number }; uMinPx: { value: number }; uTime: { value: number } };
+  private readonly lInUse = new Uint8Array(L_CAP);
+  private readonly lShown = new Uint8Array(L_CAP);
+  private readonly lData = new Float32Array(L_CAP * 14);
+
+  // ---- shock rings / prediction circles (24-ring pool) ----
+  readonly rings: THREE.InstancedMesh;
+  private readonly rActive = new Uint8Array(R_CAP);
+  /** 0 = timed expanding shock ring, 1 = persistent (caller-driven) prediction circle. */
+  private readonly rPersistent = new Uint8Array(R_CAP);
+  private readonly rPos = new Float32Array(R_CAP * 3);
+  private readonly rNormal = new Float32Array(R_CAP * 3);
+  private readonly rR0 = new Float32Array(R_CAP);
+  private readonly rR1 = new Float32Array(R_CAP);
+  private readonly rLife = new Float32Array(R_CAP);
+  private readonly rMax = new Float32Array(R_CAP);
+  private readonly rColor = new Float32Array(R_CAP * 3);
+  private rNext = 0;
 
   constructor(scene: THREE.Scene) {
     const count = LIMITS.RAIN_DROPS;
@@ -261,6 +338,305 @@ export class EffectsPool {
     this.sparks.renderOrder = 23;
     this.sparks.setColorAt(0, _c.setRGB(1, 1, 1));
     scene.add(this.sparks);
+
+    // ---- Telegraph lines: one ribbon quad per instance, oriented to face the camera around its axis ----
+    const lg = new THREE.InstancedBufferGeometry();
+    lg.setAttribute('position', new THREE.Float32BufferAttribute([-1, 0, 0, 1, 0, 0, -1, 1, 0, 1, 1, 0], 3));
+    lg.setIndex([0, 1, 2, 2, 1, 3]);
+    const mk = (n: number): THREE.InstancedBufferAttribute => {
+      const a = new THREE.InstancedBufferAttribute(new Float32Array(L_CAP * n), n);
+      a.setUsage(THREE.DynamicDrawUsage);
+      return a;
+    };
+    this.lineStart = mk(3);
+    this.lineEnd = mk(3);
+    this.lineWidth = mk(2);
+    this.lineColor = mk(4);
+    this.lineDash = mk(1);
+    lg.setAttribute('aStart', this.lineStart);
+    lg.setAttribute('aEnd', this.lineEnd);
+    lg.setAttribute('aWidth', this.lineWidth);
+    lg.setAttribute('aColor', this.lineColor);
+    lg.setAttribute('aDash', this.lineDash);
+    lg.instanceCount = 0;
+    this.lineGeo = lg;
+    this.lineUniforms = { uViewportH: { value: 1080 }, uMinPx: { value: 1.35 }, uTime: { value: 0 } };
+    const lineMat = new THREE.ShaderMaterial({
+      transparent: true,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+      side: THREE.DoubleSide,
+      uniforms: this.lineUniforms,
+      vertexShader: /* glsl */ `
+        uniform float uViewportH;
+        uniform float uMinPx;
+        attribute vec3 aStart;
+        attribute vec3 aEnd;
+        attribute vec2 aWidth;
+        attribute vec4 aColor;
+        attribute float aDash;
+        varying vec4 vColor;
+        varying float vAcross;
+        varying float vAlong;
+        varying float vDash;
+        varying float vCoverage;
+        void main() {
+          vec3 axis = aEnd - aStart;
+          float len = max(length(axis), 1e-4);
+          vec3 dir = axis / len;
+          vec3 p = aStart + axis * position.y;
+          vec3 toCam = cameraPosition - p;
+          float d = max(length(toCam), 1e-3);
+          vec3 side = cross(dir, toCam / d);
+          float sl = length(side);
+          side = sl > 1e-4 ? side / sl : normalize(cross(dir, abs(dir.y) < 0.9 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0)));
+          float w = mix(aWidth.x, aWidth.y, position.y);
+          // World size of one pixel at this depth; never thinner than uMinPx pixels on screen.
+          float pxWorld = d * 2.0 / (projectionMatrix[1][1] * uViewportH);
+          float wEff = max(w, uMinPx * pxWorld);
+          vCoverage = clamp(w / wEff, 0.0, 1.0);
+          vec3 wp = p + side * position.x * wEff * 0.5;
+          vColor = aColor;
+          vAcross = position.x;
+          vAlong = position.y * len;
+          vDash = aDash;
+          gl_Position = projectionMatrix * viewMatrix * vec4(wp, 1.0);
+        }
+      `,
+      fragmentShader: /* glsl */ `
+        uniform float uTime;
+        varying vec4 vColor;
+        varying float vAcross;
+        varying float vAlong;
+        varying float vDash;
+        varying float vCoverage;
+        void main() {
+          float core = 1.0 - abs(vAcross);
+          float a = core * core * (3.0 - 2.0 * core);
+          if (vDash > 0.5) {
+            // Dotted ACQUIRING line, dashes stream toward the target.
+            float ph = fract((vAlong - uTime * 7.0) / 0.9);
+            a *= smoothstep(0.0, 0.08, ph) * (1.0 - smoothstep(0.55, 0.63, ph));
+          }
+          // Thin lines widened to the pixel floor keep their true energy (fainter, never vanishing).
+          float energy = mix(0.35, 1.0, vCoverage);
+          gl_FragColor = vec4(vColor.rgb * vColor.a * a * energy, 1.0);
+        }
+      `,
+    });
+    this.lines = new THREE.Mesh(lg, lineMat);
+    this.lines.name = 'TelegraphLines';
+    this.lines.frustumCulled = false;
+    this.lines.renderOrder = 24;
+    scene.add(this.lines);
+
+    // ---- Shock rings: flat annulus, additive HDR colour per instance ----
+    const ringGeo = new THREE.RingGeometry(0.9, 1.0, 64, 1);
+    ringGeo.rotateX(-Math.PI / 2);
+    const ringMat = new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide, fog: false });
+    this.rings = new THREE.InstancedMesh(ringGeo, ringMat, R_CAP);
+    this.rings.name = 'ShockRings';
+    this.rings.frustumCulled = false;
+    this.rings.count = 0;
+    this.rings.renderOrder = 21;
+    this.rings.setColorAt(0, _c.setRGB(1, 1, 1));
+    scene.add(this.rings);
+  }
+
+  // =============================================================================================
+  // Telegraph lines (§5.1)
+  // =============================================================================================
+  /** Reserves a line slot; −1 when all 32 are in use (the caller must then hold its attack). */
+  acquireLine(): number {
+    for (let i = 0; i < L_CAP; i++) {
+      if (!this.lInUse[i]) {
+        this.lInUse[i] = 1;
+        this.lShown[i] = 0;
+        return i;
+      }
+    }
+    return -1;
+  }
+
+  releaseLine(i: number): void {
+    if (i < 0 || i >= L_CAP) return;
+    this.lInUse[i] = 0;
+    this.lShown[i] = 0;
+  }
+
+  /** Number of free slots (an attack needing several lines checks this first). */
+  get freeLines(): number {
+    let n = 0;
+    for (let i = 0; i < L_CAP; i++) if (!this.lInUse[i]) n++;
+    return n;
+  }
+
+  /**
+   * Updates a reserved line for this frame. Widths in metres at the start / end; `color` is linear RGB
+   * multiplied by `intensity` (HDR) and `opacity`. `visible = false` hides it (e.g. the blink off-phase).
+   */
+  setLine(i: number, start: THREE.Vector3, end: THREE.Vector3, widthStart: number, widthEnd: number, color: THREE.Color, intensity: number, opacity: number, dashed: boolean, visible = true): void {
+    if (i < 0 || i >= L_CAP || !this.lInUse[i]) return;
+    const o = i * 14;
+    const d = this.lData;
+    d[o] = start.x;
+    d[o + 1] = start.y;
+    d[o + 2] = start.z;
+    d[o + 3] = end.x;
+    d[o + 4] = end.y;
+    d[o + 5] = end.z;
+    d[o + 6] = widthStart;
+    d[o + 7] = widthEnd;
+    d[o + 8] = color.r * intensity;
+    d[o + 9] = color.g * intensity;
+    d[o + 10] = color.b * intensity;
+    d[o + 11] = opacity;
+    d[o + 12] = dashed ? 1 : 0;
+    d[o + 13] = 0;
+    this.lShown[i] = visible ? 1 : 0;
+  }
+
+  hideLine(i: number): void {
+    if (i >= 0 && i < L_CAP) this.lShown[i] = 0;
+  }
+
+  private syncLines(realTime: number, viewportH: number): void {
+    let n = 0;
+    const d = this.lData;
+    const st = this.lineStart.array as Float32Array;
+    const en = this.lineEnd.array as Float32Array;
+    const wd = this.lineWidth.array as Float32Array;
+    const co = this.lineColor.array as Float32Array;
+    const da = this.lineDash.array as Float32Array;
+    for (let i = 0; i < L_CAP; i++) {
+      if (!this.lInUse[i] || !this.lShown[i]) continue;
+      const o = i * 14;
+      st[n * 3] = d[o];
+      st[n * 3 + 1] = d[o + 1];
+      st[n * 3 + 2] = d[o + 2];
+      en[n * 3] = d[o + 3];
+      en[n * 3 + 1] = d[o + 4];
+      en[n * 3 + 2] = d[o + 5];
+      wd[n * 2] = d[o + 6];
+      wd[n * 2 + 1] = d[o + 7];
+      co[n * 4] = d[o + 8];
+      co[n * 4 + 1] = d[o + 9];
+      co[n * 4 + 2] = d[o + 10];
+      co[n * 4 + 3] = d[o + 11];
+      da[n] = d[o + 12];
+      n++;
+    }
+    this.lineGeo.instanceCount = n;
+    if (n > 0) {
+      this.lineStart.needsUpdate = true;
+      this.lineEnd.needsUpdate = true;
+      this.lineWidth.needsUpdate = true;
+      this.lineColor.needsUpdate = true;
+      this.lineDash.needsUpdate = true;
+    }
+    this.lines.visible = n > 0;
+    this.lineUniforms.uTime.value = realTime;
+    this.lineUniforms.uViewportH.value = viewportH;
+  }
+
+  // =============================================================================================
+  // Shock rings & prediction circles
+  // =============================================================================================
+  /** Expanding ring from r0 to r1 over `duration` (simulation seconds), fading out. */
+  spawnRing(position: THREE.Vector3, normal: THREE.Vector3, color: number, intensity: number, r0: number, r1: number, duration: number): void {
+    let i = this.rNext;
+    for (let k = 0; k < R_CAP; k++) {
+      const j = (this.rNext + k) % R_CAP;
+      if (!this.rActive[j]) {
+        i = j;
+        break;
+      }
+    }
+    if (this.rActive[i] && this.rPersistent[i]) return; // never steal a live prediction circle
+    this.rNext = (i + 1) % R_CAP;
+    this.writeRing(i, position, normal, color, intensity, r0, r1);
+    this.rPersistent[i] = 0;
+    this.rLife[i] = duration;
+    this.rMax[i] = duration;
+  }
+
+  /** Reserves a persistent ring (boss dive prediction circle); −1 when the pool is full. */
+  acquireRing(): number {
+    for (let i = 0; i < R_CAP; i++) {
+      if (!this.rActive[i]) {
+        this.rActive[i] = 1;
+        this.rPersistent[i] = 1;
+        this.rLife[i] = 1;
+        this.rMax[i] = 1;
+        this.rR0[i] = 0;
+        this.rR1[i] = 0;
+        return i;
+      }
+    }
+    return -1;
+  }
+
+  /** Drives a persistent ring each frame (radius, colour × intensity; intensity 0 hides it). */
+  setRing(i: number, position: THREE.Vector3, normal: THREE.Vector3, color: number, intensity: number, radius: number): void {
+    if (i < 0 || i >= R_CAP || !this.rPersistent[i]) return;
+    this.writeRing(i, position, normal, color, intensity, radius, radius);
+    this.rPersistent[i] = 1;
+  }
+
+  releaseRing(i: number): void {
+    if (i < 0 || i >= R_CAP) return;
+    this.rActive[i] = 0;
+    this.rPersistent[i] = 0;
+  }
+
+  private writeRing(i: number, position: THREE.Vector3, normal: THREE.Vector3, color: number, intensity: number, r0: number, r1: number): void {
+    this.rActive[i] = 1;
+    this.rPos[i * 3] = position.x;
+    this.rPos[i * 3 + 1] = position.y;
+    this.rPos[i * 3 + 2] = position.z;
+    this.rNormal[i * 3] = normal.x;
+    this.rNormal[i * 3 + 1] = normal.y;
+    this.rNormal[i * 3 + 2] = normal.z;
+    this.rR0[i] = r0;
+    this.rR1[i] = r1;
+    _c.setHex(color);
+    this.rColor[i * 3] = _c.r * intensity;
+    this.rColor[i * 3 + 1] = _c.g * intensity;
+    this.rColor[i * 3 + 2] = _c.b * intensity;
+  }
+
+  private updateRings(simDt: number): void {
+    let n = 0;
+    for (let i = 0; i < R_CAP; i++) {
+      if (!this.rActive[i]) continue;
+      let k = 1;
+      let radius = this.rR1[i];
+      if (!this.rPersistent[i]) {
+        this.rLife[i] -= simDt;
+        if (this.rLife[i] <= 0) {
+          this.rActive[i] = 0;
+          continue;
+        }
+        const t = 1 - this.rLife[i] / this.rMax[i];
+        const e = 1 - (1 - t) * (1 - t) * (1 - t);
+        radius = this.rR0[i] + (this.rR1[i] - this.rR0[i]) * e;
+        k = 1 - t;
+      }
+      if (radius <= 1e-3 || (this.rColor[i * 3] + this.rColor[i * 3 + 1] + this.rColor[i * 3 + 2]) * k <= 1e-4) continue;
+      _ringN.set(this.rNormal[i * 3], this.rNormal[i * 3 + 1], this.rNormal[i * 3 + 2]);
+      if (_ringN.lengthSq() < 1e-6) _ringN.copy(Y_UP);
+      _q.setFromUnitVectors(Y_UP, _ringN.normalize());
+      _s.set(radius, radius, radius);
+      _a.set(this.rPos[i * 3], this.rPos[i * 3 + 1], this.rPos[i * 3 + 2]);
+      _m4.compose(_a, _q, _s);
+      this.rings.setMatrixAt(n, _m4);
+      _c.setRGB(this.rColor[i * 3] * k, this.rColor[i * 3 + 1] * k, this.rColor[i * 3 + 2] * k);
+      this.rings.setColorAt(n, _c);
+      n++;
+    }
+    this.rings.count = n;
+    this.rings.instanceMatrix.needsUpdate = true;
+    if (this.rings.instanceColor) this.rings.instanceColor.needsUpdate = true;
   }
 
   // =============================================================================================
@@ -309,6 +685,8 @@ export class EffectsPool {
     this.pColor[i * 3 + 2] = _c.b * spec.intensity;
     this.pWidth[i] = spec.width;
     this.pTag[i] = spec.tag;
+    this.pGrazeMin[i] = Infinity;
+    this.pGrazeDone[i] = spec.owner === 'PLAYER' ? 1 : 0;
     return i;
   }
 
@@ -329,6 +707,7 @@ export class EffectsPool {
     physics: PhysicsWorld,
     targetsFor: (owner: ProjectileOwner) => readonly HitboxTarget[],
     onImpact: (impact: ProjectileImpact) => void,
+    graze: GrazeProbe | null = null,
   ): void {
     for (let i = 0; i < P_CAP; i++) {
       if (!this.pActive[i]) continue;
@@ -349,6 +728,11 @@ export class EffectsPool {
       if (targets.length) {
         physics.raycastTargets(_a, _d, _worldHit.hit ? _worldHit.distance : step, targets, _targetHit);
         tHit = _targetHit.hit;
+      }
+      // GRAZE: closest approach of this step's path (up to a world hit) to the player's body axis.
+      if (!tHit && graze && graze.active && !this.pGrazeDone[i]) {
+        _segEnd.copy(_worldHit.hit ? _worldHit.point : _b);
+        this.trackGraze(i, _a, _segEnd, _d, graze);
       }
       if (_worldHit.hit || tHit) {
         const im = this.impact;
@@ -386,6 +770,44 @@ export class EffectsPool {
     }
   }
 
+  /**
+   * Updates the round's minimum distance to the player axis; once the round passes the player's closest
+   * point (or stops at a wall beyond it) the GRAZE band 0.45 … 1.35 m is evaluated exactly once.
+   */
+  private trackGraze(i: number, a: THREE.Vector3, b: THREE.Vector3, dir: THREE.Vector3, g: GrazeProbe): void {
+    _chest.addVectors(g.a, g.b).multiplyScalar(0.5);
+    const along = (_chest.x - a.x) * dir.x + (_chest.y - a.y) * dir.y + (_chest.z - a.z) * dir.z;
+    if (along < 0 && this.pTravel[i] === 0) {
+      // Fired away from the player: never a near miss.
+      this.pGrazeDone[i] = 1;
+      return;
+    }
+    const dist = segmentSegmentDistance(a, b, g.a, g.b, _grazePt);
+    if (dist < this.pGrazeMin[i]) this.pGrazeMin[i] = dist;
+    const stepLen = a.distanceTo(b);
+    if (along <= stepLen) {
+      this.pGrazeDone[i] = 1;
+      const m = this.pGrazeMin[i];
+      if (m >= TELEGRAPH.GRAZE_MIN_DIST && m <= TELEGRAPH.GRAZE_MAX_DIST) g.onGraze(_grazePt, dir, m, this.pTag[i]);
+    }
+  }
+
+  /** Halves (×k) the speed of enemy rounds within `radius` of `point` (SK_12 Phantom Graze). */
+  scaleEnemyRoundSpeed(point: THREE.Vector3, radius: number, k: number): void {
+    const r2 = radius * radius;
+    for (let i = 0; i < P_CAP; i++) {
+      if (!this.pActive[i] || this.pOwner[i] === 0) continue;
+      const o = i * 3;
+      const dx = this.pPos[o] - point.x;
+      const dy = this.pPos[o + 1] - point.y;
+      const dz = this.pPos[o + 2] - point.z;
+      if (dx * dx + dy * dy + dz * dz > r2) continue;
+      this.pVel[o] *= k;
+      this.pVel[o + 1] *= k;
+      this.pVel[o + 2] *= k;
+    }
+  }
+
   /** Writes tracer instances (real-time visual blend of the muzzle offset). */
   private syncTracers(realDt: number): void {
     let n = 0;
@@ -417,8 +839,8 @@ export class EffectsPool {
   // Particles
   // =============================================================================================
   /** Emits a burst around `normal` (unit) at `point`. */
-  burst(point: THREE.Vector3, normal: THREE.Vector3, b: ParticleBurst): void {
-    _c.setHex(b.color);
+  burst(point: THREE.Vector3, normal: THREE.Vector3, b: ParticleBurst, colorOverride = -1): void {
+    _c.setHex(colorOverride >= 0 ? colorOverride : b.color);
     for (let k = 0; k < b.count; k++) {
       const i = this.sNext;
       this.sNext = (this.sNext + 1) % S_CAP;
@@ -491,9 +913,11 @@ export class EffectsPool {
    * @param cameraPos current camera world position
    * @param cameraVel current camera world velocity (m/s, simulation space)
    */
-  update(simDt: number, realDt: number, cameraPos: THREE.Vector3, cameraVel: THREE.Vector3): void {
+  update(simDt: number, realDt: number, cameraPos: THREE.Vector3, cameraVel: THREE.Vector3, realTime = 0, viewportH = 1080): void {
     this.syncTracers(realDt);
     this.updateParticles(simDt);
+    this.updateRings(simDt);
+    this.syncLines(realTime, viewportH);
     this.rainTime += simDt;
     // Keep float precision in the shader: rebase the rain clock once per hour (one imperceptible reshuffle).
     if (this.rainTime > 3600) this.rainTime -= 3600;
@@ -503,4 +927,59 @@ export class EffectsPool {
     _relVel.copy(u.uFall.value).sub(cameraVel);
     u.uRelVel.value.copy(_relVel);
   }
+}
+
+/**
+ * Closest distance between segments p1–q1 and p2–q2 (Ericson, Real-Time Collision Detection §5.1.9).
+ * Writes the closest point on the first segment into `outOnFirst`. Scalar math only (no allocation).
+ */
+function segmentSegmentDistance(p1: THREE.Vector3, q1: THREE.Vector3, p2: THREE.Vector3, q2: THREE.Vector3, outOnFirst: THREE.Vector3): number {
+  const d1x = q1.x - p1.x;
+  const d1y = q1.y - p1.y;
+  const d1z = q1.z - p1.z;
+  const d2x = q2.x - p2.x;
+  const d2y = q2.y - p2.y;
+  const d2z = q2.z - p2.z;
+  const rx = p1.x - p2.x;
+  const ry = p1.y - p2.y;
+  const rz = p1.z - p2.z;
+  const a = d1x * d1x + d1y * d1y + d1z * d1z;
+  const e = d2x * d2x + d2y * d2y + d2z * d2z;
+  const f = d2x * rx + d2y * ry + d2z * rz;
+  let s = 0;
+  let t = 0;
+  if (a <= 1e-9 && e <= 1e-9) {
+    s = 0;
+    t = 0;
+  } else if (a <= 1e-9) {
+    t = Math.min(1, Math.max(0, f / e));
+  } else {
+    const c = d1x * rx + d1y * ry + d1z * rz;
+    if (e <= 1e-9) {
+      s = Math.min(1, Math.max(0, -c / a));
+    } else {
+      const b = d1x * d2x + d1y * d2y + d1z * d2z;
+      const denom = a * e - b * b;
+      s = denom > 1e-9 ? Math.min(1, Math.max(0, (b * f - c * e) / denom)) : 0;
+      t = (b * s + f) / e;
+      if (t < 0) {
+        t = 0;
+        s = Math.min(1, Math.max(0, -c / a));
+      } else if (t > 1) {
+        t = 1;
+        s = Math.min(1, Math.max(0, (b - c) / a));
+      }
+    }
+  }
+  const c1x = p1.x + d1x * s;
+  const c1y = p1.y + d1y * s;
+  const c1z = p1.z + d1z * s;
+  const c2x = p2.x + d2x * t;
+  const c2y = p2.y + d2y * t;
+  const c2z = p2.z + d2z * t;
+  outOnFirst.set(c1x, c1y, c1z);
+  const dx = c1x - c2x;
+  const dy = c1y - c2y;
+  const dz = c1z - c2z;
+  return Math.sqrt(dx * dx + dy * dy + dz * dz);
 }

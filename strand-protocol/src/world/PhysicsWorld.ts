@@ -592,7 +592,7 @@ export class PhysicsWorld {
   }
 
   // ===============================================================================================
-  // Grapple anchor snap (§3.6-3): nearest gold anchor within 52 m and 6° of the view centre
+  // Grapple anchor snap (§3.6-3): nearest gold anchor within the grapple range and 6° of the view centre
   // ===============================================================================================
   findSnapAnchor(eye: THREE.Vector3, viewDir: THREE.Vector3, range: number, maxAngleDeg: number, out: AnchorSnap): AnchorSnap {
     out.anchor = null;
@@ -643,16 +643,16 @@ export class PhysicsWorld {
     out.distance = maxDist;
     for (const t of targets) {
       if (!t.alive) continue;
-      // Head sphere.
-      const th = raySphere(origin, dir, t.headCenter, t.headRadius);
+      // Head sphere (radius ≤ 0 ⇒ the target has no head region, e.g. shields / wings).
+      const th = t.headRadius > 0 ? raySphere(origin, dir, t.headCenter, t.headRadius) : -1;
       if (th >= 0 && th < out.distance) {
         out.hit = true;
         out.distance = th;
         out.target = t;
         out.region = 'HEAD';
       }
-      // Body box rotated about Y.
-      const tb = rayYawBox(origin, dir, t.bodyCenter, t.bodyHalf, t.bodyYaw);
+      // Body box rotated about Y (zero half-extent ⇒ head-only target, e.g. missiles).
+      const tb = t.bodyHalf.x > 0 ? rayYawBox(origin, dir, t.bodyCenter, t.bodyHalf, t.bodyYaw) : -1;
       if (tb >= 0 && tb < out.distance - 1e-4) {
         out.hit = true;
         out.distance = tb;

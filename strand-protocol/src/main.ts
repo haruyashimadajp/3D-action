@@ -29,11 +29,13 @@ import { getProceduralTextures } from './engine/ProceduralTextures';
 import { InputManager } from './engine/InputManager';
 import { CityBuilder, type SectorLayout } from './world/CityBuilder';
 import { PhysicsWorld, type HitboxTarget } from './world/PhysicsWorld';
-import { EffectsPool, BURST } from './entities/EffectsPool';
+import { FLOW_POINTS } from './config/constants';
+import { EffectsPool, BURST, type ProjectileImpact, type ProjectileOwner } from './entities/EffectsPool';
+import { EnemyManager } from './entities/EnemyManager';
 import { PlayerController } from './player/PlayerController';
 import { EquipmentManager } from './player/EquipmentManager';
 import { ViewModelRenderer } from './player/ViewModelRenderer';
-import { HudManager, type HudFrame } from './ui/HudManager';
+import { HUD_MAX_WARNINGS, HudManager, type HudFrame } from './ui/HudManager';
 
 // ---------------------------------------------------------------------------
 // Game clock: simulation dt = real dt × min(bullet-time scale, hitstop scale).
@@ -137,8 +139,12 @@ class AttractCamera {
 // ---------------------------------------------------------------------------
 type AppState = 'TITLE' | 'PLAYING' | 'PAUSED';
 
-const NO_TARGETS: readonly HitboxTarget[] = [];
 const _lookDelta = { yaw: 0, pitch: 0 };
+const _camRight = new THREE.Vector3();
+const _camUp = new THREE.Vector3();
+const _camBack = new THREE.Vector3();
+const _toSrc = new THREE.Vector3();
+const _bossStatus = { hp: 0, maxHp: 1, wingL: 1, wingR: 1, phase: 1, downed: false };
 const _proj = new THREE.Vector3();
 const _feet = new THREE.Vector3();
 const UP = new THREE.Vector3(0, 1, 0);
@@ -178,7 +184,10 @@ class App {
   private readonly player: PlayerController;
   private readonly equipment: EquipmentManager;
   private readonly hud: HudManager;
+  private readonly enemies: EnemyManager;
   private readonly clock = new GameClock();
+  /** `?gate=1` debug: keep the district gate open. */
+  private readonly debugGate: boolean;
   private readonly attract = new AttractCamera();
   private layout: SectorLayout;
   private state: AppState = 'TITLE';
@@ -223,7 +232,11 @@ class App {
         if (water) this.effects.burst(this.player.position, UP, BURST.LAND_SPLASH);
         else if (fall > 14) this.effects.burst(_feet.copy(this.player.position).setY(this.player.position.y + 0.05), UP, BURST.SPARK);
       },
-      onGrappleDetach: (mode) => this.equipment.onRopeDetached(mode),
+      onGrappleAttach: () => this.enemies.onRopeChanged(),
+      onGrappleDetach: (mode) => {
+        this.enemies.onRopeChanged();
+        this.equipment.onRopeDetached(mode);
+      },
       onDamaged: () => {
         this.renderer.postFx.damageFlash = 1;
         this.renderer.triggerChromaSpike(RENDER.CHROMA_SPIKE, 220);
@@ -232,6 +245,18 @@ class App {
     });
     this.equipment = new EquipmentManager(this.input, this.player, this.physics, this.effects, this.renderer, this.viewModel, this.renderer.scene);
     this.hud = new HudManager();
+    this.enemies = new EnemyManager(this.renderer.scene, this.physics, this.effects, this.player, this.renderer, {
+      onHitstop: (def) => this.clock.hitstop(def),
+      onHitMarker: (kind) => this.hud.hitMarker(kind),
+      onGraze: () => this.hud.evade(FLOW_POINTS.GRAZE),
+      onPlayerHit: (_damage, from) => this.hud.damageFrom(this.screenAngle(from)),
+      onSectorClear: () => this.setGateOpen(true),
+    });
+    // The strand can bite straight into humanoids / drones / the boss (15 dmg + stagger, anchor follows).
+    this.equipment.combat = {
+      targets: () => this.enemies.grappleTargets,
+      onGrappleTarget: (target, point) => this.enemies.onGrappleTarget(target, point),
+    };
     this.hudFrame = {
       slot: 'PISTOL',
       pendingSlot: null,
@@ -256,11 +281,25 @@ class App {
       anchorY: 0,
       anchorStrong: false,
       centerDot: ACCESSIBILITY.CENTER_DOT_DEFAULT,
+      realDt: 0,
+      warnCount: 0,
+      warnAngles: new Float32Array(HUD_MAX_WARNINGS),
+      sectorName: '',
+      remaining: 0,
+      gateOpen: false,
+      bossVisible: false,
+      bossHp: 0,
+      bossMaxHp: 1,
+      bossWingL: 1,
+      bossWingR: 1,
+      bossPhase: 1,
+      bossDowned: false,
     };
 
     this.sectorIndex = clamp(parseInt(params.get('sector') ?? '1', 10) || 1, 1, SECTORS.length);
     this.layout = this.buildSector(this.sectorIndex);
-    if (params.get('gate') === '1') this.setGateOpen(true);
+    this.debugGate = params.get('gate') === '1';
+    if (this.debugGate) this.setGateOpen(true);
 
     const viewParam = params.get('view');
     const view = viewParam?.split(',').map(Number);
@@ -280,7 +319,17 @@ class App {
     this.debugEl = params.get('debug') === '1' ? document.getElementById('debug-stats') : null;
     if (this.debugEl) {
       // Debug-only handle for automated mechanic verification (never exposed without ?debug=1).
-      window.__STRAND_DEBUG__ = { player: this.player, equipment: this.equipment, physics: this.physics, layout: () => this.layout, input: this.input };
+      window.__STRAND_DEBUG__ = {
+        player: this.player,
+        equipment: this.equipment,
+        physics: this.physics,
+        enemies: this.enemies,
+        effects: this.effects,
+        clock: this.clock,
+        layout: () => this.layout,
+        input: this.input,
+        renderer: this.renderer,
+      };
       console.info(`[STRAND] procedural textures ${(t1 - t0).toFixed(0)} ms, sector build ${(performance.now() - t1).toFixed(0)} ms`);
       this.debugEl.hidden = false;
     }
@@ -372,10 +421,13 @@ class App {
     this.input.requestPointerLock();
   }
 
+  /** Deploy and the 500 ms death retry: the player and the whole sector (wave 1) restart together. */
   private spawnPlayer(): void {
     this.player.spawn(this.layout.playerSpawn, this.layout.playerSpawnYaw);
     this.equipment.reset();
     this.effects.clearProjectiles();
+    this.setGateOpen(this.debugGate);
+    this.enemies.startSector(this.layout, this.loop);
     this.accumulator = 0;
     this.deathTimer = -1;
     this.renderer.postFx.glitch = 0;
@@ -398,11 +450,28 @@ class App {
     requestAnimationFrame(frame);
   }
 
-  private readonly targetsFor = (): readonly HitboxTarget[] => NO_TARGETS;
+  /** Player rounds test enemy hitboxes (+ shields, wings, missiles); enemy rounds test the player. */
+  private readonly targetsFor = (owner: ProjectileOwner): readonly HitboxTarget[] => (owner === 'PLAYER' ? this.enemies.targets : this.enemies.playerTargets);
 
-  private readonly onImpact = (): void => {
-    // World impacts already emit sparks / splashes inside the pool; humanoid hits arrive with the enemy system.
+  private readonly onImpact = (im: ProjectileImpact): void => {
+    this.enemies.handleImpact(im);
   };
+
+  /** Screen angle (deg, clockwise from up) of a world point relative to the view (HUD arcs). */
+  private screenAngle(world: THREE.Vector3): number {
+    const cam = this.renderer.camera;
+    _camRight.setFromMatrixColumn(cam.matrixWorld, 0);
+    _camUp.setFromMatrixColumn(cam.matrixWorld, 1);
+    _camBack.setFromMatrixColumn(cam.matrixWorld, 2);
+    _toSrc.subVectors(world, cam.position);
+    const x = _toSrc.dot(_camRight);
+    const y = _toSrc.dot(_camUp);
+    const z = -_toSrc.dot(_camBack);
+    if (Math.abs(x) < 1e-3 && Math.abs(y) < 1e-3) return z < 0 ? 180 : 0;
+    // Straight behind: point the arc downward.
+    if (z < 0 && Math.hypot(x, y) < Math.abs(z) * 0.15) return 180;
+    return (Math.atan2(x, y) * 180) / Math.PI;
+  }
 
   private fixedUpdate(dt: number): void {
     if (this.state === 'TITLE') {
@@ -413,7 +482,8 @@ class App {
     const cam = this.renderer.camera;
     this.equipment.fixedUpdate(dt, cam);
     this.player.fixedUpdate(dt, this.equipment.stepContext());
-    this.effects.updateProjectiles(dt, this.physics, this.targetsFor, this.onImpact);
+    this.enemies.fixedUpdate(dt);
+    this.effects.updateProjectiles(dt, this.physics, this.targetsFor, this.onImpact, this.enemies.graze);
     this.input.markStep();
   }
 
@@ -482,6 +552,7 @@ class App {
       cam.updateMatrixWorld();
       this.viewModel.syncEnvironment(this.player.cameraEuler);
       this.equipment.frameUpdate(this.state === 'PAUSED' ? 0 : realDt, cam, _lookDelta.yaw, _lookDelta.pitch);
+      this.enemies.frameUpdate(realDt, simDt, alpha);
       this.camVel.copy(this.player.velocity);
       fx.speed = this.player.speed;
       fx.bulletTime += ((this.player.btActive ? 1 : 0) - fx.bulletTime) * lerpFactor(14, realDt);
@@ -497,21 +568,44 @@ class App {
         this.splashTimer = 0.12;
         this.effects.burst(this.player.position, UP, BURST.WATER);
       }
-      this.updateHud();
+      this.updateHud(realDt);
     }
     this.prevCamPos.copy(cam.position);
 
     // --- World & effects ---
     this.city.update(this.clock.simTime, cam.position);
-    this.effects.update(simDt, realDt, cam.position, this.camVel);
+    this.effects.update(simDt, realDt, cam.position, this.camVel, this.clock.realTime, this.renderer.viewportHeight);
     this.renderer.update(realDt);
     this.renderer.render();
 
     if (this.debugEl) this.updateDebug();
   }
 
-  private updateHud(): void {
+  private updateHud(realDt: number): void {
     const f = this.hudFrame;
+    f.realDt = realDt;
+    // Off-screen enemies in LOCK_TELEGRAPH → blinking red arcs toward them (§6.3).
+    f.warnCount = 0;
+    const cam = this.renderer.camera;
+    for (const w of this.enemies.warnings) {
+      if (!w.active || f.warnCount >= HUD_MAX_WARNINGS) continue;
+      _proj.copy(w.position).project(cam);
+      const onScreen = _proj.z < 1 && Math.abs(_proj.x) <= 1 && Math.abs(_proj.y) <= 1;
+      if (onScreen) continue;
+      f.warnAngles[f.warnCount++] = this.screenAngle(w.position);
+    }
+    f.sectorName = this.layout.sector.name;
+    f.remaining = this.enemies.remaining;
+    f.gateOpen = this.enemies.isCleared || this.debugGate;
+    f.bossVisible = this.enemies.bossStatus(_bossStatus);
+    if (f.bossVisible) {
+      f.bossHp = _bossStatus.hp;
+      f.bossMaxHp = _bossStatus.maxHp;
+      f.bossWingL = _bossStatus.wingL;
+      f.bossWingR = _bossStatus.wingR;
+      f.bossPhase = _bossStatus.phase;
+      f.bossDowned = _bossStatus.downed;
+    }
     const e = this.equipment;
     const p = this.player;
     f.slot = e.activeSlot;
@@ -568,7 +662,8 @@ class App {
       `LAMPS ${st.lamps}  CITY-LIGHTS ${st.cityLights}\n` +
       `COLLIDERS ${this.layout.colliders.length}  WALLRUN ${this.layout.wallRunSurfaces.length}  ANCHORS ${this.layout.anchors.length}\n` +
       `PLAYER ${p.state}  POS ${p.position.x.toFixed(1)},${p.position.y.toFixed(2)},${p.position.z.toFixed(1)}  SPD ${p.speed.toFixed(1)}  ` +
-      `GEAR ${this.equipment.activeSlot}/${this.equipment.state}  ROPE ${p.ropeAttached ? p.ropeLength.toFixed(1) : '-'}  BT ${p.btGauge.toFixed(0)}`;
+      `GEAR ${this.equipment.activeSlot}/${this.equipment.state}  ROPE ${p.ropeAttached ? p.ropeLength.toFixed(1) : '-'}  BT ${p.btGauge.toFixed(0)}  HP ${p.hp.toFixed(0)}\n` +
+      `ENEMIES  WAVE ${this.enemies.waveNumber}/${this.enemies.waveTotal}  REMAINING ${this.enemies.remaining}  ${this.enemies.isCleared ? 'CLEARED' : ''}`;
   }
 }
 

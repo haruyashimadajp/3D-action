@@ -85,7 +85,8 @@ export const GUNS: Readonly<Record<GunId, GunDef>> = {
 export const GRAPPLE = {
   NAME: 'S-00 GRAPPLE LAUNCHER',
   SLOT: 4,
-  RANGE: 52.0,
+  /** User-tuned: 2.5× the spec value of 52 m (shared with PHYSICS.GRAPPLE_RANGE). */
+  RANGE: 130.0,
   PROJECTILE_SPEED: 180,
   COOLDOWN_S: 0.65,
   /** Hooking a humanoid directly: damage, stagger and pull toward the player (Phase 3 combat). */

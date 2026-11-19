@@ -11,11 +11,18 @@
  *  - HP bar (bottom-left, 240 px) + out-of-combat regen countdown line (flashes red on firing)
  *  - SPEED / ALT read-out (cyan glow above 18 m/s)
  *  - Equipment dock + LOCKED badge on STRAND while attached + 48 px ammo counter
+ *  - Hit markers: body = white × (120 ms), head = gold / red large × (180 ms), kills, shield / part breaks
+ *  - "EVADE +90" (cyan) below the crosshair on every GRAZE
+ *  - Directional lock warnings: blinking red arcs on the r = 85 px ring toward enemies locking on from
+ *    outside the view (no unfair off-screen deaths) + red damage-direction arcs on hits
+ *  - Sector progress "SECTOR 02 // REMAINING: 07" → green "GATE OPEN — ADVANCE TO NEXT DISTRICT"
+ *  - VALKYRIE-09 integrity bar with both thruster wings
  * DOM is written only when values change (no per-frame layout churn).
  */
-import { BULLET_TIME, PLAYER, clamp } from '../config/constants';
+import { BULLET_TIME, JUICE, PLAYER, TELEGRAPH, clamp } from '../config/constants';
 import { GUNS, type SlotId, isGun } from '../config/weapons';
 import type { GearState } from '../player/EquipmentManager';
+import type { HitMarkerKind } from '../entities/EnemyManager';
 
 export interface HudFrame {
   slot: SlotId;
@@ -43,7 +50,26 @@ export interface HudFrame {
   anchorY: number;
   anchorStrong: boolean;
   centerDot: boolean;
+  /** Real frame time (marker / arc timers). */
+  realDt: number;
+  /** Screen angles (deg, clockwise from up) of off-screen enemies in LOCK_TELEGRAPH. */
+  warnCount: number;
+  readonly warnAngles: Float32Array;
+  sectorName: string;
+  remaining: number;
+  gateOpen: boolean;
+  bossVisible: boolean;
+  bossHp: number;
+  bossMaxHp: number;
+  bossWingL: number;
+  bossWingR: number;
+  bossPhase: number;
+  bossDowned: boolean;
 }
+
+export const HUD_MAX_WARNINGS = 8;
+const DAMAGE_ARCS = 4;
+const DAMAGE_ARC_S = 0.65;
 
 function el<T extends HTMLElement | SVGElement = HTMLElement>(id: string): T {
   const e = document.getElementById(id);
@@ -73,6 +99,25 @@ export class HudManager {
   private readonly ammoNum = el('ammo-num');
   private readonly ammoMax = el('ammo-max');
   private readonly ammoName = el('ammo-name');
+  private readonly hitmarker = el<SVGGElement>('hitmarker');
+  private hitT = 0;
+  private hitKind: HitMarkerKind = 'BODY';
+  private readonly evadeEl = el('evade');
+  private readonly warns: SVGPathElement[] = [];
+  private readonly dmgArcs: SVGPathElement[] = [];
+  private readonly dmgT = new Float32Array(DAMAGE_ARCS);
+  private readonly dmgAngle = new Float32Array(DAMAGE_ARCS);
+  private dmgNext = 0;
+  private readonly sectorEl = el('sector-hud');
+  private readonly bossEl = el('boss-hud');
+  private readonly bossName = el('boss-name');
+  private readonly bossFill = el('boss-fill');
+  private readonly bossWL = el('boss-wl');
+  private readonly bossWR = el('boss-wr');
+  private readonly bossDown = el('boss-down');
+  private blinkClock = 0;
+  private readonly wvKeys = Array.from({ length: HUD_MAX_WARNINGS }, (_, i) => `wv${i}`);
+  private readonly waKeys = Array.from({ length: HUD_MAX_WARNINGS }, (_, i) => `wa${i}`);
   private readonly btLen: number;
   private readonly swLen: number;
   private readonly last = new Map<string, string | number | boolean>();
@@ -93,6 +138,35 @@ export class HudManager {
     this.btLen = this.btArc.getTotalLength();
     this.swLen = this.swArc.getTotalLength();
     this.btTrack.style.strokeDasharray = `${this.btLen} ${this.btLen}`;
+    for (let i = 0; i < HUD_MAX_WARNINGS; i++) this.warns.push(el<SVGPathElement>(`warn-${i}`));
+    for (let i = 0; i < DAMAGE_ARCS; i++) this.dmgArcs.push(el<SVGPathElement>(`dmg-${i}`));
+  }
+
+  /** Hit marker: body = white × 120 ms, head / kills / breaks = 180 ms (§6.3). */
+  hitMarker(kind: HitMarkerKind): void {
+    this.hitKind = kind;
+    this.hitT = (kind === 'BODY' || kind === 'SHIELD' ? JUICE.HITMARKER_BODY_MS : JUICE.HITMARKER_HEAD_MS) / 1000;
+    this.hitmarker.setAttribute('class', `hm on ${HIT_CLASS[kind]}`);
+    const big = kind === 'HEAD' || kind === 'HEAD_KILL' || kind === 'PART';
+    this.hitmarker.setAttribute('transform', big ? 'scale(1.45)' : 'scale(1)');
+  }
+
+  /** GRAZE pop-up "EVADE +90" (restarts the animation). */
+  evade(points: number): void {
+    this.evadeEl.textContent = `EVADE +${points}`;
+    this.evadeEl.classList.remove('on');
+    void this.evadeEl.offsetWidth;
+    this.evadeEl.classList.add('on');
+  }
+
+  /** Red arc toward where a hit came from (deg, clockwise from screen-up). */
+  damageFrom(angleDeg: number): void {
+    const i = this.dmgNext;
+    this.dmgNext = (i + 1) % DAMAGE_ARCS;
+    this.dmgT[i] = DAMAGE_ARC_S;
+    this.dmgAngle[i] = angleDeg;
+    this.dmgArcs[i].setAttribute('transform', `rotate(${angleDeg.toFixed(1)})`);
+    this.dmgArcs[i].style.display = 'block';
   }
 
   setVisible(on: boolean): void {
@@ -106,6 +180,7 @@ export class HudManager {
   }
 
   update(f: HudFrame): void {
+    this.updateCombat(f);
     // --- Crosshair ---
     if (this.changed('dot', f.centerDot)) this.dot.style.display = f.centerDot ? 'block' : 'none';
     if (this.changed('slot', f.slot)) {
@@ -183,4 +258,65 @@ export class HudManager {
       if (this.changed('low', false)) this.ammoNum.classList.remove('low');
     }
   }
+
+  private updateCombat(f: HudFrame): void {
+    const dt = f.realDt;
+    this.blinkClock += dt;
+    // Hit marker timer.
+    if (this.hitT > 0) {
+      this.hitT -= dt;
+      if (this.hitT <= 0) this.hitmarker.setAttribute('class', `hm ${HIT_CLASS[this.hitKind]}`);
+    }
+    // Off-screen lock warnings blink at the telegraph rate.
+    const on = Math.floor(this.blinkClock * TELEGRAPH.LOCK_BLINK_HZ * 2) % 2 === 0;
+    for (let i = 0; i < HUD_MAX_WARNINGS; i++) {
+      const vis = i < f.warnCount && on;
+      if (this.changed(this.wvKeys[i], vis)) this.warns[i].style.display = vis ? 'block' : 'none';
+      if (i < f.warnCount) {
+        const a = Math.round(f.warnAngles[i]);
+        if (this.changed(this.waKeys[i], a)) this.warns[i].setAttribute('transform', `rotate(${a})`);
+      }
+    }
+    // Damage direction arcs fade out.
+    for (let i = 0; i < DAMAGE_ARCS; i++) {
+      if (this.dmgT[i] <= 0) continue;
+      this.dmgT[i] -= dt;
+      if (this.dmgT[i] <= 0) this.dmgArcs[i].style.display = 'none';
+      else this.dmgArcs[i].style.opacity = (this.dmgT[i] / DAMAGE_ARC_S).toFixed(2);
+    }
+    // Sector progress / gate.
+    if (this.changed('gate', f.gateOpen)) this.sectorEl.classList.toggle('open', f.gateOpen);
+    const remChanged = this.changed('rem', f.remaining);
+    const nameChanged = this.changed('sname', f.sectorName);
+    if (this.changed('gateTxt', f.gateOpen) || remChanged || nameChanged) {
+      this.sectorEl.textContent = f.gateOpen ? 'GATE OPEN — ADVANCE TO NEXT DISTRICT' : `${f.sectorName} // REMAINING: ${String(f.remaining).padStart(2, '0')}`;
+    }
+    // Boss bar.
+    if (this.changed('boss', f.bossVisible)) this.bossEl.classList.toggle('on', f.bossVisible);
+    if (f.bossVisible) {
+      const hpQ = Math.round((f.bossHp / Math.max(1, f.bossMaxHp)) * 1000) / 10;
+      if (this.changed('bhp', hpQ)) this.bossFill.style.width = `${hpQ}%`;
+      if (this.changed('bp', f.bossPhase)) this.bossName.classList.toggle('p2', f.bossPhase === 2);
+      const wl = Math.round(clamp(f.bossWingL, 0, 1) * 100);
+      const wr = Math.round(clamp(f.bossWingR, 0, 1) * 100);
+      if (this.changed('bwl', wl)) {
+        (this.bossWL.firstElementChild as HTMLElement).style.width = `${wl}%`;
+        this.bossWL.classList.toggle('broken', wl === 0);
+      }
+      if (this.changed('bwr', wr)) {
+        (this.bossWR.firstElementChild as HTMLElement).style.width = `${wr}%`;
+        this.bossWR.classList.toggle('broken', wr === 0);
+      }
+      if (this.changed('bdn', f.bossDowned)) this.bossDown.classList.toggle('on', f.bossDowned);
+    }
+  }
 }
+
+const HIT_CLASS: Readonly<Record<HitMarkerKind, string>> = {
+  BODY: 'body',
+  HEAD: 'head',
+  KILL: 'kill',
+  HEAD_KILL: 'headkill',
+  SHIELD: 'shield',
+  PART: 'part',
+};

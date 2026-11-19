@@ -321,9 +321,9 @@ export class PlayerController {
     this.shakeMaxRoll = Math.max(this.shakeMaxRoll, def.maxRollDeg);
   }
 
-  /** Brief FOV widening (HS kill +2.5°). */
+  /** Brief FOV pulse: widening (HS kill +2.5°) or a micro zoom-in (negative, boss finisher). Largest magnitude wins. */
   pulseFov(deg: number): void {
-    this.fovPulse = Math.max(this.fovPulse, deg);
+    if (Math.abs(deg) > Math.abs(this.fovPulse)) this.fovPulse = deg;
   }
 
   // ===============================================================================================
@@ -922,7 +922,8 @@ export class PlayerController {
       fovRate = CAMERA.BT_FOV_LERP;
     }
     this.fov += (fovTarget - this.fov) * lerpFactor(fovRate, realDt);
-    this.fovPulse = Math.max(0, this.fovPulse - realDt * 18);
+    const fovDecay = realDt * 18;
+    this.fovPulse = this.fovPulse > 0 ? Math.max(0, this.fovPulse - fovDecay) : Math.min(0, this.fovPulse + fovDecay);
 
     // Trauma shake: displacement = trauma², 28 Hz sine-sum noise, decays 2.2 /s.
     this.trauma = Math.max(0, this.trauma - SHAKE_DECAY_PER_S * realDt);

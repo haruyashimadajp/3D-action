@@ -290,6 +290,49 @@
       #ammo-num.low { color: #ff4d66; text-shadow: 0 0 10px rgba(255, 30, 66, 0.7); }
       #ammo-max { font-size: 16px; color: rgba(232, 246, 255, 0.55); margin-left: 6px; }
       #ammo-name { font-size: 10px; letter-spacing: 0.24em; color: rgba(232, 246, 255, 0.55); }
+      /* ---------------- Phase 3 combat HUD ---------------- */
+      #xh .hm line { stroke-width: 2.2; stroke-linecap: square; }
+      #hitmarker { opacity: 0; }
+      #hitmarker.on { opacity: 1; }
+      #hitmarker.body line { stroke: #ffffff; }
+      #hitmarker.head line { stroke: #ffc93a; stroke-width: 3; filter: drop-shadow(0 0 4px rgba(255, 184, 0, 0.9)); }
+      #hitmarker.kill line { stroke: #ff1e42; stroke-width: 2.6; filter: drop-shadow(0 0 4px rgba(255, 30, 66, 0.9)); }
+      #hitmarker.headkill line { stroke: #ff1e42; stroke-width: 3.4; filter: drop-shadow(0 0 6px rgba(255, 201, 58, 0.95)); }
+      #hitmarker.shield line { stroke: #ff9500; }
+      #hitmarker.part line { stroke: #ffffff; stroke-width: 3.2; filter: drop-shadow(0 0 5px rgba(255, 149, 0, 0.95)); }
+      #xh .warn { fill: none; stroke: #ff1e42; stroke-width: 4; stroke-linecap: round; filter: drop-shadow(0 0 5px rgba(255, 30, 66, 0.95)); display: none; }
+      #xh .dmg { fill: none; stroke: rgba(255, 60, 80, 0.85); stroke-width: 6; stroke-linecap: butt; display: none; }
+      #evade {
+        position: absolute; left: 50%; top: calc(50% + 74px); transform: translateX(-50%);
+        font-size: 15px; letter-spacing: 0.3em; color: #38f8ff; text-shadow: 0 0 10px rgba(0, 240, 255, 0.95), 0 0 2px #fff;
+        opacity: 0; white-space: nowrap;
+      }
+      #evade.on { animation: evadepop 0.9s ease-out forwards; }
+      @keyframes evadepop {
+        0% { opacity: 0; transform: translateX(-50%) translateY(6px) scale(1.25); }
+        12% { opacity: 1; transform: translateX(-50%) translateY(0) scale(1); }
+        70% { opacity: 1; }
+        100% { opacity: 0; transform: translateX(-50%) translateY(-10px) scale(1); }
+      }
+      #sector-hud {
+        position: absolute; left: 50%; top: 20px; transform: translateX(-50%); text-align: center;
+        font-size: 12px; letter-spacing: 0.28em; color: rgba(232, 246, 255, 0.82); white-space: nowrap;
+        text-shadow: 0 0 6px rgba(0, 0, 0, 0.9);
+      }
+      #sector-hud.open { color: #00ff9d; text-shadow: 0 0 12px rgba(0, 255, 157, 0.9); animation: gatepulse 1.2s ease-in-out infinite; }
+      @keyframes gatepulse { 50% { text-shadow: 0 0 4px rgba(0, 255, 157, 0.4); } }
+      #boss-hud { position: absolute; left: 50%; top: 46px; transform: translateX(-50%); width: 420px; display: none; text-align: center; }
+      #boss-hud.on { display: block; }
+      #boss-name { font-size: 11px; letter-spacing: 0.4em; color: #ffffff; text-shadow: 0 0 8px rgba(255, 0, 85, 0.9); }
+      #boss-name.p2 { color: #ff4d86; }
+      #boss-bar { position: relative; height: 8px; margin-top: 5px; background: rgba(20, 26, 36, 0.8); border: 1px solid rgba(255, 255, 255, 0.35); }
+      #boss-fill { position: absolute; left: 0; top: 0; bottom: 0; width: 100%; background: linear-gradient(90deg, #ff0055, #ffffff); box-shadow: 0 0 10px rgba(255, 0, 85, 0.7); }
+      #boss-wings { display: flex; justify-content: space-between; margin-top: 4px; font-size: 9px; letter-spacing: 0.2em; color: rgba(232, 246, 255, 0.7); }
+      #boss-wings .w { width: 120px; height: 4px; background: rgba(255, 255, 255, 0.15); position: relative; }
+      #boss-wings .w i { position: absolute; left: 0; top: 0; bottom: 0; background: #ffffff; box-shadow: 0 0 6px rgba(255, 255, 255, 0.8); }
+      #boss-wings .w.broken i { background: #ff1e42; }
+      #boss-down { color: #ffc93a; letter-spacing: 0.3em; visibility: hidden; }
+      #boss-down.on { visibility: visible; }
     </style>
   </head>
   <body>
@@ -336,12 +379,37 @@
         </g>
         <path id="xh-bt-track" class="track" d="M 23.14 27.58 A 36 36 0 0 0 23.14 -27.58" />
         <path id="xh-bt-arc" class="arc ready" d="M 23.14 27.58 A 36 36 0 0 0 23.14 -27.58" />
+        <g id="hitmarker" class="hm">
+          <line x1="-15" y1="-15" x2="-7" y2="-7" />
+          <line x1="15" y1="-15" x2="7" y2="-7" />
+          <line x1="-15" y1="15" x2="-7" y2="7" />
+          <line x1="15" y1="15" x2="7" y2="7" />
+        </g>
+        <path class="warn" id="warn-0" d="M -20.56 -82.47 A 85 85 0 0 1 20.56 -82.47" />
+        <path class="warn" id="warn-1" d="M -20.56 -82.47 A 85 85 0 0 1 20.56 -82.47" />
+        <path class="warn" id="warn-2" d="M -20.56 -82.47 A 85 85 0 0 1 20.56 -82.47" />
+        <path class="warn" id="warn-3" d="M -20.56 -82.47 A 85 85 0 0 1 20.56 -82.47" />
+        <path class="warn" id="warn-4" d="M -20.56 -82.47 A 85 85 0 0 1 20.56 -82.47" />
+        <path class="warn" id="warn-5" d="M -20.56 -82.47 A 85 85 0 0 1 20.56 -82.47" />
+        <path class="warn" id="warn-6" d="M -20.56 -82.47 A 85 85 0 0 1 20.56 -82.47" />
+        <path class="warn" id="warn-7" d="M -20.56 -82.47 A 85 85 0 0 1 20.56 -82.47" />
+        <path class="dmg" id="dmg-0" d="M -32.7 -90.3 A 96 96 0 0 1 32.7 -90.3" />
+        <path class="dmg" id="dmg-1" d="M -32.7 -90.3 A 96 96 0 0 1 32.7 -90.3" />
+        <path class="dmg" id="dmg-2" d="M -32.7 -90.3 A 96 96 0 0 1 32.7 -90.3" />
+        <path class="dmg" id="dmg-3" d="M -32.7 -90.3 A 96 96 0 0 1 32.7 -90.3" />
         <g id="xh-sw" style="display: none">
           <path class="track" d="M -23.14 27.58 A 36 36 0 0 1 -23.14 -27.58" />
           <path id="xh-sw-arc" class="arc switch" d="M -23.14 27.58 A 36 36 0 0 1 -23.14 -27.58" />
         </g>
       </svg>
       <div id="xh-dot"></div>
+      <div id="evade">EVADE +90</div>
+      <div id="sector-hud"></div>
+      <div id="boss-hud">
+        <div id="boss-name">VALKYRIE-09</div>
+        <div id="boss-bar"><div id="boss-fill"></div></div>
+        <div id="boss-wings"><div class="w" id="boss-wl"><i></i></div><span id="boss-down">DOWN — HEAD EXPOSED</span><div class="w" id="boss-wr"><i></i></div></div>
+      </div>
       <div id="xh-anchor"></div>
       <div id="spd">SPEED <span id="spd-num">0.0</span> m/s · ALT <span id="alt-num">0.0</span> m</div>
       <div id="hp">
