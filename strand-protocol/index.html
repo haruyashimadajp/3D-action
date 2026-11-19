@@ -143,6 +143,110 @@
         z-index: 40;
         white-space: pre;
       }
+
+      /* ---------------- Title deploy prompt & pause ---------------- */
+      #title-start {
+        margin-top: 34px;
+        display: inline-block;
+        font-family: var(--mono-font);
+        font-size: 13px;
+        letter-spacing: 0.4em;
+        padding: 12px 22px;
+        border: 1px solid rgba(0, 240, 255, 0.7);
+        color: #e8fbff;
+        background: rgba(0, 240, 255, 0.08);
+        box-shadow: 0 0 18px rgba(0, 240, 255, 0.25) inset;
+        cursor: pointer;
+        pointer-events: auto;
+        animation: pulse 1.8s ease-in-out infinite;
+      }
+      @keyframes pulse {
+        50% { box-shadow: 0 0 28px rgba(0, 240, 255, 0.55) inset; }
+      }
+      .controls {
+        margin-top: 18px;
+        font-family: var(--mono-font);
+        font-size: 11px;
+        line-height: 1.85;
+        letter-spacing: 0.08em;
+        color: rgba(232, 246, 255, 0.62);
+      }
+      .controls b { color: var(--wallrun-cyan); font-weight: 600; }
+      #title.playing { display: none; }
+      #pause {
+        position: fixed;
+        inset: 0;
+        display: none;
+        align-items: center;
+        justify-content: center;
+        flex-direction: column;
+        background: rgba(5, 7, 14, 0.62);
+        backdrop-filter: blur(3px);
+        z-index: 30;
+        cursor: pointer;
+        text-align: center;
+      }
+      #pause.visible { display: flex; }
+      #pause .big {
+        font-size: 44px;
+        font-style: italic;
+        font-weight: 800;
+        letter-spacing: 0.08em;
+        text-shadow: 0 0 14px rgba(0, 240, 255, 0.6);
+      }
+      #pause .hint { margin-top: 12px; font-family: var(--mono-font); letter-spacing: 0.3em; font-size: 12px; color: var(--wallrun-cyan); }
+
+      /* ---------------- HUD ---------------- */
+      #hud { position: fixed; inset: 0; pointer-events: none; z-index: 20; display: none; font-family: var(--mono-font); }
+      #hud.visible { display: block; }
+      #xh { position: absolute; left: 50%; top: 50%; width: 200px; height: 200px; transform: translate(-50%, -50%); overflow: visible; }
+      #xh .ret { fill: none; stroke: rgba(240, 252, 255, 0.92); stroke-width: 1.6; filter: drop-shadow(0 0 1px #000); }
+      #xh .track { fill: none; stroke: rgba(160, 175, 190, 0.18); stroke-width: 3; }
+      #xh .arc { fill: none; stroke-width: 3; stroke-linecap: butt; transition: stroke 0.12s; }
+      #xh .arc.ready { stroke: #00f0ff; filter: drop-shadow(0 0 3px rgba(0, 240, 255, 0.8)); }
+      #xh .arc.low { stroke: #4a5260; }
+      #xh .arc.active { stroke: #ffffff; filter: drop-shadow(0 0 6px #9ffcff) drop-shadow(0 0 2px #fff); }
+      #xh .arc.switch { stroke: #ffb800; filter: drop-shadow(0 0 3px rgba(255, 184, 0, 0.8)); }
+      #xh .arc.reload { stroke: #e8f6ff; }
+      #xh-dot {
+        position: absolute; left: 50%; top: 50%; width: 2px; height: 2px; margin: -2px 0 0 -2px;
+        background: #fff; border: 1px solid #000; box-sizing: content-box;
+      }
+      #xh-anchor {
+        position: absolute; left: 0; top: 0; width: 12px; height: 12px; display: none;
+        border: 1px solid rgba(255, 184, 0, 0.75); box-shadow: 0 0 6px rgba(255, 184, 0, 0.45);
+      }
+      #xh-anchor.strong { width: 16px; height: 16px; border: 3px solid #ffd35a; box-shadow: 0 0 12px rgba(255, 184, 0, 0.95), inset 0 0 6px rgba(255, 184, 0, 0.7); }
+      #hp { position: absolute; left: 32px; bottom: 28px; width: 240px; }
+      #hp .label { font-size: 10px; letter-spacing: 0.3em; color: rgba(232, 246, 255, 0.6); display: flex; justify-content: space-between; }
+      #hp-num { font-size: 18px; letter-spacing: 0.05em; color: #f4fdff; }
+      #hp .bar { position: relative; height: 10px; margin-top: 4px; background: rgba(20, 26, 36, 0.75); border: 1px solid rgba(232, 246, 255, 0.25); }
+      #hp-fill { position: absolute; left: 0; top: 0; bottom: 0; width: 100%; background: linear-gradient(90deg, #e8f6ff, #9ffcff); transition: width 0.08s linear; }
+      #hp .segs { position: absolute; inset: 0; background: repeating-linear-gradient(90deg, transparent 0 22px, rgba(5, 7, 14, 0.9) 22px 24px); }
+      #hp.critical #hp-fill { background: linear-gradient(90deg, #ff1e42, #ff6b7d); }
+      #hp.critical #hp-num { color: #ff4d66; text-shadow: 0 0 8px rgba(255, 30, 66, 0.8); }
+      #hp.regen .bar { box-shadow: 0 0 10px rgba(0, 240, 255, 0.75); animation: regenpulse 0.6s ease-in-out infinite; }
+      @keyframes regenpulse { 50% { box-shadow: 0 0 2px rgba(0, 240, 255, 0.3); } }
+      #hp-regen { margin-top: 4px; height: 2px; background: rgba(232, 246, 255, 0.12); visibility: hidden; }
+      #hp-regen-fill { height: 100%; width: 0; background: #ffffff; }
+      #hp-regen.reset { background: rgba(255, 30, 66, 0.85); }
+      #hp-regen.reset #hp-regen-fill { background: #ff1e42; }
+      #spd { position: absolute; left: 32px; bottom: 72px; font-size: 11px; letter-spacing: 0.2em; color: rgba(232, 246, 255, 0.7); }
+      #spd-num { font-size: 22px; letter-spacing: 0.04em; color: #f4fdff; }
+      #spd.fast #spd-num { color: #00f0ff; text-shadow: 0 0 10px rgba(0, 240, 255, 0.9); }
+      #dock { position: absolute; right: 32px; bottom: 28px; text-align: right; }
+      #dock .slots { display: flex; gap: 10px; justify-content: flex-end; align-items: flex-end; font-size: 10px; letter-spacing: 0.16em; }
+      #dock .slot { color: rgba(232, 246, 255, 0.45); padding: 4px 6px; border-bottom: 2px solid transparent; transition: all 0.1s; }
+      #dock .slot.active { color: #f4fdff; font-size: 12px; border-bottom-color: #00f0ff; text-shadow: 0 0 8px rgba(0, 240, 255, 0.8); }
+      #dock .slot.pending { color: #ffb800; }
+      #dock .sep { color: rgba(232, 246, 255, 0.3); padding-bottom: 4px; }
+      #dock-locked { display: none; margin-left: 4px; padding: 1px 4px; font-size: 9px; color: #05070e; background: #00f0ff; box-shadow: 0 0 8px rgba(0, 240, 255, 0.9); }
+      #dock-locked.on { display: inline-block; }
+      #dock .ammo { margin-top: 6px; }
+      #ammo-num { font-size: 48px; line-height: 1; color: #f4fdff; }
+      #ammo-num.low { color: #ff4d66; text-shadow: 0 0 10px rgba(255, 30, 66, 0.7); }
+      #ammo-max { font-size: 16px; color: rgba(232, 246, 255, 0.55); margin-left: 6px; }
+      #ammo-name { font-size: 10px; letter-spacing: 0.24em; color: rgba(232, 246, 255, 0.55); }
     </style>
   </head>
   <body>
@@ -153,6 +257,60 @@
       <div id="title-sub"></div>
       <div class="rule"></div>
       <div id="title-sector"></div>
+      <div id="title-start">CLICK TO DEPLOY</div>
+      <div class="controls">
+        <b>WASD</b> MOVE · <b>MOUSE</b> LOOK · <b>SPACE</b> JUMP / WALL-KICK / RELEASE · <b>C / L-CTRL</b> SLIDE / CUT<br />
+        <b>LMB</b> FIRE / LAUNCH STRAND (HOLD = REEL) · <b>RMB</b> AIR BULLET-TIME · <b>Q / MOUSE 4</b> GUN ⇄ STRAND<br />
+        <b>1-4 / WHEEL</b> SELECT · <b>R</b> RELOAD · <b>ESC / TAB</b> PAUSE · <b>F</b> FULLSCREEN (Ctrl+W SAFE)
+      </div>
+    </div>
+    <div id="pause">
+      <div class="big">PAUSED</div>
+      <div class="hint">CLICK TO RESUME</div>
+      <div class="controls">F: FULLSCREEN + KEYBOARD LOCK — L-CTRL CANNOT CLOSE THE TAB IN FULLSCREEN</div>
+    </div>
+    <div id="hud">
+      <svg id="xh" viewBox="-100 -100 200 200">
+        <g id="ret-pistol" class="ret">
+          <path d="M0 -5 V-12 M0 5 V12 M-5 0 H-12 M5 0 H12" />
+        </g>
+        <g id="ret-smg" class="ret" style="display: none">
+          <path d="M-15 -8 V-15 H-8 M8 -15 H15 V-8 M15 8 V15 H8 M-8 15 H-15 V8" />
+        </g>
+        <g id="ret-shotgun" class="ret" style="display: none">
+          <circle r="22" stroke-dasharray="22 12.56" transform="rotate(-50)" />
+          <path d="M0 -4 V-8 M0 4 V8 M-4 0 H-8 M4 0 H8" />
+        </g>
+        <g id="ret-grapple" class="ret" style="display: none">
+          <circle r="12" stroke-dasharray="3 3" />
+          <path d="M0 -20 V-6 M-6 4 A6 6 0 0 0 6 4 V-1" />
+        </g>
+        <path id="xh-bt-track" class="track" d="M 23.14 27.58 A 36 36 0 0 0 23.14 -27.58" />
+        <path id="xh-bt-arc" class="arc ready" d="M 23.14 27.58 A 36 36 0 0 0 23.14 -27.58" />
+        <g id="xh-sw" style="display: none">
+          <path class="track" d="M -23.14 27.58 A 36 36 0 0 1 -23.14 -27.58" />
+          <path id="xh-sw-arc" class="arc switch" d="M -23.14 27.58 A 36 36 0 0 1 -23.14 -27.58" />
+        </g>
+      </svg>
+      <div id="xh-dot"></div>
+      <div id="xh-anchor"></div>
+      <div id="spd">SPEED <span id="spd-num">0.0</span> m/s · ALT <span id="alt-num">0.0</span> m</div>
+      <div id="hp">
+        <div class="label"><span>INTEGRITY</span><span id="hp-num">100</span></div>
+        <div class="bar"><div id="hp-fill"></div><div class="segs"></div></div>
+        <div id="hp-regen"><div id="hp-regen-fill"></div></div>
+      </div>
+      <div id="dock">
+        <div class="slots">
+          <span class="slot" id="dock-PISTOL">[1] PISTOL</span>
+          <span class="slot" id="dock-SMG">[2] SMG</span>
+          <span class="slot" id="dock-SHOTGUN">[3] SHOTGUN</span>
+          <span class="sep">|</span>
+          <span class="slot" id="dock-GRAPPLE">[Q/4] STRAND<span id="dock-locked">LOCKED</span></span>
+        </div>
+        <div class="ammo"><span id="ammo-num">8</span><span id="ammo-max">/ 8</span></div>
+        <div id="ammo-name">MK-IV RAIL PISTOL</div>
+      </div>
     </div>
     <div id="debug-stats" hidden></div>
     <script>
