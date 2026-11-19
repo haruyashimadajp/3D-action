@@ -20,6 +20,8 @@ import {
   QUALITY_PRESETS,
   clamp,
   lerpFactor,
+  INPUT,
+  SAVE_KEY,
 } from './config/constants';
 import { SECTORS } from './config/skills';
 import { Renderer } from './engine/Renderer';
@@ -140,6 +142,31 @@ const _lookDelta = { yaw: 0, pitch: 0 };
 const _proj = new THREE.Vector3();
 const _feet = new THREE.Vector3();
 const UP = new THREE.Vector3(0, 1, 0);
+
+/** Reads one field of the persisted settings object (§8.3 save key); falls back on any storage error. */
+function readSetting(key: string, fallback: number): number {
+  try {
+    const raw = localStorage.getItem(SAVE_KEY);
+    if (!raw) return fallback;
+    const data = JSON.parse(raw) as { settings?: Record<string, unknown> };
+    const v = data.settings?.[key];
+    return typeof v === 'number' && Number.isFinite(v) ? v : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+/** Merges one settings field into the save object without touching other persisted data. */
+function writeSetting(key: string, value: number): void {
+  try {
+    const raw = localStorage.getItem(SAVE_KEY);
+    const data = (raw ? JSON.parse(raw) : {}) as { settings?: Record<string, unknown> };
+    data.settings = { ...(data.settings ?? {}), [key]: value };
+    localStorage.setItem(SAVE_KEY, JSON.stringify(data));
+  } catch {
+    // Storage unavailable (private mode / sandboxed preview): the setting still applies for this session.
+  }
+}
 
 class App {
   private readonly renderer: Renderer;
@@ -267,6 +294,7 @@ class App {
     // --- Screen flow ---
     document.getElementById('title-start')?.addEventListener('click', () => this.deploy());
     document.getElementById('pause')?.addEventListener('click', () => this.input.requestPointerLock());
+    this.initSettingsUi();
     this.input.onPointerLockChange((locked) => {
       if (locked && this.state === 'PAUSED') this.setState('PLAYING');
       else if (!locked && this.state === 'PLAYING') this.setState('PAUSED');
@@ -275,6 +303,36 @@ class App {
     this.attract.step(0);
     this.attract.apply(this.renderer.camera, 1, 0);
     this.prevCamPos.copy(this.renderer.camera.position);
+  }
+
+  /**
+   * §3.1 / §8.3: mouse sensitivity (0.2–3.0, default 1.0) on the title and pause screens.
+   * Stored inside the save object under `settings.sensitivity`, preserving any other save fields.
+   */
+  private initSettingsUi(): void {
+    const range = document.getElementById('sens-range') as HTMLInputElement | null;
+    const num = document.getElementById('sens-num') as HTMLInputElement | null;
+    const reset = document.getElementById('sens-reset');
+    if (!range || !num) return;
+    const panel = document.getElementById('settings');
+    // Keep clicks / keys inside the panel from reaching the pause overlay or gameplay bindings.
+    panel?.addEventListener('click', (e) => e.stopPropagation());
+    panel?.addEventListener('keydown', (e) => e.stopPropagation());
+
+    const apply = (v: number, save: boolean): void => {
+      const value = Math.round(clamp(Number.isFinite(v) ? v : INPUT.SENSITIVITY_DEFAULT, INPUT.SENSITIVITY_MIN, INPUT.SENSITIVITY_MAX) * 100) / 100;
+      this.input.sensitivity = value;
+      range.value = String(value);
+      if (document.activeElement !== num || save) num.value = value.toFixed(2);
+      if (save) writeSetting('sensitivity', value);
+    };
+    apply(readSetting('sensitivity', INPUT.SENSITIVITY_DEFAULT), false);
+    range.addEventListener('input', () => apply(parseFloat(range.value), true));
+    num.addEventListener('change', () => apply(parseFloat(num.value), true));
+    num.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') num.blur();
+    });
+    reset?.addEventListener('click', () => apply(INPUT.SENSITIVITY_DEFAULT, true));
   }
 
   private buildSector(index: number): SectorLayout {
@@ -301,6 +359,7 @@ class App {
     this.input.gameplayEnabled = playing;
     this.input.setUnloadGuard(s !== 'TITLE');
     document.getElementById('pause')?.classList.toggle('visible', s === 'PAUSED');
+    document.getElementById('settings')?.classList.toggle('hidden', playing);
     document.getElementById('title')?.classList.toggle('playing', s !== 'TITLE');
     this.hud.setVisible(s !== 'TITLE');
     this.viewModel.root.visible = s !== 'TITLE';

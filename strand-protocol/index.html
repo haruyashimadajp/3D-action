@@ -196,6 +196,49 @@
       }
       #pause .hint { margin-top: 12px; font-family: var(--mono-font); letter-spacing: 0.3em; font-size: 12px; color: var(--wallrun-cyan); }
 
+      /* ---------------- Settings (title + pause) ---------------- */
+      #settings {
+        position: fixed;
+        left: 50%;
+        bottom: 36px;
+        transform: translateX(-50%);
+        z-index: 35;
+        display: flex;
+        align-items: center;
+        gap: 14px;
+        padding: 10px 16px;
+        font-family: var(--mono-font);
+        font-size: 11px;
+        letter-spacing: 0.2em;
+        color: rgba(232, 246, 255, 0.85);
+        background: rgba(5, 7, 14, 0.72);
+        border: 1px solid rgba(0, 240, 255, 0.35);
+        pointer-events: auto;
+        cursor: default;
+      }
+      #settings.hidden { display: none; }
+      #settings label { color: var(--wallrun-cyan); }
+      #sens-range { width: 220px; accent-color: #00f0ff; cursor: pointer; }
+      #sens-num {
+        width: 58px;
+        font: inherit;
+        letter-spacing: 0.05em;
+        color: #e8fbff;
+        background: rgba(0, 240, 255, 0.08);
+        border: 1px solid rgba(0, 240, 255, 0.45);
+        padding: 3px 5px;
+      }
+      #sens-reset {
+        font: inherit;
+        letter-spacing: 0.15em;
+        color: rgba(232, 246, 255, 0.8);
+        background: transparent;
+        border: 1px solid rgba(232, 246, 255, 0.35);
+        padding: 3px 8px;
+        cursor: pointer;
+      }
+      #sens-reset:hover { border-color: #00f0ff; color: #e8fbff; }
+
       /* ---------------- HUD ---------------- */
       #hud { position: fixed; inset: 0; pointer-events: none; z-index: 20; display: none; font-family: var(--mono-font); }
       #hud.visible { display: block; }
@@ -268,6 +311,12 @@
       <div class="big">PAUSED</div>
       <div class="hint">CLICK TO RESUME</div>
       <div class="controls">F: FULLSCREEN + KEYBOARD LOCK — L-CTRL CANNOT CLOSE THE TAB IN FULLSCREEN</div>
+    </div>
+    <div id="settings">
+      <label for="sens-range">MOUSE SENSITIVITY</label>
+      <input id="sens-range" type="range" min="0.2" max="3" step="0.05" value="1" />
+      <input id="sens-num" type="number" min="0.2" max="3" step="0.05" value="1.00" />
+      <button id="sens-reset" type="button">DEFAULT</button>
     </div>
     <div id="hud">
       <svg id="xh" viewBox="-100 -100 200 200">

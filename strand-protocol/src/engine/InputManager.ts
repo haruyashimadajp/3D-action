@@ -245,6 +245,8 @@ export class InputManager {
   }
 
   private readonly onKeyDown = (e: KeyboardEvent): void => {
+    // Typing into a settings field (title / pause menu) must not trigger game bindings.
+    if (e.target instanceof HTMLInputElement) return;
     if (this.locked && PREVENT.has(e.code)) e.preventDefault();
     if (e.code === 'Tab') e.preventDefault();
     if (e.repeat) return;
