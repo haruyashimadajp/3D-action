@@ -44,8 +44,9 @@
       #loading {
         position: fixed;
         inset: 0;
-        display: grid;
-        place-items: center;
+        display: flex;
+        align-items: center;
+        justify-content: center;
         background: var(--sky-zenith);
         font-family: var(--mono-font);
         letter-spacing: 0.32em;
@@ -61,8 +62,13 @@
       #loading.error {
         color: var(--enemy-danger);
         letter-spacing: 0.08em;
+        line-height: 1.9;
         padding: 24px;
         text-align: center;
+        white-space: pre-line;
+      }
+      #loading.error::after {
+        display: none;
       }
       #loading::after {
         content: '';
@@ -149,6 +155,53 @@
       <div id="title-sector"></div>
     </div>
     <div id="debug-stats" hidden></div>
+    <script>
+      // Boot watchdog & fatal-error surface (classic inline script: runs even when the module fails to load).
+      (function () {
+        var loading = document.getElementById('loading');
+        function show(message) {
+          if (!loading) return;
+          loading.classList.remove('hidden');
+          loading.classList.add('error');
+          loading.textContent = message;
+        }
+        window.strandShowError = show;
+        var HOWTO =
+          '開発: strand-protocol フォルダで「npm run dev」→ 表示された URL (http://localhost:5173) を開く\n' +
+          'ビルド版: 「npm run build」→ dist/index.html をダブルクリック\n' +
+          'GitHub HTML Preview: strand-protocol/dist/index.html の URL を開く\n\n' +
+          'Dev: run "npm run dev" and open the printed URL. Build: run "npm run build" and open dist/index.html.';
+        document.addEventListener('DOMContentLoaded', function () {
+          var unbuiltSource = document.querySelector('script[type="module"][src$=".ts"]');
+          if (location.protocol === 'file:' && unbuiltSource) {
+            show('このファイルは未ビルドのソースなので直接は開けません。\n' + HOWTO);
+          }
+        });
+        // Capture phase also catches <script> load failures, which do not bubble.
+        window.addEventListener(
+          'error',
+          function (e) {
+            var target = e.target;
+            if (target && target.tagName === 'SCRIPT') {
+              show('ゲームスクリプトを読み込めませんでした / Failed to load the game script.\n' + HOWTO);
+              return;
+            }
+            show('RUNTIME ERROR — ' + (e.message || (e.error && e.error.message) || 'unknown error'));
+          },
+          true
+        );
+        window.addEventListener('unhandledrejection', function (e) {
+          show('RUNTIME ERROR — ' + ((e.reason && e.reason.message) || String(e.reason)));
+        });
+        setTimeout(function () {
+          if (!window.__STRAND_BOOTED__) {
+            show(
+              'ゲームスクリプトが起動しませんでした / The game script did not start.\n' + HOWTO
+            );
+          }
+        }, 10000);
+      })();
+    </script>
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

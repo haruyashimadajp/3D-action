@@ -292,27 +292,39 @@ class App {
 // ---------------------------------------------------------------------------
 // Boot
 // ---------------------------------------------------------------------------
+declare global {
+  interface Window {
+    /** Set once the module has started booting (read by the loading watchdog in index.html). */
+    __STRAND_BOOTED__?: boolean;
+    /** Shows a fatal error on the loading overlay (defined inline in index.html). */
+    strandShowError?: (message: string) => void;
+  }
+}
+
 function boot(): void {
+  window.__STRAND_BOOTED__ = true;
   const container = document.getElementById('app');
   const loading = document.getElementById('loading');
   if (!container) throw new Error('#app container missing');
-  // Let the loading overlay paint before the synchronous texture generation.
-  requestAnimationFrame(() =>
-    requestAnimationFrame(() => {
-      try {
-        const app = new App(container);
-        app.start();
-        loading?.classList.add('hidden');
-        document.getElementById('title')?.classList.add('visible');
-      } catch (err) {
-        console.error(err);
-        if (loading) {
-          loading.textContent = `INITIALISATION FAILED — ${(err as Error).message}`;
-          loading.classList.add('error');
-        }
+  // Yield once so the loading overlay paints before the synchronous texture generation.
+  // setTimeout (not requestAnimationFrame): rAF never fires in hidden tabs / some embedded previews.
+  window.setTimeout(() => {
+    try {
+      const app = new App(container);
+      app.start();
+      loading?.classList.add('hidden');
+      document.getElementById('title')?.classList.add('visible');
+    } catch (err) {
+      console.error(err);
+      const message = `INITIALISATION FAILED — ${(err as Error).message}`;
+      if (window.strandShowError) window.strandShowError(message);
+      else if (loading) {
+        loading.textContent = message;
+        loading.classList.add('error');
       }
-    }),
-  );
+    }
+  }, 30);
 }
 
-boot();
+if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot, { once: true });
+else boot();
