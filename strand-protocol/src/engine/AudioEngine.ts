@@ -1,11 +1,19 @@
 /**
  * STRAND // PROTOCOL — Audio (§7): 100 % procedural Web Audio DSP, no audio files.
  *
- * Master routing (§7.1):
- *   [SE voices] ──┬──> [Dynamic Lowpass (bullet-time)] ──> [Master Compressor] ──> [Destination]
- *                 └──> [Convolver reverb (procedural 1.8 s city IR)] ──┘
- *   [BGM 5 layers] ──> [BGM Lowpass (bullet-time)] ──────> [Master Compressor]
- *   [UI / head-shot resonance / warnings] ───────────────> [Master Compressor]  (clear even in bullet time)
+ * Master routing (§7.1 + 5A-2):
+ *   [SE voices, rain, wind, winch] ─┬─> [Dynamic Lowpass (bullet-time)] ──┐
+ *                                   └─> [Convolver reverb (1.8 s city IR)] ┤
+ *   [BGM 5 layers] ──> [BGM Lowpass (bullet-time)] ───────────────────────┤
+ *   [clear combat path: head-shot resonance, lock warnings, hits, heartbeat] ┤
+ *                                                                          └─> [worldOut] ─> [Master Compressor] ─> [Destination]
+ *   [UI bus: menu ticks, skill modal, zoom servo] ─────────────────────────────────────────> [Master Compressor]
+ *
+ *  - worldOut ramps to 0 in 60 ms while PAUSED / RESULT / TITLE (rain included — 100 % silent) and back in
+ *    80 ms; the BGM / heartbeat / repair schedulers stop and re-sync to the current time on resume (no burst).
+ *    A hidden tab suspends the AudioContext outright. The UI bus stays live so the volume slider can be heard.
+ *  - BGM and combat SE voices are capped separately (24 / 28); player shots, lock warnings, hits and grazes
+ *    are priority voices that are never culled.
  *
  *  - Bullet time sweeps both lowpass filters 22 kHz → 680 Hz (Q 2.4) exponentially in 120 ms, back in 180 ms.
  *  - Rain ambience: looping pink noise → bandpass 1200 Hz (Q 0.6) → high-shelf 6 kHz +4 dB at gain 0.09.
@@ -69,6 +77,10 @@ export class AudioEngine {
   private bgmShelf!: BiquadFilterNode;
   private musicDuck!: GainNode;
   private uiBus!: GainNode;
+  /** 5A-2: everything except the menu UI bus; muted while paused. */
+  private worldOut!: GainNode;
+  /** Clear (bullet-time bypassing) combat feedback path inside the world bus. */
+  private clearBus!: GainNode;
   private white!: AudioBuffer;
   private pink!: AudioBuffer;
   private softCurve!: Curve;
@@ -76,6 +88,8 @@ export class AudioEngine {
   private hardCurve!: Curve;
   private windGain: GainNode | null = null;
   private windFilter: BiquadFilterNode | null = null;
+  private winchOsc: OscillatorNode | null = null;
+  private winchGain: GainNode | null = null;
   private readonly layerGains: GainNode[] = [];
   private readonly layerOn = [false, false, false, false, false];
   private readonly layerUntil = [0, 0, 0, 0, 0];
@@ -85,8 +99,14 @@ export class AudioEngine {
   private leadShaper!: WaveShaperNode;
   private leadFilter!: BiquadFilterNode;
 
-  private voices = 0;
+  /** Live voice counts per pool (5A-6). */
+  private seVoices = 0;
+  private bgmVoices = 0;
   private lockVoices = 0;
+  /** True while the BGM scheduler is creating voices (they count against the BGM pool). */
+  private bgmMode = false;
+  private paused = true;
+  private hidden = false;
   private volume: number = AUDIO.MASTER_GAIN;
   private timer = 0;
   private bgmStep = 0;
@@ -132,8 +152,49 @@ export class AudioEngine {
     this.buildGraph(c);
     this.startRain(c);
     this.startWind(c);
+    this.startWinch(c);
     this.startBgm(c);
-    if (c.state === 'suspended') c.resume().catch(() => undefined);
+    if (c.state === 'suspended' && !this.hidden) c.resume().catch(() => undefined);
+  }
+
+  /**
+   * 5A-2: PAUSED / RESULT / TITLE → world bus (rain, wind, BGM, combat SE, reverb) ramps to 0 in 60 ms and the
+   * BGM / heartbeat / repair schedulers stop; PLAYING / SKILL / TRANSITION → back to 1 in 80 ms, schedulers
+   * re-synced to the current time (no catch-up burst). The UI bus is unaffected.
+   */
+  setPaused(paused: boolean): void {
+    if (this.paused === paused) return;
+    this.paused = paused;
+    const c = this.ctx;
+    if (!c) return;
+    const t = c.currentTime;
+    const g = this.worldOut.gain;
+    g.cancelScheduledValues(t);
+    g.setValueAtTime(g.value, t);
+    g.linearRampToValueAtTime(paused ? 0 : 1, t + (paused ? AUDIO.WORLD_PAUSE_MS : AUDIO.WORLD_RESUME_MS) / 1000);
+    if (!paused) this.resyncSchedulers(t);
+  }
+
+  get isPaused(): boolean {
+    return this.paused;
+  }
+
+  /** 5A-2: a hidden tab suspends the whole context; on return it resumes (the world bus stays muted if paused). */
+  setHidden(hidden: boolean): void {
+    this.hidden = hidden;
+    const c = this.ctx;
+    if (!c) return;
+    if (hidden) c.suspend().catch(() => undefined);
+    else c.resume().catch(() => undefined);
+  }
+
+  private resyncSchedulers(now: number): void {
+    if (this.nextStepTime < now + 0.03) {
+      this.nextStepTime = now + 0.03;
+      this.gridOrigin = this.nextStepTime - this.bgmStep * AUDIO.SIXTEENTH_S;
+    }
+    this.nextHeartTime = 0;
+    this.nextRepairTime = 0;
   }
 
   /** Master volume 0..1 (settings). */
@@ -152,6 +213,11 @@ export class AudioEngine {
     this.masterOut = c.createGain();
     this.masterOut.gain.value = this.volume;
     this.compressor.connect(this.masterOut).connect(c.destination);
+    this.worldOut = c.createGain();
+    this.worldOut.gain.value = this.paused ? 0 : 1;
+    this.worldOut.connect(this.compressor);
+    this.clearBus = c.createGain();
+    this.clearBus.connect(this.worldOut);
 
     // SE voices → BT lowpass → compressor, and → convolver reverb → compressor.
     this.seBus = c.createGain();
@@ -159,12 +225,12 @@ export class AudioEngine {
     this.seFilter.type = 'lowpass';
     this.seFilter.frequency.value = AUDIO.BT_LOWPASS_OPEN_HZ;
     this.seFilter.Q.value = 0.707;
-    this.seBus.connect(this.seFilter).connect(this.compressor);
+    this.seBus.connect(this.seFilter).connect(this.worldOut);
     const convolver = c.createConvolver();
     convolver.buffer = this.buildImpulse(c);
     this.reverbSend = c.createGain();
     this.reverbSend.gain.value = AUDIO.REVERB_SEND;
-    this.seBus.connect(this.reverbSend).connect(convolver).connect(this.compressor);
+    this.seBus.connect(this.reverbSend).connect(convolver).connect(this.worldOut);
 
     // BGM layers → duck (sidechain feel) / drums → shelf (overdrive mix) → BT lowpass → compressor.
     this.bgmBus = c.createGain();
@@ -177,7 +243,7 @@ export class AudioEngine {
     this.bgmFilter.type = 'lowpass';
     this.bgmFilter.frequency.value = AUDIO.BT_LOWPASS_OPEN_HZ;
     this.bgmFilter.Q.value = 0.707;
-    this.bgmBus.connect(this.bgmShelf).connect(this.bgmFilter).connect(this.compressor);
+    this.bgmBus.connect(this.bgmShelf).connect(this.bgmFilter).connect(this.worldOut);
     this.musicDuck = c.createGain();
     this.musicDuck.connect(this.bgmBus);
 
@@ -297,28 +363,66 @@ export class AudioEngine {
     src.start();
   }
 
+  /** 5A-6 winch motor: persistent saw → bandpass 900 Hz, faded in only while reeling (GRAPPLE_PULL). */
+  private startWinch(c: AudioContext): void {
+    const W = AUDIO.WINCH;
+    const o = c.createOscillator();
+    o.type = 'sawtooth';
+    o.frequency.value = W.f0;
+    const bp = c.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.value = W.bandpassHz;
+    bp.Q.value = 1.6;
+    const g = c.createGain();
+    g.gain.value = 0;
+    o.connect(bp).connect(g).connect(this.seFilter);
+    o.start();
+    this.winchOsc = o;
+    this.winchGain = g;
+  }
+
   // =============================================================================================
-  // Voice helpers
+  // Voice helpers (5A-6: separate SE / BGM pools)
   // =============================================================================================
-  private readonly onVoiceEnded = (): void => {
-    this.voices = Math.max(0, this.voices - 1);
+  private readonly onSeEnded = (): void => {
+    this.seVoices = Math.max(0, this.seVoices - 1);
+  };
+
+  private readonly onBgmEnded = (): void => {
+    this.bgmVoices = Math.max(0, this.bgmVoices - 1);
   };
 
   private readonly onLockEnded = (): void => {
     this.lockVoices = Math.max(0, this.lockVoices - 1);
-    this.voices = Math.max(0, this.voices - 1);
+    this.seVoices = Math.max(0, this.seVoices - 1);
   };
 
-  private can(force = false): AudioContext | null {
+  /** Running context, or null; `priority` voices (shots, locks, hits, grazes) bypass the SE cap. */
+  private can(priority = false): AudioContext | null {
     const c = this.ctx;
     if (!c || c.state !== 'running') return null;
-    if (!force && this.voices >= AUDIO.MAX_VOICES) return null;
+    if (!priority && this.seVoices >= AUDIO.MAX_SE_VOICES) return null;
     return c;
   }
 
+  /** BGM voices are dropped (never SE) once their own pool is full. */
+  private bgmFull(): boolean {
+    return this.bgmMode && this.bgmVoices >= AUDIO.MAX_BGM_VOICES;
+  }
+
   private track(n: AudioScheduledSourceNode, lock = false): void {
-    this.voices++;
-    n.onended = lock ? this.onLockEnded : this.onVoiceEnded;
+    if (this.bgmMode) {
+      this.bgmVoices++;
+      n.onended = this.onBgmEnded;
+      return;
+    }
+    this.seVoices++;
+    n.onended = lock ? this.onLockEnded : this.onSeEnded;
+  }
+
+  /** Live voice counts (debug / tests). */
+  get voiceCounts(): { se: number; bgm: number; lock: number } {
+    return { se: this.seVoices, bgm: this.bgmVoices, lock: this.lockVoices };
   }
 
   /** Oscillator with an exponential pitch sweep and a fast-attack exponential decay. */
@@ -334,6 +438,7 @@ export class AudioEngine {
     attack = 0.002,
     shaper: Curve | null = null,
   ): void {
+    if (this.bgmFull()) return;
     const o = c.createOscillator();
     o.type = type;
     o.frequency.setValueAtTime(f0, t);
@@ -367,6 +472,7 @@ export class AudioEngine {
     attack = 0.002,
     shaper: Curve | null = null,
   ): void {
+    if (this.bgmFull()) return;
     const s = c.createBufferSource();
     s.buffer = this.white;
     const f = c.createBiquadFilter();
@@ -392,6 +498,7 @@ export class AudioEngine {
 
   /** Two-operator FM metallic tone. */
   private fm(c: AudioContext, carrier: number, mod: number, index: number, dur: number, peak: number, dest: AudioNode, t: number, type: OscillatorType = 'sine'): void {
+    if (this.bgmFull()) return;
     const o = c.createOscillator();
     o.type = type;
     o.frequency.value = carrier;
@@ -433,8 +540,11 @@ export class AudioEngine {
   // =============================================================================================
   // Per-frame state
   // =============================================================================================
-  /** Listener pose (camera) + swing wind (gain linear in speed while hanging on the strand). */
-  update(camPos: THREE.Vector3, forward: THREE.Vector3, up: THREE.Vector3, swinging: boolean, speed: number): void {
+  /**
+   * Listener pose (camera) + swing wind (gain linear in speed while hanging on the strand) + winch motor
+   * (only while reeling; pitch 140 → 360 Hz with speed).
+   */
+  update(camPos: THREE.Vector3, forward: THREE.Vector3, up: THREE.Vector3, swinging: boolean, speed: number, reeling = false): void {
     const c = this.ctx;
     if (!c) return;
     const l = c.listener;
@@ -457,6 +567,12 @@ export class AudioEngine {
       const k = swinging ? clamp(speed / W.maxSpeed, 0, 1) : 0;
       this.windGain.gain.setTargetAtTime(W.maxGain * k, c.currentTime, 0.06);
       this.windFilter.frequency.setTargetAtTime(W.f0 + (W.f1 - W.f0) * k, c.currentTime, 0.06);
+    }
+    if (this.winchGain && this.winchOsc) {
+      const M = AUDIO.WINCH;
+      const k = clamp(speed / M.maxSpeed, 0, 1);
+      this.winchGain.gain.setTargetAtTime(reeling ? M.gain : 0, c.currentTime, reeling ? 0.05 : 0.08);
+      this.winchOsc.frequency.setTargetAtTime(M.f0 + (M.f1 - M.f0) * k, c.currentTime, 0.05);
     }
   }
 
@@ -487,7 +603,7 @@ export class AudioEngine {
     if (!cc) return;
     if (on) {
       const B = AUDIO.BT_ENTER;
-      this.tone(cc, 'sine', B.f0, B.f1, B.ms / 1000, 0.5, this.uiBus, t, 0.004, this.softCurve);
+      this.tone(cc, 'sine', B.f0, B.f1, B.ms / 1000, 0.5, this.clearBus, t, 0.004, this.softCurve);
       // Low reverse-wind swell: noise rising into the drop.
       const s = cc.createBufferSource();
       s.buffer = this.white;
@@ -499,13 +615,13 @@ export class AudioEngine {
       g.gain.setValueAtTime(0.0001, t);
       g.gain.exponentialRampToValueAtTime(0.22, t + 0.2);
       g.gain.exponentialRampToValueAtTime(0.0001, t + 0.26);
-      s.connect(f).connect(g).connect(this.uiBus);
+      s.connect(f).connect(g).connect(this.clearBus);
       s.start(t, Math.random());
       s.stop(t + 0.3);
       this.track(s);
     } else {
       const B = AUDIO.BT_EXIT;
-      this.tone(cc, 'sine', B.f0, B.f1, B.ms / 1000, 0.38, this.uiBus, t, 0.01);
+      this.tone(cc, 'sine', B.f0, B.f1, B.ms / 1000, 0.38, this.clearBus, t, 0.01);
     }
   }
 
@@ -558,11 +674,13 @@ export class AudioEngine {
   // =============================================================================================
   // Weapons & equipment (§7.2)
   // =============================================================================================
+  /** Player gunfire — a priority voice (never culled, 5A-6). `ammoLeft` is the magazine after this shot. */
   gunshot(gun: GunId, ammoLeft: number, airborne: boolean): void {
-    const c = this.can();
+    const c = this.can(true);
     if (!c) return;
     const t = c.currentTime;
     const d = this.seBus;
+    const K = AUDIO.PISTOL_LOW_AMMO_CLICK;
     if (gun === 'PISTOL') {
       const A = AUDIO.PISTOL_TRANSIENT;
       const B = AUDIO.PISTOL_BODY;
@@ -570,14 +688,14 @@ export class AudioEngine {
       this.tone(c, 'sawtooth', A.f0, A.f1, A.ms / 1000, 0.42, d, t, 0.001, this.driveK40);
       this.tone(c, 'triangle', B.f0, B.f1, B.ms / 1000, 0.55, d, t, 0.002);
       this.noise(c, 'bandpass', T.f0, T.f1, 1.6, T.ms / 1000, 0.3, d, t, 0.003);
-      const K = AUDIO.PISTOL_LOW_AMMO_CLICK;
-      if (ammoLeft < K.rounds) this.tone(c, 'sine', K.hz, K.hz, K.ms / 1000, 0.22, this.uiBus, t + 0.03, 0.001);
+      if (ammoLeft < K.rounds) this.lowAmmoClick(c, t + 0.03);
     } else if (gun === 'SMG') {
       const j = 1 + (Math.random() * 2 - 1) * AUDIO.SMG_PITCH_JITTER;
       const A = AUDIO.SMG_ATTACK;
       const S = AUDIO.SMG_SNAP;
       this.tone(c, 'square', A.f0 * j, A.f1 * j, A.ms / 1000, 0.2, d, t, 0.001);
       this.noise(c, 'highpass', S.hz * j, S.hz * j, 0.8, S.ms / 1000, 0.22, d, t, 0.001);
+      if (ammoLeft <= AUDIO.SMG_LOW_AMMO_ROUNDS) this.lowAmmoClick(c, t + 0.025);
     } else {
       const S = AUDIO.SHOTGUN_SUB;
       const B = AUDIO.SHOTGUN_BLAST;
@@ -588,7 +706,24 @@ export class AudioEngine {
       const tp = t + P.delayMs / 1000;
       this.noise(c, 'bandpass', P.hzA, P.hzA, 4, P.ms / 1000, 0.2, d, tp, 0.001);
       this.noise(c, 'bandpass', P.hzB, P.hzB, 4, P.ms / 1000, 0.2, d, tp + 0.075, 0.001);
+      // Last shell fired.
+      if (ammoLeft === 0) this.lowAmmoClick(c, t + 0.04);
     }
+  }
+
+  /** Metallic dry click layered on low-ammo shots (sine 2600 Hz 25 ms + a short high tick). */
+  private lowAmmoClick(c: AudioContext, t: number): void {
+    const K = AUDIO.PISTOL_LOW_AMMO_CLICK;
+    this.tone(c, 'sine', K.hz, K.hz, K.ms / 1000, 0.22, this.clearBus, t, 0.001);
+    this.noise(c, 'highpass', 6000, 6000, 0.8, 0.012, 0.05, this.clearBus, t);
+  }
+
+  /** 5A-1 optical servo: zoom in 1400 → 2100 Hz (45 ms, 0.05) / out 1800 → 1100 Hz (40 ms, 0.04), UI bus. */
+  zoom(on: boolean): void {
+    const c = this.can(true);
+    if (!c) return;
+    const Z = on ? AUDIO.ZOOM_IN : AUDIO.ZOOM_OUT;
+    this.tone(c, 'sine', Z.f0, Z.f1, Z.ms / 1000, Z.gain, this.uiBus, c.currentTime, 0.003);
   }
 
   dryFire(): void {
@@ -675,16 +810,41 @@ export class AudioEngine {
     this.noise(c, 'lowpass', 900, 380, 0.8, 0.38, 0.12, this.seBus, c.currentTime, 0.02);
   }
 
+  /** 5A-6 wall-run magnetic boot tap (every 0.22 s): bandpass 1800 Hz noise 25 ms + triangle 320 → 160 Hz 30 ms. */
+  wallRunStep(): void {
+    const c = this.can();
+    if (!c) return;
+    const t = c.currentTime;
+    const W = AUDIO.WALLRUN_STEP;
+    const j = 1 + (Math.random() * 2 - 1) * 0.04;
+    this.noise(c, 'bandpass', W.noiseHz * j, W.noiseHz * j, 2.2, W.noiseMs / 1000, 0.13, this.seBus, t, 0.001);
+    this.tone(c, 'triangle', W.f0 * j, W.f1 * j, W.ms / 1000, 0.16, this.seBus, t, 0.001);
+  }
+
   // =============================================================================================
   // Combat feedback
   // =============================================================================================
   /** Body hit tick (UI path, under the hit marker). */
   hitBody(): void {
-    const c = this.can();
+    const c = this.can(true);
     if (!c) return;
     const t = c.currentTime;
-    this.tone(c, 'sine', 1900, 1500, 0.022, 0.08, this.uiBus, t, 0.001);
-    this.noise(c, 'highpass', 4200, 4200, 0.7, 0.025, 0.06, this.uiBus, t);
+    this.tone(c, 'sine', 1900, 1500, 0.022, 0.08, this.clearBus, t, 0.001);
+    this.noise(c, 'highpass', 4200, 4200, 0.7, 0.025, 0.06, this.clearBus, t);
+  }
+
+  /**
+   * 5A-6 Aegis shield / boss armour deflect — clearly not a body hit: high FM metallic ping (2400 Hz carrier ×
+   * 3700 Hz modulator, 85 ms) + a short energy resonance ring.
+   */
+  hitShield(): void {
+    const c = this.can(true);
+    if (!c) return;
+    const t = c.currentTime;
+    const H = AUDIO.HIT_SHIELD;
+    this.fm(c, H.carrierHz, H.modHz, 1.6, H.ms / 1000, 0.1, this.clearBus, t);
+    this.tone(c, 'sine', H.ringHz, H.ringHz * 0.94, H.ringMs / 1000, 0.07, this.clearBus, t + 0.004, 0.004);
+    this.noise(c, 'bandpass', 5200, 3800, 6, 0.04, 0.05, this.clearBus, t);
   }
 
   /**
@@ -703,11 +863,11 @@ export class AudioEngine {
     const C = AUDIO.HEADSHOT_CHORD;
     const dec = (C.decayMs / 1000) * (kill ? 1.6 : 1);
     const amp = kill ? 0.2 : 0.13;
-    this.noise(c, 'highpass', G.hz, G.hz, 0.7, G.ms / 1000, kill ? 0.3 : 0.22, this.uiBus, t);
-    this.tone(c, 'sine', root, root, dec, amp, this.uiBus, t, C.attackMs / 1000);
-    this.tone(c, 'sine', root * 1.5, root * 1.5, dec, amp * 0.7, this.uiBus, t, C.attackMs / 1000);
-    this.tone(c, 'sine', root * 2, root * 2, dec, amp * 0.5, this.uiBus, t, C.attackMs / 1000);
-    if (kill) this.fm(c, root * 0.5, root * 1.41, 1.8, dec * 1.4, 0.07, this.uiBus, t);
+    this.noise(c, 'highpass', G.hz, G.hz, 0.7, G.ms / 1000, kill ? 0.3 : 0.22, this.clearBus, t);
+    this.tone(c, 'sine', root, root, dec, amp, this.clearBus, t, C.attackMs / 1000);
+    this.tone(c, 'sine', root * 1.5, root * 1.5, dec, amp * 0.7, this.clearBus, t, C.attackMs / 1000);
+    this.tone(c, 'sine', root * 2, root * 2, dec, amp * 0.5, this.clearBus, t, C.attackMs / 1000);
+    if (kill) this.fm(c, root * 0.5, root * 1.41, 1.8, dec * 1.4, 0.07, this.clearBus, t);
   }
 
   /** Body kill: enemy core rupture. */
@@ -744,11 +904,11 @@ export class AudioEngine {
     const c = this.can(true);
     if (!c) return;
     const t = c.currentTime;
-    this.tone(c, 'sine', 140, 20, 1.6, 0.8, this.uiBus, t, 0.003, this.hardCurve);
+    this.tone(c, 'sine', 140, 20, 1.6, 0.8, this.clearBus, t, 0.003, this.hardCurve);
     this.noise(c, 'lowpass', 2400, 120, 0.7, 1.4, 0.5, this.seBus, t, 0.004, this.softCurve);
     const p = this.panner(c, pos, false, this.seBus);
     this.noise(c, 'highpass', 4000, 1400, 0.6, 0.8, 0.3, p, t + 0.05);
-    for (let i = 0; i < 3; i++) this.tone(c, 'sine', midiHz(62 + i * 7), midiHz(62 + i * 7), 2.4, 0.08, this.uiBus, t + 0.25 + i * 0.06, 0.01);
+    for (let i = 0; i < 3; i++) this.tone(c, 'sine', midiHz(62 + i * 7), midiHz(62 + i * 7), 2.4, 0.08, this.clearBus, t + 0.25 + i * 0.06, 0.01);
   }
 
   /** Enemy gunfire from its muzzle (spatial). */
@@ -797,7 +957,7 @@ export class AudioEngine {
     const t = c.currentTime;
     const dur = clamp(durationS, 0.12, 1.6);
     const F = sniper ? AUDIO.LOCK_TONE_SNIPER : AUDIO.LOCK_TONE;
-    const p = this.panner(c, pos, true, this.uiBus);
+    const p = this.panner(c, pos, true, this.clearBus);
     const env = c.createGain();
     env.gain.setValueAtTime(0.0001, t);
     env.gain.exponentialRampToValueAtTime(sniper ? 0.2 : 0.15, t + 0.006);
@@ -840,7 +1000,7 @@ export class AudioEngine {
     const B = AUDIO.GRAZE_BELL;
     const bell = B.hz * Math.pow(2, this.grazeSemis / 12);
     this.noise(c, 'bandpass', W.f0, W.f1, 2.2, W.ms / 1000, 0.34, this.seBus, t, 0.004);
-    this.tone(c, 'sine', bell, bell, B.ms / 1000, 0.14, this.uiBus, t + 0.02, 0.002);
+    this.tone(c, 'sine', bell, bell, B.ms / 1000, 0.14, this.clearBus, t + 0.02, 0.002);
   }
 
   /** Player hit: low punch 90 → 25 Hz + 4.2 kHz tinnitus (gain 0.06, 1.2 s decay). */
@@ -850,9 +1010,9 @@ export class AudioEngine {
     const t = c.currentTime;
     const P = AUDIO.DAMAGE_PUNCH;
     const T = AUDIO.DAMAGE_TINNITUS;
-    this.tone(c, 'sine', P.f0, P.f1, P.ms / 1000, 0.85, this.uiBus, t, 0.002, this.hardCurve);
-    this.noise(c, 'lowpass', 500, 120, 0.7, 0.18, 0.3, this.uiBus, t);
-    this.tone(c, 'sine', T.hz, T.hz, T.decayS, T.gain, this.uiBus, t, 0.01);
+    this.tone(c, 'sine', P.f0, P.f1, P.ms / 1000, 0.85, this.clearBus, t, 0.002, this.hardCurve);
+    this.noise(c, 'lowpass', 500, 120, 0.7, 0.18, 0.3, this.clearBus, t);
+    this.tone(c, 'sine', T.hz, T.hz, T.decayS, T.gain, this.clearBus, t, 0.01);
   }
 
   /** Regen start: clear F#4 + C#5 sine chord (350 ms). */
@@ -860,15 +1020,15 @@ export class AudioEngine {
     const c = this.can(true);
     if (!c) return;
     const t = c.currentTime;
-    for (const hz of AUDIO.REGEN_CHORD_HZ) this.tone(c, 'sine', hz, hz, AUDIO.REGEN_CHORD_MS / 1000, 0.12, this.uiBus, t, 0.012);
+    for (const hz of AUDIO.REGEN_CHORD_HZ) this.tone(c, 'sine', hz, hz, AUDIO.REGEN_CHORD_MS / 1000, 0.12, this.clearBus, t, 0.012);
   }
 
   death(): void {
     const c = this.can(true);
     if (!c) return;
     const t = c.currentTime;
-    for (let i = 0; i < 6; i++) this.tone(c, 'square', 200 + Math.random() * 1600, 60 + Math.random() * 200, 0.04, 0.12, this.uiBus, t + i * 0.035, 0.001);
-    this.tone(c, 'sine', 300, 30, 0.45, 0.4, this.uiBus, t, 0.003, this.softCurve);
+    for (let i = 0; i < 6; i++) this.tone(c, 'square', 200 + Math.random() * 1600, 60 + Math.random() * 200, 0.04, 0.12, this.clearBus, t + i * 0.035, 0.001);
+    this.tone(c, 'sine', 300, 30, 0.45, 0.4, this.clearBus, t, 0.003, this.softCurve);
   }
 
   // =============================================================================================
@@ -879,7 +1039,7 @@ export class AudioEngine {
     if (!c) return;
     const t = c.currentTime;
     const notes = [62, 69, 74, 81];
-    for (let i = 0; i < notes.length; i++) this.tone(c, 'sine', midiHz(notes[i]), midiHz(notes[i]), 1.4, 0.09, this.uiBus, t + i * 0.09, 0.006);
+    for (let i = 0; i < notes.length; i++) this.tone(c, 'sine', midiHz(notes[i]), midiHz(notes[i]), 1.4, 0.09, this.clearBus, t + i * 0.09, 0.006);
   }
 
   modalOpen(): void {
@@ -906,6 +1066,7 @@ export class AudioEngine {
     this.fm(c, midiHz(93), midiHz(93) * 2.01, 1.5, 0.5, 0.05, this.uiBus, t + 0.07);
   }
 
+  /** Menu tick — UI bus, audible while paused (volume preview). */
   uiTick(): void {
     const c = this.can(true);
     if (!c) return;
@@ -917,8 +1078,8 @@ export class AudioEngine {
     const c = this.can(true);
     if (!c) return;
     const t = c.currentTime;
-    this.noise(c, 'lowpass', 300, 7000, 0.9, 0.7, 0.3, this.uiBus, t, 0.45);
-    this.tone(c, 'sawtooth', 110, 880, 0.6, 0.06, this.uiBus, t, 0.4);
+    this.noise(c, 'lowpass', 300, 7000, 0.9, 0.7, 0.3, this.clearBus, t, 0.45);
+    this.tone(c, 'sawtooth', 110, 880, 0.6, 0.06, this.clearBus, t, 0.4);
   }
 
   // =============================================================================================
@@ -942,7 +1103,8 @@ export class AudioEngine {
 
   private readonly scheduler = (): void => {
     const c = this.ctx;
-    if (!c || c.state !== 'running') return;
+    // Paused / result / title: the world bus is muted and nothing is scheduled (re-synced on resume).
+    if (!c || c.state !== 'running' || this.paused) return;
     const now = c.currentTime;
     const horizon = now + AUDIO.SCHEDULER_LOOKAHEAD_S;
     // Re-sync after the tab was throttled / hidden (never burst-schedule the backlog).
@@ -950,11 +1112,13 @@ export class AudioEngine {
       this.nextStepTime = now + 0.03;
       this.gridOrigin = this.nextStepTime - this.bgmStep * AUDIO.SIXTEENTH_S;
     }
+    this.bgmMode = true;
     while (this.nextStepTime < horizon) {
       this.playStep(c, this.bgmStep, this.nextStepTime);
       this.nextStepTime += AUDIO.SIXTEENTH_S;
       this.bgmStep++;
     }
+    this.bgmMode = false;
     // Critical heartbeat: 60 Hz lowpassed double beat looping at 128 BPM.
     if (this.critical) {
       if (this.nextHeartTime < now) this.nextHeartTime = now + 0.02;
@@ -969,7 +1133,7 @@ export class AudioEngine {
       if (this.nextRepairTime < now) this.nextRepairTime = now + 0.02;
       while (this.nextRepairTime < horizon) {
         const hz = 2400 + Math.random() * 1400;
-        if (this.voices < AUDIO.MAX_VOICES) this.tone(c, 'sine', hz, hz * 1.12, 0.022, 0.018, this.uiBus, this.nextRepairTime, 0.002);
+        if (this.seVoices < AUDIO.MAX_SE_VOICES) this.tone(c, 'sine', hz, hz * 1.12, 0.022, 0.018, this.clearBus, this.nextRepairTime, 0.002);
         this.nextRepairTime += 0.13;
       }
     }
@@ -988,7 +1152,7 @@ export class AudioEngine {
     g.gain.setValueAtTime(0.0001, t);
     g.gain.exponentialRampToValueAtTime(0.9 * amp, t + 0.012);
     g.gain.exponentialRampToValueAtTime(0.0001, t + 0.16);
-    o.connect(lp).connect(g).connect(this.uiBus);
+    o.connect(lp).connect(g).connect(this.clearBus);
     o.start(t);
     o.stop(t + 0.18);
     this.track(o);
@@ -1072,6 +1236,7 @@ export class AudioEngine {
   }
 
   private leadNote(c: AudioContext, hz: number, dur: number, t: number): void {
+    if (this.bgmFull()) return;
     const g = c.createGain();
     g.gain.setValueAtTime(0.0001, t);
     g.gain.exponentialRampToValueAtTime(0.22, t + 0.012);

@@ -24,6 +24,11 @@
  *    centre anchor dot, base FOV 75–100°, quality preset, master volume
  *  - Save management (localStorage `strand_protocol_save_v1`), records, challenge modifiers, energy colours,
  *    run result screen, sector banner
+ *  - Phase 5A: tactical-zoom optical brackets [ ] (46 → 28 px) + sharpened reticle, BT arc dark-grey blink when
+ *    bullet time is refused (350 ms), tracking diamonds for the last ≤ 3 enemies and VALKYRIE (clamped to the
+ *    screen edge with distance when off-screen), "ARMORED — DESTROY WINGS", orange wing / grey armour hit
+ *    markers, "ELIMINATED // <cause>" during the death glitch, active buff tags (PIERCE ×N / ZERO-TIME /
+ *    ADRENALINE)
  * DOM is written only when values change (no per-frame layout churn).
  */
 import { BULLET_TIME, FLOW_RANKS, JUICE, PLAYER, SAVE_KEY, TELEGRAPH, clamp } from '../config/constants';
@@ -86,9 +91,26 @@ export interface HudFrame {
   bossWingR: number;
   bossPhase: number;
   bossDowned: boolean;
+  /** 0..1 tactical-zoom blend. */
+  zoom: number;
+  /** Active buffs: SK_02 piercing shots left (0 = none), SK_11 boost, SK_14 adrenaline. */
+  buffPierce: number;
+  buffZero: boolean;
+  buffAdren: boolean;
+  /** Tracking markers (screen px, already clamped), distance (m), off-screen / boss flags. */
+  trackCount: number;
+  readonly trackX: Float32Array;
+  readonly trackY: Float32Array;
+  readonly trackDist: Float32Array;
+  readonly trackOff: Uint8Array;
+  readonly trackBoss: Uint8Array;
 }
 
 export const HUD_MAX_WARNINGS = 8;
+export const HUD_MAX_TRACKS = 6;
+/** BT arc "refused" blink (ms) and armour alert (ms), 5A-1 / 5A-5. */
+const BT_DENIED_S = 0.35;
+const ALERT_S = 1.2;
 
 /** Structural view of the input's 450 ms click lock (InputManager satisfies it). */
 export interface ClickGate {
@@ -173,6 +195,17 @@ export class HudManager {
   private readonly ammoMax = el('ammo-max');
   private readonly ammoName = el('ammo-name');
   private readonly hitmarker = el<SVGGElement>('hitmarker');
+  private readonly zoomBrackets = el<SVGGElement>('xh-zoom');
+  private btDeniedT = 0;
+  private readonly alertEl = el('hud-alert');
+  private alertT = 0;
+  private readonly elimEl = el('eliminated');
+  private readonly buffPierce = el('buff-pierce');
+  private readonly buffZero = el('buff-zero');
+  private readonly buffAdren = el('buff-adren');
+  private readonly tracks: HTMLElement[];
+  private readonly trackLabels: HTMLElement[];
+  private readonly tkKeys = Array.from({ length: HUD_MAX_TRACKS }, (_, i) => [`tv${i}`, `tx${i}`, `to${i}`, `tb${i}`, `td${i}`]);
   private hitT = 0;
   private hitKind: HitMarkerKind = 'BODY';
   private readonly evadeEl = el('evade');
@@ -238,6 +271,8 @@ export class HudManager {
     for (let i = 0; i < HUD_MAX_WARNINGS; i++) this.warns.push(el<SVGPathElement>(`warn-${i}`));
     for (let i = 0; i < DAMAGE_ARCS; i++) this.dmgArcs.push(el<SVGPathElement>(`dmg-${i}`));
     this.flowLines = Array.from(el('flow-log').children) as HTMLElement[];
+    this.tracks = Array.from(el('trk-layer').children) as HTMLElement[];
+    this.trackLabels = this.tracks.map((t) => t.querySelector('span') as HTMLElement);
 
     // Skill modal: number keys 1 / 2 / 3 (ignored during the 450 ms lock).
     window.addEventListener('keydown', (e) => {
@@ -553,10 +588,34 @@ export class HudManager {
   /** Hit marker: body = white × 120 ms, head / kills / breaks = 180 ms (§6.3). */
   hitMarker(kind: HitMarkerKind): void {
     this.hitKind = kind;
-    this.hitT = (kind === 'BODY' || kind === 'SHIELD' ? JUICE.HITMARKER_BODY_MS : JUICE.HITMARKER_HEAD_MS) / 1000;
+    const light = kind === 'BODY' || kind === 'SHIELD' || kind === 'ARMOR' || kind === 'WING';
+    this.hitT = (light ? JUICE.HITMARKER_BODY_MS : JUICE.HITMARKER_HEAD_MS) / 1000;
     this.hitmarker.setAttribute('class', `hm on ${HIT_CLASS[kind]}`);
     const big = kind === 'HEAD' || kind === 'HEAD_KILL' || kind === 'PART';
     this.hitmarker.setAttribute('transform', big ? 'scale(1.45)' : 'scale(1)');
+  }
+
+  /** 5A-1: air RMB that could not start bullet time — the BT arc blinks dark grey for 350 ms. */
+  btDenied(): void {
+    this.btDeniedT = BT_DENIED_S;
+  }
+
+  /** 5A-5: short centre alert ("ARMORED — DESTROY WINGS", 1.2 s). */
+  armorAlert(): void {
+    this.alertT = ALERT_S;
+    if (this.changed('alert', true)) this.alertEl.classList.add('on');
+  }
+
+  /** 5A-5: "ELIMINATED // <cause>" over the death glitch; null hides it. */
+  eliminated(cause: string | null): void {
+    if (cause === null) {
+      this.elimEl.classList.remove('on');
+      return;
+    }
+    this.elimEl.innerHTML = `ELIMINATED <small>// ${cause}</small>`;
+    this.elimEl.classList.remove('on');
+    void this.elimEl.offsetWidth;
+    this.elimEl.classList.add('on');
   }
 
   /** GRAZE pop-up "EVADE +90" (restarts the animation). */
@@ -609,12 +668,44 @@ export class HudManager {
       if (this.changed('ancS', f.anchorStrong)) this.anchor.classList.toggle('strong', f.anchorStrong);
     }
 
-    // --- Bullet-time arc (right) ---
+    // --- Tactical zoom: optical brackets close 46 → 28 px and fade in past 20 %; the reticle tightens ---
+    const z = clamp(f.zoom, 0, 1);
+    const zq = Math.round(z * 100) / 100;
+    if (this.changed('zm', zq)) {
+      const r = 46 + (28 - 46) * zq;
+      this.zoomBrackets.setAttribute('transform', `scale(${(r / 46).toFixed(3)})`);
+      this.zoomBrackets.style.opacity = clamp((zq - 0.2) / 0.3, 0, 1).toFixed(2);
+      const ret = this.reticles[f.slot];
+      ret.setAttribute('transform', `scale(${(1 - 0.12 * zq).toFixed(3)})`);
+    }
+    const sharp = z > 0.2;
+    if (this.changed('zs', sharp) || this.changed('zsl', f.slot)) {
+      for (const k of Object.keys(this.reticles) as SlotId[]) {
+        this.reticles[k].classList.toggle('sharp', sharp && k === f.slot);
+        if (k !== f.slot) this.reticles[k].removeAttribute('transform');
+      }
+    }
+
+    // --- Bullet-time arc (right); dark-grey blink when an air activation was refused ---
     const bt = clamp(f.btGauge / BULLET_TIME.MAX_GAUGE, 0, 1);
     const btQ = Math.round(bt * 200) / 200;
     if (this.changed('bt', btQ)) this.btArc.style.strokeDasharray = `${this.btLen * btQ} ${this.btLen}`;
-    const btClass = f.btActive ? 'active' : f.btGauge < BULLET_TIME.MIN_ACTIVATE ? 'low' : 'ready';
-    if (this.changed('btc', btClass)) this.btArc.setAttribute('class', `arc ${btClass}`);
+    if (this.btDeniedT > 0) this.btDeniedT -= f.realDt;
+    const denied = this.btDeniedT > 0;
+    const btClass = denied ? 'denied' : f.btActive ? 'active' : f.btGauge < BULLET_TIME.MIN_ACTIVATE ? 'low' : 'ready';
+    if (this.changed('btc', btClass)) {
+      this.btArc.setAttribute('class', `arc ${btClass}`);
+      this.btTrack.setAttribute('class', denied ? 'track denied' : 'track');
+    }
+
+    // --- Active buff tags ---
+    const pierceOn = f.buffPierce > 0;
+    if (this.changed('bfp', f.buffPierce)) {
+      this.buffPierce.classList.toggle('on', pierceOn);
+      if (pierceOn) this.buffPierce.textContent = `PIERCE ×${f.buffPierce}`;
+    }
+    if (this.changed('bfz', f.buffZero)) this.buffZero.classList.toggle('on', f.buffZero);
+    if (this.changed('bfa', f.buffAdren)) this.buffAdren.classList.toggle('on', f.buffAdren);
 
     // --- Switch / reload arc (left) ---
     const sw = f.switchProgress >= 0 ? f.switchProgress : f.reloadProgress;
@@ -670,6 +761,29 @@ export class HudManager {
   private updateCombat(f: HudFrame): void {
     const dt = f.realDt;
     this.blinkClock += dt;
+    // Armour alert timer.
+    if (this.alertT > 0) {
+      this.alertT -= dt;
+      if (this.alertT <= 0 && this.changed('alert', false)) this.alertEl.classList.remove('on');
+    }
+    // Tracking diamonds (last ≤ 3 enemies, VALKYRIE always).
+    for (let i = 0; i < HUD_MAX_TRACKS; i++) {
+      const k = this.tkKeys[i];
+      const vis = i < f.trackCount;
+      if (this.changed(k[0], vis)) this.tracks[i].style.display = vis ? 'block' : 'none';
+      if (!vis) continue;
+      const x = Math.round(f.trackX[i]);
+      const y = Math.round(f.trackY[i]);
+      const key = x * 10000 + y;
+      if (this.changed(k[1], key)) this.tracks[i].style.transform = `translate(${x}px, ${y}px)`;
+      const off = f.trackOff[i] === 1;
+      const boss = f.trackBoss[i] === 1;
+      if (this.changed(k[2], off) || this.changed(k[3], boss)) this.tracks[i].className = `trk${off ? ' off' : ''}${boss ? ' boss' : ''}`;
+      if (off) {
+        const d = Math.round(f.trackDist[i]);
+        if (this.changed(k[4], d)) this.trackLabels[i].textContent = `${d}m`;
+      }
+    }
     // Hit marker timer.
     if (this.hitT > 0) {
       this.hitT -= dt;
@@ -727,4 +841,6 @@ const HIT_CLASS: Readonly<Record<HitMarkerKind, string>> = {
   HEAD_KILL: 'headkill',
   SHIELD: 'shield',
   PART: 'part',
+  ARMOR: 'armor',
+  WING: 'wing',
 };

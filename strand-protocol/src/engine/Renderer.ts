@@ -108,6 +108,7 @@ const KineticPostFXShader = {
     uCriticalColor: { value: new THREE.Color(COLORS.CRITICAL_VIGNETTE) },
     uHeartbeatHz: { value: 128 / 60 },
     uDamageFlash: { value: 0 },
+    uZoom: { value: 0 },
     uRainDrops: { value: 0.6 },
     uOverdrive: { value: 0 },
     uOverdriveColor: { value: new THREE.Color(COLORS.WALLRUN_CYAN) },
@@ -137,6 +138,7 @@ const KineticPostFXShader = {
     uniform float uSpeedLineInner;
     uniform float uCritical;
     uniform vec3 uCriticalColor;
+    uniform float uZoom;
     uniform float uHeartbeatHz;
     uniform float uDamageFlash;
     uniform float uRainDrops;
@@ -254,6 +256,8 @@ const KineticPostFXShader = {
 
       // --- Critical HP crimson vignette (pulses at heartbeat BPM) + scanline noise -------
       float vig = smoothstep(0.45, 1.35, radAspect);
+      // --- Tactical zoom: faint dark edge vignette (strength 0.18 at full zoom, 5A-1) ----------
+      col *= 1.0 - uZoom * 0.18 * vig;
       if (uCritical > 0.0) {
         float beat = fract(uTime * uHeartbeatHz);
         float pulse = 0.55 + 0.45 * (exp(-beat * 9.0) + 0.6 * exp(-max(beat - 0.18, 0.0) * 11.0) * step(0.18, beat));
@@ -313,6 +317,8 @@ export interface PostFxState {
   critical: number;
   /** 0..1 damage flash (decays automatically). */
   damageFlash: number;
+  /** 0..1 tactical-zoom blend (dark edge vignette). */
+  zoom: number;
   /** 0..1 raindrop vignette strength. */
   rainDrops: number;
   /** 0..1 OVERDRIVE border. */
@@ -350,6 +356,7 @@ export class Renderer {
     speedLineDensity: 0.5,
     critical: 0,
     damageFlash: 0,
+    zoom: 0,
     rainDrops: 0.6,
     overdrive: 0,
     frameFlash: 0,
@@ -692,6 +699,7 @@ export class Renderer {
     u.uSpeedLineDensity.value = fx.speedLineDensity;
     u.uCritical.value = fx.critical;
     u.uDamageFlash.value = fx.damageFlash;
+    u.uZoom.value = fx.zoom;
     u.uRainDrops.value = fx.rainDrops;
     u.uOverdrive.value = fx.overdrive;
     u.uFrameFlash.value = fx.frameFlash;

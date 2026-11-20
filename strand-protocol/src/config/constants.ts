@@ -242,7 +242,7 @@ export const PHYSICS = {
 
   /** User-tuned: 2.5× the spec value of 52 m. */
   GRAPPLE_RANGE: 130.0,
-  GRAPPLE_PROJECTILE_SPEED: 180,
+  GRAPPLE_PROJECTILE_SPEED: 340,
   GRAPPLE_SWING_ASSIST: 5.5,
   GRAPPLE_REEL_ACCEL: 24.0,
   GRAPPLE_REEL_SHORTEN_SPEED: 22.0,
@@ -547,9 +547,16 @@ export const AUDIO = {
   RAIN_SHELF_DB: 4,
   RAIN_GAIN: 0.09,
   MASTER_GAIN: 0.8,
-  /** Concurrent one-shot voice cap (oldest-first protection against SMG / swarm spam). */
-  MAX_VOICES: 72,
-  MAX_LOCK_VOICES: 6,
+  /**
+   * 5A-6 voice caps, counted separately: BGM voices can never starve combat SE. Player shots, lock warnings,
+   * hits / grazes / head-shots are priority voices that bypass the SE cap entirely.
+   */
+  MAX_BGM_VOICES: 24,
+  MAX_SE_VOICES: 28,
+  MAX_LOCK_VOICES: 10,
+  /** 5A-2 world bus (rain, wind, BGM, combat SE, reverb): pause ramp 60 ms down / 80 ms up. */
+  WORLD_PAUSE_MS: 60,
+  WORLD_RESUME_MS: 80,
 
   // §7.2 SE parameters
   PISTOL_TRANSIENT: { f0: 1400, f1: 120, ms: 35 },
@@ -557,6 +564,17 @@ export const AUDIO = {
   PISTOL_TAIL: { f0: 3200, f1: 900, ms: 180 },
   /** Last two rounds: metallic click (sine 2600 Hz, 25 ms). */
   PISTOL_LOW_AMMO_CLICK: { hz: 2600, ms: 25, rounds: 2 },
+  /** 5A-6: SMG ≤ 5 rounds left and the shotgun's last shell add the same metallic dry click. */
+  SMG_LOW_AMMO_ROUNDS: 5,
+  /** 5A-6 Aegis shield / boss armour deflect: FM 2400 Hz carrier × 3700 Hz modulator, 85 ms + energy ring. */
+  HIT_SHIELD: { carrierHz: 2400, modHz: 3700, ms: 85, ringHz: 620, ringMs: 160 },
+  /** 5A-6 wall-run magnetic boot taps every 0.22 s: bandpass 1800 Hz noise 25 ms + triangle 320 → 160 Hz 30 ms. */
+  WALLRUN_STEP: { intervalS: 0.22, noiseHz: 1800, noiseMs: 25, f0: 320, f1: 160, ms: 30 },
+  /** 5A-6 winch motor while reeling (GRAPPLE_PULL): saw 140 → 360 Hz with speed, bandpass 900 Hz, gain 0.06. */
+  WINCH: { f0: 140, f1: 360, maxSpeed: 32, bandpassHz: 900, gain: 0.06 },
+  /** 5A-1 optical servo: zoom in sine 1400 → 2100 Hz 45 ms (0.05), out 1800 → 1100 Hz 40 ms (0.04), UI bus. */
+  ZOOM_IN: { f0: 1400, f1: 2100, ms: 45, gain: 0.05 },
+  ZOOM_OUT: { f0: 1800, f1: 1100, ms: 40, gain: 0.04 },
   SMG_ATTACK: { f0: 620, f1: 140, ms: 28 },
   SMG_SNAP: { hz: 2800, ms: 40 },
   SMG_PITCH_JITTER: 0.03,

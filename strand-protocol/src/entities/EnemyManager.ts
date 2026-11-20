@@ -65,7 +65,8 @@ import { BURST, type EffectsPool, type GrazeProbe, type ProjectileImpact, type P
 // =============================================================================================
 // Public types
 // =============================================================================================
-export type HitMarkerKind = 'BODY' | 'HEAD' | 'KILL' | 'HEAD_KILL' | 'SHIELD' | 'PART';
+/** `ARMOR` = VALKYRIE head hit while airborne (deflected); `WING` = hit on a boss thruster wing (weak point). */
+export type HitMarkerKind = 'BODY' | 'HEAD' | 'KILL' | 'HEAD_KILL' | 'SHIELD' | 'PART' | 'ARMOR' | 'WING';
 
 export interface KillInfo {
   readonly kind: EnemyKind;
@@ -97,6 +98,8 @@ export interface EnemyEvents {
   onBossPhase?(phase: 1 | 2): void;
   onBossDefeated?(position: THREE.Vector3): void;
   onPlayerHit?(damage: number, from: THREE.Vector3): void;
+  /** VALKYRIE's crest deflected a head shot (not downed): "ARMORED — DESTROY WINGS". */
+  onArmorDeflect?(position: THREE.Vector3): void;
   onWaveStart?(wave: number, waves: number): void;
   onSectorClear?(): void;
   onExplosion?(position: THREE.Vector3): void;
@@ -657,6 +660,24 @@ interface Pattern {
 }
 
 const KIND_TAG: Readonly<Record<EnemyKind, number>> = { ENFORCER: 10, AEGIS: 11, VEIL: 12, PHANTOM: 13, DRONE: 14, VALKYRIE: 15 };
+/** VALKYRIE attack-specific round tags (snipe uses the kind tag 15). */
+const TAG_BOSS_SWEEP = 16;
+const TAG_BOSS_MISSILE = 17;
+/** 5A-5 death read-out "ELIMINATED // <cause>" per enemy round tag. */
+const CAUSE_BY_TAG: Readonly<Record<number, string>> = {
+  10: 'ENFORCER RIFLE',
+  11: 'AEGIS BREACHER SCATTER',
+  12: 'VEIL SNIPER',
+  13: 'PHANTOM SMG',
+  14: 'HUNTER DRONE',
+  15: 'VALKYRIE-09 RAIL SNIPE',
+  16: 'VALKYRIE-09 MG FAN',
+  17: 'VALKYRIE-09 MICRO-MISSILE',
+};
+const CAUSE_PHANTOM_SLASH = 'PHANTOM BLADE';
+const CAUSE_BOSS_DIVE = 'VALKYRIE-09 DIVE SHOCKWAVE';
+const CAUSE_BOSS_MISSILE = 'VALKYRIE-09 MICRO-MISSILE';
+const CAUSE_DRONE_BLAST = 'HUNTER DRONE SELF-DESTRUCT';
 
 function enemySpec(def: EnemyDef, damage: number, speed: number, width: number, color: number, intensity: number, tag: number): ProjectileSpec {
   return { owner: 'ENEMY', speed, range: def.gun.range + 30, damage, headMultiplier: 1, shieldMultiplier: 1, color, intensity, width, tag };
@@ -700,14 +721,14 @@ const PATTERNS = {
     kind: 'BULLET', lines: VB.SWEEP.lines, fanStepDeg: VB.SWEEP.fanStepDeg, fromPods: false,
     acquireMs: VB.SWEEP.telegraph.acquireMs, lockMs: VB.SWEEP.telegraph.lockMs,
     rounds: VB.SWEEP.roundsPerLine, roundIntervalS: VB.SWEEP.roundIntervalMs / 1000, sequentialLines: false,
-    spec: enemySpec(VALK_DEF, VB.SWEEP.damage, VB.SWEEP.speed, 0.05, 0xff3a7a, 3.6, KIND_TAG.VALKYRIE),
+    spec: enemySpec(VALK_DEF, VB.SWEEP.damage, VB.SWEEP.speed, 0.05, 0xff3a7a, 3.6, TAG_BOSS_SWEEP),
     trackRadPerS: VALK_DEF.gun.trackDegPerS * DEG2RAD, predictive: false, cooldownS: 0.5,
   },
   BOSS_MISSILES: {
     kind: 'MISSILE', lines: VB.MISSILES.count, fanStepDeg: 0, fromPods: true,
     acquireMs: VB.MISSILES.telegraph.acquireMs, lockMs: VB.MISSILES.telegraph.lockMs,
     rounds: 1, roundIntervalS: VB.MISSILES.launchIntervalMs / 1000, sequentialLines: true,
-    spec: enemySpec(VALK_DEF, VB.MISSILES.damage, VB.MISSILES.speedStart, 0.05, 0xff3a7a, 3.0, KIND_TAG.VALKYRIE),
+    spec: enemySpec(VALK_DEF, VB.MISSILES.damage, VB.MISSILES.speedStart, 0.05, 0xff3a7a, 3.0, TAG_BOSS_MISSILE),
     trackRadPerS: VALK_DEF.gun.trackDegPerS * DEG2RAD, predictive: false, cooldownS: 0.5,
   },
 } as const satisfies Record<string, Pattern>;
@@ -950,6 +971,8 @@ const PLAYER_TARGET_ID = 9999;
 const MISSILE_ID_BASE = 1000;
 /** Projectile tag of SK_15 head-shot ricochet rounds. */
 export const RICOCHET_TAG = 5;
+/** Tracking markers appear once this few enemies remain (5A-5). */
+const TRACK_REMAINING_MAX = 3;
 const DEBRIS_LIFE = TELEGRAPH.DEBRIS_LIFETIME_S;
 const DISSOLVE_S = 0.6;
 const LINE_IGNORE_NONE = undefined;
@@ -1261,6 +1284,23 @@ export class EnemyManager {
     return true;
   }
 
+  /**
+   * 5A-5 tactical tracking markers: with ≤ 3 enemies left, every alive enemy; VALKYRIE always while alive.
+   * Writes chest positions into `out` and 1 (boss) / 0 into `boss`; returns the count (≤ out.length).
+   */
+  trackedTargets(out: THREE.Vector3[], boss: Uint8Array): number {
+    const all = this.remaining <= TRACK_REMAINING_MAX;
+    let n = 0;
+    for (const e of this.enemies) {
+      if (!e.active || !e.alive || n >= out.length) continue;
+      if (!all && !e.isBoss) continue;
+      out[n].addVectors(e.pos, e.bodyOff);
+      boss[n] = e.isBoss ? 1 : 0;
+      n++;
+    }
+    return n;
+  }
+
   private aliveCount(): number {
     let n = 0;
     for (const e of this.enemies) if (e.alive) n++;
@@ -1324,12 +1364,15 @@ export class EnemyManager {
     if (kind === 'DRONE') return this.pickFrom(L.airSpawns, null, out, 12);
     let pools: ReadonlyArray<readonly SpawnPoint[]>;
     const r = this.rng();
+    // 5A-5: roofs belong to the VEIL snipers only; ENFORCER / AEGIS / PHANTOM always spawn on connected
+    // battlefields (streets, expressway decks, canal bridges, sky-bridges) — never stranded on a rooftop.
     if (kind === 'VEIL') pools = [L.perchSpawns, L.roofSpawns];
-    else if (kind === 'PHANTOM') pools = [L.groundSpawns, L.highwaySpawns];
-    else if (kind === 'AEGIS') pools = r < 0.7 || L.highwaySpawns.length === 0 ? [L.groundSpawns, L.highwaySpawns] : [L.highwaySpawns, L.groundSpawns];
-    else if (r < 0.55 || (L.highwaySpawns.length === 0 && L.skybridgeSpawns.length === 0)) pools = [L.groundSpawns, L.highwaySpawns];
-    else if (r < 0.85 && L.highwaySpawns.length > 0) pools = [L.highwaySpawns, L.groundSpawns];
-    else pools = [L.skybridgeSpawns, L.groundSpawns];
+    else if (kind === 'PHANTOM') pools = r < 0.75 || L.bridgeSpawns.length === 0 ? [L.groundSpawns, L.highwaySpawns, L.bridgeSpawns] : [L.bridgeSpawns, L.groundSpawns, L.highwaySpawns];
+    else if (kind === 'AEGIS') pools = r < 0.6 || L.highwaySpawns.length === 0 ? [L.groundSpawns, L.bridgeSpawns, L.highwaySpawns] : [L.highwaySpawns, L.groundSpawns, L.bridgeSpawns];
+    else if (r < 0.45 || (L.highwaySpawns.length === 0 && L.skybridgeSpawns.length === 0)) pools = [L.groundSpawns, L.bridgeSpawns, L.highwaySpawns];
+    else if (r < 0.6 && L.bridgeSpawns.length > 0) pools = [L.bridgeSpawns, L.groundSpawns, L.highwaySpawns];
+    else if (r < 0.85 && L.highwaySpawns.length > 0) pools = [L.highwaySpawns, L.groundSpawns, L.bridgeSpawns];
+    else pools = [L.skybridgeSpawns, L.groundSpawns, L.highwaySpawns];
     for (const pool of pools) if (this.pickFrom(null, pool, out, 9)) return true;
     for (const pool of pools) if (this.pickFrom(null, pool, out, 0)) return true;
     return false;
@@ -1927,7 +1970,7 @@ export class EnemyManager {
       if (!e.slashHit && this.player.isAlive && _v1.distanceTo(this.playerChest) <= PB.SLASH_HIT_RADIUS) {
         e.slashHit = true;
         this.effects.burst(this.playerChest, _v2.copy(e.slashDir), BURST.SLASH);
-        this.damagePlayer(PB.SLASH_DAMAGE, e.pos);
+        this.damagePlayer(PB.SLASH_DAMAGE, e.pos, CAUSE_PHANTOM_SLASH);
       }
       if (e.slashT >= PB.SLASH_LUNGE_TIME_S) {
         e.slash = 'COOL';
@@ -2194,8 +2237,12 @@ export class EnemyManager {
     this.events.onEnemyFire?.(e.kind, _v1, e.pattern.spec.damage >= PLAYER.DAMAGE_SNIPER);
   }
 
-  private damagePlayer(amount: number, from: THREE.Vector3): void {
+  /** What last hurt the player (death read-out, 5A-5). */
+  lastHitCause = '';
+
+  private damagePlayer(amount: number, from: THREE.Vector3, cause: string): void {
     if (!this.player.isAlive) return;
+    this.lastHitCause = cause;
     this.player.takeDamage(amount);
     this.events.onPlayerHit?.(amount, from);
   }
@@ -2532,7 +2579,7 @@ export class EnemyManager {
       const dh = Math.hypot(pp.x - e.shockCenter.x, pp.z - e.shockCenter.z);
       if (dh <= radius && Math.abs(pp.y - e.shockCenter.y) <= VB.DIVE.shockHeight) {
         e.shockHit = true;
-        this.damagePlayer(VB.DIVE.damage, e.shockCenter);
+        this.damagePlayer(VB.DIVE.damage, e.shockCenter, CAUSE_BOSS_DIVE);
       }
     }
     if (t >= 1) e.shockT = -1;
@@ -2624,7 +2671,7 @@ export class EnemyManager {
     this.effects.spawnRing(point, UP, 0xff5a3a, 3, 0.2, MB.blastRadius, 0.3);
     this.renderer.flashLight(point, 0xff5a3a, 14, 14, 0.18);
     this.events.onExplosion?.(point);
-    if (harmful && this.player.isAlive && point.distanceTo(this.playerChest) <= MB.blastRadius) this.damagePlayer(MB.damage, point);
+    if (harmful && this.player.isAlive && point.distanceTo(this.playerChest) <= MB.blastRadius) this.damagePlayer(MB.damage, point, CAUSE_BOSS_MISSILE);
     this.killMissile(m, true);
   }
 
@@ -3148,7 +3195,7 @@ export class EnemyManager {
     if (im.owner === 'ENEMY') {
       if (im.target === this.playerTarget) {
         _v1.copy(im.point).addScaledVector(im.direction, -20);
-        this.damagePlayer(im.damage, _v1);
+        this.damagePlayer(im.damage, _v1, CAUSE_BY_TAG[im.tag] ?? 'HOSTILE FIRE');
       }
       return;
     }
@@ -3186,13 +3233,23 @@ export class EnemyManager {
     let mult = 1;
     if (head) {
       if (e.isBoss && !e.downed) {
-        // VALKYRIE's crest deflects head shots unless she is downed.
+        // VALKYRIE's crest deflects head shots unless she is downed: metal ricochet sparks, ARMOR marker,
+        // "ARMORED — DESTROY WINGS" (5A-5).
         mult = VB.ARMORED_HEAD_MULTIPLIER;
         head = false;
+        _v1.copy(im.direction).negate();
+        this.effects.burst(im.point, _v1, BURST.SPARK, 0xe8f6ff);
+        this.effects.burst(im.point, _v1, BURST.HIT_SPARK);
+        this.markerOverride = 'ARMOR';
+        this.events.onArmorDeflect?.(im.point);
       } else mult = im.headMultiplier;
     }
     this.applyDamage(e, Math.round(im.damage * mult), head, im.point, im.direction, weapon);
+    this.markerOverride = null;
   }
+
+  /** Replaces the surviving-body hit marker for the current impact (boss armour deflect). */
+  private markerOverride: HitMarkerKind | null = null;
 
   /** Frontal 130° arc blocks the shot unless it comes steeply from above (strand / wall-run flank). */
   private shieldBlocks(e: Enemy, dir: THREE.Vector3): boolean {
@@ -3236,7 +3293,8 @@ export class EnemyManager {
     _v1.copy(dir).negate();
     this.effects.burst(point, _v1, BURST.SPARK, e.bossPhase === 2 ? VB.WING_COLOR_P2 : 0xe8f6ff);
     if (e.wingHp[side] > 0) {
-      this.events.onHitMarker?.('BODY');
+      // Orange weak-point marker (5A-5).
+      this.events.onHitMarker?.('WING');
       return;
     }
     e.wingBroken[side] = 1;
@@ -3279,7 +3337,7 @@ export class EnemyManager {
         this.events.onHitMarker?.('HEAD');
       } else {
         this.effects.burst(point, _v1, BURST.HIT_SPARK);
-        this.events.onHitMarker?.('BODY');
+        this.events.onHitMarker?.(this.markerOverride ?? 'BODY');
       }
       return;
     }
@@ -3406,7 +3464,7 @@ export class EnemyManager {
     this.effects.spawnRing(point, UP, color, 3.2, 0.3, radius, 0.32);
     this.renderer.flashLight(point, color, 16, radius * 4, 0.22);
     this.events.onExplosion?.(point);
-    if (this.player.isAlive && point.distanceTo(this.playerChest) <= radius) this.damagePlayer(damage, point);
+    if (this.player.isAlive && point.distanceTo(this.playerChest) <= radius) this.damagePlayer(damage, point, CAUSE_DRONE_BLAST);
     this.applyAreaDamage(point, radius, damage, 4, false);
   }
 

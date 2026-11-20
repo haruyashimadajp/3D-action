@@ -119,6 +119,7 @@ const _tmp = new THREE.Vector3();
 const _tmp2 = new THREE.Vector3();
 const _hit = createRayHit();
 const _save = new THREE.Vector3();
+const _rampN = new THREE.Vector3();
 
 type Axis3 = 'x' | 'y' | 'z';
 const AXES_XZ = ['x', 'z'] as const;
@@ -229,7 +230,14 @@ export class PhysicsWorld {
 
     // Vertical first (landing / ceilings), then horizontal axes.
     const dy = this.sweepAxis(pos, r, h, 'y', delta.y);
-    pos.y += dy;
+    if (delta.y > 0) {
+      // Ramp underside is a ceiling: a jump from below stops under the slab instead of warping on top (5A-3).
+      const slabBottom = this.rampCeiling(pos, r, h);
+      if (slabBottom !== null && pos.y + dy + h > slabBottom) {
+        pos.y = slabBottom - h - SKIN;
+        out.hitCeiling = true;
+      } else pos.y += dy;
+    } else pos.y += dy;
     if (delta.y < 0 && dy > delta.y + EPS) {
       out.grounded = true;
       out.groundKind = this.lastKind;
@@ -388,6 +396,28 @@ export class PhysicsWorld {
         else out.downhill.set(s, 0, 0);
         const slope = Math.atan2(rise, len);
         out.groundNormal.set(out.downhill.x * Math.sin(slope), Math.cos(slope), out.downhill.z * Math.sin(slope));
+      }
+    }
+    return best;
+  }
+
+  /**
+   * Lowest ramp underside (surface − thickness) above the head of a box at `pos`, sampled at the centre and
+   * the four footprint corners; only slabs the head is still below (5 cm tolerance) count. Null if none.
+   */
+  private rampCeiling(pos: THREE.Vector3, r: number, h: number): number | null {
+    let best: number | null = null;
+    const head = pos.y + h;
+    for (let i = 0; i < this.ramps.length; i++) {
+      const rp = this.ramps[i];
+      for (let c = -1; c < CORNERS.length; c++) {
+        const x = c < 0 ? pos.x : pos.x + CORNERS[c][0] * r;
+        const z = c < 0 ? pos.z : pos.z + CORNERS[c][1] * r;
+        const y = this.rampHeightAt(rp, x, z);
+        if (y === null) continue;
+        const bottom = y - rp.thickness;
+        if (head > bottom + 0.05) continue;
+        if (best === null || bottom < best) best = bottom;
       }
     }
     return best;
@@ -568,7 +598,117 @@ export class PhysicsWorld {
       out.collider = this.colliders[bestIdx];
       out.kind = out.collider.kind;
     }
+    // Sloped on-ramp slabs (top y(along), bottom y − thickness): rounds, strand hooks and enemy sight lines
+    // can never pass through an on-ramp (5A-3).
+    if (!(ignore && ignore.has('HIGHWAY'))) {
+      for (let i = 0; i < this.ramps.length; i++) {
+        const t = this.rayRamp(this.ramps[i], origin, dir, out.hit ? out.distance : maxDist, _rampN);
+        if (t < 0) continue;
+        out.hit = true;
+        out.distance = t;
+        out.point.copy(dir).multiplyScalar(t).add(origin);
+        out.normal.copy(_rampN);
+        out.collider = null;
+        out.kind = 'HIGHWAY';
+      }
+    }
     return out;
+  }
+
+  /**
+   * Ray vs one ramp slab, in the ramp's (along, lateral, y) frame: the solid is a ≤ along ≤ b,
+   * lmin ≤ lateral ≤ lmax and −thickness ≤ y − surface(along) ≤ 0 — three linear slabs in t.
+   * Returns the entry distance (< maxDist) and the entry normal, or −1.
+   */
+  private rayRamp(rp: RampCollider, origin: THREE.Vector3, dir: THREE.Vector3, maxDist: number, n: THREE.Vector3): number {
+    const alongZ = rp.axis === 'z';
+    const oA = alongZ ? origin.z : origin.x;
+    const dA = alongZ ? dir.z : dir.x;
+    const oL = alongZ ? origin.x : origin.z;
+    const dL = alongZ ? dir.x : dir.z;
+    const span = rp.alongEnd - rp.alongStart;
+    if (Math.abs(span) < 1e-6) return -1;
+    const k = (rp.yEnd - rp.yStart) / span;
+    let t0 = 0;
+    let t1 = maxDist;
+    let which = -1; // 0 along end, 1 lateral side, 2 top / bottom
+    let sign = 0;
+    // Along slab.
+    const a0 = Math.min(rp.alongStart, rp.alongEnd);
+    const a1 = Math.max(rp.alongStart, rp.alongEnd);
+    if (Math.abs(dA) < 1e-12) {
+      if (oA < a0 || oA > a1) return -1;
+    } else {
+      let ta = (a0 - oA) / dA;
+      let tb = (a1 - oA) / dA;
+      if (ta > tb) {
+        const s = ta;
+        ta = tb;
+        tb = s;
+      }
+      if (ta > t0) {
+        t0 = ta;
+        which = 0;
+        sign = dA > 0 ? -1 : 1;
+      }
+      if (tb < t1) t1 = tb;
+      if (t0 > t1) return -1;
+    }
+    // Lateral slab.
+    if (Math.abs(dL) < 1e-12) {
+      if (oL < rp.lateralMin || oL > rp.lateralMax) return -1;
+    } else {
+      let ta = (rp.lateralMin - oL) / dL;
+      let tb = (rp.lateralMax - oL) / dL;
+      if (ta > tb) {
+        const s = ta;
+        ta = tb;
+        tb = s;
+      }
+      if (ta > t0) {
+        t0 = ta;
+        which = 1;
+        sign = dL > 0 ? -1 : 1;
+      }
+      if (tb < t1) t1 = tb;
+      if (t0 > t1) return -1;
+    }
+    // Height slab: f(t) = y(t) − surface(along(t)) ∈ [−thickness, 0].
+    const f0 = origin.y - rp.yStart - k * (oA - rp.alongStart);
+    const fd = dir.y - k * dA;
+    if (Math.abs(fd) < 1e-12) {
+      if (f0 < -rp.thickness || f0 > 0) return -1;
+    } else {
+      let ta = (-rp.thickness - f0) / fd;
+      let tb = (0 - f0) / fd;
+      let fromTop = false;
+      if (ta > tb) {
+        const s = ta;
+        ta = tb;
+        tb = s;
+        fromTop = true;
+      }
+      if (ta > t0) {
+        t0 = ta;
+        which = 2;
+        sign = fromTop ? 1 : -1;
+      }
+      if (tb < t1) t1 = tb;
+      if (t0 > t1) return -1;
+    }
+    if (which < 0 || t0 >= maxDist) return -1; // origin inside the slab, or farther than the current best
+    if (which === 2) {
+      // Surface normal (−k along, 1 up), flipped for the underside.
+      const inv = 1 / Math.sqrt(1 + k * k);
+      if (alongZ) n.set(0, inv, -k * inv);
+      else n.set(-k * inv, inv, 0);
+      if (sign < 0) n.negate();
+    } else if (which === 0) {
+      if (alongZ) n.set(0, 0, sign);
+      else n.set(sign, 0, 0);
+    } else if (alongZ) n.set(sign, 0, 0);
+    else n.set(0, 0, sign);
+    return t0;
   }
 
   /** Segment a → b (projectile step). */

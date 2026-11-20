@@ -8,6 +8,9 @@
  *  delayed gravity, wall-kicks, slides that accelerate down ramps, rope pendulum constraint & winch reel.
  *  Air-only bullet time (0.25×) with gauge, out-of-combat regeneration, camera work (speed FOV, BT zoom,
  *  wall-run / slide / swing roll, landing spring), trauma-based camera shake with accessibility scaling.
+ *  v1.2: RMB = tactical zoom (equipment) + air bullet time; with a gun zoomed the weapon's FOV offset replaces the
+ *  −7° BT offset (never both). An air RMB press that cannot start bullet time (gauge < 12, NO BULLET TIME)
+ *  raises onBulletTimeDenied (HUD arc blink). Strand attached from the ground to a higher anchor lifts off at once.
  */
 import * as THREE from 'three';
 import {
@@ -68,6 +71,8 @@ export interface PlayerEvents {
   onGrappleAttach?(): void;
   onGrappleDetach?(mode: RopeDetach): void;
   onBulletTime?(active: boolean): void;
+  /** Air RMB press while bullet time cannot start (gauge < 12 or NO BULLET TIME) — zoom only. */
+  onBulletTimeDenied?(): void;
   onRegenStart?(): void;
   onDamaged?(amount: number): void;
   onDeath?(): void;
@@ -107,6 +112,9 @@ const UP = new THREE.Vector3(0, 1, 0);
 const AIR_STATES: ReadonlySet<MoveState> = new Set<MoveState>(['AIRBORNE', 'WALL_RUN_L', 'WALL_RUN_R', 'GRAPPLE_SWING', 'GRAPPLE_PULL']);
 /** Rope attaches at the player's chest/winch height above the feet. */
 const ROPE_ATTACH_Y = 1.2;
+/** 5A-4: ground attach to an anchor > 2.2 m above the feet lifts off with vy ≥ 4.2 m/s. */
+const GROUND_ATTACH_MIN_RISE = 2.2;
+const GROUND_ATTACH_LIFT = 4.2;
 
 export class PlayerController {
   // ---- kinematic state (feet position) ----
@@ -138,6 +146,13 @@ export class PlayerController {
   // ---- bullet time ----
   btGauge: number = BULLET_TIME.MAX_GAUGE;
   btActive = false;
+  private airRmbPrev = false;
+
+  // ---- tactical zoom (written by the equipment each frame) ----
+  /** Blended weapon zoom FOV offset (deg, ≤ 0). */
+  zoomFovDeg = 0;
+  /** A gun zoom is engaged: the −7° bullet-time FOV offset is not added on top. */
+  gunZoom = false;
 
   // ---- rope ----
   ropeAttached = false;
@@ -277,6 +292,11 @@ export class PlayerController {
     return this.regenerating;
   }
 
+  /** SK_11 zero-time speed boost running (HUD buff tag). */
+  get speedBoostActive(): boolean {
+    return this.boostAmount > 0 && this.simTime < this.boostUntil;
+  }
+
   /** 0 → 1 progress of the out-of-combat regen countdown (1 = regenerating / full). */
   get regenCountdown(): number {
     const since = (this.simTime - Math.max(this.lastAttackTime, this.lastDamageTime)) * 1000;
@@ -320,9 +340,9 @@ export class PlayerController {
     this.recoilRecoverDegPerS = recoverDegPerS;
   }
 
-  /** Camera shake (§2.2): trauma accumulates (max 1), displacement = trauma². */
-  addTrauma(def: ShakeDef): void {
-    this.trauma = Math.min(1, this.trauma + def.trauma);
+  /** Camera shake (§2.2): trauma accumulates (max 1), displacement = trauma². `scale` < 1 while zoomed. */
+  addTrauma(def: ShakeDef, scale = 1): void {
+    this.trauma = Math.min(1, this.trauma + def.trauma * scale);
     // The strongest active event defines the angular envelope until the trauma has fully decayed.
     this.shakeMaxPitchYaw = Math.max(this.shakeMaxPitchYaw, def.maxPitchYawDeg);
     this.shakeMaxRoll = Math.max(this.shakeMaxRoll, def.maxRollDeg);
@@ -383,6 +403,11 @@ export class PlayerController {
     this.ropeAnchor.copy(anchor);
     this.ropeLength = Math.max(PHYSICS.GRAPPLE_MIN_LENGTH, this.ropeAttachPoint(_tmp).distanceTo(anchor));
     this.state = 'GRAPPLE_SWING';
+    // 5A-4: hooked from the ground onto something higher → a light lift straight into the pendulum / reel.
+    if (this.grounded && anchor.y > this.position.y + GROUND_ATTACH_MIN_RISE) {
+      this.grounded = false;
+      this.velocity.y = Math.max(this.velocity.y, GROUND_ATTACH_LIFT);
+    }
     this.addTrauma(SHAKE.ANCHOR_IMPACT);
     this.events.onGrappleAttach?.();
   }
@@ -415,7 +440,8 @@ export class PlayerController {
   }
 
   updateBulletTime(realDt: number): void {
-    const want = !this.modifiers.bulletTimeDisabled && this.input.isDown('BULLET_TIME') && this.isAirborne && this.state !== 'DEAD';
+    const airRmb = this.input.isDown('BULLET_TIME') && this.isAirborne && this.state !== 'DEAD';
+    const want = !this.modifiers.bulletTimeDisabled && airRmb;
     if (this.btActive) {
       this.btGauge -= BULLET_TIME.DRAIN_PER_REAL_S * (1 - this.modifiers.btDrainReduction) * realDt;
       if (this.btGauge <= 0 || !want) {
@@ -425,6 +451,9 @@ export class PlayerController {
     } else if (want && this.btGauge >= BULLET_TIME.MIN_ACTIVATE) {
       this.setBulletTime(true);
     }
+    // Air press (or leaving the ground with RMB held) that could not start bullet time → zoom only + HUD blink.
+    if (airRmb && !this.airRmbPrev && !this.btActive) this.events.onBulletTimeDenied?.();
+    this.airRmbPrev = airRmb;
     if (!this.btActive) this.btGauge = Math.min(BULLET_TIME.MAX_GAUGE, this.btGauge + BULLET_TIME.REGEN_PER_S * realDt);
   }
 
@@ -952,7 +981,8 @@ export class PlayerController {
       fovTarget = Math.min(CAMERA.SPEED_FOV_HARD_CAP, base + t * (CAMERA.SPEED_FOV_MAX - CAMERA.BASE_FOV));
       fovRate = CAMERA.SPEED_FOV_LERP;
     }
-    if (this.btActive) {
+    // Bullet time −7° only without a gun zoom (the weapon zoom offset is applied instead, never both).
+    if (this.btActive && !this.gunZoom) {
       fovTarget += CAMERA.BT_FOV_OFFSET;
       fovRate = CAMERA.BT_FOV_LERP;
     }
@@ -988,7 +1018,7 @@ export class PlayerController {
     );
     camera.position.copy(this.eye);
     camera.rotation.copy(this.cameraEuler);
-    const fov = this.fov + this.fovPulse;
+    const fov = this.fov + this.fovPulse + this.zoomFovDeg;
     if (Math.abs(camera.fov - fov) > 1e-3) {
       camera.fov = fov;
       camera.updateProjectionMatrix();

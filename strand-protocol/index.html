@@ -307,6 +307,50 @@
       #hitmarker.headkill line { stroke: #ff1e42; stroke-width: 3.4; filter: drop-shadow(0 0 6px rgba(255, 201, 58, 0.95)); }
       #hitmarker.shield line { stroke: #ff9500; }
       #hitmarker.part line { stroke: #ffffff; stroke-width: 3.2; filter: drop-shadow(0 0 5px rgba(255, 149, 0, 0.95)); }
+      #hitmarker.armor line { stroke: #8a96a8; stroke-width: 2.4; stroke-dasharray: 3 2; }
+      #hitmarker.wing line { stroke: #ff8a1e; stroke-width: 3; filter: drop-shadow(0 0 5px rgba(255, 138, 30, 0.95)); }
+      /* ---------------- Phase 5A: tactical zoom, BT denial, tracking, death cause, buffs ---------------- */
+      #xh-zoom { opacity: 0; }
+      #xh-zoom path { fill: none; stroke: #38f8ff; stroke-width: 1.1; vector-effect: non-scaling-stroke; filter: drop-shadow(0 0 2px rgba(0, 240, 255, 0.9)); }
+      #xh .ret.sharp { stroke: #ffffff; stroke-width: 1.3; filter: drop-shadow(0 0 1px #000) drop-shadow(0 0 2px rgba(0, 240, 255, 0.55)); }
+      #xh .arc.denied, #xh .track.denied { stroke: #2b313b !important; filter: none !important; animation: btdeny 0.35s steps(1, end) forwards; }
+      @keyframes btdeny { 0% { opacity: 1; } 25% { opacity: 0.25; } 50% { opacity: 1; } 75% { opacity: 0.25; } 100% { opacity: 1; } }
+      .trk { position: absolute; left: 0; top: 0; width: 0; height: 0; display: none; will-change: transform; }
+      .trk i { position: absolute; left: -6px; top: -6px; width: 12px; height: 12px; border: 1.5px solid rgba(255, 30, 66, 0.65); transform: rotate(45deg); box-shadow: 0 0 6px rgba(255, 30, 66, 0.45); }
+      .trk.boss i { left: -9px; top: -9px; width: 18px; height: 18px; border: 2px solid #ff1e42; box-shadow: 0 0 10px rgba(220, 20, 60, 0.85); }
+      .trk.boss i + i { display: block; left: -5px; top: -5px; width: 10px; height: 10px; border-width: 1.5px; }
+      .trk i + i { display: none; }
+      .trk span { position: absolute; left: 12px; top: -6px; font-size: 10px; letter-spacing: 0.12em; color: rgba(255, 90, 110, 0.9); text-shadow: 0 0 4px #000; white-space: nowrap; display: none; }
+      .trk.off span { display: block; }
+      .trk.boss span { color: #ff3a5a; }
+      #hud-alert {
+        position: absolute; left: 50%; top: calc(50% - 92px); transform: translateX(-50%);
+        font-size: 13px; letter-spacing: 0.32em; color: #c9d3e2; white-space: nowrap; opacity: 0;
+        text-shadow: 0 0 8px rgba(0, 0, 0, 0.95), 0 0 10px rgba(255, 138, 30, 0.6);
+      }
+      #hud-alert.on { opacity: 1; }
+      #hud-alert b { color: #ff8a1e; font-weight: 700; }
+      #eliminated {
+        position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%) skewX(-10deg); z-index: 26; pointer-events: none;
+        font-family: var(--hud-font); font-size: clamp(28px, 4.4vw, 58px); font-style: italic; font-weight: 900; letter-spacing: 0.04em;
+        color: #fff2f4; white-space: nowrap; display: none;
+        text-shadow: 3px 0 0 rgba(255, 30, 66, 0.85), -3px 0 0 rgba(0, 240, 255, 0.55), 0 0 22px rgba(255, 30, 66, 0.8);
+      }
+      #eliminated.on { display: block; animation: elimin 0.5s ease-out both; }
+      #eliminated small { font-size: 0.48em; letter-spacing: 0.12em; color: #ff4d66; }
+      @keyframes elimin { 0% { opacity: 0; transform: translate(-50%, -50%) skewX(-10deg) scale(1.18); } 18% { opacity: 1; transform: translate(-50%, -50%) skewX(-10deg) scale(1); } }
+      #buffs { position: absolute; left: 50%; top: calc(50% + 100px); transform: translateX(-50%); display: flex; gap: 8px; white-space: nowrap; }
+      #buffs span { display: none; padding: 2px 6px; font-size: 10px; letter-spacing: 0.22em; border: 1px solid currentColor; background: rgba(5, 7, 14, 0.45); }
+      #buffs span.on { display: inline-block; }
+      #buff-pierce { color: #ffc93a; text-shadow: 0 0 6px rgba(255, 184, 0, 0.8); }
+      #buff-zero { color: #38f8ff; text-shadow: 0 0 6px rgba(0, 240, 255, 0.8); }
+      #buff-adren { color: #ff1e42; text-shadow: 0 0 6px rgba(255, 30, 66, 0.85); }
+      #pause.mini { background: rgba(5, 7, 14, 0.28); backdrop-filter: none; animation: minifade 0.16s 0.14s both; }
+      #pause.mini .big, #pause.mini .hint, #pause.mini .controls, #pause.mini #pause-panel { display: none; }
+      #pause .mini-msg { display: none; font-size: 18px; font-style: italic; font-weight: 800; letter-spacing: 0.22em; color: #e8f6ff; text-shadow: 0 0 14px rgba(0, 240, 255, 0.8); padding: 14px 26px; border: 1px solid rgba(0, 240, 255, 0.55); background: rgba(5, 7, 14, 0.7); }
+      #pause.mini .mini-msg { display: block; }
+      #pause .mini-msg b { color: #00f0ff; }
+      @keyframes minifade { from { opacity: 0; } to { opacity: 1; } }
       #xh .warn { fill: none; stroke: #ff1e42; stroke-width: 4; stroke-linecap: round; filter: drop-shadow(0 0 5px rgba(255, 30, 66, 0.95)); display: none; }
       #xh .dmg { fill: none; stroke: rgba(255, 60, 80, 0.85); stroke-width: 6; stroke-linecap: butt; display: none; }
       #evade {
@@ -441,11 +485,12 @@
       <div id="title-start">CLICK TO DEPLOY</div>
       <div class="controls">
         <b>WASD</b> MOVE · <b>MOUSE</b> LOOK · <b>SPACE</b> JUMP / WALL-KICK / RELEASE · <b>C / L-CTRL</b> SLIDE / CUT<br />
-        <b>LMB</b> FIRE / LAUNCH STRAND (HOLD = REEL) · <b>RMB</b> AIR BULLET-TIME · <b>Q / MOUSE 4</b> GUN ⇄ STRAND<br />
+        <b>LMB</b> FIRE / LAUNCH STRAND (HOLD = REEL) · <b>RMB</b> TACTICAL ZOOM (+ AIR BULLET-TIME) · <b>Q / MOUSE 4</b> GUN ⇄ STRAND<br />
         <b>1-4 / WHEEL</b> SELECT · <b>R</b> RELOAD · <b>ESC / TAB</b> PAUSE · <b>F</b> FULLSCREEN (Ctrl+W SAFE)
       </div>
     </div>
     <div id="pause">
+      <div class="mini-msg">PROTOCOL INSTALLED — <b>CLICK TO DEPLOY</b></div>
       <div class="big">PAUSED</div>
       <div class="hint">CLICK TO RESUME</div>
       <div class="controls">F: FULLSCREEN + KEYBOARD LOCK — L-CTRL CANNOT CLOSE THE TAB IN FULLSCREEN</div>
@@ -513,6 +558,9 @@
           <circle r="12" stroke-dasharray="3 3" />
           <path d="M0 -20 V-6 M-6 4 A6 6 0 0 0 6 4 V-1" />
         </g>
+        <g id="xh-zoom">
+          <path d="M -40 -11 H -46 V 11 H -40 M 40 -11 H 46 V 11 H 40" />
+        </g>
         <path id="xh-bt-track" class="track" d="M 23.14 27.58 A 36 36 0 0 0 23.14 -27.58" />
         <path id="xh-bt-arc" class="arc ready" d="M 23.14 27.58 A 36 36 0 0 0 23.14 -27.58" />
         <g id="hitmarker" class="hm">
@@ -540,6 +588,16 @@
       </svg>
       <div id="xh-dot"></div>
       <div id="evade">EVADE +90</div>
+      <div id="hud-alert"><b>ARMORED</b> — DESTROY WINGS</div>
+      <div id="buffs"><span id="buff-pierce">PIERCE ×3</span><span id="buff-zero">ZERO-TIME</span><span id="buff-adren">ADRENALINE</span></div>
+      <div id="trk-layer">
+        <div class="trk"><i></i><i></i><span></span></div>
+        <div class="trk"><i></i><i></i><span></span></div>
+        <div class="trk"><i></i><i></i><span></span></div>
+        <div class="trk"><i></i><i></i><span></span></div>
+        <div class="trk"><i></i><i></i><span></span></div>
+        <div class="trk"><i></i><i></i><span></span></div>
+      </div>
       <div id="sector-hud"></div>
       <div id="flow">
         <div id="flow-rank">D</div>
@@ -572,6 +630,7 @@
         <div id="ammo-name">MK-IV RAIL PISTOL</div>
       </div>
     </div>
+    <div id="eliminated"></div>
     <div id="debug-stats" hidden></div>
     <script>
       // Boot watchdog & fatal-error surface (classic inline script: runs even when the module fails to load).
@@ -586,9 +645,8 @@
         window.strandShowError = show;
         var HOWTO =
           '開発: strand-protocol フォルダで「npm run dev」→ 表示された URL (http://localhost:5173) を開く\n' +
-          'ビルド版: 「npm run build」→ dist/index.html をダブルクリック\n' +
-          'GitHub HTML Preview: strand-protocol/dist/index.html の URL を開く\n\n' +
-          'Dev: run "npm run dev" and open the printed URL. Build: run "npm run build" and open dist/index.html.';
+          'ビルド版: 「npm run build」→「npm run preview」→ 表示された URL を開く\n\n' +
+          'Dev: run "npm run dev" and open the printed URL. Build: run "npm run build", then "npm run preview".';
         document.addEventListener('DOMContentLoaded', function () {
           var unbuiltSource = document.querySelector('script[type="module"][src$=".ts"]');
           if (location.protocol === 'file:' && unbuiltSource) {

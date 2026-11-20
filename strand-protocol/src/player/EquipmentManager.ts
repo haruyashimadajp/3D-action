@@ -10,6 +10,11 @@
  *  - Reel-in (LMB held) only while GRAPPLE is in hand; with a gun it is a pure pendulum.
  * 5-state gear FSM: IDLE · HOLSTERING · DRAWING · FIRING_RECOVERY · RELOADING (switch cancels reload and
  * interrupts recovery). Clicks up to 150 ms before a switch completes are buffered and fired on completion.
+ * v1.2 / 5A-4: the gear timers (holster / draw, fire recovery, reload) run on REAL time — bullet time slows the
+ * world, not the hands (only hitstop pauses them); the hook flies at 340 m/s and at ≥ 0.6× real-time speed in
+ * bullet time; LMB is ignored while a hook is in flight (no self-cancel).
+ * 5A-1 tactical zoom: RMB with a gun in IDLE / FIRING_RECOVERY blends in the weapon's zoom (FOV, sensitivity,
+ * spread, view-model pivot, −10…−20 % visual recoil); reloads, switches and the grapple drop it.
  */
 import * as THREE from 'three';
 import { COLORS, DEG2RAD, EQUIP, MATERIALS, PHYSICS, clamp } from '../config/constants';
@@ -49,6 +54,8 @@ export interface EquipmentModifiers {
 
 export interface EquipmentEvents {
   onShot?(gun: GunId, ammoLeft: number, airborne: boolean): void;
+  /** Tactical zoom engaged / released (servo SE). */
+  onZoom?(on: boolean): void;
   onDryFire?(gun: GunId): void;
   onSwitchStart?(to: SlotId): void;
   onSwitchDone?(slot: SlotId): void;
@@ -99,9 +106,16 @@ export class EquipmentManager {
   pendingSlot: SlotId | null = null;
   readonly ammo: Record<GunId, number> = { PISTOL: GUNS.PISTOL.magazine, SMG: GUNS.SMG.magazine, SHOTGUN: GUNS.SHOTGUN.magazine };
 
+  /** Gear timer (real seconds, see 5A-4) and its duration. */
   private stateTime = 0;
   private stateDuration = 0;
+  /** Overshoot of the last FIRING_RECOVERY (keeps the SMG cadence exact at coarse bullet-time steps). */
+  private recoveryCarry = 0;
   private simTime = 0;
+  /** 5A-1 tactical zoom: target state, 0..1 blend and the gun whose zoom parameters apply. */
+  private zoomTarget = false;
+  zoomBlend = 0;
+  private zoomGun: GunId = 'PISTOL';
   private lastShotAt = -1e9;
   private smgBurstIndex = 0;
   private grappleReadyAt = 0;
@@ -169,6 +183,8 @@ export class EquipmentManager {
     sliding: false,
     wallSide: 0,
     sinceShot: 10,
+    zoom: 0,
+    zoomGun: 'PISTOL',
   };
   private readonly stepCtx: PlayerStepContext = { grappleEquipped: false, reelHeld: false };
 
@@ -221,6 +237,12 @@ export class EquipmentManager {
     this.lastShotAt = -1e9;
     this.hookMesh.visible = false;
     this.ropeMesh.count = 0;
+    this.recoveryCarry = 0;
+    this.zoomTarget = false;
+    this.zoomBlend = 0;
+    this.input.lookScale = 1;
+    this.player.zoomFovDeg = 0;
+    this.player.gunZoom = false;
     this.momentumLeft = 0;
     this.momentumUntil = -1;
     this.freeNextDetach = false;
@@ -273,6 +295,11 @@ export class EquipmentManager {
   /** True while SK_02 piercing shots are armed (HUD / tests). */
   get momentumArmed(): boolean {
     return this.momentumLeft > 0 && this.simTime <= this.momentumUntil;
+  }
+
+  /** SK_02 piercing shots still loaded (0 when the window is closed) — HUD buff tag. */
+  get momentumShotsLeft(): number {
+    return this.momentumArmed ? this.momentumLeft : 0;
   }
 
   // ===============================================================================================
@@ -394,12 +421,19 @@ export class EquipmentManager {
   // ===============================================================================================
   // Fixed step
   // ===============================================================================================
-  fixedUpdate(dt: number, camera: THREE.PerspectiveCamera): void {
+  /**
+   * `dt` is the scaled simulation step; `btScale` the current bullet-time scale (1 or 0.25). Gear timers advance
+   * by dt / btScale = real time in bullet time (hitstop still slows them, as it scales dt itself).
+   */
+  fixedUpdate(dt: number, camera: THREE.PerspectiveCamera, btScale = 1): void {
+    const bt = Math.max(0.05, btScale);
     this.simTime += dt;
-    this.updateHook(dt);
+    this.updateHook(dt * Math.max(1, GRAPPLE.BT_MIN_SPEED_FACTOR / bt));
     if (!this.player.isAlive) return;
 
-    this.stateTime += dt;
+    const gearDt = dt / bt;
+    this.stateTime += gearDt;
+    this.recoveryCarry = 0;
     switch (this.state) {
       case 'HOLSTERING':
         if (this.stateTime >= this.stateDuration) {
@@ -424,6 +458,7 @@ export class EquipmentManager {
         break;
       case 'FIRING_RECOVERY':
         if (this.stateTime >= this.stateDuration) {
+          this.recoveryCarry = Math.min(this.stateTime - this.stateDuration, gearDt);
           this.enter('IDLE', 0);
           if (isGun(this.activeSlot) && this.ammo[this.activeSlot] === 0) this.startReload();
         }
@@ -456,8 +491,12 @@ export class EquipmentManager {
       }
       this.fireGun(gun, camera);
     } else if (this.input.hasBuffered('FIRE')) {
-      // GRAPPLE: a new launch (cuts any attached strand first). Cooldown applies only when not attached.
-      if (this.player.ropeAttached || this.hookInFlight || this.simTime >= this.grappleReadyAt) {
+      if (this.hookInFlight) {
+        // 5A-4: clicks while the hook is flying are swallowed — never a self-cancel, never a stale re-fire
+        // that would cut the strand the moment it lands.
+        this.input.consumeBuffered('FIRE');
+      } else if (this.player.ropeAttached || this.simTime >= this.grappleReadyAt) {
+        // GRAPPLE: a new launch (cuts any attached strand first). Cooldown applies only when not attached.
         this.input.consumeBuffered('FIRE');
         this.fireHook(camera);
       }
@@ -471,6 +510,11 @@ export class EquipmentManager {
     this.ammo[gun.id]--;
     this.lastShotAt = this.simTime;
     this.enter('FIRING_RECOVERY', gun.intervalMs / 1000);
+    this.stateTime = this.recoveryCarry;
+    this.recoveryCarry = 0;
+    // Tactical zoom: tighter cone and −10…−20 % visual recoil, proportional to the blend.
+    const zoomed = this.zoomBlend >= 0.5;
+    const recoilK = 1 - (1 - gun.zoom.recoilScale) * this.zoomBlend;
 
     this.player.eyePosition(_eye);
     this.player.aimDirection(_aim);
@@ -480,7 +524,13 @@ export class EquipmentManager {
     if (_right.lengthSq() < 1e-6) _right.set(1, 0, 0);
     _right.normalize();
     _up.crossVectors(_right, _aim).normalize();
-    const spreadDeg = this.player.btActive ? gun.spreadBtDeg : gun.spreadDeg;
+    const spreadDeg = zoomed
+      ? this.player.btActive
+        ? gun.zoom.spreadBtDeg
+        : gun.zoom.spreadDeg
+      : this.player.btActive
+        ? gun.spreadBtDeg
+        : gun.spreadDeg;
     const tanHalf = Math.tan((spreadDeg / 2) * DEG2RAD);
     // SK_02 momentum chamber: the first N shots inside the window pierce shields / bodies at +35 % speed.
     const momentum = this.momentumLeft > 0 && this.simTime <= this.momentumUntil;
@@ -500,10 +550,10 @@ export class EquipmentManager {
     const r = gun.recoil;
     const horiz = r.sineSway ? Math.sin(this.smgBurstIndex * 0.9) * r.horizontalDeg : (Math.random() * 2 - 1) * r.horizontalDeg;
     this.smgBurstIndex++;
-    this.player.addRecoil(r.verticalDeg, horiz, r.recoverDegPerS);
-    this.player.addTrauma(gun.shake);
+    this.player.addRecoil(r.verticalDeg * recoilK, horiz * recoilK, r.recoverDegPerS);
+    this.player.addTrauma(gun.shake, recoilK);
     this.player.notifyFired();
-    this.viewModel.onFire(gun.id);
+    this.viewModel.onFire(gun.id, recoilK);
     this.renderer.flashLight(_muzzle, this.plasma ? PLASMA_HEX : this.energyHex, gun.id === 'SHOTGUN' ? 18 : 9, 12, gun.id === 'SMG' ? 0.04 : 0.07);
     this.effects.burst(_muzzle, _aim, BURST.MUZZLE, this.muzzleColor.getHex());
 
@@ -602,6 +652,7 @@ export class EquipmentManager {
   frameUpdate(realDt: number, camera: THREE.PerspectiveCamera, lookYaw: number, lookPitch: number): void {
     this.lookYaw = lookYaw;
     this.lookPitch = lookPitch;
+    if (realDt > 0) this.updateZoom(realDt);
     // Gold diamond lock display works with ANY slot equipped (§3.6-3).
     this.player.eyePosition(_eye);
     this.player.viewDirection(_aim);
@@ -647,7 +698,35 @@ export class EquipmentManager {
     f.sliding = this.player.isSliding;
     f.wallSide = this.player.state === 'WALL_RUN_L' ? -1 : this.player.state === 'WALL_RUN_R' ? 1 : 0;
     f.sinceShot = this.simTime - this.lastShotAt;
+    f.zoom = this.zoomBlend;
+    f.zoomGun = this.zoomGun;
     this.viewModel.update(realDt, f);
+  }
+
+  /**
+   * 5A-1: RMB held with a gun drawn (IDLE / FIRING_RECOVERY) → zoom. Grounded or not; bullet time is decided by
+   * the player (air only). Blend += (target − blend) · min(1, rate · realDt); FOV offset, sensitivity and the
+   * view-model pivot follow the blend. Frozen frames (pause, realDt = 0) never touch it.
+   */
+  private updateZoom(realDt: number): void {
+    const gunReady = isGun(this.activeSlot) && (this.state === 'IDLE' || this.state === 'FIRING_RECOVERY');
+    const target = gunReady && this.player.isAlive && this.input.isDown('BULLET_TIME');
+    if (isGun(this.activeSlot) && (target || this.zoomBlend <= 0.001)) this.zoomGun = this.activeSlot;
+    if (target !== this.zoomTarget) {
+      this.zoomTarget = target;
+      this.events.onZoom?.(target);
+    }
+    const z = GUNS[this.zoomGun].zoom;
+    this.zoomBlend += ((target ? 1 : 0) - this.zoomBlend) * Math.min(1, z.lerpRate * realDt);
+    if (this.zoomBlend < 0.0005) this.zoomBlend = 0;
+    this.player.gunZoom = target;
+    this.player.zoomFovDeg = z.fovOffsetDeg * this.zoomBlend;
+    this.input.lookScale = 1 + (z.sensitivity - 1) * this.zoomBlend;
+  }
+
+  /** True while the zoom is engaged (RMB with a gun ready). */
+  get isZooming(): boolean {
+    return this.zoomTarget;
   }
 
   /** Straight when taut; a sagging quadratic curve when slack. 16 instanced segments, no allocation. */

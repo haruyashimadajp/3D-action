@@ -152,7 +152,8 @@ export const VEIL_BEHAVIOUR = {
   BACKSTEP_RADIUS: 14,
   /** Sight laser drawn while not telegraphing (thin red). */
   SIGHT_WIDTH: 0.01,
-  SIGHT_OPACITY: 0.2,
+  /** 5A-5: 0.20 → 0.42 so the snipe laser reads clearly at night. */
+  SIGHT_OPACITY: 0.42,
 } as const;
 
 /** 4. Phantom — high-mobility blink trooper: 10 m blinks at 32 m/s, 2-round pulse gun, dash slash ≤ 4.5 m. */

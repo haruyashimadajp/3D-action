@@ -6,13 +6,17 @@
  *  - Held state for continuous actions (WASD, fire, bullet time, slide).
  *  - Buffered presses (150 ms) for jump / fire / grapple: a press is remembered with its timestamp and
  *    consumed by the first simulation step in which the action becomes possible (§3.6-2).
- *  - Discrete actions (slot select, Q toggle, wheel, reload, pause) are queued and drained once per frame.
+ *  - Discrete actions (slot select, Q toggle, wheel, reload, pause) are queued and drained once per frame —
+ *    only while gameplay input is enabled: nothing typed on the title / pause / modal screens is replayed on
+ *    the first frame back in play (5A-4).
+ *  - Tactical zoom scales the look sensitivity (`lookScale`, 0.72× … 0.88× at full zoom).
  *  - 450 ms click / number-key lock for the skill-choice modal (§3.6-5).
  *  - Ctrl+W safety: a leave-page confirmation while playing, and optional fullscreen + Keyboard Lock so
  *    the browser cannot steal Ctrl / W.
  */
 import { INPUT, clamp } from '../config/constants';
 
+/** `BULLET_TIME` is the RMB hold: tactical zoom with a gun, plus air bullet time when airborne (v1.2). */
 export type HeldAction = 'FORWARD' | 'BACK' | 'LEFT' | 'RIGHT' | 'JUMP' | 'SLIDE' | 'FIRE' | 'BULLET_TIME';
 export type BufferedAction = 'JUMP' | 'FIRE' | 'SLIDE';
 export type DiscreteAction =
@@ -62,6 +66,8 @@ export class InputManager {
   sensitivity: number = INPUT.SENSITIVITY_DEFAULT;
   /** Input only drives the game while true (title / pause / modal screens set it false). */
   gameplayEnabled = false;
+  /** Extra look multiplier (tactical zoom sensitivity, 1 = none). */
+  lookScale = 1;
 
   private readonly held = new Set<HeldAction>();
   /** Physical key codes currently down (for keys sharing one action). */
@@ -131,13 +137,15 @@ export class InputManager {
   }
 
   /** Fullscreen + Keyboard Lock: Ctrl / W / Tab / Esc can no longer be intercepted by the browser. */
-  toggleFullscreen(): void {
+  toggleFullscreen(relock = true): void {
     const kb = (navigator as Navigator & { keyboard?: KeyboardLockApi }).keyboard;
     if (!document.fullscreenElement) {
       document.documentElement
         .requestFullscreen()
         .then(() => kb?.lock(['ControlLeft', 'KeyW', 'KeyA', 'KeyS', 'KeyD', 'KeyC', 'Tab', 'Space']).catch(() => undefined))
-        .then(() => this.requestPointerLock())
+        .then(() => {
+          if (relock) this.requestPointerLock();
+        })
         .catch(() => undefined);
     } else {
       kb?.unlock();
@@ -211,7 +219,7 @@ export class InputManager {
 
   /** Returns accumulated look delta in radians (yaw, pitch) and resets it. */
   consumeLook(out: { yaw: number; pitch: number }): { yaw: number; pitch: number } {
-    const k = INPUT.BASE_RAD_PER_PIXEL * clamp(this.sensitivity, INPUT.SENSITIVITY_MIN, INPUT.SENSITIVITY_MAX);
+    const k = INPUT.BASE_RAD_PER_PIXEL * clamp(this.sensitivity, INPUT.SENSITIVITY_MIN, INPUT.SENSITIVITY_MAX) * this.lookScale;
     out.yaw = -this.lookX * k;
     out.pitch = -this.lookY * k;
     this.lookX = 0;
@@ -266,9 +274,13 @@ export class InputManager {
       if (held === 'SLIDE') this.press('SLIDE');
     }
     const d = KEY_DISCRETE[e.code];
-    if (d) {
+    // Title / pause / modal: discrete actions are never queued (no stale SLOT / RELOAD / PAUSE on resume).
+    // F still toggles fullscreen there, immediately (the key press is the required user gesture).
+    if (d && this.gameplayEnabled) {
       if (d.startsWith('SLOT') && this.clicksLocked) return;
       this.queue.push(d);
+    } else if (d === 'FULLSCREEN') {
+      this.toggleFullscreen(false);
     }
   };
 
@@ -291,7 +303,7 @@ export class InputManager {
     } else if (e.button === 3 || e.button === 4) {
       // Mouse side button ("Mouse Side 4"): grapple ⇄ last gun toggle.
       e.preventDefault();
-      this.queue.push('TOGGLE_GRAPPLE');
+      if (this.gameplayEnabled) this.queue.push('TOGGLE_GRAPPLE');
     }
   };
 
@@ -310,7 +322,7 @@ export class InputManager {
   private readonly onWheel = (e: WheelEvent): void => {
     if (!this.locked) return;
     e.preventDefault();
-    if (this.clicksLocked || Math.abs(e.deltaY) < 1) return;
+    if (this.clicksLocked || !this.gameplayEnabled || Math.abs(e.deltaY) < 1) return;
     this.queue.push(e.deltaY > 0 ? 'SLOT_NEXT' : 'SLOT_PREV');
   };
 

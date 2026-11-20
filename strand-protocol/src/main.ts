@@ -8,6 +8,7 @@
  */
 import * as THREE from 'three';
 import {
+  AUDIO,
   FIXED_DT,
   MAX_FRAME_DT,
   GAME_TITLE,
@@ -64,7 +65,7 @@ import { EnemyManager, RICOCHET_TAG, type HitMarkerKind, type KillInfo } from '.
 import { PlayerController } from './player/PlayerController';
 import { EquipmentManager } from './player/EquipmentManager';
 import { ViewModelRenderer } from './player/ViewModelRenderer';
-import { HUD_MAX_WARNINGS, HudManager, SaveStore, formatTime, type HudFrame } from './ui/HudManager';
+import { HUD_MAX_TRACKS, HUD_MAX_WARNINGS, HudManager, SaveStore, formatTime, type HudFrame } from './ui/HudManager';
 
 // ---------------------------------------------------------------------------
 // Game clock: simulation dt = real dt × min(bullet-time scale, hitstop scale).
@@ -287,6 +288,12 @@ const _ricoDir = new THREE.Vector3();
 const _ricoTargets = [new THREE.Vector3(), new THREE.Vector3(), new THREE.Vector3()];
 const _flowOut = { label: '', points: 0 };
 const UP = new THREE.Vector3(0, 1, 0);
+const _trkPos = Array.from({ length: HUD_MAX_TRACKS }, () => new THREE.Vector3());
+const _trkBoss = new Uint8Array(HUD_MAX_TRACKS);
+/** Tracking diamonds clamp this far inside the screen edge (px). */
+const TRACK_EDGE_MARGIN_PX = 44;
+/** Volume-slider preview tick throttle (s). */
+const VOLUME_TICK_S = 0.06;
 
 /** Delay between the last kill and the skill modal / result screen (lets the kill juice play out). */
 const CLEAR_TO_MODAL_S = 1.0;
@@ -365,6 +372,11 @@ class App {
   private transitionBuilt = false;
   /** SK_11: kills inside the current bullet-time activation. */
   private btKills = 0;
+  /** 5A-6 wall-run boot tap timer (simulation s). */
+  private wallStepTimer = 0;
+  /** 5A-5: the pause overlay is the light "PROTOCOL INSTALLED — CLICK TO DEPLOY" variant. */
+  private pauseMini = false;
+  private lastVolumeTick = -1;
 
   /** Debug-only frozen camera pose from `?view=x,y,z,yawDeg,pitchDeg` or `?view=spawn` (title screen). */
   private readonly fixedView: { pos: THREE.Vector3; yaw: number; pitch: number } | null;
@@ -406,6 +418,7 @@ class App {
         this.equipment.onRopeDetached(mode);
       },
       onBulletTime: (active) => this.onBulletTime(active),
+      onBulletTimeDenied: () => this.hud.btDenied(),
       onRegenStart: () => audio.regenStart(),
       onDamaged: () => {
         this.renderer.postFx.damageFlash = 1;
@@ -416,6 +429,8 @@ class App {
       onDeath: () => {
         this.stats.deaths++;
         audio.death();
+        // 5A-5: the one-line cause during the glitch blackout.
+        this.hud.eliminated(this.enemies.lastHitCause || 'SYSTEM FAILURE');
         this.beginDeath(PLAYER.DEATH_RETRY_MS);
       },
     });
@@ -426,6 +441,7 @@ class App {
         if (gun === 'SHOTGUN' && airborne && this.skills.SK_07 > 0) this.player.hover(skillValue2(this.skills, 'SK_07'));
       },
       onDryFire: () => audio.dryFire(),
+      onZoom: (on) => audio.zoom(on),
       onSwitchStart: (to) => audio.switchGear(to),
       onReloadStart: () => audio.reload(true),
       onReloadDone: () => audio.reload(false),
@@ -448,6 +464,7 @@ class App {
       },
       onBossDefeated: (pos) => audio.bossKill(pos),
       onPlayerHit: (_damage, from) => this.hud.damageFrom(this.screenAngle(from)),
+      onArmorDeflect: () => this.hud.armorAlert(),
       onWaveStart: (wave, waves) => {
         if (wave > 1) this.hud.flowLog(`WAVE ${wave}/${waves}`, 0, 'skill');
       },
@@ -496,6 +513,16 @@ class App {
       bossWingR: 1,
       bossPhase: 1,
       bossDowned: false,
+      zoom: 0,
+      buffPierce: 0,
+      buffZero: false,
+      buffAdren: false,
+      trackCount: 0,
+      trackX: new Float32Array(HUD_MAX_TRACKS),
+      trackY: new Float32Array(HUD_MAX_TRACKS),
+      trackDist: new Float32Array(HUD_MAX_TRACKS),
+      trackOff: new Uint8Array(HUD_MAX_TRACKS),
+      trackBoss: new Uint8Array(HUD_MAX_TRACKS),
     };
 
     this.startSector = clamp(parseInt(params.get('sector') ?? '1', 10) || 1, 1, SECTORS.length);
@@ -565,6 +592,8 @@ class App {
       if (locked && this.state === 'PAUSED') this.setState('PLAYING');
       else if (!locked && this.state === 'PLAYING') this.setState('PAUSED');
     });
+    // 5A-2: a hidden tab suspends all audio; returning resumes it (the world bus stays muted while paused).
+    document.addEventListener('visibilitychange', () => this.audio.setHidden(document.hidden));
     this.setState('TITLE');
 
     this.attract.step(0);
@@ -611,6 +640,15 @@ class App {
   private onSettingChanged(key: keyof SaveSettings): void {
     this.applySetting(key);
     this.store.write();
+    if (key === 'volume') {
+      // Volume preview: only the UI tick sounds (the world bus is muted on the title / pause screens).
+      this.audio.init();
+      const now = performance.now() / 1000;
+      if (now - this.lastVolumeTick >= VOLUME_TICK_S) {
+        this.lastVolumeTick = now;
+        this.audio.uiTick();
+      }
+    }
   }
 
   private applyEnergyColor(): void {
@@ -670,11 +708,18 @@ class App {
   private setState(s: AppState): void {
     this.state = s;
     const playing = s === 'PLAYING';
+    if (s !== 'PAUSED') this.pauseMini = false;
     this.input.gameplayEnabled = playing;
+    // 5A-4: nothing pressed on the title / pause / modal screens leaks into the first frame of play.
+    if (playing) this.input.clearActions();
     this.input.setUnloadGuard(s !== 'TITLE');
-    document.getElementById('pause')?.classList.toggle('visible', s === 'PAUSED');
+    // 5A-2: rain, wind, BGM and every world SE are fully silent while paused, on the result screen and title.
+    this.audio.setPaused(s === 'PAUSED' || s === 'RESULT' || s === 'TITLE');
+    const pause = document.getElementById('pause');
+    pause?.classList.toggle('visible', s === 'PAUSED');
+    pause?.classList.toggle('mini', s === 'PAUSED' && this.pauseMini);
     document.getElementById('title')?.classList.toggle('playing', s !== 'TITLE');
-    this.hud.showPanels(s === 'TITLE' || s === 'PAUSED', s === 'TITLE');
+    this.hud.showPanels(s === 'TITLE' || (s === 'PAUSED' && !this.pauseMini), s === 'TITLE');
     this.hud.setVisible(s !== 'TITLE');
     this.hud.setDim(s === 'SKILL' || s === 'RESULT');
     this.viewModel.root.visible = s !== 'TITLE';
@@ -720,6 +765,8 @@ class App {
     this.accumulator = 0;
     this.deathTimer = -1;
     this.btKills = 0;
+    this.wallStepTimer = 0;
+    this.hud.eliminated(null);
     this.renderer.postFx.glitch = 0;
     this.renderer.postFx.fade = 0;
     this.renderer.postFx.critical = 0;
@@ -779,7 +826,9 @@ class App {
     this.hud.flowLog(`${SKILL_BY_ID[id].nameEn} Lv.${this.skills[id]}`, 0, 'skill');
     this.input.clearActions();
     // Resume through the pause state: the pick (click / key) is a user gesture, so the re-lock normally
-    // succeeds at once; if the browser refuses it the pause overlay asks for one more click.
+    // succeeds at once; if the browser refuses it (common after a keyboard pick) a light one-click overlay
+    // "PROTOCOL INSTALLED — CLICK TO DEPLOY" appears instead of the full settings pause screen (5A-5).
+    this.pauseMini = true;
     this.setState('PAUSED');
     this.input.requestPointerLock();
   }
@@ -861,6 +910,7 @@ class App {
     this.updateSectorLabel();
     this.spawnPlayer();
     this.showSectorBanner();
+    this.pauseMini = true;
     this.setState('PAUSED');
     this.input.requestPointerLock();
   }
@@ -868,6 +918,7 @@ class App {
   private returnToTitle(): void {
     this.hud.hideResult();
     this.hud.closeSkillModal();
+    this.hud.eliminated(null);
     this.input.exitPointerLock();
     this.loop = 0;
     this.skills = emptySkillLevels();
@@ -900,7 +951,8 @@ class App {
   // =============================================================================================
   private onHitMarker(kind: HitMarkerKind): void {
     this.hud.hitMarker(kind);
-    if (kind === 'BODY' || kind === 'SHIELD') this.audio.hitBody();
+    if (kind === 'BODY' || kind === 'WING') this.audio.hitBody();
+    else if (kind === 'SHIELD' || kind === 'ARMOR') this.audio.hitShield();
     else if (kind === 'HEAD' || kind === 'HEAD_KILL') this.audio.headshot(kind === 'HEAD_KILL', this.clock.realTime);
     // SK_04 wall overclock: head-shot while wall-running → BT gauge + instant reload.
     if ((kind === 'HEAD' || kind === 'HEAD_KILL') && this.player.isWallRunning && this.skills.SK_04 > 0) {
@@ -1075,7 +1127,7 @@ class App {
     }
     if (this.state !== 'PLAYING') return;
     const cam = this.renderer.camera;
-    this.equipment.fixedUpdate(dt, cam);
+    this.equipment.fixedUpdate(dt, cam, this.clock.bulletTimeScale);
     this.player.fixedUpdate(dt, this.equipment.stepContext());
     this.enemies.fixedUpdate(dt);
     this.effects.updateProjectiles(dt, this.physics, this.targetsFor, this.onImpact, this.enemies.graze);
@@ -1164,6 +1216,7 @@ class App {
       fx.bulletTime = 0;
       fx.speedLines = 0;
       fx.overdrive = 0;
+      fx.zoom = 0;
     } else {
       const frozen = this.state !== 'PLAYING';
       this.player.updateCamera(frozen ? 0 : realDt, alpha, cam);
@@ -1175,6 +1228,7 @@ class App {
       fx.speed = this.player.speed;
       fx.bulletTime += ((this.player.btActive ? 1 : 0) - fx.bulletTime) * lerpFactor(14, realDt);
       fx.critical += ((this.player.isCritical && this.player.isAlive ? 1 : 0) - fx.critical) * lerpFactor(6, realDt);
+      fx.zoom = this.equipment.zoomBlend;
       this.applyFlowRank(realDt);
       // Speed lines (§6.2 Pass 4 · FLOW table): from rank B at ≥ 18 m/s, denser with rank, always dense at SSS.
       const sp = this.player.speed;
@@ -1182,6 +1236,15 @@ class App {
       const sl = rk >= 6 ? 1 : rk >= 2 ? clamp((sp - RENDER.SPEEDLINE_MIN_SPEED) / 14, 0, 1) * (0.35 + 0.13 * (rk - 2)) : 0;
       fx.speedLines += (sl - fx.speedLines) * lerpFactor(8, realDt);
       fx.speedLineDensity = rk >= 6 ? 1 : 0.3 + 0.1 * Math.max(0, rk - 2);
+      // 5A-6: magnetic boot taps every 0.22 s (simulation time) while wall-running.
+      if (this.player.isWallRunning && this.player.isAlive) {
+        this.wallStepTimer -= simDt;
+        if (this.wallStepTimer <= 0) {
+          this.audio.wallRunStep();
+          this.wallStepTimer += AUDIO.WALLRUN_STEP.intervalS;
+          if (this.wallStepTimer < 0) this.wallStepTimer = AUDIO.WALLRUN_STEP.intervalS;
+        }
+      } else this.wallStepTimer = 0;
       // Shallow canal: wake splashes while wading.
       this.splashTimer -= simDt;
       if (this.player.isInWater && this.player.speed > 2 && this.splashTimer <= 0) {
@@ -1197,7 +1260,7 @@ class App {
     _camFwd.copy(_camBack).negate();
     _camUp.setFromMatrixColumn(cam.matrixWorld, 1);
     const live = playing && this.player.isAlive;
-    this.audio.update(cam.position, _camFwd, _camUp, live && this.player.ropeAttached, this.player.speed);
+    this.audio.update(cam.position, _camFwd, _camUp, live && this.player.ropeAttached, this.player.speed, live && this.player.state === 'GRAPPLE_PULL');
     this.audio.setPlayerState(live && this.player.isCritical, live && this.player.isRegenerating);
     if (this.state === 'PLAYING') this.audio.setCalm(this.enemies.isCleared || this.player.isRegenerating);
 
@@ -1232,6 +1295,7 @@ class App {
       if (onScreen) continue;
       f.warnAngles[f.warnCount++] = this.screenAngle(w.position);
     }
+    this.updateTracking(f);
     f.sectorName = this.sectorLabel;
     f.remaining = this.enemies.remaining;
     f.gateOpen = (this.enemies.isCleared && this.layout.sector.reward === 'SKILL') || this.debugGate;
@@ -1262,6 +1326,10 @@ class App {
     f.regenCountdown = p.regenCountdown;
     f.regenerating = p.isRegenerating;
     f.sinceShot = e.sinceShot;
+    f.zoom = e.zoomBlend;
+    f.buffPierce = e.momentumShotsLeft;
+    f.buffZero = this.skills.SK_11 > 0 && p.speedBoostActive;
+    f.buffAdren = this.skills.SK_14 > 0 && p.isCritical && p.isAlive;
     f.speed = p.speed;
     f.altitude = p.position.y;
     const an = e.snap.anchor;
@@ -1280,6 +1348,53 @@ class App {
     this.stats.flowScore = fl.earned * modifierScoreMultiplier(this.activeMods);
     this.stats.peakFlowPoints = fl.peak;
     this.hud.updateFlow(fl.rankIndex, fl.progress, fl.decayGrace, fl.points, this.stats.flowScore);
+  }
+
+  /**
+   * 5A-5 tactical tracking: the last ≤ 3 enemies and VALKYRIE get a diamond at their screen position; off-screen
+   * targets are clamped to the screen edge (44 px inset) along their view-space direction, with the distance.
+   */
+  private updateTracking(f: HudFrame): void {
+    const n = this.enemies.trackedTargets(_trkPos, _trkBoss);
+    const cam = this.renderer.camera;
+    const w = this.renderer.viewportWidth;
+    const h = this.renderer.viewportHeight;
+    _camRight.setFromMatrixColumn(cam.matrixWorld, 0);
+    _camUp.setFromMatrixColumn(cam.matrixWorld, 1);
+    _camBack.setFromMatrixColumn(cam.matrixWorld, 2);
+    const hx = w / 2 - TRACK_EDGE_MARGIN_PX;
+    const hy = h / 2 - TRACK_EDGE_MARGIN_PX;
+    for (let i = 0; i < n; i++) {
+      const pos = _trkPos[i];
+      _toSrc.subVectors(pos, cam.position);
+      f.trackDist[i] = _toSrc.length();
+      f.trackBoss[i] = _trkBoss[i];
+      const forward = -_toSrc.dot(_camBack);
+      let sx = 0;
+      let sy = 0;
+      let off = true;
+      if (forward > 0.1) {
+        _proj.copy(pos).project(cam);
+        sx = _proj.x * (w / 2);
+        sy = -_proj.y * (h / 2);
+        off = Math.abs(sx) > hx || Math.abs(sy) > hy;
+      }
+      if (off) {
+        // Direction on screen from the view-space offset (works behind the camera too).
+        let dx = _toSrc.dot(_camRight);
+        let dy = -_toSrc.dot(_camUp);
+        if (forward <= 0.1 && Math.abs(dx) < 1e-3 && Math.abs(dy) < 1e-3) dy = 1;
+        const k = Math.min(hx / Math.max(Math.abs(dx), 1e-6), hy / Math.max(Math.abs(dy), 1e-6));
+        dx *= k;
+        dy *= k;
+        sx = dx;
+        sy = dy;
+      }
+      f.trackX[i] = w / 2 + sx;
+      f.trackY[i] = h / 2 + sy;
+      f.trackOff[i] = off ? 1 : 0;
+    }
+    f.trackCount = n;
   }
 
   private fpsLast = performance.now();

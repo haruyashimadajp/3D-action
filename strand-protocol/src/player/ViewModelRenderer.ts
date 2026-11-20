@@ -11,7 +11,7 @@
  */
 import * as THREE from 'three';
 import { CAMERA, COLORS, MATERIALS, clamp, lerpFactor } from '../config/constants';
-import { SLOT_ORDER, type SlotId } from '../config/weapons';
+import { GUNS, SLOT_ORDER, type GunId, type SlotId } from '../config/weapons';
 
 const SLOT_KEYS: readonly SlotId[] = SLOT_ORDER;
 
@@ -37,6 +37,9 @@ export interface ViewModelFrame {
   wallSide: number;
   /** Seconds since the last shot (pump / charge animation). */
   sinceShot: number;
+  /** 0..1 tactical-zoom blend and the gun whose zoom pivot applies (5A-1). */
+  zoom: number;
+  zoomGun: GunId;
 }
 
 const _v = new THREE.Vector3();
@@ -397,10 +400,11 @@ export class ViewModelRenderer {
   // =============================================================================================
   // Events
   // =============================================================================================
-  onFire(slot: SlotId): void {
+  /** `kickScale` < 1 while zoomed (−10 … −20 % visual recoil). */
+  onFire(slot: SlotId, kickScale = 1): void {
     const r = this.rigs[slot];
-    this.kickVZ += r.kickBack * 28;
-    this.kickVP += r.kickPitch * 28;
+    this.kickVZ += r.kickBack * 28 * kickScale;
+    this.kickVP += r.kickPitch * 28 * kickScale;
     if (slot !== 'GRAPPLE') {
       this.flashLife = slot === 'SHOTGUN' ? 0.07 : 0.045;
       this.flashMat.uniforms.uSeed.value = Math.random();
@@ -490,14 +494,18 @@ export class ViewModelRenderer {
     this.winchGlow.emissiveIntensity = MATERIALS.PLAYER_STRAND.emissive * (f.ropeAttached ? 1.0 : 0.35);
     this.leftRaise += ((f.ropeAttached || f.hookInFlight ? 1 : 0) - this.leftRaise) * lerpFactor(9, realDt);
 
-    // Compose the right-hand pivot.
+    // Compose the right-hand pivot. Tactical zoom slides it toward the centre-high sight position
+    // (hip X 0.21 / Y −0.20 / Z −0.42 → the gun's zoom pivot) and calms sway / bob by half.
+    const z = clamp(f.zoom, 0, 1);
+    const zd = GUNS[f.zoomGun].zoom;
+    const calm = 1 - 0.5 * z;
     const p = this.weaponPivot;
     p.position.set(
-      0.21 + this.swayX + bobX,
-      -0.2 + this.swayY + bobY - ease * 0.32 - reloadDip - this.lower,
-      -0.42 + this.kickZ + ease * 0.05,
+      0.21 + (zd.vmX - 0.21) * z + (this.swayX + bobX) * calm,
+      -0.2 + (zd.vmY + 0.2) * z + (this.swayY + bobY) * calm - ease * 0.32 - reloadDip - this.lower,
+      -0.42 + (zd.vmZ + 0.42) * z + this.kickZ + ease * 0.05,
     );
-    p.rotation.set(this.kickP + ease * 0.95 + this.swayY * 2, this.swayX * 2.5, -this.tilt - ease * 0.35 + reloadRoll, 'XYZ');
+    p.rotation.set(this.kickP + ease * 0.95 + this.swayY * 2 * calm, this.swayX * 2.5 * calm, (-this.tilt - ease * 0.35 + reloadRoll) * (1 - 0.6 * z), 'XYZ');
 
     // Left arm: raised forward while the strand is out.
     this.leftArm.position.set(-0.26 + this.swayX * 0.7 + bobX * 0.6, -0.33 + this.leftRaise * 0.08 + this.swayY * 0.7 + bobY - this.lower, -0.44 - this.leftRaise * 0.04);

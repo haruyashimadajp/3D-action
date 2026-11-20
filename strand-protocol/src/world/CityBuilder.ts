@@ -126,6 +126,8 @@ export interface SectorLayout {
   readonly groundSpawns: readonly SpawnPoint[];
   /** Layer 1: expressway deck positions. */
   readonly highwaySpawns: readonly SpawnPoint[];
+  /** Layer 0: canal truss-bridge decks (connected street battlefield, 5A-5). */
+  readonly bridgeSpawns: readonly SpawnPoint[];
   /** Layer 2: sky-bridge roofs. */
   readonly skybridgeSpawns: readonly SpawnPoint[];
   /** Layer 3: rooftops (Y ≥ 30 m). */
@@ -1741,6 +1743,7 @@ export class CityBuilder {
     const canalWater: RectXZ[] = [];
     const groundSpawns: SpawnPoint[] = [];
     const highwaySpawns: SpawnPoint[] = [];
+    const bridgeSpawns: SpawnPoint[] = [];
     const skybridgeSpawns: SpawnPoint[] = [];
     const roofSpawns: SpawnPoint[] = [];
     const perchSpawns: SpawnPoint[] = [];
@@ -2091,6 +2094,10 @@ export class CityBuilder {
       const axis = s.axis;
       const L = b.along1 - b.along0;
       G.hw.push(boxGeoWorld(axis, b.along0, b.along1, b.lat0, b.lat1, -LEVEL.BRIDGE_DECK_THICKNESS_M, LEVEL.BRIDGE_DECK_Y - 0.005));
+      // Enemy spawn points across the deck (centre + both quarter points of the span).
+      for (const k of [-0.5, 0, 0.5]) {
+        bridgeSpawns.push({ position: pt(axis, c.coord + k * (c.width / 2), LEVEL.BRIDGE_DECK_Y, (b.lat0 + b.lat1) / 2), layer: 0, building: -1 });
+      }
       colliders.push(colliderAL(axis, c.coord - c.width / 2, c.coord + c.width / 2, b.lat0, b.lat1, -LEVEL.BRIDGE_DECK_THICKNESS_M, LEVEL.BRIDGE_DECK_Y, 'BRIDGE'));
       const neon = BRIDGE_NEON[bi % BRIDGE_NEON.length];
       const tops = [3.5, 5.6, 6.5, 5.6, 3.5];
@@ -2861,6 +2868,9 @@ export class CityBuilder {
     const keptGround = groundSpawns.filter((s) => Math.hypot(s.position.x - playerSpawn.x, s.position.z - playerSpawn.z) > 30 && inArea(s.position.x, s.position.z, 3));
     groundSpawns.length = 0;
     groundSpawns.push(...keptGround);
+    const keptBridge = bridgeSpawns.filter((s) => Math.hypot(s.position.x - playerSpawn.x, s.position.z - playerSpawn.z) > 30 && inArea(s.position.x, s.position.z, 3));
+    bridgeSpawns.length = 0;
+    bridgeSpawns.push(...keptBridge);
 
     // ------------------------------------------------------------------ 15. cinematic loop (title attract)
     const lane = av.coord + spawnLane * 3.5;
@@ -2939,6 +2949,7 @@ export class CityBuilder {
       playerSpawnYaw,
       groundSpawns,
       highwaySpawns,
+      bridgeSpawns,
       skybridgeSpawns,
       roofSpawns,
       perchSpawns,

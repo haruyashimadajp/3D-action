@@ -14,7 +14,8 @@
  *    A screen-space minimum width keeps a 0.015 m line visible at 100 m while fading it by its true coverage.
  *  - Shock rings / ground prediction circles: 24 additive rings in ONE InstancedMesh.
  *  - GRAZE (§5.1-3): every enemy round tracks its closest approach to the player's body axis; when it passes
- *    the player without hitting and the closest distance was 0.45 m … 1.35 m, a single GRAZE fires.
+ *    the player without hitting and the closest distance was 0.45 m … 1.35 m, a single GRAZE fires — after one
+ *    line-of-sight check from the chest to the closest point (a round passing behind cover never counts, 5A-5).
  */
 import * as THREE from 'three';
 import { COLORS, JUICE, LIMITS, RENDER, TELEGRAPH, createRng } from '../config/constants';
@@ -40,6 +41,8 @@ const _worldHit = createRayHit();
 const _targetHit = createTargetHit();
 const _chest = new THREE.Vector3();
 const _grazePt = new THREE.Vector3();
+/** A wall the round itself stopped on (≤ 5 cm short of the closest point) does not count as cover. */
+const GRAZE_LOS_TOLERANCE_M = 0.05;
 const _segEnd = new THREE.Vector3();
 const _ringN = new THREE.Vector3();
 const Y_UP = new THREE.Vector3(0, 1, 0);
@@ -211,6 +214,8 @@ export class EffectsPool {
   // ---- GRAZE tracking per round ----
   private readonly pGrazeMin = new Float32Array(P_CAP);
   private readonly pGrazeDone = new Uint8Array(P_CAP);
+  /** Closest point of the round's path to the player axis (where the minimum was reached). */
+  private readonly pGrazePt = new Float32Array(P_CAP * 3);
 
   // ---- telegraph lines (§5.1, 32-line pool) ----
   readonly lines: THREE.Mesh;
@@ -759,7 +764,7 @@ export class EffectsPool {
       // GRAZE: closest approach of this step's path (up to a world hit) to the player's body axis.
       if (!tHit && graze && graze.active && !this.pGrazeDone[i]) {
         _segEnd.copy(_worldHit.hit ? _worldHit.point : _b);
-        this.trackGraze(i, _a, _segEnd, _d, graze);
+        this.trackGraze(i, _a, _segEnd, _d, graze, physics);
       }
       if (_worldHit.hit || tHit) {
         const im = this.impact;
@@ -813,7 +818,7 @@ export class EffectsPool {
    * Updates the round's minimum distance to the player axis; once the round passes the player's closest
    * point (or stops at a wall beyond it) the GRAZE band 0.45 … 1.35 m is evaluated exactly once.
    */
-  private trackGraze(i: number, a: THREE.Vector3, b: THREE.Vector3, dir: THREE.Vector3, g: GrazeProbe): void {
+  private trackGraze(i: number, a: THREE.Vector3, b: THREE.Vector3, dir: THREE.Vector3, g: GrazeProbe, physics: PhysicsWorld): void {
     _chest.addVectors(g.a, g.b).multiplyScalar(0.5);
     const along = (_chest.x - a.x) * dir.x + (_chest.y - a.y) * dir.y + (_chest.z - a.z) * dir.z;
     if (along < 0 && this.pTravel[i] === 0) {
@@ -822,12 +827,22 @@ export class EffectsPool {
       return;
     }
     const dist = segmentSegmentDistance(a, b, g.a, g.b, _grazePt);
-    if (dist < this.pGrazeMin[i]) this.pGrazeMin[i] = dist;
+    const o = i * 3;
+    if (dist < this.pGrazeMin[i]) {
+      this.pGrazeMin[i] = dist;
+      this.pGrazePt[o] = _grazePt.x;
+      this.pGrazePt[o + 1] = _grazePt.y;
+      this.pGrazePt[o + 2] = _grazePt.z;
+    }
     const stepLen = a.distanceTo(b);
     if (along <= stepLen) {
       this.pGrazeDone[i] = 1;
       const m = this.pGrazeMin[i];
-      if (m >= TELEGRAPH.GRAZE_MIN_DIST && m <= TELEGRAPH.GRAZE_MAX_DIST) g.onGraze(_grazePt, dir, m, this.pTag[i]);
+      if (m < TELEGRAPH.GRAZE_MIN_DIST || m > TELEGRAPH.GRAZE_MAX_DIST) return;
+      // One sight check chest → closest point: a round passing on the far side of cover is not a near miss.
+      _grazePt.set(this.pGrazePt[o], this.pGrazePt[o + 1], this.pGrazePt[o + 2]);
+      if (!physics.lineOfSight(_chest, _grazePt, GRAZE_LOS_TOLERANCE_M)) return;
+      g.onGraze(_grazePt, dir, m, this.pTag[i]);
     }
   }
 
