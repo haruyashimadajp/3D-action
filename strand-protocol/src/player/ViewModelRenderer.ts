@@ -104,6 +104,11 @@ export class ViewModelRenderer {
   private winchAngle = 0;
   private leftRaise = 0;
   private time = 0;
+  /** Energy-coloured emissive materials (collected once) + the strand rim light, for the unlockable colours. */
+  private readonly energyMats: THREE.MeshStandardMaterial[] = [];
+  private rimLight!: THREE.DirectionalLight;
+  private energyHex: number = COLORS.PLAYER_STRAND;
+  private plasma = false;
 
   constructor(private readonly scene: THREE.Scene, private readonly vmCamera: THREE.PerspectiveCamera) {
     this.root.name = 'ViewModel';
@@ -125,6 +130,7 @@ export class ViewModelRenderer {
     key.position.set(-0.6, 1.0, 0.8);
     const rim = new THREE.DirectionalLight(COLORS.PLAYER_STRAND, 1.4);
     rim.position.set(0.9, 0.3, -1.0);
+    this.rimLight = rim;
     const fill = new THREE.PointLight(0xffb070, 0.6, 2.5, 2);
     fill.position.set(0.1, -0.6, -0.2);
     scene.add(key, rim, fill);
@@ -233,6 +239,30 @@ export class ViewModelRenderer {
     this.weaponPivot.add(this.flash);
 
     this.weaponPivot.position.set(0.21, -0.2, -0.42);
+
+    const strandHex = COLORS.PLAYER_STRAND;
+    const seen = new Set<THREE.Material>();
+    this.root.traverse((o) => {
+      const m = (o as THREE.Mesh).material;
+      if (!(m instanceof THREE.MeshStandardMaterial) || seen.has(m)) return;
+      seen.add(m);
+      if (m.emissive.getHex() === strandHex) this.energyMats.push(m);
+    });
+  }
+
+  /** §8.3 weapon energy colour: every strand-cyan emissive part, the muzzle flash and the rim light. */
+  setEnergyColor(hex: number): void {
+    if (hex === this.energyHex) return;
+    this.energyHex = hex;
+    for (const m of this.energyMats) m.emissive.setHex(hex);
+    this.rimLight.color.setHex(hex);
+    if (!this.plasma) (this.flashMat.uniforms.uColor.value as THREE.Color).setHex(hex);
+  }
+
+  /** FLOW SS+: the muzzle flash turns plasma blue-white. */
+  setPlasmaMuzzle(on: boolean): void {
+    this.plasma = on;
+    (this.flashMat.uniforms.uColor.value as THREE.Color).setHex(on ? 0xdcf2ff : this.energyHex);
   }
 
   // =============================================================================================

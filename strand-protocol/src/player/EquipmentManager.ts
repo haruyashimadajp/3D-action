@@ -14,6 +14,7 @@
 import * as THREE from 'three';
 import { COLORS, DEG2RAD, EQUIP, MATERIALS, PHYSICS, clamp } from '../config/constants';
 import { GRAPPLE, GUNS, SLOT_ORDER, type GunDef, type GunId, type SlotId, isGun } from '../config/weapons';
+import { SKILL_BY_ID, SKILL_CONSTANTS } from '../config/skills';
 import type { InputManager, DiscreteAction } from '../engine/InputManager';
 import type { Renderer } from '../engine/Renderer';
 import { BURST, type EffectsPool, type ProjectileSpec } from '../entities/EffectsPool';
@@ -40,6 +41,10 @@ export interface EquipmentModifiers {
   shotgunImpulseBonus: number;
   /** SK_03: magazine refill fraction when switching to a gun while hanging. */
   swingReloadFraction: number;
+  /** SK_02: number of piercing, +35 % speed shots after a strand release / switch (0 = not owned). */
+  momentumShots: number;
+  /** SK_06: hooking an enemy directly resets the strand cooldown. */
+  enemyHookResetsCooldown: boolean;
 }
 
 export interface EquipmentEvents {
@@ -118,7 +123,27 @@ export class EquipmentManager {
   /** Anchor currently inside the 6° snap cone (HUD gold diamond), refreshed every frame. */
   readonly snap: AnchorSnap = { anchor: null, angleDeg: 0, distance: 0 };
 
-  readonly modifiers: EquipmentModifiers = { switchTimeMultiplier: 1, reloadTimeMultiplier: 1, shotgunImpulseBonus: 0, swingReloadFraction: 0 };
+  readonly modifiers: EquipmentModifiers = {
+    switchTimeMultiplier: 1,
+    reloadTimeMultiplier: 1,
+    shotgunImpulseBonus: 0,
+    swingReloadFraction: 0,
+    momentumShots: 0,
+    enemyHookResetsCooldown: false,
+  };
+  /** SK_02 state: piercing shots left and the end of the 1.8 s window. */
+  private momentumLeft = 0;
+  private momentumUntil = -1;
+  /** SK_06: the next strand release skips the 0.65 s cooldown. */
+  private freeNextDetach = false;
+  /** Weapon energy colour (§8.3 unlockable) and FLOW SS+ plasma muzzle. */
+  private energyHex: number = COLORS.PLAYER_STRAND;
+  private plasma = false;
+  /** FLOW A+: strengthened strand light trail. */
+  private strandBoost = 1;
+  private specs: Record<GunId, ProjectileSpec> = buildSpecs(COLORS.PLAYER_STRAND, false, false);
+  private pierceSpecs: Record<GunId, ProjectileSpec> = buildSpecs(COLORS.PLAYER_STRAND, false, true);
+  private readonly muzzleColor = new THREE.Color(BURST.MUZZLE.color);
   combat: GrappleCombatHooks | null = null;
 
   // Rope visuals (world scene)
@@ -196,6 +221,58 @@ export class EquipmentManager {
     this.lastShotAt = -1e9;
     this.hookMesh.visible = false;
     this.ropeMesh.count = 0;
+    this.momentumLeft = 0;
+    this.momentumUntil = -1;
+    this.freeNextDetach = false;
+  }
+
+  // ===============================================================================================
+  // Progression visuals
+  // ===============================================================================================
+  /** Weapon energy colour (tracers, strand, muzzle); the view-model is recoloured by its own renderer. */
+  setEnergyColor(hex: number): void {
+    if (hex === this.energyHex) return;
+    this.energyHex = hex;
+    _strand.setHex(hex);
+    this.rebuildSpecs();
+  }
+
+  /** FLOW SS+: plasma blue-white muzzle and tracers. */
+  setPlasmaMuzzle(on: boolean): void {
+    if (on === this.plasma) return;
+    this.plasma = on;
+    this.rebuildSpecs();
+  }
+
+  /** FLOW A+: brighter, thicker strand light trail (1 = normal). */
+  setStrandBoost(k: number): void {
+    this.strandBoost = k;
+  }
+
+  private rebuildSpecs(): void {
+    this.specs = buildSpecs(this.energyHex, this.plasma, false);
+    this.pierceSpecs = buildSpecs(this.energyHex, this.plasma, true);
+    this.muzzleColor.setHex(this.energyHex).lerp(_white, 0.45);
+    if (this.plasma) this.muzzleColor.setHex(PLASMA_HEX);
+  }
+
+  /** SK_02: arm the momentum window (strand released, or a gun drawn from the strand). */
+  private armMomentum(): void {
+    if (this.modifiers.momentumShots <= 0) return;
+    this.momentumLeft = this.modifiers.momentumShots;
+    this.momentumUntil = this.simTime + SKILL_CONSTANTS.MOMENTUM_WINDOW_S;
+  }
+
+  /** SK_04: instant reload of the active gun. */
+  instantReload(): void {
+    if (!isGun(this.activeSlot)) return;
+    this.refill(this.activeSlot, 1);
+    if (this.state === 'RELOADING') this.enter('IDLE', 0);
+  }
+
+  /** True while SK_02 piercing shots are armed (HUD / tests). */
+  get momentumArmed(): boolean {
+    return this.momentumLeft > 0 && this.simTime <= this.momentumUntil;
   }
 
   // ===============================================================================================
@@ -292,6 +369,13 @@ export class EquipmentManager {
   /** Strand released / cut ⇒ 0.65 s re-use cooldown (not when the release is a re-fire). */
   onRopeDetached(mode: RopeDetach): void {
     if (mode === 'REFIRE' || this.suppressCooldown) return;
+    this.armMomentum();
+    if (this.freeNextDetach) {
+      // SK_06: hooking an enemy reset the cooldown.
+      this.freeNextDetach = false;
+      this.grappleReadyAt = this.simTime;
+      return;
+    }
     this.grappleReadyAt = this.simTime + PHYSICS.GRAPPLE_COOLDOWN;
   }
 
@@ -326,6 +410,8 @@ export class EquipmentManager {
             this.lastGun = this.activeSlot;
             // SK_03 swing reloader: switching to a gun while hanging refills the magazine.
             if (prev === 'GRAPPLE' && this.player.ropeAttached && this.modifiers.swingReloadFraction > 0) this.refill(this.activeSlot, this.modifiers.swingReloadFraction);
+            // SK_02: drawing a gun from the strand arms the momentum chamber.
+            if (prev === 'GRAPPLE') this.armMomentum();
           }
           this.enter('DRAWING', this.switchDurationS() / 2);
         }
@@ -396,7 +482,10 @@ export class EquipmentManager {
     _up.crossVectors(_right, _aim).normalize();
     const spreadDeg = this.player.btActive ? gun.spreadBtDeg : gun.spreadDeg;
     const tanHalf = Math.tan((spreadDeg / 2) * DEG2RAD);
-    const spec: ProjectileSpec = SPECS[gun.id];
+    // SK_02 momentum chamber: the first N shots inside the window pierce shields / bodies at +35 % speed.
+    const momentum = this.momentumLeft > 0 && this.simTime <= this.momentumUntil;
+    if (momentum) this.momentumLeft--;
+    const spec: ProjectileSpec = momentum ? this.pierceSpecs[gun.id] : this.specs[gun.id];
     for (let p = 0; p < gun.pellets; p++) {
       _dir.copy(_aim);
       if (tanHalf > 0) {
@@ -415,8 +504,8 @@ export class EquipmentManager {
     this.player.addTrauma(gun.shake);
     this.player.notifyFired();
     this.viewModel.onFire(gun.id);
-    this.renderer.flashLight(_muzzle, gun.tracerColor, gun.id === 'SHOTGUN' ? 18 : 9, 12, gun.id === 'SMG' ? 0.04 : 0.07);
-    this.effects.burst(_muzzle, _aim, BURST.MUZZLE);
+    this.renderer.flashLight(_muzzle, this.plasma ? PLASMA_HEX : this.energyHex, gun.id === 'SHOTGUN' ? 18 : 9, 12, gun.id === 'SMG' ? 0.04 : 0.07);
+    this.effects.burst(_muzzle, _aim, BURST.MUZZLE, this.muzzleColor.getHex());
 
     // Kinetic shotgun recoil jump: opposite to the view (+11.5 m/s airborne, +2.0 m/s grounded).
     const airborne = !this.player.isGrounded;
@@ -496,6 +585,7 @@ export class EquipmentManager {
       this.effects.burst(this.hookTarget, _dir.subVectors(this.hookStart, this.hookTarget).normalize(), BURST.HOOK);
       this.player.attachRope(this.hookTarget);
       if (this.hookEnemy && this.combat) this.combat.onGrappleTarget(this.hookEnemy, this.hookTarget);
+      this.freeNextDetach = this.hookEnemy !== null && this.modifiers.enemyHookResetsCooldown;
       this.events.onHookAttached?.(this.hookTarget, this.hookSnapped);
     } else {
       // Miss: the hook snaps back and the cooldown starts.
@@ -531,7 +621,7 @@ export class EquipmentManager {
       this.hookMesh.rotation.y += realDt * 20;
       // White-hot under tension.
       const tension = this.player.ropeAttached ? this.player.ropeTension : 0.2;
-      _col.copy(_strand).lerp(_white, tension).multiplyScalar(MATERIALS.PLAYER_STRAND.emissive);
+      _col.copy(_strand).lerp(_white, tension).multiplyScalar(MATERIALS.PLAYER_STRAND.emissive * this.strandBoost);
       this.ropeMat.color.copy(_col);
     } else {
       this.ropeMesh.count = 0;
@@ -574,7 +664,8 @@ export class EquipmentManager {
       _dir.subVectors(_b, _a);
       const len = _dir.length();
       if (len > 1e-5) _q.setFromUnitVectors(Y_AXIS, _dir.divideScalar(len));
-      _s.set(1, len, 1);
+      const w = this.strandBoost > 1 ? 1.6 : 1;
+      _s.set(w, len, w);
       _m4.compose(_mid, _q, _s);
       this.ropeMesh.setMatrixAt(i, _m4);
     }
@@ -605,12 +696,41 @@ export class EquipmentManager {
   }
 }
 
-/** Projectile specs per gun (precomputed, no allocation per shot). */
-const SPECS: Readonly<Record<GunId, ProjectileSpec>> = {
-  PISTOL: { owner: 'PLAYER', speed: GUNS.PISTOL.projectileSpeed, range: GUNS.PISTOL.range, damage: GUNS.PISTOL.damageBody, headMultiplier: GUNS.PISTOL.headMultiplier, shieldMultiplier: GUNS.PISTOL.shieldMultiplier, color: GUNS.PISTOL.tracerColor, intensity: MATERIALS.PLAYER_STRAND.emissive, width: 0.03, tag: 0 },
-  SMG: { owner: 'PLAYER', speed: GUNS.SMG.projectileSpeed, range: GUNS.SMG.range, damage: GUNS.SMG.damageBody, headMultiplier: GUNS.SMG.headMultiplier, shieldMultiplier: GUNS.SMG.shieldMultiplier, color: GUNS.SMG.tracerColor, intensity: MATERIALS.PLAYER_STRAND.emissive * 0.8, width: 0.018, tag: 1 },
-  SHOTGUN: { owner: 'PLAYER', speed: GUNS.SHOTGUN.projectileSpeed, range: GUNS.SHOTGUN.range, damage: GUNS.SHOTGUN.damageBody, headMultiplier: GUNS.SHOTGUN.headMultiplier, shieldMultiplier: GUNS.SHOTGUN.shieldMultiplier, color: GUNS.SHOTGUN.tracerColor, intensity: MATERIALS.PLAYER_STRAND.emissive * 0.7, width: 0.016, tag: 2 },
-};
+/** FLOW SS+ plasma blue-white. */
+const PLASMA_HEX = 0xdcf2ff;
+
+/**
+ * Projectile specs per gun, rebuilt only when the energy colour / plasma state changes (no allocation per shot).
+ * `pierce` = SK_02 momentum rounds (+35 % speed, pass through shields and bodies).
+ */
+function buildSpecs(energyHex: number, plasma: boolean, pierce: boolean): Record<GunId, ProjectileSpec> {
+  const c = new THREE.Color(plasma ? PLASMA_HEX : energyHex);
+  const base = c.getHex();
+  const light = c.clone().lerp(new THREE.Color(1, 1, 1), 0.35).getHex();
+  const k = plasma ? 1.35 : 1;
+  const speedK = pierce ? 1 + SKILL_BY_ID.SK_02.values2![0] : 1;
+  const mk = (id: GunId, color: number, intensity: number, width: number, tag: number): ProjectileSpec => {
+    const g = GUNS[id];
+    return {
+      owner: 'PLAYER',
+      speed: g.projectileSpeed * speedK,
+      range: g.range,
+      damage: g.damageBody,
+      headMultiplier: g.headMultiplier,
+      shieldMultiplier: g.shieldMultiplier,
+      color,
+      intensity: intensity * k * (pierce ? 1.25 : 1),
+      width: width * (pierce ? 1.4 : 1),
+      tag,
+      pierce,
+    };
+  };
+  return {
+    PISTOL: mk('PISTOL', base, MATERIALS.PLAYER_STRAND.emissive, 0.03, 0),
+    SMG: mk('SMG', base, MATERIALS.PLAYER_STRAND.emissive * 0.8, 0.018, 1),
+    SHOTGUN: mk('SHOTGUN', light, MATERIALS.PLAYER_STRAND.emissive * 0.7, 0.016, 2),
+  };
+}
 
 function bezier(a: THREE.Vector3, c: THREE.Vector3, b: THREE.Vector3, t: number, out: THREE.Vector3): THREE.Vector3 {
   const u = 1 - t;

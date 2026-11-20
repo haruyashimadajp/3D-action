@@ -71,6 +71,10 @@ export type HitRegion = 'HEAD' | 'BODY';
 /** Humanoid / drone hitbox: head sphere (HS ×2.5) + yaw-rotated body box. */
 export interface HitboxTarget {
   readonly id: number;
+  /** Hitboxes of one body share a group (piercing rounds never hit the same body twice). */
+  readonly group?: number;
+  /** Shield hitbox: piercing rounds pass straight through it (SK_02). */
+  readonly shield?: boolean;
   alive: boolean;
   readonly headCenter: THREE.Vector3;
   headRadius: number;
@@ -637,12 +641,18 @@ export class PhysicsWorld {
   // ===============================================================================================
   // Hitboxes (§5.2): head sphere first (HS), then body OBB (yaw-rotated)
   // ===============================================================================================
-  raycastTargets(origin: THREE.Vector3, dir: THREE.Vector3, maxDist: number, targets: readonly HitboxTarget[], out: TargetHit): TargetHit {
+  /**
+   * Nearest hitbox along the ray. `skipGroup` ≥ 0 ignores every hitbox of that body group; `skipShields` lets the
+   * ray pass through shield hitboxes (piercing rounds).
+   */
+  raycastTargets(origin: THREE.Vector3, dir: THREE.Vector3, maxDist: number, targets: readonly HitboxTarget[], out: TargetHit, skipGroup = -1, skipShields = false): TargetHit {
     out.hit = false;
     out.target = null;
     out.distance = maxDist;
     for (const t of targets) {
       if (!t.alive) continue;
+      if (skipShields && t.shield) continue;
+      if (skipGroup >= 0 && t.group === skipGroup) continue;
       // Head sphere (radius ≤ 0 ⇒ the target has no head region, e.g. shields / wings).
       const th = t.headRadius > 0 ? raySphere(origin, dir, t.headCenter, t.headRadius) : -1;
       if (th >= 0 && th < out.distance) {

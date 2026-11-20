@@ -196,48 +196,55 @@
       }
       #pause .hint { margin-top: 12px; font-family: var(--mono-font); letter-spacing: 0.3em; font-size: 12px; color: var(--wallrun-cyan); }
 
-      /* ---------------- Settings (title + pause) ---------------- */
-      #settings {
+      /* ---------------- Settings / accessibility (title + pause) ---------------- */
+      .panel {
         position: fixed;
-        left: 50%;
-        bottom: 36px;
-        transform: translateX(-50%);
         z-index: 35;
-        display: flex;
-        align-items: center;
-        gap: 14px;
-        padding: 10px 16px;
+        padding: 12px 16px;
         font-family: var(--mono-font);
         font-size: 11px;
-        letter-spacing: 0.2em;
+        letter-spacing: 0.16em;
         color: rgba(232, 246, 255, 0.85);
-        background: rgba(5, 7, 14, 0.72);
+        background: rgba(5, 7, 14, 0.78);
         border: 1px solid rgba(0, 240, 255, 0.35);
         pointer-events: auto;
         cursor: default;
       }
-      #settings.hidden { display: none; }
-      #settings label { color: var(--wallrun-cyan); }
-      #sens-range { width: 220px; accent-color: #00f0ff; cursor: pointer; }
+      .panel.hidden { display: none; }
+      .panel .ptitle { font-size: 10px; letter-spacing: 0.4em; color: var(--wallrun-cyan); margin: 2px 0 8px; }
+      .panel .ptitle:not(:first-child) { margin-top: 12px; }
+      #settings { right: 4vw; bottom: 9vh; width: 430px; }
+      #settings .row { display: flex; align-items: center; gap: 10px; margin: 6px 0; }
+      #settings .row > label { width: 150px; color: rgba(232, 246, 255, 0.72); }
+      #settings input[type='range'] { flex: 1; accent-color: #00f0ff; cursor: pointer; min-width: 0; }
       #sens-num {
-        width: 58px;
-        font: inherit;
-        letter-spacing: 0.05em;
-        color: #e8fbff;
-        background: rgba(0, 240, 255, 0.08);
-        border: 1px solid rgba(0, 240, 255, 0.45);
-        padding: 3px 5px;
+        width: 58px; font: inherit; letter-spacing: 0.05em; color: #e8fbff;
+        background: rgba(0, 240, 255, 0.08); border: 1px solid rgba(0, 240, 255, 0.45); padding: 3px 5px;
       }
-      #sens-reset {
-        font: inherit;
-        letter-spacing: 0.15em;
-        color: rgba(232, 246, 255, 0.8);
-        background: transparent;
-        border: 1px solid rgba(232, 246, 255, 0.35);
-        padding: 3px 8px;
-        cursor: pointer;
+      .val { width: 44px; text-align: right; color: #e8fbff; }
+      .btn, .seg button {
+        font: inherit; letter-spacing: 0.14em; color: rgba(232, 246, 255, 0.8); background: transparent;
+        border: 1px solid rgba(232, 246, 255, 0.3); padding: 3px 8px; cursor: pointer;
       }
-      #sens-reset:hover { border-color: #00f0ff; color: #e8fbff; }
+      .btn:hover, .seg button:hover { border-color: #00f0ff; color: #e8fbff; }
+      .seg { display: flex; gap: 4px; }
+      .seg button.on { color: #05070e; background: #00f0ff; border-color: #00f0ff; box-shadow: 0 0 8px rgba(0, 240, 255, 0.6); }
+      .seg button:disabled { opacity: 0.35; cursor: not-allowed; }
+      #protocol { right: 4vw; top: 7vh; width: 430px; }
+      #records { line-height: 1.8; color: rgba(232, 246, 255, 0.78); }
+      #records b { color: #f4fdff; font-weight: 600; }
+      #mods .seg { flex-wrap: wrap; }
+      #mods .note { margin-top: 6px; color: rgba(232, 246, 255, 0.5); letter-spacing: 0.1em; }
+      #colors { display: flex; gap: 8px; flex-wrap: wrap; }
+      #colors button { width: 74px; padding: 6px 4px; font: inherit; font-size: 9px; letter-spacing: 0.1em; background: rgba(5, 7, 14, 0.6); border: 1px solid rgba(232, 246, 255, 0.25); color: rgba(232, 246, 255, 0.8); cursor: pointer; }
+      #colors button i { display: block; height: 6px; margin-bottom: 5px; }
+      #colors button.on { border-color: #fff; box-shadow: 0 0 10px rgba(255, 255, 255, 0.35); }
+      #colors button:disabled { opacity: 0.35; cursor: not-allowed; }
+      #pause-panel { position: absolute; left: 50%; top: calc(50% + 70px); transform: translateX(-50%); width: min(560px, 90vw); text-align: left; cursor: default; }
+      #pause-run { font-family: var(--mono-font); font-size: 11px; letter-spacing: 0.18em; color: rgba(232, 246, 255, 0.75); text-align: center; }
+      #pause-skills { margin-top: 10px; display: flex; flex-wrap: wrap; gap: 6px; justify-content: center; font-family: var(--mono-font); font-size: 10px; letter-spacing: 0.1em; }
+      #pause-skills span { padding: 3px 6px; border: 1px solid rgba(0, 240, 255, 0.4); color: #cffbff; }
+      #pause-quit { display: block; margin: 14px auto 0; }
 
       /* ---------------- HUD ---------------- */
       #hud { position: fixed; inset: 0; pointer-events: none; z-index: 20; display: none; font-family: var(--mono-font); }
@@ -333,6 +340,94 @@
       #boss-wings .w.broken i { background: #ff1e42; }
       #boss-down { color: #ffc93a; letter-spacing: 0.3em; visibility: hidden; }
       #boss-down.on { visibility: visible; }
+      /* ---------------- Phase 4: FLOW RANK (top-right) ---------------- */
+      #flow { position: absolute; right: 32px; top: 28px; width: 220px; text-align: right; }
+      #flow-rank {
+        font-family: var(--hud-font); font-size: 64px; line-height: 0.95; font-weight: 800; font-style: italic;
+        letter-spacing: 0.02em; color: #9aa6b8; text-shadow: 0 0 10px rgba(0, 0, 0, 0.8); transition: color 0.15s;
+      }
+      #flow-rank.pop { animation: rankpop 0.35s ease-out; }
+      @keyframes rankpop { 0% { transform: scale(1.35); } 100% { transform: scale(1); } }
+      #flow-rank.r1 { color: #38f8ff; text-shadow: 0 0 10px rgba(0, 240, 255, 0.6); }
+      #flow-rank.r2 { color: #8ffcff; text-shadow: 0 0 14px rgba(0, 240, 255, 0.85); }
+      #flow-rank.r3 { color: #ffb800; text-shadow: 0 0 14px rgba(255, 184, 0, 0.85); }
+      #flow-rank.r4 { color: #ff2bd6; text-shadow: 0 0 16px rgba(255, 43, 214, 0.9); }
+      #flow-rank.r5 { color: #ff1e42; text-shadow: 0 0 18px rgba(255, 30, 66, 0.95), 0 0 2px #fff; }
+      #flow-rank.r6 { color: #ffffff; text-shadow: 0 0 18px #38f8ff, 0 0 32px rgba(0, 240, 255, 0.9), 0 0 3px #fff; }
+      #flow-bar { position: relative; height: 4px; margin-top: 6px; background: rgba(232, 246, 255, 0.14); }
+      #flow-fill { position: absolute; right: 0; top: 0; bottom: 0; width: 0; background: #e8f6ff; box-shadow: 0 0 6px rgba(232, 246, 255, 0.7); }
+      #flow-delay { position: absolute; right: 0; top: 6px; height: 1px; width: 0; background: rgba(0, 240, 255, 0.8); }
+      #flow-pts { margin-top: 10px; font-size: 10px; letter-spacing: 0.24em; color: rgba(232, 246, 255, 0.6); }
+      #flow-log { margin-top: 6px; font-size: 11px; letter-spacing: 0.16em; line-height: 1.7; }
+      #flow-log div { color: #e8f6ff; text-shadow: 0 0 6px rgba(0, 0, 0, 0.9); white-space: nowrap; }
+      #flow-log div.fresh { animation: logpop 0.4s ease-out; }
+      #flow-log div.skill { color: #ffd35a; }
+      #flow-log div.evade { color: #38f8ff; }
+      @keyframes logpop { 0% { opacity: 0; transform: translateX(14px); } 100% { opacity: 1; transform: none; } }
+      /* Rank C+: faint cyan glow on the HUD frame. */
+      #hud.flow-c #hp .bar, #hud.flow-c #flow-bar { box-shadow: 0 0 8px rgba(0, 240, 255, 0.45); }
+      #hud.flow-c #dock .ammo, #hud.flow-c #spd { text-shadow: 0 0 6px rgba(0, 240, 255, 0.35); }
+      #hud.dim { opacity: 0.35; }
+      /* Sector banner */
+      #banner { position: absolute; left: 50%; top: 22%; transform: translateX(-50%); text-align: center; opacity: 0; white-space: nowrap; }
+      #banner.on { animation: banner 3.2s ease-out forwards; }
+      #banner .s { font-family: var(--hud-font); font-size: 44px; font-weight: 800; font-style: italic; letter-spacing: 0.1em; color: #f4fdff; text-shadow: 0 0 16px rgba(0, 240, 255, 0.7); }
+      #banner .sub { margin-top: 6px; font-size: 12px; letter-spacing: 0.38em; color: var(--wallrun-cyan); }
+      #banner .loop { margin-top: 6px; font-size: 11px; letter-spacing: 0.4em; color: #ff4d86; }
+      @keyframes banner { 0% { opacity: 0; transform: translateX(-50%) translateY(10px); } 12% { opacity: 1; transform: translateX(-50%); } 75% { opacity: 1; } 100% { opacity: 0; } }
+
+      /* ---------------- Skill modal (3 choices, 450 ms input lock) ---------------- */
+      #skill-modal {
+        position: fixed; inset: 0; z-index: 38; display: none; flex-direction: column; align-items: center; justify-content: center;
+        background: radial-gradient(ellipse at center, rgba(5, 7, 14, 0.55), rgba(5, 7, 14, 0.88)); font-family: var(--mono-font);
+      }
+      #skill-modal.on { display: flex; }
+      #skill-head { font-family: var(--hud-font); font-size: 30px; font-weight: 800; font-style: italic; letter-spacing: 0.1em; color: #00ff9d; text-shadow: 0 0 14px rgba(0, 255, 157, 0.7); }
+      #skill-sub { margin-top: 6px; font-size: 11px; letter-spacing: 0.4em; color: rgba(232, 246, 255, 0.7); }
+      #skill-lock { position: relative; width: 360px; height: 4px; margin: 18px 0 8px; background: rgba(232, 246, 255, 0.15); }
+      #skill-lock-fill { position: absolute; left: 0; top: 0; bottom: 0; width: 0; background: #ff9500; box-shadow: 0 0 8px rgba(255, 149, 0, 0.8); }
+      #skill-lock.open #skill-lock-fill { background: #00ff9d; box-shadow: 0 0 10px rgba(0, 255, 157, 0.9); }
+      #skill-lock-label { font-size: 10px; letter-spacing: 0.4em; color: #ff9500; margin-bottom: 14px; }
+      #skill-lock-label.open { color: #00ff9d; }
+      #skill-cards { display: flex; gap: 18px; }
+      .skill-card {
+        width: 250px; min-height: 250px; padding: 16px; text-align: left; font: inherit; color: #e8f6ff; cursor: pointer;
+        background: linear-gradient(180deg, rgba(10, 18, 32, 0.92), rgba(5, 7, 14, 0.94)); border: 1px solid rgba(0, 240, 255, 0.35);
+        transition: transform 0.12s, border-color 0.12s, box-shadow 0.12s; display: flex; flex-direction: column; gap: 8px;
+      }
+      .skill-card:hover:not(.locked) { transform: translateY(-4px); border-color: #00f0ff; box-shadow: 0 0 22px rgba(0, 240, 255, 0.35); }
+      .skill-card.locked { cursor: wait; opacity: 0.55; }
+      .skill-card .k { font-size: 11px; letter-spacing: 0.3em; color: #ffb800; }
+      .skill-card .cat { font-size: 10px; letter-spacing: 0.2em; color: rgba(232, 246, 255, 0.55); }
+      .skill-card .nm { font-family: var(--hud-font); font-size: 20px; font-weight: 800; letter-spacing: 0.04em; color: #f4fdff; }
+      .skill-card .en { font-size: 10px; letter-spacing: 0.3em; color: var(--wallrun-cyan); }
+      .skill-card .tr { font-size: 10px; letter-spacing: 0.06em; line-height: 1.6; color: rgba(232, 246, 255, 0.65); }
+      .skill-card .fx { font-size: 12px; letter-spacing: 0.04em; line-height: 1.6; color: #fff3c4; }
+      .skill-card .lv { margin-top: auto; display: flex; gap: 5px; align-items: center; font-size: 10px; letter-spacing: 0.2em; color: rgba(232, 246, 255, 0.6); }
+      .skill-card .lv i { width: 18px; height: 5px; background: rgba(232, 246, 255, 0.18); }
+      .skill-card .lv i.own { background: #00f0ff; box-shadow: 0 0 6px rgba(0, 240, 255, 0.8); }
+      .skill-card .lv i.next { background: #ffb800; box-shadow: 0 0 6px rgba(255, 184, 0, 0.8); }
+      #skill-hint { margin-top: 16px; font-size: 10px; letter-spacing: 0.32em; color: rgba(232, 246, 255, 0.5); }
+
+      /* ---------------- Result ---------------- */
+      #result {
+        position: fixed; inset: 0; z-index: 39; display: none; flex-direction: column; align-items: center; justify-content: center;
+        background: rgba(5, 7, 14, 0.82); backdrop-filter: blur(3px); font-family: var(--mono-font);
+      }
+      #result.on { display: flex; }
+      #result-title { font-family: var(--hud-font); font-size: 40px; font-weight: 800; font-style: italic; letter-spacing: 0.1em; color: #f4fdff; text-shadow: 0 0 16px rgba(0, 240, 255, 0.6); }
+      #result-rank { margin-top: 8px; font-family: var(--hud-font); font-size: 110px; line-height: 1; font-weight: 800; font-style: italic; color: #ffb800; text-shadow: 0 0 26px rgba(255, 184, 0, 0.8); }
+      #result-stats { margin-top: 10px; display: grid; grid-template-columns: auto auto; gap: 6px 36px; font-size: 13px; letter-spacing: 0.18em; }
+      #result-stats span:nth-child(odd) { color: rgba(232, 246, 255, 0.6); }
+      #result-stats span:nth-child(even) { color: #f4fdff; text-align: right; }
+      #result-notes { margin-top: 14px; min-height: 18px; font-size: 11px; letter-spacing: 0.24em; color: #00ff9d; text-align: center; line-height: 1.8; }
+      #result-buttons { margin-top: 22px; display: flex; gap: 14px; }
+      #result-buttons .btn { padding: 10px 18px; font-size: 12px; letter-spacing: 0.3em; }
+      #result-endless { border-color: rgba(255, 30, 66, 0.7) !important; color: #ffd0d8 !important; }
+
+      /* District transition fade */
+      #fader { position: fixed; inset: 0; z-index: 37; background: #05070e; opacity: 0; pointer-events: none; transition: opacity 0.25s ease; }
+      #fader.on { opacity: 1; }
     </style>
   </head>
   <body>
@@ -354,13 +449,54 @@
       <div class="big">PAUSED</div>
       <div class="hint">CLICK TO RESUME</div>
       <div class="controls">F: FULLSCREEN + KEYBOARD LOCK — L-CTRL CANNOT CLOSE THE TAB IN FULLSCREEN</div>
+      <div id="pause-panel">
+        <div id="pause-run"></div>
+        <div id="pause-skills"></div>
+        <button id="pause-quit" class="btn" type="button">ABANDON RUN → TITLE</button>
+      </div>
     </div>
-    <div id="settings">
-      <label for="sens-range">MOUSE SENSITIVITY</label>
-      <input id="sens-range" type="range" min="0.2" max="3" step="0.05" value="1" />
-      <input id="sens-num" type="number" min="0.2" max="3" step="0.05" value="1.00" />
-      <button id="sens-reset" type="button">DEFAULT</button>
+    <div id="settings" class="panel">
+      <div class="ptitle">SETTINGS // ACCESSIBILITY</div>
+      <div class="row">
+        <label for="sens-range">MOUSE SENSITIVITY</label>
+        <input id="sens-range" type="range" min="0.2" max="3" step="0.05" value="1" />
+        <input id="sens-num" type="number" min="0.2" max="3" step="0.05" value="1.00" />
+        <button id="sens-reset" class="btn" type="button">DEFAULT</button>
+      </div>
+      <div class="row"><label>CAMERA SHAKE</label><div class="seg" id="set-shake"><button type="button" data-v="0">0%</button><button type="button" data-v="0.5">50%</button><button type="button" data-v="1">100%</button></div></div>
+      <div class="row"><label>WALL-RUN / SWING ROLL</label><div class="seg" id="set-roll"><button type="button" data-v="0">0%</button><button type="button" data-v="0.5">50%</button><button type="button" data-v="1">100%</button></div></div>
+      <div class="row"><label>CENTER ANCHOR DOT</label><div class="seg" id="set-dot"><button type="button" data-v="1">ON</button><button type="button" data-v="0">OFF</button></div></div>
+      <div class="row"><label for="set-fov">BASE FOV</label><input id="set-fov" type="range" min="75" max="100" step="1" value="84" /><span class="val" id="set-fov-val">84°</span></div>
+      <div class="row"><label>QUALITY</label><div class="seg" id="set-quality"><button type="button" data-v="HIGH">HIGH</button><button type="button" data-v="MEDIUM">MEDIUM</button><button type="button" data-v="LOW">LOW</button></div></div>
+      <div class="row"><label for="set-vol">MASTER VOLUME</label><input id="set-vol" type="range" min="0" max="100" step="1" value="80" /><span class="val" id="set-vol-val">80</span></div>
     </div>
+    <div id="protocol" class="panel">
+      <div class="ptitle">RECORDS</div>
+      <div id="records"></div>
+      <div class="ptitle">CHALLENGE MODIFIERS</div>
+      <div id="mods"><div class="seg" id="mod-buttons"></div><div class="note" id="mod-note"></div></div>
+      <div class="ptitle">WEAPON ENERGY COLOUR</div>
+      <div id="colors"></div>
+    </div>
+    <div id="skill-modal">
+      <div id="skill-head">SECTOR CLEARED</div>
+      <div id="skill-sub">SELECT ONE PROTOCOL</div>
+      <div id="skill-lock"><div id="skill-lock-fill"></div></div>
+      <div id="skill-lock-label">INPUT LOCK</div>
+      <div id="skill-cards"></div>
+      <div id="skill-hint">CLICK A CARD OR PRESS 1 / 2 / 3</div>
+    </div>
+    <div id="result">
+      <div id="result-title">RUN COMPLETE</div>
+      <div id="result-rank">S</div>
+      <div id="result-stats"></div>
+      <div id="result-notes"></div>
+      <div id="result-buttons">
+        <button id="result-endless" class="btn" type="button">ENDLESS PROTOCOL — LOOP 2</button>
+        <button id="result-title-btn" class="btn" type="button">TITLE</button>
+      </div>
+    </div>
+    <div id="fader"></div>
     <div id="hud">
       <svg id="xh" viewBox="-100 -100 200 200">
         <g id="ret-pistol" class="ret">
@@ -405,6 +541,13 @@
       <div id="xh-dot"></div>
       <div id="evade">EVADE +90</div>
       <div id="sector-hud"></div>
+      <div id="flow">
+        <div id="flow-rank">D</div>
+        <div id="flow-bar"><div id="flow-fill"></div><div id="flow-delay"></div></div>
+        <div id="flow-pts">FLOW 0</div>
+        <div id="flow-log"><div></div><div></div><div></div></div>
+      </div>
+      <div id="banner"><div class="s" id="banner-s"></div><div class="sub" id="banner-sub"></div><div class="loop" id="banner-loop"></div></div>
       <div id="boss-hud">
         <div id="boss-name">VALKYRIE-09</div>
         <div id="boss-bar"><div id="boss-fill"></div></div>

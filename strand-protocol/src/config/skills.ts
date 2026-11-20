@@ -1,7 +1,11 @@
 /**
  * STRAND // PROTOCOL — Roguelite data: 15 technical skills, 5-sector structure,
  * endless-loop scaling, rank criteria and hardcore challenge modifiers (§8).
+ * Also the pure progression logic built on that data: skill rolls, the derived FLOW / skill / modifier numbers
+ * handed to the player, equipment and enemy systems, run-rank evaluation, energy-colour unlocks and the
+ * persistent save schema (`localStorage` key strand_protocol_save_v1).
  */
+import { PLAYER, type FlowRankDef } from './constants';
 
 // ---------------------------------------------------------------------------
 // §8.1 Sector structure
@@ -258,6 +262,9 @@ export const SKILL_CONSTANTS = {
 export const RUN_RANK = {
   S_PLUS: { maxDeaths: 0, maxTimeS: 330, minHeadshotRate: 0.45 },
   S: { maxDeaths: 1, maxTimeS: 420, minAvgFlowRankIndex: 3 },
+  /** A / B / C from clear time, deaths and the run's FLOW score (the spec leaves these thresholds open). */
+  A: { maxDeaths: 3, maxTimeS: 600, minFlowScore: 15000 },
+  B: { maxDeaths: 6, maxTimeS: 900, minFlowScore: 7000 },
 } as const;
 
 export type ModifierId = 'ONE_SHOT_PROTOCOL' | 'NO_BULLET_TIME' | 'HYPER_SPEED';
@@ -276,11 +283,315 @@ export const HYPER_SPEED_LOCK_REDUCTION = 0.25;
 export const HYPER_SPEED_SPEED_BONUS = 0.2;
 export const ONE_SHOT_HP = 1;
 
-/** Unlockable weapon energy colors (persisted). */
-export const ENERGY_COLORS = [
-  { id: 'CYAN', label: 'シアン', hex: 0x38f8ff },
-  { id: 'CRIMSON', label: 'クリムゾン', hex: 0xff1e42 },
-  { id: 'GOLD', label: 'ゴールド', hex: 0xffb800 },
-  { id: 'VIOLET', label: 'バイオレット', hex: 0xb44bff },
-  { id: 'WHITE', label: 'ピュアホワイト', hex: 0xffffff },
-] as const;
+/** Unlockable weapon energy colors (persisted). Unlock conditions are not given by the spec; see `unlock`. */
+export type EnergyColorId = 'CYAN' | 'CRIMSON' | 'GOLD' | 'VIOLET' | 'WHITE';
+export const ENERGY_COLORS: readonly { readonly id: EnergyColorId; readonly label: string; readonly hex: number; readonly unlock: string }[] = [
+  { id: 'CYAN', label: 'シアン', hex: 0x38f8ff, unlock: 'DEFAULT' },
+  { id: 'CRIMSON', label: 'クリムゾン', hex: 0xff1e42, unlock: 'CLEAR SECTOR 05' },
+  { id: 'GOLD', label: 'ゴールド', hex: 0xffb800, unlock: 'RANK S OR BETTER' },
+  { id: 'VIOLET', label: 'バイオレット', hex: 0xb44bff, unlock: '250 TOTAL HEADSHOTS' },
+  { id: 'WHITE', label: 'ピュアホワイト', hex: 0xffffff, unlock: 'RANK S+' },
+];
+export const VIOLET_HEADSHOTS = 250;
+
+// ---------------------------------------------------------------------------
+// Skill loadout (levels 0..3) and the 3-choice roll
+// ---------------------------------------------------------------------------
+export type SkillLevels = Record<SkillId, number>;
+
+export function emptySkillLevels(): SkillLevels {
+  const out = {} as SkillLevels;
+  for (const s of SKILLS) out[s.id] = 0;
+  return out;
+}
+
+export const SKILL_BY_ID: Readonly<Record<SkillId, SkillDef>> = Object.fromEntries(SKILLS.map((s) => [s.id, s])) as Record<SkillId, SkillDef>;
+
+/** Primary value at the current level (0 when not owned). */
+export function skillValue(levels: SkillLevels, id: SkillId): number {
+  const l = levels[id];
+  return l > 0 ? SKILL_BY_ID[id].values[l - 1] : 0;
+}
+
+/** Secondary value at the current level (0 when not owned). */
+export function skillValue2(levels: SkillLevels, id: SkillId): number {
+  const l = levels[id];
+  const v = SKILL_BY_ID[id].values2;
+  return l > 0 && v ? v[l - 1] : 0;
+}
+
+/** Up to 3 distinct skills that are not yet at Lv.3 (uniform pick). */
+export function rollSkillChoices(levels: SkillLevels, rng: () => number, count: number = SKILL_CONSTANTS.CHOICES_PER_CLEAR): SkillDef[] {
+  const pool = SKILLS.filter((s) => levels[s.id] < SKILL_MAX_LEVEL);
+  const out: SkillDef[] = [];
+  while (out.length < count && pool.length > 0) out.push(pool.splice(Math.floor(rng() * pool.length), 1)[0]);
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Derived modifiers: FLOW rank × skills × challenge modifiers → numbers for the gameplay systems
+// ---------------------------------------------------------------------------
+export interface DerivedModifiers {
+  // Equipment
+  switchTimeMultiplier: number;
+  reloadTimeMultiplier: number;
+  shotgunImpulseBonus: number;
+  swingReloadFraction: number;
+  // Player
+  maxSpeedBonus: number;
+  wallKickHeightBonus: number;
+  kickBoostBonus: number;
+  wallRunTimeBonusS: number;
+  btDrainReduction: number;
+  regenDelayMs: number;
+  criticalMoveBonus: number;
+  bulletTimeDisabled: boolean;
+  // Enemies / combat
+  grappleStunS: number;
+  btKillRecoveryBonus: number;
+  smgPartBonus: number;
+  grazeBtBonus: number;
+  lockTimeReduction: number;
+}
+
+export function createDerivedModifiers(): DerivedModifiers {
+  return {
+    switchTimeMultiplier: 1,
+    reloadTimeMultiplier: 1,
+    shotgunImpulseBonus: 0,
+    swingReloadFraction: 0,
+    maxSpeedBonus: 0,
+    wallKickHeightBonus: 0,
+    kickBoostBonus: 0,
+    wallRunTimeBonusS: 0,
+    btDrainReduction: 0,
+    regenDelayMs: PLAYER.REGEN_DELAY_MS,
+    criticalMoveBonus: 0,
+    bulletTimeDisabled: false,
+    grappleStunS: SKILL_CONSTANTS.GRAPPLE_BASE_STUN_S,
+    btKillRecoveryBonus: 0,
+    smgPartBonus: 0,
+    grazeBtBonus: 0,
+    lockTimeReduction: 0,
+  };
+}
+
+/**
+ * Combines the FLOW rank bonuses (§2.4), skill levels (§8.2) and challenge modifiers (§8.3) into `out`.
+ * Reductions stack multiplicatively; SK_14's +30 / 45 / 60 % switch & reload speed applies only while critical.
+ */
+export function deriveModifiers(levels: SkillLevels, flow: FlowRankDef, critical: boolean, mods: ReadonlySet<ModifierId>, out: DerivedModifiers): DerivedModifiers {
+  const surge = critical ? 1 + skillValue2(levels, 'SK_14') : 1;
+  out.switchTimeMultiplier = ((1 - flow.switchReduction) * (1 - skillValue(levels, 'SK_01'))) / surge;
+  out.reloadTimeMultiplier = (1 - flow.reloadReduction) / surge;
+  out.shotgunImpulseBonus = skillValue(levels, 'SK_07');
+  out.swingReloadFraction = skillValue(levels, 'SK_03');
+  out.maxSpeedBonus = (1 + flow.maxSpeedBonus) * (1 + (mods.has('HYPER_SPEED') ? HYPER_SPEED_SPEED_BONUS : 0)) - 1;
+  out.wallKickHeightBonus = flow.wallKickHeightBonus;
+  out.kickBoostBonus = skillValue(levels, 'SK_05');
+  out.wallRunTimeBonusS = skillValue2(levels, 'SK_05');
+  out.btDrainReduction = skillValue(levels, 'SK_10');
+  out.regenDelayMs = levels.SK_13 > 0 ? skillValue(levels, 'SK_13') : PLAYER.REGEN_DELAY_MS;
+  out.criticalMoveBonus = skillValue(levels, 'SK_14');
+  out.bulletTimeDisabled = mods.has('NO_BULLET_TIME');
+  out.grappleStunS = levels.SK_06 > 0 ? skillValue(levels, 'SK_06') : SKILL_CONSTANTS.GRAPPLE_BASE_STUN_S;
+  out.btKillRecoveryBonus = flow.btKillRecoveryBonus;
+  out.smgPartBonus = skillValue(levels, 'SK_09');
+  out.grazeBtBonus = skillValue(levels, 'SK_12');
+  out.lockTimeReduction = mods.has('HYPER_SPEED') ? HYPER_SPEED_LOCK_REDUCTION : 0;
+  return out;
+}
+
+/** Product of the active challenge modifiers' score multipliers. */
+export function modifierScoreMultiplier(mods: ReadonlySet<ModifierId>): number {
+  let k = 1;
+  for (const m of MODIFIERS) if (mods.has(m.id)) k *= m.scoreMultiplier;
+  return k;
+}
+
+// ---------------------------------------------------------------------------
+// Run statistics & rank (§8.3)
+// ---------------------------------------------------------------------------
+export type RunRankId = 'S+' | 'S' | 'A' | 'B' | 'C';
+
+export interface RunStats {
+  loop: number;
+  timeS: number;
+  deaths: number;
+  kills: number;
+  headshotKills: number;
+  /** FLOW points earned this loop (before decay) × challenge multiplier. */
+  flowScore: number;
+  peakFlowPoints: number;
+  /** Seconds spent at each FLOW rank (D … SSS) — time-weighted average rank. */
+  readonly rankTime: Float64Array;
+  grazes: number;
+}
+
+export function createRunStats(loop: number): RunStats {
+  return { loop, timeS: 0, deaths: 0, kills: 0, headshotKills: 0, flowScore: 0, peakFlowPoints: 0, rankTime: new Float64Array(7), grazes: 0 };
+}
+
+export function headshotRate(s: RunStats): number {
+  return s.kills > 0 ? s.headshotKills / s.kills : 0;
+}
+
+export function averageFlowRankIndex(s: RunStats): number {
+  let t = 0;
+  let w = 0;
+  for (let i = 0; i < s.rankTime.length; i++) {
+    t += s.rankTime[i];
+    w += s.rankTime[i] * i;
+  }
+  return t > 0 ? w / t : 0;
+}
+
+export function computeRunRank(s: RunStats): RunRankId {
+  const R = RUN_RANK;
+  if (s.deaths <= R.S_PLUS.maxDeaths && s.timeS <= R.S_PLUS.maxTimeS && headshotRate(s) >= R.S_PLUS.minHeadshotRate) return 'S+';
+  if (s.deaths <= R.S.maxDeaths && s.timeS <= R.S.maxTimeS && averageFlowRankIndex(s) >= R.S.minAvgFlowRankIndex) return 'S';
+  if (s.deaths <= R.A.maxDeaths && s.timeS <= R.A.maxTimeS && s.flowScore >= R.A.minFlowScore) return 'A';
+  if (s.deaths <= R.B.maxDeaths && s.timeS <= R.B.maxTimeS && s.flowScore >= R.B.minFlowScore) return 'B';
+  return 'C';
+}
+
+const RANK_ORDER: readonly RunRankId[] = ['C', 'B', 'A', 'S', 'S+'];
+export function rankAtLeast(r: RunRankId, min: RunRankId): boolean {
+  return RANK_ORDER.indexOf(r) >= RANK_ORDER.indexOf(min);
+}
+
+// ---------------------------------------------------------------------------
+// Persistent save (§8.3: best time, best FLOW score, max loop, total HS, unlocked energy colours)
+// ---------------------------------------------------------------------------
+export interface SaveSettings {
+  sensitivity: number;
+  /** 0 / 0.5 / 1 */
+  shake: number;
+  /** 0 / 0.5 / 1 */
+  roll: number;
+  centerDot: boolean;
+  fov: number;
+  quality: 'HIGH' | 'MEDIUM' | 'LOW';
+  volume: number;
+}
+
+export interface SaveData {
+  bestTimeS: number | null;
+  bestFlowScore: number;
+  /** Highest loop reached (1 = first run). */
+  maxLoop: number;
+  totalHeadshots: number;
+  unlockedColors: EnergyColorId[];
+  selectedColor: EnergyColorId;
+  bestRank: RunRankId | null;
+  /** First full clear: unlocks the hardcore challenge modifiers. */
+  cleared: boolean;
+  activeModifiers: ModifierId[];
+  settings: SaveSettings;
+}
+
+export function defaultSave(): SaveData {
+  return {
+    bestTimeS: null,
+    bestFlowScore: 0,
+    maxLoop: 1,
+    totalHeadshots: 0,
+    unlockedColors: ['CYAN'],
+    selectedColor: 'CYAN',
+    bestRank: null,
+    cleared: false,
+    activeModifiers: [],
+    settings: { sensitivity: 1, shake: 1, roll: 1, centerDot: true, fov: 84, quality: 'HIGH', volume: 0.8 },
+  };
+}
+
+function num(v: unknown, fallback: number, lo: number, hi: number): number {
+  return typeof v === 'number' && Number.isFinite(v) ? Math.min(hi, Math.max(lo, v)) : fallback;
+}
+
+/** Snaps to the 0 % / 50 % / 100 % accessibility steps. */
+function tri(v: unknown): number {
+  const n = num(v, 1, 0, 1);
+  return n < 0.25 ? 0 : n < 0.75 ? 0.5 : 1;
+}
+
+function pick<T extends string>(v: unknown, allowed: readonly T[], fallback: T): T {
+  return typeof v === 'string' && (allowed as readonly string[]).includes(v) ? (v as T) : fallback;
+}
+
+/** Validates anything read from storage; unknown / corrupt fields fall back to defaults. */
+export function sanitizeSave(raw: unknown): SaveData {
+  const d = defaultSave();
+  if (!raw || typeof raw !== 'object') return d;
+  const r = raw as Record<string, unknown>;
+  const colorIds = ENERGY_COLORS.map((c) => c.id);
+  const modIds = MODIFIERS.map((m) => m.id);
+  const st = (r.settings && typeof r.settings === 'object' ? r.settings : {}) as Record<string, unknown>;
+  const unlocked = Array.isArray(r.unlockedColors) ? r.unlockedColors.filter((c): c is EnergyColorId => (colorIds as string[]).includes(c as string)) : [];
+  if (!unlocked.includes('CYAN')) unlocked.unshift('CYAN');
+  const selected = pick(r.selectedColor, colorIds, 'CYAN');
+  const cleared = r.cleared === true;
+  return {
+    bestTimeS: typeof r.bestTimeS === 'number' && Number.isFinite(r.bestTimeS) && r.bestTimeS > 0 ? r.bestTimeS : null,
+    bestFlowScore: num(r.bestFlowScore, 0, 0, 1e9),
+    maxLoop: Math.floor(num(r.maxLoop, 1, 1, 999)),
+    totalHeadshots: Math.floor(num(r.totalHeadshots, 0, 0, 1e9)),
+    unlockedColors: [...new Set(unlocked)],
+    selectedColor: unlocked.includes(selected) ? selected : 'CYAN',
+    bestRank: r.bestRank === null || r.bestRank === undefined ? null : pick(r.bestRank, RANK_ORDER, 'C'),
+    cleared,
+    activeModifiers: cleared && Array.isArray(r.activeModifiers) ? [...new Set(r.activeModifiers.filter((m): m is ModifierId => (modIds as string[]).includes(m as string)))] : [],
+    settings: {
+      sensitivity: num(st.sensitivity, d.settings.sensitivity, 0.2, 3),
+      shake: tri(st.shake),
+      roll: tri(st.roll),
+      centerDot: typeof st.centerDot === 'boolean' ? st.centerDot : d.settings.centerDot,
+      fov: Math.round(num(st.fov, d.settings.fov, 75, 100)),
+      quality: pick(st.quality, ['HIGH', 'MEDIUM', 'LOW'] as const, 'HIGH'),
+      volume: num(st.volume, d.settings.volume, 0, 1),
+    },
+  };
+}
+
+export interface RunRecordResult {
+  newBestTime: boolean;
+  newBestScore: boolean;
+  unlocked: EnergyColorId[];
+}
+
+/**
+ * Folds a completed loop into the save (Sector 05 cleared). Energy-colour unlocks: CRIMSON on any clear,
+ * GOLD at rank S or better, WHITE at S+, VIOLET at 250 total head-shots (also checked on every save).
+ */
+export function recordRun(save: SaveData, stats: RunStats, rank: RunRankId): RunRecordResult {
+  const res: RunRecordResult = { newBestTime: false, newBestScore: false, unlocked: [] };
+  if (save.bestTimeS === null || stats.timeS < save.bestTimeS) {
+    save.bestTimeS = stats.timeS;
+    res.newBestTime = true;
+  }
+  if (stats.flowScore > save.bestFlowScore) {
+    save.bestFlowScore = Math.round(stats.flowScore);
+    res.newBestScore = true;
+  }
+  if (save.bestRank === null || rankAtLeast(rank, save.bestRank)) save.bestRank = rank;
+  save.cleared = true;
+  const grant = (id: EnergyColorId): void => {
+    if (save.unlockedColors.includes(id)) return;
+    save.unlockedColors.push(id);
+    res.unlocked.push(id);
+  };
+  grant('CRIMSON');
+  if (rankAtLeast(rank, 'S')) grant('GOLD');
+  if (rank === 'S+') grant('WHITE');
+  for (const id of checkHeadshotUnlock(save)) res.unlocked.push(id);
+  return res;
+}
+
+/** VIOLET: 250 total head-shots. Returns newly unlocked ids. */
+export function checkHeadshotUnlock(save: SaveData): EnergyColorId[] {
+  if (save.totalHeadshots >= VIOLET_HEADSHOTS && !save.unlockedColors.includes('VIOLET')) {
+    save.unlockedColors.push('VIOLET');
+    return ['VIOLET'];
+  }
+  return [];
+}

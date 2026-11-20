@@ -1,17 +1,21 @@
 /**
  * STRAND // PROTOCOL — Entry point.
  * Fixed-step simulation (120 Hz, frame clamp 0.05 s) + variable-rate rendering with interpolation,
- * global game clock (bullet-time × hitstop time scaling), screen flow (title → playing ⇄ paused),
- * scene orchestration: input → equipment → player → projectiles → camera → view-model → HUD → render.
+ * global game clock (bullet-time × hitstop time scaling), screen flow
+ * (title → playing ⇄ paused → skill choice → gate transition → … → Sector 05 result → endless loop),
+ * scene orchestration: input → equipment → player → enemies → projectiles → camera → view-model → HUD → render.
+ * Also hosts the FLOW RANK system (§2.4) and the runtime triggers of the 15 roguelite skills (§8.2).
  */
 import * as THREE from 'three';
 import {
-  ACCESSIBILITY,
   FIXED_DT,
   MAX_FRAME_DT,
   GAME_TITLE,
   GAME_SUBTITLE,
   CAMERA,
+  FLOW_POINTS,
+  FLOW_RANKS,
+  INPUT,
   PLAYER,
   RENDER,
   DEG2RAD,
@@ -20,22 +24,47 @@ import {
   QUALITY_PRESETS,
   clamp,
   lerpFactor,
-  INPUT,
-  SAVE_KEY,
 } from './config/constants';
-import { SECTORS } from './config/skills';
+import {
+  ENERGY_COLORS,
+  MODIFIERS,
+  ONE_SHOT_HP,
+  SECTORS,
+  SKILL_BY_ID,
+  SKILL_CONSTANTS,
+  SKILLS,
+  averageFlowRankIndex,
+  checkHeadshotUnlock,
+  computeRunRank,
+  createDerivedModifiers,
+  createRunStats,
+  deriveModifiers,
+  emptySkillLevels,
+  headshotRate,
+  modifierScoreMultiplier,
+  recordRun,
+  rollSkillChoices,
+  skillValue,
+  skillValue2,
+  type EnergyColorId,
+  type ModifierId,
+  type RunStats,
+  type SaveSettings,
+  type SkillId,
+  type SkillLevels,
+} from './config/skills';
+import { AudioEngine } from './engine/AudioEngine';
 import { Renderer } from './engine/Renderer';
 import { getProceduralTextures } from './engine/ProceduralTextures';
 import { InputManager } from './engine/InputManager';
 import { CityBuilder, type SectorLayout } from './world/CityBuilder';
 import { PhysicsWorld, type HitboxTarget } from './world/PhysicsWorld';
-import { FLOW_POINTS } from './config/constants';
-import { EffectsPool, BURST, type ProjectileImpact, type ProjectileOwner } from './entities/EffectsPool';
-import { EnemyManager } from './entities/EnemyManager';
+import { EffectsPool, BURST, type ProjectileImpact, type ProjectileOwner, type ProjectileSpec } from './entities/EffectsPool';
+import { EnemyManager, RICOCHET_TAG, type HitMarkerKind, type KillInfo } from './entities/EnemyManager';
 import { PlayerController } from './player/PlayerController';
 import { EquipmentManager } from './player/EquipmentManager';
 import { ViewModelRenderer } from './player/ViewModelRenderer';
-import { HUD_MAX_WARNINGS, HudManager, type HudFrame } from './ui/HudManager';
+import { HUD_MAX_WARNINGS, HudManager, SaveStore, formatTime, type HudFrame } from './ui/HudManager';
 
 // ---------------------------------------------------------------------------
 // Game clock: simulation dt = real dt × min(bullet-time scale, hitstop scale).
@@ -78,6 +107,110 @@ export class GameClock {
       if (this.hitstopRemainingMs === 0) this.hitstopScale = 1.0;
     }
     return scaled;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// §2.4 FLOW RANK: points from technical actions, multi-kill bonus, decay after 3.5 s, −40 % on hit
+// (at most one rank lost per hit). Runs on simulation time (bullet time stretches the windows).
+// ---------------------------------------------------------------------------
+export class FlowSystem {
+  points = 0;
+  rankIndex = 0;
+  /** FLOW points earned this loop (before decay) — the run's FLOW score base. */
+  earned = 0;
+  peak = 0;
+  private sinceGain = 1e9;
+  private lastKillAt = -1e9;
+  private chain = 0;
+  private time = 0;
+
+  reset(): void {
+    this.points = 0;
+    this.rankIndex = 0;
+    this.earned = 0;
+    this.peak = 0;
+    this.sinceGain = 1e9;
+    this.lastKillAt = -1e9;
+    this.chain = 0;
+  }
+
+  /** Clears the per-loop score but keeps the current rank (endless loops / new run). */
+  resetScore(): void {
+    this.earned = 0;
+    this.peak = this.points;
+  }
+
+  add(points: number): void {
+    this.points += points;
+    this.earned += points;
+    this.sinceGain = 0;
+    if (this.points > this.peak) this.peak = this.points;
+    this.updateRank();
+  }
+
+  /** Kill points: body 100 / HS 220 + air 80 | wall-run 100 | swing 120, × multi-kill (+25 % per chained kill within 2.5 s, max +100 %). */
+  kill(info: KillInfo, out: { label: string; points: number }): void {
+    const P = FLOW_POINTS;
+    let pts = info.headshot ? P.HEADSHOT_KILL : P.BODY_KILL;
+    let tag = '';
+    if (info.swinging) {
+      pts += P.SWING_KILL_BONUS;
+      tag = 'SWING ';
+    } else if (info.wallRun) {
+      pts += P.WALLRUN_KILL_BONUS;
+      tag = 'WALLRUN ';
+    } else if (info.airborne) {
+      pts += P.AIR_KILL_BONUS;
+      tag = 'AIR ';
+    }
+    if (this.time - this.lastKillAt <= P.MULTIKILL_WINDOW_MS / 1000) this.chain++;
+    else this.chain = 0;
+    this.lastKillAt = this.time;
+    const mult = 1 + Math.min(P.MULTIKILL_MAX, P.MULTIKILL_STEP * this.chain);
+    out.points = Math.round(pts * mult);
+    out.label = `${tag}${info.headshot ? 'HEADSHOT' : 'KILL'}${mult > 1 ? ` ×${mult.toFixed(2)}` : ''}`;
+    this.add(out.points);
+  }
+
+  /** Player hit: −40 % of the current points, never more than one rank down. */
+  hit(): void {
+    const floor = this.rankIndex > 0 ? FLOW_RANKS[this.rankIndex - 1].minPoints : 0;
+    this.points = Math.max(floor, this.points * (1 - FLOW_POINTS.HIT_PENALTY_RATIO));
+    this.updateRank();
+  }
+
+  update(dt: number): void {
+    this.time += dt;
+    this.sinceGain += dt;
+    if (this.sinceGain * 1000 > FLOW_POINTS.DECAY_DELAY_MS && this.points > 0) {
+      this.points = Math.max(0, this.points - FLOW_RANKS[this.rankIndex].decayPerS * dt);
+      this.updateRank();
+    }
+  }
+
+  private updateRank(): void {
+    let r = 0;
+    for (let i = FLOW_RANKS.length - 1; i >= 0; i--) {
+      if (this.points >= FLOW_RANKS[i].minPoints) {
+        r = i;
+        break;
+      }
+    }
+    this.rankIndex = r;
+  }
+
+  /** 0..1 toward the next rank (1 at SSS). */
+  get progress(): number {
+    const r = this.rankIndex;
+    if (r >= FLOW_RANKS.length - 1) return 1;
+    const lo = FLOW_RANKS[r].minPoints;
+    return clamp((this.points - lo) / (FLOW_RANKS[r + 1].minPoints - lo), 0, 1);
+  }
+
+  /** 1 → 0 across the 3.5 s grace before decay starts. */
+  get decayGrace(): number {
+    return clamp(1 - (this.sinceGain * 1000) / FLOW_POINTS.DECAY_DELAY_MS, 0, 1);
   }
 }
 
@@ -137,42 +270,47 @@ class AttractCamera {
 // ---------------------------------------------------------------------------
 // Application
 // ---------------------------------------------------------------------------
-type AppState = 'TITLE' | 'PLAYING' | 'PAUSED';
+type AppState = 'TITLE' | 'PLAYING' | 'PAUSED' | 'SKILL' | 'TRANSITION' | 'RESULT';
 
 const _lookDelta = { yaw: 0, pitch: 0 };
 const _camRight = new THREE.Vector3();
 const _camUp = new THREE.Vector3();
 const _camBack = new THREE.Vector3();
+const _camFwd = new THREE.Vector3();
 const _toSrc = new THREE.Vector3();
 const _bossStatus = { hp: 0, maxHp: 1, wingL: 1, wingR: 1, phase: 1, downed: false };
 const _proj = new THREE.Vector3();
 const _feet = new THREE.Vector3();
+const _chest = new THREE.Vector3();
+const _killPos = new THREE.Vector3();
+const _ricoDir = new THREE.Vector3();
+const _ricoTargets = [new THREE.Vector3(), new THREE.Vector3(), new THREE.Vector3()];
+const _flowOut = { label: '', points: 0 };
 const UP = new THREE.Vector3(0, 1, 0);
 
-/** Reads one field of the persisted settings object (§8.3 save key); falls back on any storage error. */
-function readSetting(key: string, fallback: number): number {
-  try {
-    const raw = localStorage.getItem(SAVE_KEY);
-    if (!raw) return fallback;
-    const data = JSON.parse(raw) as { settings?: Record<string, unknown> };
-    const v = data.settings?.[key];
-    return typeof v === 'number' && Number.isFinite(v) ? v : fallback;
-  } catch {
-    return fallback;
-  }
-}
+/** Delay between the last kill and the skill modal / result screen (lets the kill juice play out). */
+const CLEAR_TO_MODAL_S = 1.0;
+const CLEAR_TO_RESULT_S = 2.8;
+/** District transition: fade out, rebuild, fade in. */
+const TRANSITION_FADE_S = 0.3;
+/** Crossing the opened gate plane by this much (m) starts the transition. */
+const GATE_CROSS_M = 1.2;
+/** SK_12: radius of "surrounding" enemy rounds slowed on a graze (spec leaves it open). */
+const PHANTOM_GRAZE_RADIUS_M = 15;
 
-/** Merges one settings field into the save object without touching other persisted data. */
-function writeSetting(key: string, value: number): void {
-  try {
-    const raw = localStorage.getItem(SAVE_KEY);
-    const data = (raw ? JSON.parse(raw) : {}) as { settings?: Record<string, unknown> };
-    data.settings = { ...(data.settings ?? {}), [key]: value };
-    localStorage.setItem(SAVE_KEY, JSON.stringify(data));
-  } catch {
-    // Storage unavailable (private mode / sandboxed preview): the setting still applies for this session.
-  }
-}
+/** SK_15 ricochet round: 55 damage, interrupts the target's telegraph. */
+const RICOCHET_SPEC: ProjectileSpec = {
+  owner: 'PLAYER',
+  speed: 240,
+  range: SKILL_CONSTANTS.RICOCHET_RANGE_M + 4,
+  damage: 55,
+  headMultiplier: 1,
+  shieldMultiplier: 1,
+  color: 0xffd35a,
+  intensity: 3.6,
+  width: 0.026,
+  tag: RICOCHET_TAG,
+};
 
 class App {
   private readonly renderer: Renderer;
@@ -185,13 +323,19 @@ class App {
   private readonly equipment: EquipmentManager;
   private readonly hud: HudManager;
   private readonly enemies: EnemyManager;
+  private readonly audio = new AudioEngine();
+  private readonly store = new SaveStore();
   private readonly clock = new GameClock();
+  private readonly flow = new FlowSystem();
   /** `?gate=1` debug: keep the district gate open. */
   private readonly debugGate: boolean;
+  /** `?quality=` overrides the saved preset for this session. */
+  private readonly qualityOverride: boolean;
   private readonly attract = new AttractCamera();
   private layout: SectorLayout;
   private state: AppState = 'TITLE';
   private sectorIndex: number;
+  private readonly startSector: number;
   private loop = 0;
   private accumulator = 0;
   private lastFrame = performance.now();
@@ -202,8 +346,26 @@ class App {
   private deathTimer = -1;
   private deathDuration: number = PLAYER.DEATH_RETRY_MS / 1000;
   private splashTimer = 0;
-  /** FLOW rank index (0 = D … 6 = SSS); driven by the FLOW system. Speed lines appear from rank B. */
-  private flowRankIndex = 0;
+  /** FLOW rank index (0 = D … 6 = SSS) currently applied to visuals / audio. */
+  private flowRankIndex = -1;
+  /** HUD sector label (rebuilt only when the district or loop changes — no per-frame strings). */
+  private sectorLabel = '';
+
+  // ---- run / progression ----
+  private skills: SkillLevels = emptySkillLevels();
+  private readonly derived = createDerivedModifiers();
+  private activeMods = new Set<ModifierId>();
+  private stats: RunStats = createRunStats(1);
+  /** Seconds until the pending clear action (skill modal or result) runs; −1 = none. */
+  private clearTimer = -1;
+  private clearAction: 'SKILL' | 'RESULT' | null = null;
+  /** The cleared sector's skill has been chosen (or none was available): the gate may be crossed. */
+  private gateReady = false;
+  private transitionT = -1;
+  private transitionBuilt = false;
+  /** SK_11: kills inside the current bullet-time activation. */
+  private btKills = 0;
+
   /** Debug-only frozen camera pose from `?view=x,y,z,yawDeg,pitchDeg` or `?view=spawn` (title screen). */
   private readonly fixedView: { pos: THREE.Vector3; yaw: number; pitch: number } | null;
   private readonly debugEl: HTMLElement | null;
@@ -215,7 +377,8 @@ class App {
     this.renderer = new Renderer(container);
     const params = new URLSearchParams(window.location.search);
     const q = params.get('quality')?.toUpperCase();
-    if (q && q in QUALITY_PRESETS) this.renderer.setQuality(q as QualityPreset);
+    this.qualityOverride = !!q && q in QUALITY_PRESETS;
+    if (this.qualityOverride) this.renderer.setQuality(q as QualityPreset);
 
     const t0 = performance.now();
     const textures = getProceduralTextures(this.renderer.renderer);
@@ -227,30 +390,69 @@ class App {
     this.input = new InputManager(this.renderer.renderer.domElement);
     this.viewModel = new ViewModelRenderer(this.renderer.viewModelScene, this.renderer.viewModelCamera);
     this.viewModel.root.visible = false;
+    const audio = this.audio;
     this.player = new PlayerController(this.input, this.physics, {
+      onJump: () => audio.jump(),
+      onWallKick: () => audio.jump(),
+      onSlideStart: () => audio.slide(),
       onLand: (fall, water) => {
         if (water) this.effects.burst(this.player.position, UP, BURST.LAND_SPLASH);
         else if (fall > 14) this.effects.burst(_feet.copy(this.player.position).setY(this.player.position.y + 0.05), UP, BURST.SPARK);
+        if (fall > 6 || water) audio.land(fall, water);
       },
       onGrappleAttach: () => this.enemies.onRopeChanged(),
       onGrappleDetach: (mode) => {
         this.enemies.onRopeChanged();
         this.equipment.onRopeDetached(mode);
       },
+      onBulletTime: (active) => this.onBulletTime(active),
+      onRegenStart: () => audio.regenStart(),
       onDamaged: () => {
         this.renderer.postFx.damageFlash = 1;
         this.renderer.triggerChromaSpike(RENDER.CHROMA_SPIKE, 220);
+        audio.playerHit();
+        this.flow.hit();
       },
-      onDeath: () => this.beginDeath(PLAYER.DEATH_RETRY_MS),
+      onDeath: () => {
+        this.stats.deaths++;
+        audio.death();
+        this.beginDeath(PLAYER.DEATH_RETRY_MS);
+      },
     });
-    this.equipment = new EquipmentManager(this.input, this.player, this.physics, this.effects, this.renderer, this.viewModel, this.renderer.scene);
+    this.equipment = new EquipmentManager(this.input, this.player, this.physics, this.effects, this.renderer, this.viewModel, this.renderer.scene, {
+      onShot: (gun, ammoLeft, airborne) => {
+        audio.gunshot(gun, ammoLeft, airborne);
+        // SK_07 blast thruster: 0.35 s of half gravity after an air recoil jump.
+        if (gun === 'SHOTGUN' && airborne && this.skills.SK_07 > 0) this.player.hover(skillValue2(this.skills, 'SK_07'));
+      },
+      onDryFire: () => audio.dryFire(),
+      onSwitchStart: (to) => audio.switchGear(to),
+      onReloadStart: () => audio.reload(true),
+      onReloadDone: () => audio.reload(false),
+      onHookFired: () => audio.strandFire(),
+      onHookAttached: () => audio.strandAnchor(),
+      onHookMissed: () => audio.strandMiss(),
+    });
     this.hud = new HudManager();
     this.enemies = new EnemyManager(this.renderer.scene, this.physics, this.effects, this.player, this.renderer, {
-      onHitstop: (def) => this.clock.hitstop(def),
-      onHitMarker: (kind) => this.hud.hitMarker(kind),
-      onGraze: () => this.hud.evade(FLOW_POINTS.GRAZE),
+      onHitstop: (def: HitstopDef) => this.clock.hitstop(def),
+      onHitMarker: (kind) => this.onHitMarker(kind),
+      onKill: (info) => this.onKill(info),
+      onGraze: () => this.onGraze(),
+      onLockStart: (_kind, pos, lockS, sniper) => audio.lock(pos, lockS / Math.max(this.clock.bulletTimeScale, 0.05), sniper),
+      onEnemyFire: (kind, pos, sniper) => audio.enemyFire(kind, pos, sniper),
+      onShieldBreak: (pos, weapon) => this.onPartBreak(pos, weapon, 'SHIELD BREAK'),
+      onBossPartBreak: (pos, weapon) => this.onPartBreak(pos, weapon, 'WING BREAK'),
+      onBossPhase: (phase) => {
+        if (phase === 2) this.hud.flowLog('VALKYRIE // PHASE 2', 0, 'skill');
+      },
+      onBossDefeated: (pos) => audio.bossKill(pos),
       onPlayerHit: (_damage, from) => this.hud.damageFrom(this.screenAngle(from)),
-      onSectorClear: () => this.setGateOpen(true),
+      onWaveStart: (wave, waves) => {
+        if (wave > 1) this.hud.flowLog(`WAVE ${wave}/${waves}`, 0, 'skill');
+      },
+      onSectorClear: () => this.onSectorCleared(),
+      onExplosion: (pos) => audio.explosion(pos),
     });
     // The strand can bite straight into humanoids / drones / the boss (15 dmg + stagger, anchor follows).
     this.equipment.combat = {
@@ -280,7 +482,7 @@ class App {
       anchorX: 0,
       anchorY: 0,
       anchorStrong: false,
-      centerDot: ACCESSIBILITY.CENTER_DOT_DEFAULT,
+      centerDot: true,
       realDt: 0,
       warnCount: 0,
       warnAngles: new Float32Array(HUD_MAX_WARNINGS),
@@ -296,7 +498,8 @@ class App {
       bossDowned: false,
     };
 
-    this.sectorIndex = clamp(parseInt(params.get('sector') ?? '1', 10) || 1, 1, SECTORS.length);
+    this.startSector = clamp(parseInt(params.get('sector') ?? '1', 10) || 1, 1, SECTORS.length);
+    this.sectorIndex = this.startSector;
     this.layout = this.buildSector(this.sectorIndex);
     this.debugGate = params.get('gate') === '1';
     if (this.debugGate) this.setGateOpen(true);
@@ -320,12 +523,17 @@ class App {
     if (this.debugEl) {
       // Debug-only handle for automated mechanic verification (never exposed without ?debug=1).
       window.__STRAND_DEBUG__ = {
+        app: this,
         player: this.player,
         equipment: this.equipment,
         physics: this.physics,
         enemies: this.enemies,
         effects: this.effects,
         clock: this.clock,
+        flow: this.flow,
+        audio: this.audio,
+        hud: this.hud,
+        store: this.store,
         layout: () => this.layout,
         input: this.input,
         renderer: this.renderer,
@@ -340,55 +548,112 @@ class App {
     if (subEl) subEl.textContent = GAME_SUBTITLE;
     this.updateSectorLabel();
 
+    // --- Settings, save, title panels ---
+    this.applyAllSettings();
+    this.hud.bindSettings(this.store.data.settings, (key) => this.onSettingChanged(key));
+    this.applyEnergyColor();
+    this.renderTitlePanels();
+
     // --- Screen flow ---
     document.getElementById('title-start')?.addEventListener('click', () => this.deploy());
-    document.getElementById('pause')?.addEventListener('click', () => this.input.requestPointerLock());
-    this.initSettingsUi();
+    document.getElementById('pause')?.addEventListener('click', () => {
+      this.audio.init();
+      this.input.requestPointerLock();
+    });
+    document.getElementById('pause-quit')?.addEventListener('click', () => this.returnToTitle());
     this.input.onPointerLockChange((locked) => {
       if (locked && this.state === 'PAUSED') this.setState('PLAYING');
       else if (!locked && this.state === 'PLAYING') this.setState('PAUSED');
     });
+    this.setState('TITLE');
 
     this.attract.step(0);
     this.attract.apply(this.renderer.camera, 1, 0);
     this.prevCamPos.copy(this.renderer.camera.position);
   }
 
-  /**
-   * §3.1 / §8.3: mouse sensitivity (0.2–3.0, default 1.0) on the title and pause screens.
-   * Stored inside the save object under `settings.sensitivity`, preserving any other save fields.
-   */
-  private initSettingsUi(): void {
-    const range = document.getElementById('sens-range') as HTMLInputElement | null;
-    const num = document.getElementById('sens-num') as HTMLInputElement | null;
-    const reset = document.getElementById('sens-reset');
-    if (!range || !num) return;
-    const panel = document.getElementById('settings');
-    // Keep clicks / keys inside the panel from reaching the pause overlay or gameplay bindings.
-    panel?.addEventListener('click', (e) => e.stopPropagation());
-    panel?.addEventListener('keydown', (e) => e.stopPropagation());
-
-    const apply = (v: number, save: boolean): void => {
-      const value = Math.round(clamp(Number.isFinite(v) ? v : INPUT.SENSITIVITY_DEFAULT, INPUT.SENSITIVITY_MIN, INPUT.SENSITIVITY_MAX) * 100) / 100;
-      this.input.sensitivity = value;
-      range.value = String(value);
-      if (document.activeElement !== num || save) num.value = value.toFixed(2);
-      if (save) writeSetting('sensitivity', value);
-    };
-    apply(readSetting('sensitivity', INPUT.SENSITIVITY_DEFAULT), false);
-    range.addEventListener('input', () => apply(parseFloat(range.value), true));
-    num.addEventListener('change', () => apply(parseFloat(num.value), true));
-    num.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') num.blur();
-    });
-    reset?.addEventListener('click', () => apply(INPUT.SENSITIVITY_DEFAULT, true));
+  // =============================================================================================
+  // Settings (§3.1, §3.6-7, §9.2) & save
+  // =============================================================================================
+  private applySetting(key: keyof SaveSettings): void {
+    const s = this.store.data.settings;
+    switch (key) {
+      case 'sensitivity':
+        this.input.sensitivity = clamp(s.sensitivity, INPUT.SENSITIVITY_MIN, INPUT.SENSITIVITY_MAX);
+        break;
+      case 'shake':
+        this.player.settings.shakeScale = s.shake;
+        break;
+      case 'roll':
+        this.player.settings.rollScale = s.roll;
+        break;
+      case 'centerDot':
+        this.hudFrame.centerDot = s.centerDot;
+        break;
+      case 'fov':
+        this.player.settings.baseFov = clamp(s.fov, CAMERA.FOV_SETTING_MIN, CAMERA.FOV_SETTING_MAX);
+        break;
+      case 'quality':
+        if (!this.qualityOverride) this.renderer.setQuality(s.quality);
+        break;
+      case 'volume':
+        this.audio.setVolume(s.volume);
+        break;
+      default:
+        break;
+    }
   }
 
+  private applyAllSettings(): void {
+    for (const k of ['sensitivity', 'shake', 'roll', 'centerDot', 'fov', 'quality', 'volume'] as const) this.applySetting(k);
+  }
+
+  private onSettingChanged(key: keyof SaveSettings): void {
+    this.applySetting(key);
+    this.store.write();
+  }
+
+  private applyEnergyColor(): void {
+    const c = ENERGY_COLORS.find((e) => e.id === this.store.data.selectedColor) ?? ENERGY_COLORS[0];
+    this.equipment.setEnergyColor(c.hex);
+    this.viewModel.setEnergyColor(c.hex);
+  }
+
+  private renderTitlePanels(): void {
+    this.hud.renderProtocol(
+      this.store.data,
+      (id: ModifierId) => {
+        const d = this.store.data;
+        if (!d.cleared) return;
+        const i = d.activeModifiers.indexOf(id);
+        if (i >= 0) d.activeModifiers.splice(i, 1);
+        else d.activeModifiers.push(id);
+        this.store.write();
+        this.audio.uiTick();
+        this.renderTitlePanels();
+      },
+      (id: EnergyColorId) => {
+        const d = this.store.data;
+        if (!d.unlockedColors.includes(id)) return;
+        d.selectedColor = id;
+        this.store.write();
+        this.applyEnergyColor();
+        this.audio.uiTick();
+        this.renderTitlePanels();
+      },
+    );
+  }
+
+  // =============================================================================================
+  // Sector lifecycle
+  // =============================================================================================
   private buildSector(index: number): SectorLayout {
     const layout = this.city.buildSector(index, this.loop);
     this.physics.setLayout(layout);
     this.attract.rebuild(layout);
     this.layout = layout;
+    this.sectorIndex = index;
+    this.sectorLabel = this.loop > 0 ? `${layout.sector.name} · LOOP ${this.loop + 1}` : layout.sector.name;
     return layout;
   }
 
@@ -408,36 +673,216 @@ class App {
     this.input.gameplayEnabled = playing;
     this.input.setUnloadGuard(s !== 'TITLE');
     document.getElementById('pause')?.classList.toggle('visible', s === 'PAUSED');
-    document.getElementById('settings')?.classList.toggle('hidden', playing);
     document.getElementById('title')?.classList.toggle('playing', s !== 'TITLE');
+    this.hud.showPanels(s === 'TITLE' || s === 'PAUSED', s === 'TITLE');
     this.hud.setVisible(s !== 'TITLE');
+    this.hud.setDim(s === 'SKILL' || s === 'RESULT');
     this.viewModel.root.visible = s !== 'TITLE';
+    if (playing) (document.activeElement as HTMLElement | null)?.blur?.();
+    if (s === 'PAUSED') this.refreshPauseInfo();
   }
 
-  /** Title → drop into the district at the avenue spawn with the rail pistol drawn. */
+  private refreshPauseInfo(): void {
+    const owned = SKILLS.filter((k) => this.skills[k.id] > 0).map((k) => ({ name: k.name, level: this.skills[k.id] }));
+    const mods = MODIFIERS.filter((m) => this.activeMods.has(m.id)).map((m) => m.label);
+    this.hud.setPauseInfo(
+      `${this.layout.sector.name} · LOOP ${this.loop + 1} · TIME ${formatTime(this.stats.timeS)} · DEATHS ${this.stats.deaths}` +
+        (mods.length ? ` · ${mods.join(' + ')}` : ''),
+      owned,
+    );
+  }
+
+  /** Title → new run: skills reset, challenge modifiers from the save, drop into the first district. */
   private deploy(): void {
+    this.audio.init();
+    this.skills = emptySkillLevels();
+    this.activeMods = new Set(this.store.data.cleared ? this.store.data.activeModifiers : []);
+    this.player.maxHp = this.activeMods.has('ONE_SHOT_PROTOCOL') ? ONE_SHOT_HP : PLAYER.MAX_HP;
+    this.loop = 0;
+    this.flow.reset();
+    this.stats = createRunStats(1);
+    this.hud.clearFlowLog();
+    if (this.sectorIndex !== this.startSector || this.layout.loop !== 0) this.buildSector(this.startSector);
     this.spawnPlayer();
+    this.showSectorBanner();
     this.setState('PLAYING');
     this.input.requestPointerLock();
   }
 
-  /** Deploy and the 500 ms death retry: the player and the whole sector (wave 1) restart together. */
-  private spawnPlayer(): void {
+  /**
+   * Deploy, district entry and the 500 ms death retry: the player and the whole sector (wave 1) restart together.
+   * `restartSector` false only re-spawns the player (death after the sector was already cleared).
+   */
+  private spawnPlayer(restartSector = true): void {
     this.player.spawn(this.layout.playerSpawn, this.layout.playerSpawnYaw);
     this.equipment.reset();
     this.effects.clearProjectiles();
-    this.setGateOpen(this.debugGate);
-    this.enemies.startSector(this.layout, this.loop);
     this.accumulator = 0;
     this.deathTimer = -1;
+    this.btKills = 0;
     this.renderer.postFx.glitch = 0;
     this.renderer.postFx.fade = 0;
     this.renderer.postFx.critical = 0;
+    if (!restartSector) return;
+    this.setGateOpen(this.debugGate);
+    this.enemies.startSector(this.layout, this.loop);
+    this.clearTimer = -1;
+    this.clearAction = null;
+    this.gateReady = this.debugGate;
+    this.audio.setCalm(false);
+  }
+
+  private showSectorBanner(): void {
+    const sec = this.layout.sector;
+    this.hud.banner(sec.name, sec.subtitle, this.loop > 0 ? `ENDLESS PROTOCOL // LOOP ${this.loop + 1}` : '');
   }
 
   private beginDeath(totalMs: number): void {
     this.deathDuration = totalMs / 1000;
     this.deathTimer = 0;
+  }
+
+  /** All waves down: open the gate (Sectors 1–4) and queue the 3-choice skill modal, or the run result (Sector 5). */
+  private onSectorCleared(): void {
+    this.audio.setCalm(true);
+    this.store.write();
+    if (this.layout.sector.reward === 'RUN_COMPLETE') {
+      this.clearAction = 'RESULT';
+      this.clearTimer = CLEAR_TO_RESULT_S;
+      return;
+    }
+    this.setGateOpen(true);
+    this.audio.gateOpen();
+    this.clearAction = 'SKILL';
+    this.clearTimer = CLEAR_TO_MODAL_S;
+  }
+
+  /** §1.2 / §3.6-5: three choices, every click and the 1/2/3 keys disabled for the first 450 ms. */
+  private openSkillModal(): void {
+    const choices = rollSkillChoices(this.skills, Math.random);
+    if (choices.length === 0) {
+      this.gateReady = true;
+      this.hud.flowLog('ALL PROTOCOLS MAXED', 0, 'skill');
+      return;
+    }
+    this.setState('SKILL');
+    this.input.lockClicks(INPUT.SKILL_MODAL_LOCK_MS);
+    this.hud.openSkillModal(`${this.layout.sector.name} CLEARED`, choices, this.skills, this.input, (id) => this.pickSkill(id));
+    this.input.exitPointerLock();
+    this.audio.modalOpen();
+  }
+
+  private pickSkill(id: SkillId): void {
+    this.skills[id] = Math.min(3, this.skills[id] + 1);
+    this.gateReady = true;
+    this.audio.uiSelect();
+    this.hud.flowLog(`${SKILL_BY_ID[id].nameEn} Lv.${this.skills[id]}`, 0, 'skill');
+    this.input.clearActions();
+    // Resume through the pause state: the pick (click / key) is a user gesture, so the re-lock normally
+    // succeeds at once; if the browser refuses it the pause overlay asks for one more click.
+    this.setState('PAUSED');
+    this.input.requestPointerLock();
+  }
+
+  /** Opened gate crossed (Sectors 1–4): fade, build the next district, keep skills / FLOW / run stats. */
+  private beginTransition(): void {
+    this.setState('TRANSITION');
+    this.transitionT = 0;
+    this.transitionBuilt = false;
+    document.getElementById('fader')?.classList.add('on');
+    this.audio.transition();
+  }
+
+  private updateTransition(realDt: number): void {
+    if (this.transitionT < 0) return;
+    this.transitionT += realDt;
+    if (!this.transitionBuilt && this.transitionT >= TRANSITION_FADE_S) {
+      this.transitionBuilt = true;
+      this.buildSector(this.sectorIndex + 1);
+      this.spawnPlayer();
+      this.showSectorBanner();
+      this.updateSectorLabel();
+      document.getElementById('fader')?.classList.remove('on');
+    }
+    if (this.transitionBuilt && this.transitionT >= TRANSITION_FADE_S * 2) {
+      this.transitionT = -1;
+      this.setState(this.input.isPointerLocked ? 'PLAYING' : 'PAUSED');
+    }
+  }
+
+  /** Sector 05 cleared: rank, records, unlocks, then endless loop or title (§8.3). */
+  private showResult(): void {
+    this.setState('RESULT');
+    this.input.exitPointerLock();
+    const st = this.stats;
+    st.flowScore = Math.round(this.flow.earned * modifierScoreMultiplier(this.activeMods));
+    const rank = computeRunRank(st);
+    const save = this.store.data;
+    const rec = recordRun(save, st, rank);
+    save.maxLoop = Math.max(save.maxLoop, this.loop + 2);
+    this.store.write();
+    const avg = averageFlowRankIndex(st);
+    const mult = modifierScoreMultiplier(this.activeMods);
+    const notes: string[] = [];
+    if (rec.newBestTime) notes.push('NEW BEST TIME');
+    if (rec.newBestScore) notes.push('NEW BEST FLOW SCORE');
+    for (const id of rec.unlocked) notes.push(`ENERGY COLOUR UNLOCKED — ${id}`);
+    if (this.loop === 0) notes.push('ENDLESS PROTOCOL UNLOCKED · CHALLENGE MODIFIERS UNLOCKED');
+    this.hud.showResult(
+      {
+        title: this.loop === 0 ? 'RUN COMPLETE' : `LOOP ${this.loop + 1} COMPLETE`,
+        rank,
+        rows: [
+          ['CLEAR TIME', formatTime(st.timeS)],
+          ['DEATHS', String(st.deaths)],
+          ['KILLS', String(st.kills)],
+          ['HEADSHOT RATE', `${Math.round(headshotRate(st) * 100)}%`],
+          ['AVERAGE FLOW RANK', `${FLOW_RANKS[Math.round(avg)].id} (${avg.toFixed(2)})`],
+          ['PEAK FLOW', String(Math.round(this.flow.peak))],
+          ['GRAZES', String(st.grazes)],
+          ['FLOW SCORE', mult > 1 ? `${st.flowScore} (×${mult.toFixed(2)})` : String(st.flowScore)],
+        ],
+        notes,
+        endlessLabel: `ENDLESS PROTOCOL — LOOP ${this.loop + 2}`,
+      },
+      () => this.startNextLoop(),
+      () => this.returnToTitle(),
+    );
+  }
+
+  /** Endless Protocol: skills carry over; enemy HP +25 %, lock −8 %, count +20 % per loop. */
+  private startNextLoop(): void {
+    this.audio.init();
+    this.hud.hideResult();
+    this.loop++;
+    this.stats = createRunStats(this.loop + 1);
+    this.flow.resetScore();
+    this.buildSector(1);
+    this.updateSectorLabel();
+    this.spawnPlayer();
+    this.showSectorBanner();
+    this.setState('PAUSED');
+    this.input.requestPointerLock();
+  }
+
+  private returnToTitle(): void {
+    this.hud.hideResult();
+    this.hud.closeSkillModal();
+    this.input.exitPointerLock();
+    this.loop = 0;
+    this.skills = emptySkillLevels();
+    this.flow.reset();
+    this.effects.clearProjectiles();
+    this.enemies.clear();
+    this.buildSector(this.startSector);
+    this.setGateOpen(this.debugGate);
+    this.updateSectorLabel();
+    this.clearTimer = -1;
+    this.transitionT = -1;
+    document.getElementById('fader')?.classList.remove('on');
+    this.renderTitlePanels();
+    this.audio.setCalm(true);
+    this.setState('TITLE');
   }
 
   start(): void {
@@ -448,6 +893,108 @@ class App {
       this.tick(realDt);
     };
     requestAnimationFrame(frame);
+  }
+
+  // =============================================================================================
+  // Combat events → FLOW, skills, audio
+  // =============================================================================================
+  private onHitMarker(kind: HitMarkerKind): void {
+    this.hud.hitMarker(kind);
+    if (kind === 'BODY' || kind === 'SHIELD') this.audio.hitBody();
+    else if (kind === 'HEAD' || kind === 'HEAD_KILL') this.audio.headshot(kind === 'HEAD_KILL', this.clock.realTime);
+    // SK_04 wall overclock: head-shot while wall-running → BT gauge + instant reload.
+    if ((kind === 'HEAD' || kind === 'HEAD_KILL') && this.player.isWallRunning && this.skills.SK_04 > 0) {
+      this.player.addBulletTimeGauge(skillValue(this.skills, 'SK_04'));
+      this.equipment.instantReload();
+      this.hud.flowLog('WALL OVERCLOCK', 0, 'skill');
+    }
+  }
+
+  private onKill(info: KillInfo): void {
+    // Copy everything first: skill effects below can trigger nested kills that reuse the info record.
+    const headshot = info.headshot;
+    const weapon = info.weapon;
+    const inAir = info.airborne || info.wallRun || info.swinging;
+    const bt = info.bulletTime;
+    _killPos.copy(info.position);
+
+    this.flow.kill(info, _flowOut);
+    this.hud.flowLog(_flowOut.label, _flowOut.points, 'kill');
+    this.stats.kills++;
+    if (headshot) {
+      this.stats.headshotKills++;
+      this.store.data.totalHeadshots++;
+      if (checkHeadshotUnlock(this.store.data).length) {
+        this.store.write();
+        this.hud.flowLog('ENERGY COLOUR UNLOCKED — VIOLET', 0, 'skill');
+      }
+    } else this.audio.kill(_killPos);
+    const r = this.flow.rankIndex;
+    // FLOW S+: RGB split on kills; SSS: kill frame flash.
+    if (r >= 4) this.renderer.triggerChromaSpike(0.006, 160);
+    if (r >= 6) this.renderer.postFx.frameFlash = Math.max(this.renderer.postFx.frameFlash, 0.55);
+    if (bt) this.btKills++;
+
+    // SK_08 thermal headhunter: rail-pistol head-shot kill → EM shock (65 dmg, cancels telegraphs).
+    if (headshot && weapon === 0 && this.skills.SK_08 > 0) {
+      const radius = skillValue(this.skills, 'SK_08');
+      this.effects.spawnRing(_killPos, UP, 0x38f8ff, 3.6, 0.3, radius, 0.32);
+      this.effects.burst(_killPos, UP, BURST.DISCHARGE_CYAN);
+      this.renderer.flashLight(_killPos, 0x38f8ff, 18, radius * 3, 0.2);
+      this.audio.partBreak(_killPos);
+      this.hud.flowLog('THERMAL SHOCK', 0, 'skill');
+      this.enemies.applyAreaDamage(_killPos, radius, skillValue2(this.skills, 'SK_08'), 4, true);
+    }
+    // SK_15 head-shot ricochet: airborne head-shot kill → 1/2/3 rounds to the nearest other enemies (≤ 18 m).
+    if (headshot && inAir && this.skills.SK_15 > 0) {
+      const shots = skillValue(this.skills, 'SK_15');
+      const n = this.enemies.nearestEnemies(_killPos, SKILL_CONSTANTS.RICOCHET_RANGE_M, _ricoTargets);
+      if (n > 0) {
+        for (let i = 0; i < shots; i++) {
+          _ricoDir.subVectors(_ricoTargets[i % n], _killPos).normalize();
+          this.effects.spawnProjectile(_killPos, _ricoDir, RICOCHET_SPEC);
+        }
+        this.hud.flowLog(`RICOCHET ×${shots}`, 0, 'skill');
+      }
+    }
+  }
+
+  private onGraze(): void {
+    this.hud.evade(FLOW_POINTS.GRAZE);
+    this.flow.add(FLOW_POINTS.GRAZE);
+    this.hud.flowLog('EVADE', FLOW_POINTS.GRAZE, 'evade');
+    this.stats.grazes++;
+    this.audio.graze(this.clock.realTime);
+    // SK_12 phantom graze: surrounding enemy rounds at half speed for 0.6 s (the BT bonus is a combat modifier).
+    if (this.skills.SK_12 > 0) {
+      this.player.eyePosition(_chest);
+      this.effects.scaleEnemyRoundSpeed(_chest, PHANTOM_GRAZE_RADIUS_M, 0.5, skillValue2(this.skills, 'SK_12'));
+    }
+  }
+
+  private onPartBreak(pos: THREE.Vector3, weapon: number, label: string): void {
+    this.flow.add(FLOW_POINTS.SHIELD_BREAK);
+    this.hud.flowLog(label, FLOW_POINTS.SHIELD_BREAK, 'kill');
+    this.audio.partBreak(pos);
+    // SK_09 pulse shieldbreaker: an SMG break refills the SMG magazine.
+    if (weapon === 1 && this.skills.SK_09 > 0) {
+      this.equipment.refill('SMG', 1);
+      this.hud.flowLog('SMG REFILLED', 0, 'skill');
+    }
+  }
+
+  private onBulletTime(active: boolean): void {
+    this.audio.setBulletTime(active);
+    if (active) {
+      this.btKills = 0;
+      return;
+    }
+    // SK_11 zero-time bonus: 2+ kills in one activation → speed boost when time resumes.
+    if (this.btKills >= 2 && this.skills.SK_11 > 0) {
+      this.player.speedBoost(skillValue(this.skills, 'SK_11'), skillValue2(this.skills, 'SK_11'));
+      this.hud.flowLog(`ZERO-TIME +${skillValue(this.skills, 'SK_11')} m/s`, 0, 'skill');
+    }
+    this.btKills = 0;
   }
 
   /** Player rounds test enemy hitboxes (+ shields, wings, missiles); enemy rounds test the player. */
@@ -473,6 +1020,54 @@ class App {
     return (Math.atan2(x, y) * 180) / Math.PI;
   }
 
+  /** FLOW rank × skills × challenge modifiers → player / equipment / enemy modifiers (SK_14 tracks HP live). */
+  private applyModifiers(): void {
+    const d = deriveModifiers(this.skills, FLOW_RANKS[this.flow.rankIndex], this.player.isCritical, this.activeMods, this.derived);
+    const pm = this.player.modifiers;
+    pm.maxSpeedBonus = d.maxSpeedBonus;
+    pm.wallKickHeightBonus = d.wallKickHeightBonus;
+    pm.kickBoostBonus = d.kickBoostBonus;
+    pm.wallRunTimeBonusS = d.wallRunTimeBonusS;
+    pm.btDrainReduction = d.btDrainReduction;
+    pm.regenDelayMs = d.regenDelayMs;
+    pm.criticalMoveBonus = d.criticalMoveBonus;
+    pm.bulletTimeDisabled = d.bulletTimeDisabled;
+    const em = this.equipment.modifiers;
+    em.switchTimeMultiplier = d.switchTimeMultiplier;
+    em.reloadTimeMultiplier = d.reloadTimeMultiplier;
+    em.shotgunImpulseBonus = d.shotgunImpulseBonus;
+    em.swingReloadFraction = d.swingReloadFraction;
+    em.momentumShots = skillValue(this.skills, 'SK_02');
+    em.enemyHookResetsCooldown = this.skills.SK_06 > 0;
+    const cm = this.enemies.modifiers;
+    cm.grappleStunS = d.grappleStunS;
+    cm.btKillRecoveryBonus = d.btKillRecoveryBonus;
+    cm.smgPartBonus = d.smgPartBonus;
+    cm.grazeBtBonus = d.grazeBtBonus;
+    cm.lockTimeReduction = d.lockTimeReduction;
+  }
+
+  /** FLOW rank visuals & BGM layers (§2.4 table). Changes are applied only when the rank changes. */
+  private applyFlowRank(realDt: number): void {
+    const r = this.flow.rankIndex;
+    const fx = this.renderer.postFx;
+    if (r !== this.flowRankIndex) {
+      this.flowRankIndex = r;
+      const def = FLOW_RANKS[r];
+      this.renderer.setBloomStrength(def.bloomStrength);
+      this.city.setNeonBoost(r >= 3 ? 0.25 : 0);
+      this.equipment.setStrandBoost(r >= 3 ? 1.6 : 1);
+      this.effects.setRainNeonReflect(r >= 4 ? 1 : 0);
+      this.equipment.setPlasmaMuzzle(r >= 5);
+      this.viewModel.setPlasmaMuzzle(r >= 5);
+      this.audio.setFlowRank(r, def.bgmLayers);
+    }
+    // SS+: searchlights pulse on the BGM beat; SSS: OVERDRIVE cyan electric border.
+    const phase = this.audio.beatPhase(this.clock.realTime);
+    this.city.setSearchlightPulse(r >= 5 ? Math.pow(1 - phase, 3) : 0);
+    fx.overdrive += ((r >= 6 ? 1 : 0) - fx.overdrive) * lerpFactor(6, realDt);
+  }
+
   private fixedUpdate(dt: number): void {
     if (this.state === 'TITLE') {
       this.attract.step(dt);
@@ -484,6 +1079,7 @@ class App {
     this.player.fixedUpdate(dt, this.equipment.stepContext());
     this.enemies.fixedUpdate(dt);
     this.effects.updateProjectiles(dt, this.physics, this.targetsFor, this.onImpact, this.enemies.graze);
+    this.flow.update(dt);
     this.input.markStep();
   }
 
@@ -495,6 +1091,7 @@ class App {
     _lookDelta.yaw = 0;
     _lookDelta.pitch = 0;
     if (playing) {
+      this.applyModifiers();
       this.input.consumeLook(_lookDelta);
       this.player.applyLook(_lookDelta.yaw, _lookDelta.pitch);
       for (const a of this.equipment.handleActions()) {
@@ -518,11 +1115,30 @@ class App {
       const fx = this.renderer.postFx;
       fx.glitch = clamp(this.deathTimer / glitchEnd, 0, 1);
       fx.fade = clamp((this.deathTimer - glitchEnd * 0.5) / glitchEnd, 0, 1);
-      if (this.deathTimer >= this.deathDuration) this.spawnPlayer();
+      // A sector already cleared stays cleared (stray rounds after the last kill only respawn the player).
+      if (this.deathTimer >= this.deathDuration) this.spawnPlayer(!this.enemies.isCleared);
     }
 
-    // --- Simulation clock (frozen while paused) ---
-    const simDt = this.state === 'PAUSED' ? 0 : this.clock.advance(realDt);
+    // --- Run clock, clear → modal / result, gate crossing, district transition ---
+    if (playing) {
+      this.stats.timeS += realDt;
+      this.stats.rankTime[this.flow.rankIndex] += realDt;
+      if (this.clearTimer >= 0) {
+        this.clearTimer -= realDt;
+        if (this.clearTimer < 0) {
+          const action = this.clearAction;
+          this.clearAction = null;
+          if (action === 'SKILL') this.openSkillModal();
+          else if (action === 'RESULT') this.showResult();
+        }
+      }
+      this.checkGateCrossing();
+    }
+    if (this.state === 'SKILL' && this.hud.updateSkillModal()) this.audio.modalUnlocked();
+    if (this.state === 'TRANSITION') this.updateTransition(realDt);
+
+    // --- Simulation clock (frozen outside PLAYING) ---
+    const simDt = this.state === 'PLAYING' || this.state === 'TITLE' ? this.clock.advance(realDt) : 0;
     this.accumulator += simDt;
     let steps = 0;
     while (this.accumulator >= FIXED_DT && steps < 12) {
@@ -542,26 +1158,30 @@ class App {
       } else {
         this.attract.apply(cam, alpha, realDt);
       }
-      this.renderer.setFov(CAMERA.BASE_FOV);
+      this.renderer.setFov(this.player.settings.baseFov);
       if (simDt > 0) this.camVel.subVectors(cam.position, this.prevCamPos).divideScalar(simDt);
       fx.speed = this.camVel.length();
       fx.bulletTime = 0;
       fx.speedLines = 0;
+      fx.overdrive = 0;
     } else {
-      this.player.updateCamera(this.state === 'PAUSED' ? 0 : realDt, alpha, cam);
+      const frozen = this.state !== 'PLAYING';
+      this.player.updateCamera(frozen ? 0 : realDt, alpha, cam);
       cam.updateMatrixWorld();
       this.viewModel.syncEnvironment(this.player.cameraEuler);
-      this.equipment.frameUpdate(this.state === 'PAUSED' ? 0 : realDt, cam, _lookDelta.yaw, _lookDelta.pitch);
+      this.equipment.frameUpdate(frozen ? 0 : realDt, cam, _lookDelta.yaw, _lookDelta.pitch);
       this.enemies.frameUpdate(realDt, simDt, alpha);
       this.camVel.copy(this.player.velocity);
       fx.speed = this.player.speed;
       fx.bulletTime += ((this.player.btActive ? 1 : 0) - fx.bulletTime) * lerpFactor(14, realDt);
       fx.critical += ((this.player.isCritical && this.player.isAlive ? 1 : 0) - fx.critical) * lerpFactor(6, realDt);
+      this.applyFlowRank(realDt);
       // Speed lines (§6.2 Pass 4 · FLOW table): from rank B at ≥ 18 m/s, denser with rank, always dense at SSS.
       const sp = this.player.speed;
-      const sl = this.flowRankIndex >= 6 ? 1 : this.flowRankIndex >= 2 ? clamp((sp - RENDER.SPEEDLINE_MIN_SPEED) / 14, 0, 1) * (0.35 + 0.13 * (this.flowRankIndex - 2)) : 0;
+      const rk = this.flowRankIndex;
+      const sl = rk >= 6 ? 1 : rk >= 2 ? clamp((sp - RENDER.SPEEDLINE_MIN_SPEED) / 14, 0, 1) * (0.35 + 0.13 * (rk - 2)) : 0;
       fx.speedLines += (sl - fx.speedLines) * lerpFactor(8, realDt);
-      fx.speedLineDensity = this.flowRankIndex >= 6 ? 1 : 0.3 + 0.1 * Math.max(0, this.flowRankIndex - 2);
+      fx.speedLineDensity = rk >= 6 ? 1 : 0.3 + 0.1 * Math.max(0, rk - 2);
       // Shallow canal: wake splashes while wading.
       this.splashTimer -= simDt;
       if (this.player.isInWater && this.player.speed > 2 && this.splashTimer <= 0) {
@@ -572,6 +1192,15 @@ class App {
     }
     this.prevCamPos.copy(cam.position);
 
+    // --- Audio: listener, swing wind, heartbeat / repair, calm mix ---
+    _camBack.setFromMatrixColumn(cam.matrixWorld, 2);
+    _camFwd.copy(_camBack).negate();
+    _camUp.setFromMatrixColumn(cam.matrixWorld, 1);
+    const live = playing && this.player.isAlive;
+    this.audio.update(cam.position, _camFwd, _camUp, live && this.player.ropeAttached, this.player.speed);
+    this.audio.setPlayerState(live && this.player.isCritical, live && this.player.isRegenerating);
+    if (this.state === 'PLAYING') this.audio.setCalm(this.enemies.isCleared || this.player.isRegenerating);
+
     // --- World & effects ---
     this.city.update(this.clock.simTime, cam.position);
     this.effects.update(simDt, realDt, cam.position, this.camVel, this.clock.realTime, this.renderer.viewportHeight);
@@ -579,6 +1208,15 @@ class App {
     this.renderer.render();
 
     if (this.debugEl) this.updateDebug();
+  }
+
+  /** Opened gate (after the skill pick) crossed toward the next district. */
+  private checkGateCrossing(): void {
+    if (!this.gateReady || this.layout.sector.reward !== 'SKILL' || !this.player.isAlive) return;
+    if (!this.enemies.isCleared && !this.debugGate) return;
+    const g = this.layout.gate;
+    _toSrc.subVectors(this.player.position, g.position);
+    if (_toSrc.dot(g.normal) > GATE_CROSS_M) this.beginTransition();
   }
 
   private updateHud(realDt: number): void {
@@ -594,9 +1232,9 @@ class App {
       if (onScreen) continue;
       f.warnAngles[f.warnCount++] = this.screenAngle(w.position);
     }
-    f.sectorName = this.layout.sector.name;
+    f.sectorName = this.sectorLabel;
     f.remaining = this.enemies.remaining;
-    f.gateOpen = this.enemies.isCleared || this.debugGate;
+    f.gateOpen = (this.enemies.isCleared && this.layout.sector.reward === 'SKILL') || this.debugGate;
     f.bossVisible = this.enemies.bossStatus(_bossStatus);
     if (f.bossVisible) {
       f.bossHp = _bossStatus.hp;
@@ -638,6 +1276,10 @@ class App {
       }
     }
     this.hud.update(f);
+    const fl = this.flow;
+    this.stats.flowScore = fl.earned * modifierScoreMultiplier(this.activeMods);
+    this.stats.peakFlowPoints = fl.peak;
+    this.hud.updateFlow(fl.rankIndex, fl.progress, fl.decayGrace, fl.points, this.stats.flowScore);
   }
 
   private fpsLast = performance.now();
@@ -663,7 +1305,53 @@ class App {
       `COLLIDERS ${this.layout.colliders.length}  WALLRUN ${this.layout.wallRunSurfaces.length}  ANCHORS ${this.layout.anchors.length}\n` +
       `PLAYER ${p.state}  POS ${p.position.x.toFixed(1)},${p.position.y.toFixed(2)},${p.position.z.toFixed(1)}  SPD ${p.speed.toFixed(1)}  ` +
       `GEAR ${this.equipment.activeSlot}/${this.equipment.state}  ROPE ${p.ropeAttached ? p.ropeLength.toFixed(1) : '-'}  BT ${p.btGauge.toFixed(0)}  HP ${p.hp.toFixed(0)}\n` +
-      `ENEMIES  WAVE ${this.enemies.waveNumber}/${this.enemies.waveTotal}  REMAINING ${this.enemies.remaining}  ${this.enemies.isCleared ? 'CLEARED' : ''}`;
+      `ENEMIES  WAVE ${this.enemies.waveNumber}/${this.enemies.waveTotal}  REMAINING ${this.enemies.remaining}  ${this.enemies.isCleared ? 'CLEARED' : ''}  |  ` +
+      `FLOW ${FLOW_RANKS[this.flow.rankIndex].id} ${this.flow.points.toFixed(0)}  LOOP ${this.loop + 1}`;
+  }
+
+  // =============================================================================================
+  // Debug / test hooks (only reachable through ?debug=1)
+  // =============================================================================================
+  debugInfo(): Record<string, unknown> {
+    return {
+      state: this.state,
+      sector: this.sectorIndex,
+      loop: this.loop,
+      skills: { ...this.skills },
+      flow: { points: this.flow.points, rank: FLOW_RANKS[this.flow.rankIndex].id, earned: this.flow.earned },
+      stats: { ...this.stats, rankTime: Array.from(this.stats.rankTime) },
+      gateReady: this.gateReady,
+      clearAction: this.clearAction,
+      derived: { ...this.derived },
+      mods: [...this.activeMods],
+    };
+  }
+
+  /** Grants a skill level directly (tests). */
+  debugGrantSkill(id: SkillId, level = 1): void {
+    this.skills[id] = clamp(level, 0, 3);
+  }
+
+  /** Kills every enemy of the current sector (tests). */
+  debugClearSector(): void {
+    this.enemies.debugKillAll();
+  }
+
+  /** Sets challenge modifiers for the next deploy (tests). */
+  debugSetModifiers(ids: ModifierId[]): void {
+    this.store.data.cleared = true;
+    this.store.data.activeModifiers = ids;
+  }
+
+  /** Starts the run without the pointer-lock gesture (tests). */
+  debugDeploy(): void {
+    this.deploy();
+    this.setState('PLAYING');
+  }
+
+  /** Forces a screen state (tests). */
+  debugForceState(s: AppState): void {
+    this.setState(s);
   }
 }
 

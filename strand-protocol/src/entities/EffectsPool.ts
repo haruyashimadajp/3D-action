@@ -59,11 +59,15 @@ export interface ProjectileSpec {
   readonly width: number;
   /** Free tag for the combat system (gun id / enemy kind). */
   readonly tag: number;
+  /** Passes through shields and bodies (each body is hit once); stops at world geometry (SK_02). */
+  readonly pierce?: boolean;
 }
 
 export interface ProjectileImpact {
   owner: ProjectileOwner;
   tag: number;
+  /** The round pierces (continues after this impact). */
+  pierce: boolean;
   damage: number;
   headMultiplier: number;
   shieldMultiplier: number;
@@ -169,10 +173,17 @@ export class EffectsPool {
   private readonly pColor = new Float32Array(P_CAP * 3);
   private readonly pWidth = new Float32Array(P_CAP);
   private readonly pTag = new Int32Array(P_CAP);
+  private readonly pPierce = new Uint8Array(P_CAP);
+  /** Body group a piercing round last passed through (−1 = none). */
+  private readonly pSkipGroup = new Int32Array(P_CAP);
+  /** SK_12: remaining slow time (s) and the factor to undo when it ends. */
+  private readonly pSlowT = new Float32Array(P_CAP);
+  private readonly pSlowK = new Float32Array(P_CAP);
   private pNext = 0;
   private readonly impact: ProjectileImpact = {
     owner: 'PLAYER',
     tag: 0,
+    pierce: false,
     damage: 0,
     headMultiplier: 1,
     shieldMultiplier: 1,
@@ -685,6 +696,10 @@ export class EffectsPool {
     this.pColor[i * 3 + 2] = _c.b * spec.intensity;
     this.pWidth[i] = spec.width;
     this.pTag[i] = spec.tag;
+    this.pPierce[i] = spec.pierce ? 1 : 0;
+    this.pSkipGroup[i] = -1;
+    this.pSlowT[i] = 0;
+    this.pSlowK[i] = 1;
     this.pGrazeMin[i] = Infinity;
     this.pGrazeDone[i] = spec.owner === 'PLAYER' ? 1 : 0;
     return i;
@@ -712,6 +727,17 @@ export class EffectsPool {
     for (let i = 0; i < P_CAP; i++) {
       if (!this.pActive[i]) continue;
       const o = i * 3;
+      if (this.pSlowT[i] > 0) {
+        this.pSlowT[i] -= dt;
+        if (this.pSlowT[i] <= 0) {
+          // Slow window over: restore the original velocity.
+          const k = 1 / this.pSlowK[i];
+          this.pVel[o] *= k;
+          this.pVel[o + 1] *= k;
+          this.pVel[o + 2] *= k;
+          this.pSlowK[i] = 1;
+        }
+      }
       _a.set(this.pPos[o], this.pPos[o + 1], this.pPos[o + 2]);
       _d.set(this.pVel[o], this.pVel[o + 1], this.pVel[o + 2]);
       const speed = _d.length();
@@ -726,7 +752,8 @@ export class EffectsPool {
       const targets = targetsFor(owner);
       let tHit = false;
       if (targets.length) {
-        physics.raycastTargets(_a, _d, _worldHit.hit ? _worldHit.distance : step, targets, _targetHit);
+        const pierce = this.pPierce[i] === 1;
+        physics.raycastTargets(_a, _d, _worldHit.hit ? _worldHit.distance : step, targets, _targetHit, pierce ? this.pSkipGroup[i] : -1, pierce);
         tHit = _targetHit.hit;
       }
       // GRAZE: closest approach of this step's path (up to a world hit) to the player's body axis.
@@ -738,6 +765,7 @@ export class EffectsPool {
         const im = this.impact;
         im.owner = owner;
         im.tag = this.pTag[i];
+        im.pierce = tHit && this.pPierce[i] === 1;
         im.damage = this.pDamage[i];
         im.headMultiplier = this.pHead[i];
         im.shieldMultiplier = this.pShield[i];
@@ -757,6 +785,17 @@ export class EffectsPool {
           im.region = 'BODY';
           im.travelled = this.pTravel[i] + _worldHit.distance;
           this.burst(im.point, im.normal, im.kind === 'WATER' ? BURST.WATER : BURST.SPARK);
+        }
+        if (im.pierce && _targetHit.target) {
+          // Piercing round: keep flying from just past the hit, never re-hitting this body.
+          this.pSkipGroup[i] = _targetHit.target.group ?? _targetHit.target.id;
+          this.pPos[o] = _targetHit.point.x + _d.x * 0.02;
+          this.pPos[o + 1] = _targetHit.point.y + _d.y * 0.02;
+          this.pPos[o + 2] = _targetHit.point.z + _d.z * 0.02;
+          this.pTravel[i] += _targetHit.distance;
+          onImpact(im);
+          if (this.pTravel[i] >= this.pRange[i] - 1e-3) this.pActive[i] = 0;
+          continue;
         }
         this.pActive[i] = 0;
         onImpact(im);
@@ -792,11 +831,18 @@ export class EffectsPool {
     }
   }
 
-  /** Halves (×k) the speed of enemy rounds within `radius` of `point` (SK_12 Phantom Graze). */
-  scaleEnemyRoundSpeed(point: THREE.Vector3, radius: number, k: number): void {
+  /**
+   * Scales (×k) the speed of enemy rounds within `radius` of `point` for `durationS` of simulation time, then
+   * restores it (SK_12 Phantom Graze: half speed for 0.6 s). Rounds already slowed are not slowed twice.
+   */
+  scaleEnemyRoundSpeed(point: THREE.Vector3, radius: number, k: number, durationS: number): void {
     const r2 = radius * radius;
     for (let i = 0; i < P_CAP; i++) {
       if (!this.pActive[i] || this.pOwner[i] === 0) continue;
+      if (this.pSlowT[i] > 0) {
+        this.pSlowT[i] = Math.max(this.pSlowT[i], durationS);
+        continue;
+      }
       const o = i * 3;
       const dx = this.pPos[o] - point.x;
       const dy = this.pPos[o + 1] - point.y;
@@ -805,6 +851,8 @@ export class EffectsPool {
       this.pVel[o] *= k;
       this.pVel[o + 1] *= k;
       this.pVel[o + 2] *= k;
+      this.pSlowT[i] = durationS;
+      this.pSlowK[i] = k;
     }
   }
 

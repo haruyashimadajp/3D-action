@@ -32,6 +32,7 @@ import {
   LIMITS,
   MATERIALS,
   PHYSICS,
+  PLAYER,
   SHAKE,
   TELEGRAPH,
   clamp,
@@ -84,11 +85,15 @@ export interface EnemyEvents {
   onHitMarker?(kind: HitMarkerKind): void;
   onKill?(info: KillInfo): void;
   onGraze?(point: THREE.Vector3): void;
-  /** LOCK_TELEGRAPH start: high-frequency lock sound at the muzzle (spatial). */
-  onLockStart?(kind: EnemyKind, position: THREE.Vector3): void;
-  onEnemyFire?(kind: EnemyKind, position: THREE.Vector3): void;
-  onShieldBreak?(position: THREE.Vector3): void;
-  onBossPartBreak?(position: THREE.Vector3): void;
+  /**
+   * LOCK_TELEGRAPH start: high-frequency lock sound at the muzzle (spatial). `lockS` is the lock duration in
+   * simulation seconds; `sniper` marks 100-damage rounds (sharper 1400 → 2800 Hz tone).
+   */
+  onLockStart?(kind: EnemyKind, position: THREE.Vector3, lockS: number, sniper: boolean): void;
+  onEnemyFire?(kind: EnemyKind, position: THREE.Vector3, sniper: boolean): void;
+  /** `weapon` tag of the breaking blow (1 = SMG for SK_09). */
+  onShieldBreak?(position: THREE.Vector3, weapon: number): void;
+  onBossPartBreak?(position: THREE.Vector3, weapon: number): void;
   onBossPhase?(phase: 1 | 2): void;
   onBossDefeated?(position: THREE.Vector3): void;
   onPlayerHit?(damage: number, from: THREE.Vector3): void;
@@ -137,6 +142,7 @@ const DOWN = new THREE.Vector3(0, -1, 0);
 const _acqColor = new THREE.Color(TELEGRAPH.ACQ_COLOR);
 const _lockColor = new THREE.Color(TELEGRAPH.LOCK_COLOR);
 const _sightColor = new THREE.Color(0xff1030);
+const _nearDist = new Float32Array(8);
 
 const GRAVITY = PHYSICS.GRAVITY;
 
@@ -861,6 +867,8 @@ class Enemy {
   constructor(readonly index: number) {
     const mk = (id: number): HitboxTarget => ({
       id,
+      group: index,
+      shield: id % 4 === 1,
       alive: false,
       headCenter: new THREE.Vector3(),
       headRadius: 0,
@@ -940,6 +948,8 @@ const GLOW_INSTANCES = 1500;
 const SHIELD_CAP = RIG_POOL.AEGIS;
 const PLAYER_TARGET_ID = 9999;
 const MISSILE_ID_BASE = 1000;
+/** Projectile tag of SK_15 head-shot ricochet rounds. */
+export const RICOCHET_TAG = 5;
 const DEBRIS_LIFE = TELEGRAPH.DEBRIS_LIFETIME_S;
 const DISSOLVE_S = 0.6;
 const LINE_IGNORE_NONE = undefined;
@@ -1188,6 +1198,17 @@ export class EnemyManager {
   /** Death retry: the same sector restarts from wave 1. */
   resetSector(): void {
     if (this.layout) this.startSector(this.layout, this.loop);
+  }
+
+  /** Removes every enemy, round-trip state and wave (title screen). */
+  clear(): void {
+    this.clearAll();
+    this.waveLists = [];
+    this.wave = -1;
+    this.totalCount = 0;
+    this.killedCount = 0;
+    this.cleared = false;
+    this.bossDefeated = false;
   }
 
   private clearAll(): void {
@@ -2160,7 +2181,7 @@ export class EnemyManager {
     }
     e.warning.position.copy(e.muzzle);
     e.warning.active = true;
-    this.events.onLockStart?.(e.kind, e.muzzle);
+    this.events.onLockStart?.(e.kind, e.muzzle, e.lockS, e.pattern.spec.damage >= PLAYER.DAMAGE_SNIPER);
   }
 
   private fireLine(e: Enemy, i: number): void {
@@ -2170,7 +2191,7 @@ export class EnemyManager {
     else this.effects.spawnProjectile(_v1, _v2, e.pattern.spec);
     e.recoilV += e.isBoss ? 4 : 7;
     this.renderer.flashLight(_v1, e.pattern.spec.color, e.pattern.spec.damage >= 100 ? 10 : 6, 12, 0.05);
-    this.events.onEnemyFire?.(e.kind, _v1);
+    this.events.onEnemyFire?.(e.kind, _v1, e.pattern.spec.damage >= PLAYER.DAMAGE_SNIPER);
   }
 
   private damagePlayer(amount: number, from: THREE.Vector3): void {
@@ -2444,14 +2465,14 @@ export class EnemyManager {
         e.bossT = 0;
         e.warning.position.copy(e.pos).setY(e.pos.y + 1.4 * e.scale);
         e.warning.active = true;
-        this.events.onLockStart?.(e.kind, e.warning.position);
+        this.events.onLockStart?.(e.kind, e.warning.position, e.lockS, false);
       }
     } else if (e.bossT >= e.lockS) {
       this.releaseLines(e);
       e.bossMode = 'DIVING';
       e.bossT = 0;
       e.warning.active = false;
-      this.events.onEnemyFire?.(e.kind, e.pos);
+      this.events.onEnemyFire?.(e.kind, e.pos, false);
     }
     this.faceYaw(e, yawOf(e.diveTarget.x - e.pos.x, e.diveTarget.z - e.pos.z), 300, dt);
   }
@@ -3142,20 +3163,26 @@ export class EnemyManager {
     const e = this.enemies[t.id >> 2];
     if (!e || !e.alive) return;
     const part = t.id & 3;
+    const ricochet = im.tag === RICOCHET_TAG;
+    // Kill-info weapon tag: ricochets count as skill damage.
+    const weapon = ricochet ? 4 : im.tag;
     const partBonus = im.tag === 1 ? 1 + this.modifiers.smgPartBonus : 1;
     if (part === 1) {
-      this.damageShield(e, im.damage * im.shieldMultiplier * partBonus, im.point, im.direction);
+      this.damageShield(e, im.damage * im.shieldMultiplier * partBonus, im.point, im.direction, weapon);
       return;
     }
     if (part >= 2) {
-      this.damageWing(e, part - 2, im.damage * partBonus, im.point, im.direction);
+      this.damageWing(e, part - 2, im.damage * partBonus, im.point, im.direction, weapon);
       return;
     }
     let head = im.region === 'HEAD';
-    if (e.kind === 'AEGIS' && e.shieldHp > 0 && this.shieldBlocks(e, im.direction)) {
-      this.damageShield(e, im.damage * im.shieldMultiplier * partBonus, im.point, im.direction);
+    // Piercing rounds (SK_02) pass through the Aegis shield; everything else is blocked by its frontal arc.
+    if (!im.pierce && e.kind === 'AEGIS' && e.shieldHp > 0 && this.shieldBlocks(e, im.direction)) {
+      this.damageShield(e, im.damage * im.shieldMultiplier * partBonus, im.point, im.direction, weapon);
       return;
     }
+    // SK_15 ricochet interrupts the target's telegraph.
+    if (ricochet) this.cancelAttack(e, 0.6);
     let mult = 1;
     if (head) {
       if (e.isBoss && !e.downed) {
@@ -3164,7 +3191,7 @@ export class EnemyManager {
         head = false;
       } else mult = im.headMultiplier;
     }
-    this.applyDamage(e, Math.round(im.damage * mult), head, im.point, im.direction, im.tag);
+    this.applyDamage(e, Math.round(im.damage * mult), head, im.point, im.direction, weapon);
   }
 
   /** Frontal 130° arc blocks the shot unless it comes steeply from above (strand / wall-run flank). */
@@ -3179,7 +3206,7 @@ export class EnemyManager {
     return below < AEGIS_SHIELD.OVERHEAD_PASS_DEG;
   }
 
-  private damageShield(e: Enemy, dmg: number, point: THREE.Vector3, dir: THREE.Vector3): void {
+  private damageShield(e: Enemy, dmg: number, point: THREE.Vector3, dir: THREE.Vector3, weapon: number): void {
     e.shieldHp -= dmg;
     e.shieldFlash = 0.07;
     _v1.copy(dir).negate();
@@ -3199,10 +3226,10 @@ export class EnemyManager {
     this.events.onHitstop?.(HITSTOP.SHIELD_OR_BOSS_PART_BREAK);
     this.player.addTrauma(SHAKE.SHIELD_OR_BOSS_PART_BREAK);
     this.events.onHitMarker?.('PART');
-    this.events.onShieldBreak?.(_v2);
+    this.events.onShieldBreak?.(_v2, weapon);
   }
 
-  private damageWing(e: Enemy, side: number, dmg: number, point: THREE.Vector3, dir: THREE.Vector3): void {
+  private damageWing(e: Enemy, side: number, dmg: number, point: THREE.Vector3, dir: THREE.Vector3, weapon: number): void {
     if (e.wingBroken[side]) return;
     e.wingHp[side] -= dmg;
     e.hitFlash = 0.05;
@@ -3223,7 +3250,7 @@ export class EnemyManager {
     this.events.onHitstop?.(HITSTOP.SHIELD_OR_BOSS_PART_BREAK);
     this.player.addTrauma(SHAKE.SHIELD_OR_BOSS_PART_BREAK);
     this.events.onHitMarker?.('PART');
-    this.events.onBossPartBreak?.(_v2);
+    this.events.onBossPartBreak?.(_v2, weapon);
     this.startDowned(e);
   }
 
@@ -3420,6 +3447,33 @@ export class EnemyManager {
     return pick;
   }
 
+  /**
+   * Up to `out.length` distinct living enemies (body centres) nearest to `point` within `radius`, sorted by
+   * distance (SK_15 ricochet targets). Returns how many were written.
+   */
+  nearestEnemies(point: THREE.Vector3, radius: number, out: THREE.Vector3[]): number {
+    let n = 0;
+    const max = out.length;
+    _nearDist.fill(Infinity);
+    for (const o of this.enemies) {
+      if (!o.alive) continue;
+      const d = o.hit.bodyCenter.distanceTo(point);
+      if (d > radius) continue;
+      // Insertion into the sorted top-`max` list.
+      let k = Math.min(n, max - 1);
+      if (n === max && d >= _nearDist[max - 1]) continue;
+      while (k > 0 && _nearDist[k - 1] > d) {
+        _nearDist[k] = _nearDist[k - 1];
+        out[k].copy(out[k - 1]);
+        k--;
+      }
+      _nearDist[k] = d;
+      out[k].copy(o.hit.bodyCenter);
+      if (n < max) n++;
+    }
+    return n;
+  }
+
   // =============================================================================================
   // Grapple bite (§4 S-00): 15 damage + 0.4 s stagger, the strand stays fixed to the enemy
   // =============================================================================================
@@ -3432,8 +3486,8 @@ export class EnemyManager {
     _v2.subVectors(point, _v1);
     if (_v2.lengthSq() < 1e-6) _v2.set(0, 0, 1);
     _v2.normalize();
-    if (part === 1) this.damageShield(e, GRAPPLE_HOOK_DAMAGE, point, _v2);
-    else if (part >= 2) this.damageWing(e, part - 2, GRAPPLE_HOOK_DAMAGE, point, _v2);
+    if (part === 1) this.damageShield(e, GRAPPLE_HOOK_DAMAGE, point, _v2, 3);
+    else if (part >= 2) this.damageWing(e, part - 2, GRAPPLE_HOOK_DAMAGE, point, _v2, 3);
     else this.applyDamage(e, GRAPPLE_HOOK_DAMAGE, false, point, _v2, 3);
     if (!e.alive) return;
     e.stun = Math.max(e.stun, this.modifiers.grappleStunS);
@@ -3458,6 +3512,17 @@ export class EnemyManager {
     return out;
   }
 
+  /** Tests: skip to the last wave and kill everything alive (the normal clear / boss-defeat flow follows). */
+  debugKillAll(): void {
+    this.queue.length = 0;
+    if (this.wave < this.waveLists.length - 1) this.wave = this.waveLists.length - 1;
+    for (const e of this.enemies) {
+      if (!e.alive) continue;
+      _v1.copy(e.pos).add(e.bodyOff);
+      this.applyDamage(e, 1e6, false, _v1, UP, 4);
+    }
+  }
+
   get stats(): { total: number; killed: number; wave: number; waves: number; remaining: number; cleared: boolean } {
     return { total: this.totalCount, killed: this.killedCount, wave: this.wave + 1, waves: this.waveLists.length, remaining: this.remaining, cleared: this.cleared };
   }
@@ -3469,17 +3534,31 @@ export class EnemyManager {
 const ROSTER_ORDER: readonly EnemyKind[] = ['ENFORCER', 'AEGIS', 'VEIL', 'PHANTOM', 'DRONE', 'VALKYRIE'];
 
 function composeWaves(sector: SectorDef, loop: number): EnemyKind[][] {
+  // Endless +20 % per loop applies to the sector total (9 → 11 at Loop 2), split across kinds by largest remainder.
   const scale = 1 + ENDLESS.SPAWN_COUNT_PER_LOOP * loop;
   const remaining = new Map<EnemyKind, number>();
-  let total = 0;
+  let baseRegular = 0;
+  for (const k of ROSTER_ORDER) if (k !== 'VALKYRIE') baseRegular += sector.roster[k] ?? 0;
+  const targetRegular = Math.round(baseRegular * scale);
+  const fracs: { k: EnemyKind; f: number }[] = [];
+  let assigned = 0;
   for (const k of ROSTER_ORDER) {
     const base = sector.roster[k] ?? 0;
-    const n = k === 'VALKYRIE' ? base : Math.round(base * scale);
-    if (n > 0) {
-      remaining.set(k, n);
-      total += n;
+    if (base <= 0) continue;
+    if (k === 'VALKYRIE') {
+      remaining.set(k, base);
+      continue;
     }
+    const exact = base * scale;
+    const n = Math.floor(exact);
+    remaining.set(k, n);
+    assigned += n;
+    fracs.push({ k, f: exact - n });
   }
+  fracs.sort((a, b) => b.f - a.f);
+  for (let i = 0; assigned < targetRegular && i < fracs.length; i++, assigned++) remaining.set(fracs[i].k, (remaining.get(fracs[i].k) ?? 0) + 1);
+  let total = 0;
+  for (const n of remaining.values()) total += n;
   const baseTotal = sector.waves.reduce((a, w) => a + w.count, 0);
   const waves: EnemyKind[][] = [];
   let left = total;

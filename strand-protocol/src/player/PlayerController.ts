@@ -129,6 +129,11 @@ export class PlayerController {
   lastAttackTime = -1e9;
   lastDamageTime = -1e9;
   private regenerating = false;
+  /** SK_07: gravity halved until this sim time. */
+  private hoverUntil = -1;
+  /** SK_11: speed boost amount (m/s) and expiry. */
+  private boostAmount = 0;
+  private boostUntil = -1;
 
   // ---- bullet time ----
   btGauge: number = BULLET_TIME.MAX_GAUGE;
@@ -227,6 +232,8 @@ export class PlayerController {
     this.fov = this.settings.baseFov;
     this.wallSurface = null;
     this.lastWallSurface = null;
+    this.hoverUntil = -1;
+    this.boostUntil = -1;
   }
 
   get isAlive(): boolean {
@@ -470,7 +477,7 @@ export class PlayerController {
     }
 
     // Soft speed cap: only the excess above 34 m/s (SSS 40.1) is dragged at 1.8 /s.
-    const cap = PHYSICS.SOFT_SPEED_CAP * (1 + this.modifiers.maxSpeedBonus);
+    const cap = PHYSICS.SOFT_SPEED_CAP * (1 + this.modifiers.maxSpeedBonus) + this.activeBoost();
     const sp = this.velocity.length();
     if (sp > cap) this.velocity.multiplyScalar((cap + (sp - cap) * Math.exp(-PHYSICS.SOFT_CAP_DRAG * dt)) / sp);
 
@@ -511,7 +518,35 @@ export class PlayerController {
     let s = PHYSICS.RUN_SPEED;
     if (this.inWater) s *= PHYSICS.CANAL_SPEED_MULT;
     if (this.isCritical) s *= 1 + this.modifiers.criticalMoveBonus;
-    return s;
+    return s + this.activeBoost();
+  }
+
+  /** SK_07 blast thruster: 0.35 s at half gravity after a shotgun air recoil jump. */
+  private gravityScale(): number {
+    return this.simTime < this.hoverUntil ? 0.5 : 1;
+  }
+
+  private activeBoost(): number {
+    return this.simTime < this.boostUntil ? this.boostAmount : 0;
+  }
+
+  /** SK_07: halves gravity for `seconds` of simulation time. */
+  hover(seconds: number): void {
+    this.hoverUntil = Math.max(this.hoverUntil, this.simTime + seconds);
+  }
+
+  /**
+   * SK_11 zero-time bonus: +`amount` m/s along the current horizontal motion (or the view when nearly still);
+   * for `seconds` the run-speed target and the soft cap are raised by the same amount so it is not damped away.
+   */
+  speedBoost(amount: number, seconds: number): void {
+    if (this.state === 'DEAD') return;
+    _tmp.set(this.velocity.x, 0, this.velocity.z);
+    if (_tmp.lengthSq() < 4) _tmp.set(-Math.sin(this.yaw), 0, -Math.cos(this.yaw));
+    _tmp.normalize();
+    this.velocity.addScaledVector(_tmp, amount);
+    this.boostAmount = amount;
+    this.boostUntil = this.simTime + seconds;
   }
 
   /** Ground acceleration (75 m/s²) toward wish × run speed; friction 10 /s; excess speed decays smoothly. */
@@ -634,7 +669,7 @@ export class PlayerController {
 
   private stepAirborne(dt: number): void {
     this.colliderHeight = this.colliderHeight < PLAYER.HEIGHT && !this.canStand() ? PLAYER.SLIDE_HEIGHT : PLAYER.HEIGHT;
-    this.velocity.y += PHYSICS.GRAVITY * dt;
+    this.velocity.y += PHYSICS.GRAVITY * this.gravityScale() * dt;
     this.airStrafe(dt, PHYSICS.AIR_ACCEL);
 
     // Coyote jumps (ledge 140 ms / wall-run end 160 ms).
@@ -760,7 +795,7 @@ export class PlayerController {
       this.groundMove(dt);
       if (this.state === 'GRAPPLE_PULL') this.velocity.y = Math.max(this.velocity.y, 1.0);
     } else {
-      this.velocity.y += PHYSICS.GRAVITY * dt;
+      this.velocity.y += PHYSICS.GRAVITY * this.gravityScale() * dt;
       // Swing assist: WASD thrust perpendicular to the rope (+5.5 m/s²).
       if (_wish.lengthSq() > 1e-4) {
         _tmp.copy(_wish).normalize();

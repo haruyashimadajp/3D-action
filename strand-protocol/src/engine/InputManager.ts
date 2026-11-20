@@ -201,6 +201,14 @@ export class InputManager {
     return out;
   }
 
+  /** Discards queued discrete actions and buffered presses (e.g. number keys used to pick a skill card). */
+  clearActions(): void {
+    this.queue.length = 0;
+    this.consumed.add('FIRE');
+    this.consumed.add('JUMP');
+    this.consumed.add('SLIDE');
+  }
+
   /** Returns accumulated look delta in radians (yaw, pitch) and resets it. */
   consumeLook(out: { yaw: number; pitch: number }): { yaw: number; pitch: number } {
     const k = INPUT.BASE_RAD_PER_PIXEL * clamp(this.sensitivity, INPUT.SENSITIVITY_MIN, INPUT.SENSITIVITY_MAX);

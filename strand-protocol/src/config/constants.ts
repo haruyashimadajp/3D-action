@@ -524,6 +524,99 @@ export const LEVEL = {
   OUTER_GROUND_M: 720,
 } as const;
 
+// ---------------------------------------------------------------------------
+// §7 Sound (100 % procedural Web Audio DSP)
+// ---------------------------------------------------------------------------
+export const AUDIO = {
+  // §7.1 master routing
+  /** Bullet-time dynamic lowpass: 22 kHz → 680 Hz (Q 2.4) in 120 ms, back in 180 ms (SE + BGM buses). */
+  BT_LOWPASS_OPEN_HZ: 22000,
+  BT_LOWPASS_CLOSED_HZ: 680,
+  BT_LOWPASS_Q: 2.4,
+  BT_LOWPASS_IN_MS: 120,
+  BT_LOWPASS_OUT_MS: 180,
+  /** City reverb impulse response: stereo exponentially decaying white noise. */
+  REVERB_LENGTH_S: 1.8,
+  REVERB_DECAY: 3.2,
+  REVERB_ROLLOFF_HZ: 4500,
+  REVERB_SEND: 0.28,
+  /** Rain ambience: pink noise → bandpass 1200 Hz (Q 0.6) + high-shelf 6 kHz +4 dB at 0.09. */
+  RAIN_BANDPASS_HZ: 1200,
+  RAIN_BANDPASS_Q: 0.6,
+  RAIN_SHELF_HZ: 6000,
+  RAIN_SHELF_DB: 4,
+  RAIN_GAIN: 0.09,
+  MASTER_GAIN: 0.8,
+  /** Concurrent one-shot voice cap (oldest-first protection against SMG / swarm spam). */
+  MAX_VOICES: 72,
+  MAX_LOCK_VOICES: 6,
+
+  // §7.2 SE parameters
+  PISTOL_TRANSIENT: { f0: 1400, f1: 120, ms: 35 },
+  PISTOL_BODY: { f0: 180, f1: 42, ms: 110 },
+  PISTOL_TAIL: { f0: 3200, f1: 900, ms: 180 },
+  /** Last two rounds: metallic click (sine 2600 Hz, 25 ms). */
+  PISTOL_LOW_AMMO_CLICK: { hz: 2600, ms: 25, rounds: 2 },
+  SMG_ATTACK: { f0: 620, f1: 140, ms: 28 },
+  SMG_SNAP: { hz: 2800, ms: 40 },
+  SMG_PITCH_JITTER: 0.03,
+  SHOTGUN_SUB: { f0: 135, f1: 28, ms: 260 },
+  SHOTGUN_BLAST: { hz: 900, ms: 220, shaperK: 40 },
+  SHOTGUN_PUMP: { delayMs: 280, hzA: 1800, hzB: 2200, ms: 45 },
+  /** Air recoil jump: sub +3 dB. */
+  SHOTGUN_AIR_SUB_DB: 3,
+  HEADSHOT_GLASS: { hz: 5500, ms: 90 },
+  HEADSHOT_CHORD: { attackMs: 2, decayMs: 240 },
+  /** Consecutive head-shots within 5 s climb this pentatonic ladder (C6 D6 E6 G6 A6 C7 D7 E7). */
+  HEADSHOT_LADDER_HZ: [1046.5, 1174.66, 1318.51, 1567.98, 1760.0, 2093.0, 2349.32, 2637.02] as readonly number[],
+  HEADSHOT_CHAIN_S: 5,
+  SWITCH_HOLSTER: { hz: 800, ms: 45 },
+  SWITCH_CLICK: { delayMs: 90, f0: 1600, f1: 2400, ms: 30 },
+  SWITCH_REEL_FM_HZ: 3100,
+  STRAND_FIRE_AIR: { f0: 2200, f1: 600, ms: 120 },
+  STRAND_FIRE_PAYOUT: { f0: 900, f1: 1800 },
+  STRAND_ANCHOR: { squareHz: 420, fmHz: 1950, ms: 140 },
+  /** Swing wind: bandpass 400 → 1600 Hz, gain rises linearly with speed. */
+  SWING_WIND: { f0: 400, f1: 1600, maxSpeed: 34, maxGain: 0.16 },
+  LOCK_TONE: { f0: 980, f1: 1960, tremoloHz: 25 },
+  LOCK_TONE_SNIPER: { f0: 1400, f1: 2800 },
+  GRAZE_WHOOSH: { f0: 2400, f1: 450, ms: 160 },
+  GRAZE_BELL: { hz: 1760, ms: 120 },
+  /** Consecutive grazes inside this window raise the bell by a semitone each (cap one octave). */
+  GRAZE_CHAIN_S: 3,
+  GRAZE_CHAIN_MAX_SEMITONES: 12,
+  BT_ENTER: { f0: 160, f1: 32, ms: 280 },
+  BT_EXIT: { f0: 45, f1: 220, ms: 200 },
+  DAMAGE_PUNCH: { f0: 90, f1: 25, ms: 260 },
+  DAMAGE_TINNITUS: { hz: 4200, gain: 0.06, decayS: 1.2 },
+  HEARTBEAT: { lowpassHz: 60, bpm: PLAYER.CRITICAL_HEARTBEAT_BPM, dubDelayS: 0.15 },
+  /** Out-of-combat regen start: clear F#4 + C#5 sine chord, 350 ms. */
+  REGEN_CHORD_HZ: [369.99, 554.37] as readonly number[],
+  REGEN_CHORD_MS: 350,
+
+  // §7.3 adaptive 5-layer BGM
+  BPM: 136,
+  /** 16th note = 60 / 136 / 4 = 110.29 ms. */
+  SIXTEENTH_S: 60 / 136 / 4,
+  SCHEDULER_INTERVAL_MS: 25,
+  SCHEDULER_LOOKAHEAD_S: 0.1,
+  /** Layer 1 bass roots per bar: D2 / F2 / G2 / A#1. */
+  BASS_ROOTS_HZ: [73.42, 87.31, 98.0, 58.27] as readonly number[],
+  BASS_LOWPASS_HZ: 380,
+  KICK: { f0: 130, f1: 42 },
+  SNARE_BODY_HZ: 210,
+  /** D minor pentatonic (D F G A C), octave 4–5. */
+  ARP_SCALE_HZ: [293.66, 349.23, 392.0, 440.0, 523.25, 587.33, 698.46, 783.99, 880.0, 1046.5] as readonly number[],
+  /** Arp delay = 3/16 note, feedback 0.35. */
+  ARP_DELAY_SIXTEENTHS: 3,
+  ARP_DELAY_FEEDBACK: 0.35,
+  HAT_HIGHPASS_HZ: 8000,
+  /** Layers 2–5 fade out over 800 ms when out of combat (sector clear / regenerating). */
+  CALM_FADE_MS: 800,
+  LAYER_FADE_S: 0.6,
+  BGM_GAIN: 0.42,
+} as const;
+
 /** localStorage key (§8.3). */
 export const SAVE_KEY = 'strand_protocol_save_v1';
 
