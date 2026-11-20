@@ -273,14 +273,20 @@
       /* 5B-5 helmet-visor depth: side panels tilt toward the centre; faint optical scales on both edges. */
       #hp, #spd { transform: perspective(900px) rotateY(5deg); transform-origin: left center; }
       #dock { transform: perspective(900px) rotateY(-5deg); transform-origin: right center; }
-      .visor { position: absolute; top: 28vh; height: 44vh; width: 14px; opacity: 0.14; pointer-events: none;
+      .visor { position: absolute; top: 32vh; height: 36vh; width: 8px; opacity: 0.14; pointer-events: none;
         background: repeating-linear-gradient(to bottom, #00f0ff 0 1px, transparent 1px 10px); }
-      .visor::after { content: ''; position: absolute; top: 0; bottom: 0; width: 6px;
+      .visor::after { content: ''; position: absolute; top: 0; bottom: 0; width: 4px;
         background: repeating-linear-gradient(to bottom, #00f0ff 0 2px, transparent 2px 50px); }
       #visor-l { left: 10px; }
-      #visor-l::after { left: 14px; }
+      #visor-l::after { left: 8px; }
       #visor-r { right: 10px; transform: scaleX(-1); }
-      #visor-r::after { left: 14px; }
+      #visor-r::after { left: 8px; }
+      /* Laptop resolutions: the HUD keeps its ≤ 8 % screen share (side panels at 86 %). */
+      @media (max-width: 1500px) {
+        #hp, #spd { scale: 0.86; }
+        #dock { scale: 0.86; }
+        #flow { scale: 0.86; transform-origin: top right; }
+      }
       #hp .label { font-size: 10px; letter-spacing: 0.3em; color: rgba(232, 246, 255, 0.6); display: flex; justify-content: space-between; }
       #hp-num { font-size: 18px; letter-spacing: 0.05em; color: #f4fdff; }
       #hp .bar { position: relative; height: 10px; margin-top: 4px; background: rgba(20, 26, 36, 0.75); border: 1px solid rgba(232, 246, 255, 0.25); }
