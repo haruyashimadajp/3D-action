@@ -98,15 +98,20 @@
         opacity: 1;
         transform: none;
       }
-      #title-name {
-        font-size: clamp(36px, 6.4vw, 92px);
-        font-weight: 800;
-        font-style: italic;
-        letter-spacing: 0.04em;
-        line-height: 1;
-        color: #f4fdff;
-        text-shadow: 0 0 18px rgba(0, 240, 255, 0.55), 0 0 2px #fff;
+      /* 5B-5: geometric SVG wordmark (no system-font dependency) */
+      #title-name { line-height: 0; }
+      #title-name svg { display: block; width: clamp(340px, 46vw, 760px); height: auto; overflow: visible; filter: drop-shadow(0 0 12px rgba(0, 240, 255, 0.42)); }
+      #title-menu { margin-top: 26px; display: flex; gap: 10px; flex-wrap: wrap; pointer-events: auto; }
+      .tbtn {
+        font-family: var(--mono-font); font-size: 13px; letter-spacing: 0.32em; padding: 11px 18px; cursor: pointer;
+        color: #e8fbff; background: rgba(5, 7, 14, 0.55); border: 1px solid rgba(0, 240, 255, 0.42);
+        clip-path: polygon(10px 0, 100% 0, calc(100% - 10px) 100%, 0 100%);
+        transition: background 0.12s, color 0.12s, border-color 0.12s;
       }
+      .tbtn:hover { border-color: #00f0ff; background: rgba(0, 240, 255, 0.14); }
+      .tbtn.on { color: #05070e; background: #00f0ff; border-color: #00f0ff; }
+      .tbtn.primary { border-color: rgba(0, 240, 255, 0.85); background: rgba(0, 240, 255, 0.12); animation: pulse 1.8s ease-in-out infinite; box-shadow: 0 0 18px rgba(0, 240, 255, 0.25) inset; }
+      #title .controls { max-width: min(640px, 52vw); }
       #title-sub {
         margin-top: 14px;
         font-size: clamp(11px, 1.15vw, 16px);
@@ -145,21 +150,6 @@
       }
 
       /* ---------------- Title deploy prompt & pause ---------------- */
-      #title-start {
-        margin-top: 34px;
-        display: inline-block;
-        font-family: var(--mono-font);
-        font-size: 13px;
-        letter-spacing: 0.4em;
-        padding: 12px 22px;
-        border: 1px solid rgba(0, 240, 255, 0.7);
-        color: #e8fbff;
-        background: rgba(0, 240, 255, 0.08);
-        box-shadow: 0 0 18px rgba(0, 240, 255, 0.25) inset;
-        cursor: pointer;
-        pointer-events: auto;
-        animation: pulse 1.8s ease-in-out infinite;
-      }
       @keyframes pulse {
         50% { box-shadow: 0 0 28px rgba(0, 240, 255, 0.55) inset; }
       }
@@ -211,6 +201,17 @@
         cursor: default;
       }
       .panel.hidden { display: none; }
+      /* 5B-5 drawers (title): SETTINGS / PROTOCOL slide in from the right; nothing overlaps the left title block. */
+      .panel.drawer {
+        right: 0; top: 0; bottom: 0; width: min(440px, 92vw); padding: 7vh 22px 22px; overflow-y: auto;
+        border-width: 0 0 0 1px; background: rgba(5, 7, 14, 0.86); backdrop-filter: blur(4px);
+        transform: translateX(105%); visibility: hidden; transition: transform 0.28s ease, visibility 0s linear 0.28s;
+      }
+      .panel.drawer.open { transform: none; visibility: visible; transition: transform 0.28s ease; }
+      .panel .drawer-close { display: none; position: absolute; top: 16px; right: 18px; }
+      .panel.drawer .drawer-close { display: block; }
+      #settings.drawer { right: 0; bottom: 0; width: min(440px, 92vw); }
+      #protocol.drawer { right: 0; top: 0; width: min(440px, 92vw); }
       .panel .ptitle { font-size: 10px; letter-spacing: 0.4em; color: var(--wallrun-cyan); margin: 2px 0 8px; }
       .panel .ptitle:not(:first-child) { margin-top: 12px; }
       #settings { right: 4vw; bottom: 9vh; width: 430px; }
@@ -250,7 +251,8 @@
       #hud { position: fixed; inset: 0; pointer-events: none; z-index: 20; display: none; font-family: var(--mono-font); }
       #hud.visible { display: block; }
       #xh { position: absolute; left: 50%; top: 50%; width: 200px; height: 200px; transform: translate(-50%, -50%); overflow: visible; }
-      #xh .ret { fill: none; stroke: rgba(240, 252, 255, 0.92); stroke-width: 1.6; filter: drop-shadow(0 0 1px #000); }
+      #xh .ret { fill: none; stroke: rgba(240, 252, 255, 0.92); stroke-width: 1.6; filter: drop-shadow(0 0 1px #000); transition: transform 0.04s linear; }
+      #xh .ret path, #xh .ret circle { vector-effect: non-scaling-stroke; }
       #xh .track { fill: none; stroke: rgba(160, 175, 190, 0.18); stroke-width: 3; }
       #xh .arc { fill: none; stroke-width: 3; stroke-linecap: butt; transition: stroke 0.12s; }
       #xh .arc.ready { stroke: #00f0ff; filter: drop-shadow(0 0 3px rgba(0, 240, 255, 0.8)); }
@@ -268,6 +270,17 @@
       }
       #xh-anchor.strong { width: 16px; height: 16px; border: 3px solid #ffd35a; box-shadow: 0 0 12px rgba(255, 184, 0, 0.95), inset 0 0 6px rgba(255, 184, 0, 0.7); }
       #hp { position: absolute; left: 32px; bottom: 28px; width: 240px; }
+      /* 5B-5 helmet-visor depth: side panels tilt toward the centre; faint optical scales on both edges. */
+      #hp, #spd { transform: perspective(900px) rotateY(5deg); transform-origin: left center; }
+      #dock { transform: perspective(900px) rotateY(-5deg); transform-origin: right center; }
+      .visor { position: absolute; top: 28vh; height: 44vh; width: 14px; opacity: 0.14; pointer-events: none;
+        background: repeating-linear-gradient(to bottom, #00f0ff 0 1px, transparent 1px 10px); }
+      .visor::after { content: ''; position: absolute; top: 0; bottom: 0; width: 6px;
+        background: repeating-linear-gradient(to bottom, #00f0ff 0 2px, transparent 2px 50px); }
+      #visor-l { left: 10px; }
+      #visor-l::after { left: 14px; }
+      #visor-r { right: 10px; transform: scaleX(-1); }
+      #visor-r::after { left: 14px; }
       #hp .label { font-size: 10px; letter-spacing: 0.3em; color: rgba(232, 246, 255, 0.6); display: flex; justify-content: space-between; }
       #hp-num { font-size: 18px; letter-spacing: 0.05em; color: #f4fdff; }
       #hp .bar { position: relative; height: 10px; margin-top: 4px; background: rgba(20, 26, 36, 0.75); border: 1px solid rgba(232, 246, 255, 0.25); }
@@ -478,15 +491,52 @@
     <div id="app"></div>
     <div id="loading">GENERATING CITY</div>
     <div id="title">
-      <div id="title-name"></div>
+      <div id="title-name">
+        <svg id="logo" viewBox="-28 -12 1086 106" role="img" aria-label="STRAND // PROTOCOL">
+          <defs>
+            <linearGradient id="lg-steel" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0" stop-color="#ffffff" />
+              <stop offset="0.55" stop-color="#d9f7ff" />
+              <stop offset="1" stop-color="#7fe7ff" />
+            </linearGradient>
+            <linearGradient id="lg-cyan" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#b9fbff" /><stop offset="1" stop-color="#00f0ff" /></linearGradient>
+            <linearGradient id="lg-red" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#ff8aa0" /><stop offset="1" stop-color="#ff1e42" /></linearGradient>
+            <filter id="lg-glow" x="-20%" y="-40%" width="140%" height="180%">
+              <feGaussianBlur stdDeviation="5" result="b" />
+              <feMerge><feMergeNode in="b" /><feMergeNode in="SourceGraphic" /></feMerge>
+            </filter>
+            <mask id="lg-cut" maskUnits="userSpaceOnUse" x="-60" y="-20" width="1200" height="140">
+              <rect x="-60" y="-20" width="1200" height="140" fill="#fff" />
+              <rect x="-60" y="38.5" width="1200" height="3.2" fill="#000" />
+              <polygon points="140,-20 152,-20 92,120 80,120" fill="#000" />
+              <polygon points="760,-20 772,-20 712,120 700,120" fill="#000" />
+            </mask>
+          </defs>
+          <g transform="skewX(-12)">
+            <g mask="url(#lg-cut)">
+              <path d="M0 0 L56 0 L56 14 L0 14 Z M0 0 L14 0 L14 44 L0 44 Z M0 33 L56 33 L56 47 L0 47 Z M42 36 L56 36 L56 80 L42 80 Z M0 66 L56 66 L56 80 L0 80 Z M68 0 L124 0 L124 14 L68 14 Z M89 0 L103 0 L103 80 L89 80 Z M136 0 L150 0 L150 80 L136 80 Z M136 0 L180 0 L192 12 L192 36 L180 47 L136 47 Z M150 33 L176 33 L178 31 L178 16 L176 14 L150 14 Z M162 47 L176 47 L192 80 L178 80 Z M220 0 L244 0 L260 16 L260 80 L246 80 L246 54 L218 54 L218 80 L204 80 L204 16 Z M218 20 L218 40 L246 40 L246 20 L240 14 L224 14 Z M272 0 L286 0 L286 80 L272 80 Z M314 0 L328 0 L328 80 L314 80 Z M272 0 L288 0 L328 80 L312 80 Z M340 0 L380 0 L396 16 L396 64 L380 80 L340 80 Z M354 66 L374 66 L382 58 L382 22 L374 14 L354 14 Z" fill="url(#lg-steel)" />
+              <path d="M506 0 L520 0 L520 80 L506 80 Z M506 0 L550 0 L562 12 L562 38 L550 49 L506 49 Z M520 35 L546 35 L548 33 L548 16 L546 14 L520 14 Z M574 0 L588 0 L588 80 L574 80 Z M574 0 L618 0 L630 12 L630 36 L618 47 L574 47 Z M588 33 L614 33 L616 31 L616 16 L614 14 L588 14 Z M600 47 L614 47 L630 80 L616 80 Z M654 0 L686 0 L698 12 L698 68 L686 80 L654 80 L642 68 L642 12 Z M656 20 L656 60 L662 66 L678 66 L684 60 L684 20 L678 14 L662 14 Z M710 0 L766 0 L766 14 L710 14 Z M731 0 L745 0 L745 80 L731 80 Z M790 0 L822 0 L834 12 L834 68 L822 80 L790 80 L778 68 L778 12 Z M792 20 L792 60 L798 66 L814 66 L820 60 L820 20 L814 14 L798 14 Z M858 0 L902 0 L902 14 L866 14 L860 20 L860 60 L866 66 L902 66 L902 80 L858 80 L846 68 L846 12 Z M926 0 L958 0 L970 12 L970 68 L958 80 L926 80 L914 68 L914 12 Z M928 20 L928 60 L934 66 L950 66 L956 60 L956 20 L950 14 L934 14 Z M982 0 L996 0 L996 80 L982 80 Z M982 66 L1036 66 L1036 80 L982 80 Z" fill="url(#lg-steel)" />
+            </g>
+            <g filter="url(#lg-glow)">
+              <polygon points="422,80 452,0 468,0 438,80" fill="url(#lg-cyan)" />
+              <polygon points="456,80 486,0 502,0 472,80" fill="url(#lg-red)" />
+            </g>
+            <rect x="0" y="88" width="418" height="3" fill="#00f0ff" opacity="0.85" />
+            <rect x="506" y="88" width="560" height="3" fill="#ff1e42" opacity="0.75" />
+          </g>
+        </svg>
+      </div>
       <div id="title-sub"></div>
       <div class="rule"></div>
       <div id="title-sector"></div>
-      <div id="title-start">CLICK TO DEPLOY</div>
+      <div id="title-menu">
+        <button id="title-start" class="tbtn primary" type="button">DEPLOY</button>
+        <button id="title-protocol-btn" class="tbtn" type="button">PROTOCOL</button>
+        <button id="title-settings-btn" class="tbtn" type="button">SETTINGS</button>
+      </div>
       <div class="controls">
-        <b>WASD</b> MOVE · <b>MOUSE</b> LOOK · <b>SPACE</b> JUMP / WALL-KICK / RELEASE · <b>C / L-CTRL</b> SLIDE / CUT<br />
-        <b>LMB</b> FIRE / LAUNCH STRAND (HOLD = REEL) · <b>RMB</b> TACTICAL ZOOM (+ AIR BULLET-TIME) · <b>Q / MOUSE 4</b> GUN ⇄ STRAND<br />
-        <b>1-4 / WHEEL</b> SELECT · <b>R</b> RELOAD · <b>ESC / TAB</b> PAUSE · <b>F</b> FULLSCREEN (Ctrl+W SAFE)
+        <b>WASD</b> MOVE · <b>SPACE</b> JUMP / KICK · <b>CTRL</b> SLIDE · <b>LMB</b> FIRE / STRAND · <b>RMB</b> ZOOM (+ AIR BULLET-TIME)<br />
+        <b>Q</b> GUN ⇄ STRAND · <b>1-4</b> SELECT · <b>R</b> RELOAD · <b>ESC</b> PAUSE · <b>F</b> FULLSCREEN
       </div>
     </div>
     <div id="pause">
@@ -501,6 +551,7 @@
       </div>
     </div>
     <div id="settings" class="panel">
+      <button class="btn drawer-close" type="button" data-drawer="settings">✕ CLOSE</button>
       <div class="ptitle">SETTINGS // ACCESSIBILITY</div>
       <div class="row">
         <label for="sens-range">MOUSE SENSITIVITY</label>
@@ -516,6 +567,7 @@
       <div class="row"><label for="set-vol">MASTER VOLUME</label><input id="set-vol" type="range" min="0" max="100" step="1" value="80" /><span class="val" id="set-vol-val">80</span></div>
     </div>
     <div id="protocol" class="panel">
+      <button class="btn drawer-close" type="button" data-drawer="protocol">✕ CLOSE</button>
       <div class="ptitle">RECORDS</div>
       <div id="records"></div>
       <div class="ptitle">CHALLENGE MODIFIERS</div>
@@ -543,6 +595,8 @@
     </div>
     <div id="fader"></div>
     <div id="hud">
+      <div class="visor" id="visor-l"></div>
+      <div class="visor" id="visor-r"></div>
       <svg id="xh" viewBox="-100 -100 200 200">
         <g id="ret-pistol" class="ret">
           <path d="M0 -5 V-12 M0 5 V12 M-5 0 H-12 M5 0 H12" />

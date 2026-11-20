@@ -434,6 +434,63 @@ export const QUALITY_PRESETS: Readonly<Record<QualityPreset, QualityDef>> = {
 // ---------------------------------------------------------------------------
 // §9.2 Performance limits
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Phase 5B — art pass (PHASE5_BRUSHUP_PLAN.md 5B-1 … 5B-5). Draw calls stay ≤ 120.
+// ---------------------------------------------------------------------------
+/** 5B-1: point / line accents above the 0.92 bloom threshold (window walls stay ≤ 0.28). */
+export const NEON_BLOOM = {
+  SIGN: 1.38,
+  LAMP_HEAD: 1.45,
+  LAMP_RING: 1.3,
+  HOVER_TRAIL: 1.55,
+  AVIATION_PEAK: 1.6,
+  UNDERSIDE_STRIP: 1.6,
+  /** Soft additive halo around every lamp head: radius 2.2 m, alpha 0.28 · exp(−r² · 3.5). */
+  LAMP_HALO_RADIUS_M: 2.2,
+  LAMP_HALO_FALLOFF: 3.5,
+  LAMP_HALO_OPACITY: 0.28,
+} as const;
+
+/** 5B-2: ground AO (0 → 2.6 m) and the low-rise city bounce / high moonlight gradient on tower walls. */
+export const CITY_SHADING = {
+  AO_HEIGHT_M: 2.6,
+  AO_MIN: 0.45,
+  BOUNCE_TOP_M: 16,
+  BOUNCE_COLOR: 0x5a2a8c,
+  BOUNCE_STRENGTH: 0.07,
+  MOON_FROM_M: 40,
+  MOON_TO_M: 95,
+  MOON_COLOR: 0x8fb4e6,
+  MOON_STRENGTH: 0.05,
+  /** City lights are evaluated on walls only up to this height (they reach ≈ 36 m). */
+  WALL_LIGHT_MAX_Y: 40,
+} as const;
+
+/** 5B-3: tower silhouettes, canopies, fins, steam. */
+export const SILHOUETTE = {
+  SETBACK_MIN_ROOF_M: 45,
+  SETBACK_CHANCE: 0.6,
+  SETBACK_AT_MIN: 0.65,
+  SETBACK_AT_MAX: 0.8,
+  SETBACK_SCALE_MIN: 0.65,
+  SETBACK_SCALE_MAX: 0.78,
+  /** Upper tier must start above every sky-bridge / mid-level panel / Layer-2 sign (≤ 35 m). */
+  SETBACK_MIN_Y: 36,
+  SETBACK_MIN_UPPER_M: 9,
+  CROWN_MIN_ROOF_M: 50,
+  CANOPY_Y: 4.2,
+  CANOPY_DEPTH_M: 1.4,
+  STEAM_MIN: 40,
+  STEAM_MAX: 60,
+} as const;
+
+/** 5B-4: hot impact scorch decals. */
+export const SCORCH = {
+  POOL: 48,
+  COOL_S: 0.85,
+  SIZE_M: 0.34,
+} as const;
+
 export const LIMITS = {
   DRAW_CALLS_PER_FRAME: 120,
   FAR_BUILDINGS: 100,

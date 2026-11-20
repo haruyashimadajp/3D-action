@@ -8,6 +8,8 @@
  *  - Wet road atlas (512²): lanes, centre line, white dashes, crosswalk, manholes, puddles
  *  - Cyan wall-run panel (512²): Albedo / Emissive (strips + chevrons) / Roughness / Normal
  *  - Hologram neon sign atlas (1024²): 8 vertical katakana / English-symbol strips
+ *  - Sign atlas (1024², 5B-3): 6 wide banners + 2 seamless scrolling LED tickers, 8 emblems / holograms
+ *  - Tactical tech PBR set (512², 5B-4): carbon weave, panel grooves, screw heads, edge wear, brushed metal
  *  - Rooftop machinery (256²): AC-unit fan grille Albedo / Roughness / Normal
  */
 import * as THREE from 'three';
@@ -41,7 +43,17 @@ export interface ProceduralTextureLibrary {
   neonAtlas: THREE.Texture;
   /** Number of strips in the neon atlas (u is split evenly). */
   neonAtlasStrips: number;
+  /**
+   * 5B-3 sign atlas (1024²): top half = 8 wide banner rows (1024 × 64; rows 6–7 are seamless scrolling
+   * tickers), bottom half = 4 × 2 corporate emblems / geometric holograms (256²).
+   */
+  signAtlas: THREE.Texture;
+  /** 5B-4 shared tactical tech PBR set (512²): carbon weave, panel grooves, edge wear, brushed metal. */
+  tech: PbrTextureSet;
 }
+
+/** Rows in the wide-banner half of the sign atlas and emblem cells (4 × 2). */
+export const SIGN_ATLAS = { WIDE_ROWS: 8, SCROLL_ROWS: [6, 7] as readonly number[], EMBLEMS: 8 } as const;
 
 // ---------------------------------------------------------------------------
 // Low-level helpers
@@ -1054,6 +1066,290 @@ function generateNeonAtlas(anisotropy: number): THREE.Texture {
 }
 
 // ---------------------------------------------------------------------------
+// 4b. Sign atlas (5B-3): wide banners + scrolling tickers (top) and emblems (bottom), 1024²
+// ---------------------------------------------------------------------------
+const WIDE_SIGNS: ReadonlyArray<{ text: string; color: string; glow: string }> = [
+  { text: 'ラーメン 24H ◆ NEON NOODLE', color: '#ffd28a', glow: '#ffa21f' },
+  { text: 'OMEGA//CORP — STRAND SYSTEMS', color: '#aefcff', glow: '#00f0ff' },
+  { text: 'サイバー薬局 PHARMA+', color: '#9dffc8', glow: '#39ff88' },
+  { text: 'HOTEL 九龍 ◆ VACANCY', color: '#ff9ef0', glow: '#ff2bd6' },
+  { text: 'KARAOKE カラオケ ▶ BAR', color: '#d6a8ff', glow: '#b44bff' },
+  { text: 'EXPRESS 09 ▶▶ EXIT 4B', color: '#7ff8ff', glow: '#38f8ff' },
+  { text: '▶ SECTOR LOCKDOWN ▶ STAY INDOORS ▶ CURFEW 23:00 ', color: '#ffc96a', glow: '#ffa21f' },
+  { text: '◆ VALKYRIE-09 SIGHTED ◆ ネオン市 警報 ◆ GRID 480 ', color: '#ff86b0', glow: '#ff2b6d' },
+];
+
+function generateSignAtlas(anisotropy: number): THREE.Texture {
+  const W = 1024;
+  const H = 1024;
+  const RH = 64;
+  const [c, ctx] = makeCanvas(W, H);
+  ctx.clearRect(0, 0, W, H);
+  const font = "'Hiragino Kaku Gothic ProN','Yu Gothic','Meiryo','Noto Sans CJK JP','Noto Sans JP','Arial Black',sans-serif";
+  const glowText = (text: string, x: number, y: number, color: string, glow: string, align: CanvasTextAlign): void => {
+    ctx.textAlign = align;
+    ctx.save();
+    ctx.shadowColor = glow;
+    ctx.shadowBlur = 16;
+    ctx.fillStyle = glow;
+    ctx.fillText(text, x, y);
+    ctx.shadowBlur = 5;
+    ctx.fillStyle = color;
+    ctx.fillText(text, x, y);
+    ctx.restore();
+  };
+  // ---- Wide banners (rows 0–5) and seamless tickers (rows 6–7).
+  WIDE_SIGNS.forEach((def, r) => {
+    const y0 = r * RH;
+    const scroll = SIGN_ATLAS.SCROLL_ROWS.includes(r);
+    ctx.fillStyle = scroll ? 'rgba(4,6,12,0.82)' : 'rgba(8,10,18,0.6)';
+    ctx.fillRect(2, y0 + 3, W - 4, RH - 6);
+    ctx.textBaseline = 'middle';
+    if (scroll) {
+      // LED dot-matrix ticker: the text tiles every W px so a fract(u + t) scroll never shows a seam.
+      ctx.font = `800 ${RH * 0.56}px ${font}`;
+      const tw = ctx.measureText(def.text).width;
+      const reps = Math.max(1, Math.round(W / tw));
+      const step = W / reps;
+      for (let k = 0; k <= reps; k++) glowText(def.text, k * step, y0 + RH / 2, def.color, def.glow, 'left');
+      ctx.fillStyle = 'rgba(0,0,0,0.55)';
+      for (let x = 0; x < W; x += 4) ctx.fillRect(x, y0, 1, RH);
+      for (let y = y0; y < y0 + RH; y += 4) ctx.fillRect(0, y, W, 1);
+    } else {
+      ctx.save();
+      ctx.shadowColor = def.glow;
+      ctx.shadowBlur = 12;
+      ctx.strokeStyle = def.color;
+      ctx.lineWidth = 3;
+      ctx.strokeRect(8, y0 + 8, W - 16, RH - 16);
+      ctx.restore();
+      ctx.font = `900 ${RH * 0.5}px ${font}`;
+      glowText(def.text, W / 2, y0 + RH / 2 + 1, def.color, def.glow, 'center');
+    }
+  });
+  // ---- Emblems (bottom half: 4 × 2 cells of 256²).
+  const E = 256;
+  const emblem = (i: number, draw: (cx: number, cy: number, r: number) => void, color: string, glow: string): void => {
+    const cx = (i % 4) * E + E / 2;
+    const cy = 512 + Math.floor(i / 4) * E + E / 2;
+    ctx.save();
+    ctx.shadowColor = glow;
+    ctx.shadowBlur = 20;
+    ctx.strokeStyle = color;
+    ctx.fillStyle = color;
+    ctx.lineWidth = 9;
+    draw(cx, cy, E * 0.38);
+    ctx.restore();
+  };
+  const poly = (cx: number, cy: number, r: number, n: number, rot: number): void => {
+    ctx.beginPath();
+    for (let k = 0; k <= n; k++) {
+      const a = rot + (k / n) * Math.PI * 2;
+      if (k === 0) ctx.moveTo(cx + Math.cos(a) * r, cy + Math.sin(a) * r);
+      else ctx.lineTo(cx + Math.cos(a) * r, cy + Math.sin(a) * r);
+    }
+    ctx.stroke();
+  };
+  // 0 concentric ring logo
+  emblem(0, (cx, cy, r) => {
+    for (const k of [1, 0.66, 0.33]) {
+      ctx.beginPath();
+      ctx.arc(cx, cy, r * k, 0.3, Math.PI * 2 - 0.3);
+      ctx.stroke();
+    }
+  }, '#aefcff', '#00f0ff');
+  // 1 hexagon corporate logo with inner Y
+  emblem(1, (cx, cy, r) => {
+    poly(cx, cy, r, 6, Math.PI / 6);
+    poly(cx, cy, r * 0.62, 6, Math.PI / 6);
+    ctx.beginPath();
+    ctx.moveTo(cx, cy);
+    ctx.lineTo(cx, cy + r * 0.62);
+    ctx.moveTo(cx, cy);
+    ctx.lineTo(cx - r * 0.54, cy - r * 0.31);
+    ctx.moveTo(cx, cy);
+    ctx.lineTo(cx + r * 0.54, cy - r * 0.31);
+    ctx.stroke();
+  }, '#ff9ef0', '#ff2bd6');
+  // 2 warning triangle
+  emblem(2, (cx, cy, r) => {
+    poly(cx, cy + r * 0.15, r, 3, -Math.PI / 2);
+    ctx.fillRect(cx - 7, cy - r * 0.35, 14, r * 0.6);
+    ctx.fillRect(cx - 7, cy + r * 0.38, 14, 14);
+  }, '#ffd28a', '#ffa21f');
+  // 3 barcode
+  emblem(3, (cx, cy, r) => {
+    let x = cx - r;
+    let k = 0;
+    while (x < cx + r) {
+      const w = 3 + ((k * 7919) % 5) * 3;
+      if (k % 2 === 0) ctx.fillRect(x, cy - r * 0.7, w, r * 1.2);
+      x += w + 3;
+      k++;
+    }
+    ctx.font = `800 ${Math.floor(r * 0.3)}px monospace`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('0x09-480', cx, cy + r * 0.82);
+  }, '#9dffc8', '#39ff88');
+  // 4 waveform graph
+  emblem(4, (cx, cy, r) => {
+    ctx.strokeRect(cx - r, cy - r * 0.7, r * 2, r * 1.4);
+    ctx.lineWidth = 6;
+    ctx.beginPath();
+    for (let k = 0; k <= 40; k++) {
+      const x = cx - r + (k / 40) * r * 2;
+      const y = cy + Math.sin(k * 0.7) * Math.cos(k * 0.23) * r * 0.5;
+      if (k === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+  }, '#7ff8ff', '#38f8ff');
+  // 5 target reticle
+  emblem(5, (cx, cy, r) => {
+    ctx.beginPath();
+    ctx.arc(cx, cy, r, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(cx, cy, r * 0.45, 0, Math.PI * 2);
+    ctx.stroke();
+    for (let k = 0; k < 4; k++) {
+      const a = (k * Math.PI) / 2;
+      ctx.beginPath();
+      ctx.moveTo(cx + Math.cos(a) * r * 0.6, cy + Math.sin(a) * r * 0.6);
+      ctx.lineTo(cx + Math.cos(a) * r * 1.15, cy + Math.sin(a) * r * 1.15);
+      ctx.stroke();
+    }
+  }, '#ff86b0', '#ff2b6d');
+  // 6 kanji seal 零
+  emblem(6, (cx, cy, r) => {
+    ctx.strokeRect(cx - r, cy - r, r * 2, r * 2);
+    ctx.font = `900 ${Math.floor(r * 1.5)}px ${font}`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('零', cx, cy + 4);
+  }, '#d6a8ff', '#b44bff');
+  // 7 chevron arrows
+  emblem(7, (cx, cy, r) => {
+    for (let k = -1; k <= 1; k++) {
+      ctx.beginPath();
+      ctx.moveTo(cx - r * 0.5 + k * r * 0.55, cy - r * 0.6);
+      ctx.lineTo(cx + k * r * 0.55, cy);
+      ctx.lineTo(cx - r * 0.5 + k * r * 0.55, cy + r * 0.6);
+      ctx.stroke();
+    }
+  }, '#aefcff', '#00f0ff');
+  const tex = finalizeTexture(c, THREE.SRGBColorSpace, anisotropy, false);
+  tex.wrapS = THREE.RepeatWrapping; // tickers scroll along u
+  tex.premultiplyAlpha = false;
+  return tex;
+}
+
+// ---------------------------------------------------------------------------
+// 4c. Tactical tech PBR set (5B-4, 512²): carbon weave, machined panel grooves, edge wear, brushed metal.
+//     Shared by the first-person weapons / arm armour and the enemy armour batch.
+// ---------------------------------------------------------------------------
+function generateTechSet(anisotropy: number): PbrTextureSet {
+  const S = 512;
+  const [albC, alb] = makeCanvas(S, S);
+  const [rghC, rgh] = makeCanvas(S, S);
+  const [, hgt] = makeCanvas(S, S);
+  const rng = createRng(0x7ec4);
+  // Base: neutral mid grey so per-part colours (material colour / instance colour) still read.
+  alb.fillStyle = '#b9bec6';
+  alb.fillRect(0, 0, S, S);
+  rgh.fillStyle = grayCss(0.42);
+  rgh.fillRect(0, 0, S, S);
+  hgt.fillStyle = grayCss(0.6);
+  hgt.fillRect(0, 0, S, S);
+  // Brushed metal: fine horizontal streaks.
+  for (let i = 0; i < 1400; i++) {
+    const y = rng() * S;
+    const x = rng() * S;
+    const len = 30 + rng() * 140;
+    const v = 0.5 + rng() * 0.25;
+    alb.fillStyle = `rgba(${Math.round(255 * v)},${Math.round(255 * v)},${Math.round(255 * v)},0.12)`;
+    alb.fillRect(x, y, len, 1);
+    rgh.fillStyle = grayCss(0.3 + rng() * 0.25);
+    rgh.globalAlpha = 0.25;
+    rgh.fillRect(x, y, len, 1);
+    rgh.globalAlpha = 1;
+  }
+  // Carbon weave patches (2 × 2 twill) in alternating panels.
+  const cell = 8;
+  for (let py = 0; py < S; py += 128) {
+    for (let px = 0; px < S; px += 128) {
+      if (((px + py) / 128) % 2 !== 0) continue;
+      for (let y = py; y < py + 128; y += cell) {
+        for (let x = px; x < px + 128; x += cell) {
+          const k = ((x - px) / cell + (y - py) / cell) % 4 < 2;
+          alb.fillStyle = k ? 'rgba(40,44,52,0.55)' : 'rgba(70,76,88,0.5)';
+          alb.fillRect(x, y, cell, cell);
+          hgt.fillStyle = grayCss(k ? 0.62 : 0.54);
+          hgt.fillRect(x, y, cell, cell);
+          rgh.fillStyle = grayCss(k ? 0.36 : 0.5);
+          rgh.fillRect(x, y, cell, cell);
+        }
+      }
+    }
+  }
+  // Machined panel grooves (seams every 128 px + random sub-panels) with highlighted, worn edges.
+  const groove = (x0: number, y0: number, x1: number, y1: number): void => {
+    hgt.fillStyle = grayCss(0.18);
+    alb.fillStyle = 'rgba(18,20,26,0.9)';
+    if (x0 === x1) {
+      hgt.fillRect(x0 - 1, y0, 3, y1 - y0);
+      alb.fillRect(x0 - 1, y0, 3, y1 - y0);
+      alb.fillStyle = 'rgba(235,240,248,0.35)';
+      alb.fillRect(x0 + 2, y0, 1, y1 - y0);
+    } else {
+      hgt.fillRect(x0, y0 - 1, x1 - x0, 3);
+      alb.fillRect(x0, y0 - 1, x1 - x0, 3);
+      alb.fillStyle = 'rgba(235,240,248,0.35)';
+      alb.fillRect(x0, y0 + 2, x1 - x0, 1);
+    }
+  };
+  for (let k = 0; k <= S; k += 128) {
+    groove(k, 0, k, S);
+    groove(0, k, S, k);
+  }
+  for (let i = 0; i < 18; i++) {
+    const x = Math.floor(rng() * 4) * 128 + 16 + Math.floor(rng() * 6) * 16;
+    const y = Math.floor(rng() * 4) * 128 + 16 + Math.floor(rng() * 6) * 16;
+    const w = 24 + Math.floor(rng() * 5) * 8;
+    const h = 24 + Math.floor(rng() * 5) * 8;
+    groove(x, y, x + w, y);
+    groove(x, y + h, x + w, y + h);
+    groove(x, y, x, y + h);
+    groove(x + w, y, x + w, y + h);
+    // Recessed screw heads at the corners.
+    for (const [sx, sy] of [[x + 5, y + 5], [x + w - 5, y + 5], [x + 5, y + h - 5], [x + w - 5, y + h - 5]]) {
+      hgt.fillStyle = grayCss(0.3);
+      hgt.beginPath();
+      hgt.arc(sx, sy, 2.4, 0, Math.PI * 2);
+      hgt.fill();
+    }
+  }
+  // Edge wear: bright scuffs along seams, lower roughness where polished.
+  for (let i = 0; i < 260; i++) {
+    const onX = rng() < 0.5;
+    const line = Math.floor(rng() * 5) * 128;
+    const t = rng() * S;
+    const x = onX ? line + (rng() - 0.5) * 6 : t;
+    const y = onX ? t : line + (rng() - 0.5) * 6;
+    alb.fillStyle = 'rgba(240,244,250,0.22)';
+    alb.fillRect(x, y, onX ? 2 : 6 + rng() * 14, onX ? 6 + rng() * 14 : 2);
+    rgh.fillStyle = grayCss(0.18);
+    rgh.fillRect(x, y, onX ? 2 : 10, onX ? 10 : 2);
+  }
+  return {
+    map: finalizeTexture(albC, THREE.SRGBColorSpace, anisotropy),
+    roughnessMap: finalizeTexture(rghC, THREE.NoColorSpace, anisotropy),
+    normalMap: normalTextureFromHeight(hgt, S, S, 2.4, anisotropy),
+  };
+}
+
+// ---------------------------------------------------------------------------
 // 5. Rooftop machinery: AC-unit fan grille (256²)
 // ---------------------------------------------------------------------------
 function generateMachinerySet(anisotropy: number): PbrTextureSet {
@@ -1137,6 +1433,8 @@ export function getProceduralTextures(renderer: THREE.WebGLRenderer): Procedural
     machinery: generateMachinerySet(aniso),
     neonAtlas: generateNeonAtlas(aniso),
     neonAtlasStrips: NEON_STRIPS.length,
+    signAtlas: generateSignAtlas(aniso),
+    tech: generateTechSet(aniso),
   };
   return cache;
 }

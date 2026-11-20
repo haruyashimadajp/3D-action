@@ -294,6 +294,9 @@ const _trkBoss = new Uint8Array(HUD_MAX_TRACKS);
 const TRACK_EDGE_MARGIN_PX = 44;
 /** Volume-slider preview tick throttle (s). */
 const VOLUME_TICK_S = 0.06;
+/** 5B-5 speed lines: FLOW D / C intensity at ≥ 18 m/s and the on-ramp downhill slide boost. */
+const SPEEDLINE_LOW_RANK = 0.22;
+const SPEEDLINE_RAMP_BOOST = 0.2;
 
 /** Delay between the last kill and the skill modal / result screen (lets the kill juice play out). */
 const CLEAR_TO_MODAL_S = 1.0;
@@ -396,11 +399,12 @@ class App {
     const textures = getProceduralTextures(this.renderer.renderer);
     const t1 = performance.now();
     this.city = new CityBuilder(textures);
+    if (this.qualityOverride) this.city.setQuality(q as QualityPreset);
     this.renderer.scene.add(this.city.root);
     this.effects = new EffectsPool(this.renderer.scene);
 
     this.input = new InputManager(this.renderer.renderer.domElement);
-    this.viewModel = new ViewModelRenderer(this.renderer.viewModelScene, this.renderer.viewModelCamera);
+    this.viewModel = new ViewModelRenderer(this.renderer.viewModelScene, this.renderer.viewModelCamera, textures.tech);
     this.viewModel.root.visible = false;
     const audio = this.audio;
     this.player = new PlayerController(this.input, this.physics, {
@@ -514,6 +518,7 @@ class App {
       bossPhase: 1,
       bossDowned: false,
       zoom: 0,
+      reticleKick: 0,
       buffPierce: 0,
       buffZero: false,
       buffAdren: false,
@@ -571,7 +576,8 @@ class App {
 
     const titleEl = document.getElementById('title-name');
     const subEl = document.getElementById('title-sub');
-    if (titleEl) titleEl.textContent = GAME_TITLE;
+    // The wordmark is an inline SVG (5B-5); keep the name for assistive tech.
+    if (titleEl) titleEl.setAttribute('aria-label', GAME_TITLE);
     if (subEl) subEl.textContent = GAME_SUBTITLE;
     this.updateSectorLabel();
 
@@ -583,6 +589,13 @@ class App {
 
     // --- Screen flow ---
     document.getElementById('title-start')?.addEventListener('click', () => this.deploy());
+    for (const [id, name] of [['title-settings-btn', 'settings'], ['title-protocol-btn', 'protocol']] as const) {
+      document.getElementById(id)?.addEventListener('click', () => {
+        this.audio.init();
+        this.hud.toggleDrawer(name);
+        this.audio.uiTick();
+      });
+    }
     document.getElementById('pause')?.addEventListener('click', () => {
       this.audio.init();
       this.input.requestPointerLock();
@@ -623,7 +636,10 @@ class App {
         this.player.settings.baseFov = clamp(s.fov, CAMERA.FOV_SETTING_MIN, CAMERA.FOV_SETTING_MAX);
         break;
       case 'quality':
-        if (!this.qualityOverride) this.renderer.setQuality(s.quality);
+        if (!this.qualityOverride) {
+          this.renderer.setQuality(s.quality);
+          this.city.setQuality(s.quality);
+        }
         break;
       case 'volume':
         this.audio.setVolume(s.volume);
@@ -719,7 +735,8 @@ class App {
     pause?.classList.toggle('visible', s === 'PAUSED');
     pause?.classList.toggle('mini', s === 'PAUSED' && this.pauseMini);
     document.getElementById('title')?.classList.toggle('playing', s !== 'TITLE');
-    this.hud.showPanels(s === 'TITLE' || (s === 'PAUSED' && !this.pauseMini), s === 'TITLE');
+    // 5B-5: the title uses right-side drawers (SETTINGS / PROTOCOL buttons); the pause screen shows settings.
+    this.hud.showPanels(s === 'PAUSED' && !this.pauseMini, false, s === 'TITLE');
     this.hud.setVisible(s !== 'TITLE');
     this.hud.setDim(s === 'SKILL' || s === 'RESULT');
     this.viewModel.root.visible = s !== 'TITLE';
@@ -1230,12 +1247,15 @@ class App {
       fx.critical += ((this.player.isCritical && this.player.isAlive ? 1 : 0) - fx.critical) * lerpFactor(6, realDt);
       fx.zoom = this.equipment.zoomBlend;
       this.applyFlowRank(realDt);
-      // Speed lines (§6.2 Pass 4 · FLOW table): from rank B at ≥ 18 m/s, denser with rank, always dense at SSS.
+      // Speed lines (5B-5): from 18 m/s at every rank — faint 0.22 at D / C, stronger and denser B → SSS
+      // (always on at SSS); +0.2 while sliding down an on-ramp.
       const sp = this.player.speed;
       const rk = this.flowRankIndex;
-      const sl = rk >= 6 ? 1 : rk >= 2 ? clamp((sp - RENDER.SPEEDLINE_MIN_SPEED) / 14, 0, 1) * (0.35 + 0.13 * (rk - 2)) : 0;
+      const fast = clamp((sp - RENDER.SPEEDLINE_MIN_SPEED) / 14, 0, 1);
+      let sl = rk >= 6 ? 1 : rk >= 2 ? fast * (0.35 + 0.13 * (rk - 2)) : fast * SPEEDLINE_LOW_RANK;
+      if (this.player.isRampSliding && sp >= RENDER.SPEEDLINE_MIN_SPEED) sl = Math.min(1, sl + SPEEDLINE_RAMP_BOOST);
       fx.speedLines += (sl - fx.speedLines) * lerpFactor(8, realDt);
-      fx.speedLineDensity = rk >= 6 ? 1 : 0.3 + 0.1 * Math.max(0, rk - 2);
+      fx.speedLineDensity = rk >= 6 ? 1 : rk >= 2 ? 0.3 + 0.1 * (rk - 2) : 0.22;
       // 5A-6: magnetic boot taps every 0.22 s (simulation time) while wall-running.
       if (this.player.isWallRunning && this.player.isAlive) {
         this.wallStepTimer -= simDt;
@@ -1327,6 +1347,7 @@ class App {
     f.regenerating = p.isRegenerating;
     f.sinceShot = e.sinceShot;
     f.zoom = e.zoomBlend;
+    f.reticleKick = e.reticleKick;
     f.buffPierce = e.momentumShotsLeft;
     f.buffZero = this.skills.SK_11 > 0 && p.speedBoostActive;
     f.buffAdren = this.skills.SK_14 > 0 && p.isCritical && p.isAlive;

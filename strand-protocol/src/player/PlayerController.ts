@@ -292,6 +292,11 @@ export class PlayerController {
     return this.regenerating;
   }
 
+  /** Sliding downhill on an on-ramp (speed-line boost, 5B-5). */
+  get isRampSliding(): boolean {
+    return this.state === 'SLIDING' && this.move.rampIndex >= 0 && this.velocity.dot(this.move.downhill) > 1;
+  }
+
   /** SK_11 zero-time speed boost running (HUD buff tag). */
   get speedBoostActive(): boolean {
     return this.boostAmount > 0 && this.simTime < this.boostUntil;

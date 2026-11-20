@@ -16,9 +16,12 @@
  *  - GRAZE (§5.1-3): every enemy round tracks its closest approach to the player's body axis; when it passes
  *    the player without hitting and the closest distance was 0.45 m … 1.35 m, a single GRAZE fires — after one
  *    line-of-sight check from the chest to the closest point (a round passing behind cover never counts, 5A-5).
+ *  - 5B-4 scorch decals: 48 hot impact marks in ONE InstancedMesh (ring buffer) lying on the hit normal;
+ *    white-hot orange (enemy rounds: crimson-hot) with an energy-cyan rim, cooling to dark red and gone in
+ *    0.85 s of simulation time — all colour / fade work is done in the shader.
  */
 import * as THREE from 'three';
-import { COLORS, JUICE, LIMITS, RENDER, TELEGRAPH, createRng } from '../config/constants';
+import { COLORS, JUICE, LIMITS, RENDER, SCORCH, TELEGRAPH, createRng } from '../config/constants';
 import {
   type HitboxTarget,
   type HitRegion,
@@ -37,6 +40,7 @@ const _q = new THREE.Quaternion();
 const _s = new THREE.Vector3();
 const _c = new THREE.Color();
 const Z_AXIS = new THREE.Vector3(0, 0, 1);
+const _qSpin = new THREE.Quaternion();
 const _worldHit = createRayHit();
 const _targetHit = createTargetHit();
 const _chest = new THREE.Vector3();
@@ -232,6 +236,11 @@ export class EffectsPool {
 
   // ---- shock rings / prediction circles (24-ring pool) ----
   readonly rings: THREE.InstancedMesh;
+  /** 5B-4 hot impact scorch decals (ring buffer). */
+  private readonly scorch: THREE.InstancedMesh;
+  private readonly scorchAttr: THREE.InstancedBufferAttribute;
+  private readonly scorchTime = { value: 0 };
+  private scorchNext = 0;
   private readonly rActive = new Uint8Array(R_CAP);
   /** 0 = timed expanding shock ring, 1 = persistent (caller-driven) prediction circle. */
   private readonly rPersistent = new Uint8Array(R_CAP);
@@ -457,6 +466,76 @@ export class EffectsPool {
     this.rings.renderOrder = 21;
     this.rings.setColorAt(0, _c.setRGB(1, 1, 1));
     scene.add(this.rings);
+
+    // ---- 5B-4 scorch decals: aScorch = (birth sim time, owner 0 player / 1 enemy, seed) ----
+    const scGeo = new THREE.PlaneGeometry(1, 1);
+    this.scorchAttr = new THREE.InstancedBufferAttribute(new Float32Array(SCORCH.POOL * 3).fill(-1e6), 3);
+    scGeo.setAttribute('aScorch', this.scorchAttr);
+    const scMat = new THREE.ShaderMaterial({
+      transparent: true,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+      polygonOffset: true,
+      polygonOffsetFactor: -4,
+      polygonOffsetUnits: -8,
+      uniforms: { uTime: this.scorchTime, uCool: { value: SCORCH.COOL_S }, uRim: { value: new THREE.Color(COLORS.PLAYER_STRAND) } },
+      vertexShader: /* glsl */ `
+        attribute vec3 aScorch;
+        varying vec2 vUv; varying vec3 vSc;
+        void main() {
+          vUv = uv;
+          vSc = aScorch;
+          gl_Position = projectionMatrix * viewMatrix * modelMatrix * instanceMatrix * vec4(position, 1.0);
+        }
+      `,
+      fragmentShader: /* glsl */ `
+        uniform float uTime; uniform float uCool; uniform vec3 uRim;
+        varying vec2 vUv; varying vec3 vSc;
+        float h12(vec2 p) { vec3 p3 = fract(vec3(p.xyx) * 0.1031); p3 += dot(p3, p3.yzx + 33.33); return fract((p3.x + p3.y) * p3.z); }
+        void main() {
+          float age = (uTime - vSc.x) / uCool;
+          if (age < 0.0 || age > 1.0) discard;
+          vec2 c = vUv - 0.5;
+          float r = length(c) * 2.0;
+          // Jagged burn edge.
+          float ang = atan(c.y, c.x);
+          float edge = 0.78 + 0.22 * h12(vec2(floor(ang * 5.0 + vSc.z * 40.0), vSc.z * 13.0));
+          float mask = 1.0 - smoothstep(edge * 0.55, edge, r);
+          float core = exp(-r * r * 9.0);
+          vec3 hot = vSc.y > 0.5 ? vec3(1.0, 0.32, 0.22) : vec3(1.0, 0.72, 0.38);
+          vec3 cold = vec3(0.32, 0.03, 0.015);
+          float cool = smoothstep(0.0, 0.55, age);
+          vec3 col = mix(hot * 3.2, cold, cool) * (0.35 + 0.65 * core);
+          // Energy-cyan rim flash for the first instants.
+          col += uRim * smoothstep(0.35, 0.8, r) * mask * (1.0 - smoothstep(0.0, 0.18, age)) * 1.4 * (1.0 - vSc.y);
+          float a = mask * (1.0 - smoothstep(0.55, 1.0, age));
+          gl_FragColor = vec4(col * a, 1.0);
+        }
+      `,
+    });
+    this.scorch = new THREE.InstancedMesh(scGeo, scMat, SCORCH.POOL);
+    this.scorch.name = 'ScorchDecals';
+    this.scorch.frustumCulled = false;
+    this.scorch.count = 0;
+    this.scorch.renderOrder = 19;
+    scene.add(this.scorch);
+  }
+
+  /** 5B-4: hot impact decal on a world surface (point on the surface, outward unit normal). */
+  addScorch(point: THREE.Vector3, normal: THREE.Vector3, enemy: boolean): void {
+    const i = this.scorchNext;
+    this.scorchNext = (i + 1) % SCORCH.POOL;
+    _q.setFromUnitVectors(Z_AXIS, normal);
+    _d.copy(normal).multiplyScalar(0.015).add(point);
+    const spin = Math.random() * Math.PI * 2;
+    const sz = SCORCH.SIZE_M * (0.75 + Math.random() * 0.55);
+    _s.set(sz, sz, 1);
+    _m4.compose(_d, _q.multiply(_qSpin.setFromAxisAngle(Z_AXIS, spin)), _s);
+    this.scorch.setMatrixAt(i, _m4);
+    this.scorchAttr.setXYZ(i, this.scorchTime.value, enemy ? 1 : 0, Math.random());
+    this.scorch.instanceMatrix.needsUpdate = true;
+    this.scorchAttr.needsUpdate = true;
+    if (this.scorch.count < SCORCH.POOL) this.scorch.count = Math.max(this.scorch.count, i + 1);
   }
 
   // =============================================================================================
@@ -790,6 +869,7 @@ export class EffectsPool {
           im.region = 'BODY';
           im.travelled = this.pTravel[i] + _worldHit.distance;
           this.burst(im.point, im.normal, im.kind === 'WATER' ? BURST.WATER : BURST.SPARK);
+          if (im.kind !== 'WATER' && im.kind !== 'BARRIER') this.addScorch(im.point, im.normal, owner === 'ENEMY');
         }
         if (im.pierce && _targetHit.target) {
           // Piercing round: keep flying from just past the hit, never re-hitting this body.
@@ -978,6 +1058,7 @@ export class EffectsPool {
    */
   update(simDt: number, realDt: number, cameraPos: THREE.Vector3, cameraVel: THREE.Vector3, realTime = 0, viewportH = 1080): void {
     this.syncTracers(realDt);
+    this.scorchTime.value += simDt;
     this.updateParticles(simDt);
     this.updateRings(simDt);
     this.syncLines(realTime, viewportH);

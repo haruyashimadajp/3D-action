@@ -8,9 +8,13 @@
  * Animation: holster / draw (110 ms each), recoil springs, reload with magazine drop, shotgun pump
  * (280 ms after the shot), look sway (±0.035 m, lerp 14·dt), movement bob (0.012 m, stops in the air /
  * on walls), slide & wall-run tilt, muzzle flash, emissive charge / shell-count indicators, winch spin.
+ * Phase 5B-4: weapons and arm armour share the procedural tactical tech PBR set (carbon weave, machined
+ * grooves, edge wear, brushed metal); each gun carries a diegetic ammo gauge (energy colour → blinking
+ * crimson when low) along its left flank.
  */
 import * as THREE from 'three';
 import { CAMERA, COLORS, MATERIALS, clamp, lerpFactor } from '../config/constants';
+import type { PbrTextureSet } from '../engine/ProceduralTextures';
 import { GUNS, SLOT_ORDER, type GunId, type SlotId } from '../config/weapons';
 
 const SLOT_KEYS: readonly SlotId[] = SLOT_ORDER;
@@ -74,6 +78,9 @@ interface WeaponRig {
   readonly shells?: THREE.Mesh[];
   readonly hook?: THREE.Object3D;
   readonly drum?: THREE.Object3D;
+  /** Diegetic ammo gauge (scaled along z from the rear end) and its material. */
+  readonly ammoBar?: THREE.Mesh;
+  readonly ammoMat?: THREE.MeshBasicMaterial;
   /** Recoil impulse: back (m) and pitch (rad). */
   readonly kickBack: number;
   readonly kickPitch: number;
@@ -113,17 +120,32 @@ export class ViewModelRenderer {
   private energyHex: number = COLORS.PLAYER_STRAND;
   private plasma = false;
 
-  constructor(private readonly scene: THREE.Scene, private readonly vmCamera: THREE.PerspectiveCamera) {
+  constructor(
+    private readonly scene: THREE.Scene,
+    private readonly vmCamera: THREE.PerspectiveCamera,
+    tech: PbrTextureSet | null = null,
+  ) {
     this.root.name = 'ViewModel';
     scene.add(this.root);
     this.root.add(this.weaponPivot, this.leftArm);
     this.weaponPivot.add(this.rightHand);
 
     // Values tuned so silhouettes read against the night city (the view-model has its own lights).
-    const gunmetal = std(0x3a4352, 0.34, 0.72);
-    const darkMetal = std(0x262c36, 0.4, 0.7);
-    const polymer = std(0x1d222b, 0.55, 0.25);
-    const armor = std(0x343d4c, 0.42, 0.55);
+    // 5B-4: metals / polymer / armour get the shared tech PBR maps (albedo ≈ 0.48 linear → colour ×2.05).
+    const techify = (m: THREE.MeshStandardMaterial, normal: number): THREE.MeshStandardMaterial => {
+      if (!tech) return m;
+      m.map = tech.map;
+      m.roughnessMap = tech.roughnessMap;
+      m.normalMap = tech.normalMap;
+      m.normalScale.set(normal, normal);
+      m.color.multiplyScalar(2.05);
+      m.roughness = Math.min(1, m.roughness / 0.45);
+      return m;
+    };
+    const gunmetal = techify(std(0x3a4352, 0.34, 0.72), 0.9);
+    const darkMetal = techify(std(0x262c36, 0.4, 0.7), 0.8);
+    const polymer = techify(std(0x1d222b, 0.55, 0.25), 0.6);
+    const armor = techify(std(0x343d4c, 0.42, 0.55), 1.0);
     const glove = std(0x24282f, 0.7, 0.08);
     const sleeve = std(0x1d222a, 0.66, 0.15);
 
@@ -268,6 +290,25 @@ export class ViewModelRenderer {
     (this.flashMat.uniforms.uColor.value as THREE.Color).setHex(on ? 0xdcf2ff : this.energyHex);
   }
 
+  /**
+   * Diegetic ammo gauge on the gun's left flank: a dark track + a glowing bar whose length follows
+   * ammo / magazine (rear-anchored).
+   */
+  private ammoGauge(g: THREE.Group, x: number, y: number, zRear: number, len: number): { bar: THREE.Mesh; mat: THREE.MeshBasicMaterial } {
+    const track = new THREE.Mesh(new THREE.BoxGeometry(0.0022, 0.0075, len + 0.006), new THREE.MeshBasicMaterial({ color: 0x07090d }));
+    track.position.set(x + 0.0004, y, zRear - len / 2);
+    g.add(track);
+    const geo = new THREE.BoxGeometry(0.0026, 0.0052, 1);
+    geo.translate(0, 0, -0.5);
+    const mat = new THREE.MeshBasicMaterial({ color: new THREE.Color(COLORS.PLAYER_STRAND).multiplyScalar(2.2) });
+    const bar = new THREE.Mesh(geo, mat);
+    bar.position.set(x, y, zRear);
+    bar.scale.set(1, 1, len);
+    bar.userData.len = len;
+    g.add(bar);
+    return { bar, mat };
+  }
+
   // =============================================================================================
   // Weapon builders (local space: +Z toward the player, −Z toward the muzzle)
   // =============================================================================================
@@ -296,7 +337,8 @@ export class ViewModelRenderer {
     const mag = box(0.024, 0.07, 0.03, dark, 0, -0.085, 0.025);
     mag.rotation.x = -0.25;
     g.add(mag);
-    return { group: g, muzzle, energy, mag, kickBack: 0.05, kickPitch: 0.13 };
+    const gauge = this.ammoGauge(g, -0.0182, 0.026, 0.035, 0.085);
+    return { group: g, muzzle, energy, mag, ammoBar: gauge.bar, ammoMat: gauge.mat, kickBack: 0.05, kickPitch: 0.13 };
   }
 
   private buildSmg(gunmetal: THREE.Material, polymer: THREE.Material, dark: THREE.Material): WeaponRig {
@@ -324,7 +366,8 @@ export class ViewModelRenderer {
     const mag = box(0.024, 0.12, 0.034, dark, 0, -0.08, -0.07);
     mag.rotation.x = 0.12;
     g.add(mag);
-    return { group: g, muzzle, energy, mag, kickBack: 0.016, kickPitch: 0.035 };
+    const gauge = this.ammoGauge(g, -0.0238, -0.004, 0.05, 0.11);
+    return { group: g, muzzle, energy, mag, ammoBar: gauge.bar, ammoMat: gauge.mat, kickBack: 0.016, kickPitch: 0.035 };
   }
 
   private buildShotgun(gunmetal: THREE.Material, polymer: THREE.Material, dark: THREE.Material): WeaponRig {
@@ -354,7 +397,8 @@ export class ViewModelRenderer {
     const muzzle = new THREE.Object3D();
     muzzle.position.set(0, 0.022, -0.48);
     g.add(muzzle);
-    return { group: g, muzzle, energy, pump, shells, kickBack: 0.09, kickPitch: 0.28 };
+    const gauge = this.ammoGauge(g, -0.0312, 0.026, 0.07, 0.13);
+    return { group: g, muzzle, energy, pump, shells, ammoBar: gauge.bar, ammoMat: gauge.mat, kickBack: 0.09, kickPitch: 0.28 };
   }
 
   private buildGrapple(gunmetal: THREE.Material, polymer: THREE.Material, dark: THREE.Material): WeaponRig {
@@ -478,6 +522,20 @@ export class ViewModelRenderer {
       rig.pump.position.z = -0.24 + pumpT * 0.07;
     }
     if (rig.shells) rig.shells.forEach((s, i) => (s.visible = i < f.ammo));
+    // Diegetic ammo gauge: length = ammo / magazine; energy colour, blinking crimson at ≤ 25 % (last shell).
+    if (rig.ammoBar && rig.ammoMat && f.magazine > 0) {
+      const frac = clamp(f.ammo / f.magazine, 0, 1);
+      const len = rig.ammoBar.userData.len as number;
+      rig.ammoBar.scale.z = Math.max(1e-4, len * frac);
+      rig.ammoBar.visible = frac > 0;
+      const low = f.ammo <= Math.max(1, Math.floor(f.magazine * 0.25));
+      if (low) {
+        const blink = Math.sin(this.time * 18) > 0 ? 2.6 : 0.9;
+        rig.ammoMat.color.setHex(COLORS.ENEMY_DANGER).multiplyScalar(blink);
+      } else {
+        rig.ammoMat.color.setHex(this.plasma ? 0xdcf2ff : this.energyHex).multiplyScalar(2.2);
+      }
+    }
 
     // Pistol charge glow rises between shots; SMG emitter flickers while firing.
     if (f.slot === 'PISTOL') rig.energy.emissiveIntensity = MATERIALS.PLAYER_STRAND.emissive * (0.35 + 0.65 * clamp(f.sinceShot / 0.3, 0, 1));

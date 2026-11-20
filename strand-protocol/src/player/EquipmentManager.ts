@@ -116,6 +116,8 @@ export class EquipmentManager {
   private zoomTarget = false;
   zoomBlend = 0;
   private zoomGun: GunId = 'PISTOL';
+  /** 0..1 reticle bloom from recent shots (HUD dynamic reticle, decays in real time). */
+  reticleKick = 0;
   private lastShotAt = -1e9;
   private smgBurstIndex = 0;
   private grappleReadyAt = 0;
@@ -238,6 +240,7 @@ export class EquipmentManager {
     this.hookMesh.visible = false;
     this.ropeMesh.count = 0;
     this.recoveryCarry = 0;
+    this.reticleKick = 0;
     this.zoomTarget = false;
     this.zoomBlend = 0;
     this.input.lookScale = 1;
@@ -447,7 +450,10 @@ export class EquipmentManager {
             // SK_02: drawing a gun from the strand arms the momentum chamber.
             if (prev === 'GRAPPLE') this.armMomentum();
           }
+          // Carry the holster overshoot into the draw (exact 220 ms even at coarse bullet-time steps).
+          const over = Math.min(this.stateTime - this.stateDuration, gearDt);
           this.enter('DRAWING', this.switchDurationS() / 2);
+          this.stateTime = over;
         }
         break;
       case 'DRAWING':
@@ -551,6 +557,7 @@ export class EquipmentManager {
     const horiz = r.sineSway ? Math.sin(this.smgBurstIndex * 0.9) * r.horizontalDeg : (Math.random() * 2 - 1) * r.horizontalDeg;
     this.smgBurstIndex++;
     this.player.addRecoil(r.verticalDeg * recoilK, horiz * recoilK, r.recoverDegPerS);
+    this.reticleKick = Math.min(1, this.reticleKick + RETICLE_KICK[gun.id] * recoilK);
     this.player.addTrauma(gun.shake, recoilK);
     this.player.notifyFired();
     this.viewModel.onFire(gun.id, recoilK);
@@ -652,7 +659,10 @@ export class EquipmentManager {
   frameUpdate(realDt: number, camera: THREE.PerspectiveCamera, lookYaw: number, lookPitch: number): void {
     this.lookYaw = lookYaw;
     this.lookPitch = lookPitch;
-    if (realDt > 0) this.updateZoom(realDt);
+    if (realDt > 0) {
+      this.updateZoom(realDt);
+      this.reticleKick *= Math.exp(-RETICLE_KICK_DECAY * realDt);
+    }
     // Gold diamond lock display works with ANY slot equipped (§3.6-3).
     this.player.eyePosition(_eye);
     this.player.viewDirection(_aim);
@@ -777,6 +787,9 @@ export class EquipmentManager {
 
 /** FLOW SS+ plasma blue-white. */
 const PLASMA_HEX = 0xdcf2ff;
+/** 5B-5 dynamic reticle: bloom added per shot and its real-time decay rate (1/s). */
+const RETICLE_KICK: Readonly<Record<GunId, number>> = { PISTOL: 0.5, SMG: 0.14, SHOTGUN: 1.0 };
+const RETICLE_KICK_DECAY = 6.5;
 
 /**
  * Projectile specs per gun, rebuilt only when the energy colour / plasma state changes (no allocation per shot).

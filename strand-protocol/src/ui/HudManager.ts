@@ -29,6 +29,8 @@
  *    screen edge with distance when off-screen), "ARMORED — DESTROY WINGS", orange wing / grey armour hit
  *    markers, "ELIMINATED // <cause>" during the death glitch, active buff tags (PIERCE ×N / ZERO-TIME /
  *    ADRENALINE)
+ *  - Phase 5B: dynamic reticle (recoil / SMG bursts open it, zoom tightens it), helmet-visor perspective on
+ *    the side panels + faint edge scales, title SETTINGS / PROTOCOL as right-side drawers
  * DOM is written only when values change (no per-frame layout churn).
  */
 import { BULLET_TIME, FLOW_RANKS, JUICE, PLAYER, SAVE_KEY, TELEGRAPH, clamp } from '../config/constants';
@@ -93,6 +95,8 @@ export interface HudFrame {
   bossDowned: boolean;
   /** 0..1 tactical-zoom blend. */
   zoom: number;
+  /** 0..1 recoil bloom of the reticle (shots open it, it closes again — 5B-5 dynamic reticle). */
+  reticleKick: number;
   /** Active buffs: SK_02 piercing shots left (0 = none), SK_11 boost, SK_14 adrenaline. */
   buffPierce: number;
   buffZero: boolean;
@@ -206,6 +210,9 @@ export class HudManager {
   private readonly tracks: HTMLElement[];
   private readonly trackLabels: HTMLElement[];
   private readonly tkKeys = Array.from({ length: HUD_MAX_TRACKS }, (_, i) => [`tv${i}`, `tx${i}`, `to${i}`, `tb${i}`, `td${i}`]);
+  /** 5B-5 title drawers (SETTINGS / PROTOCOL slide in from the right). */
+  private drawerMode = false;
+  private drawerOpen: 'settings' | 'protocol' | null = null;
   private hitT = 0;
   private hitKind: HitMarkerKind = 'BODY';
   private readonly evadeEl = el('evade');
@@ -282,6 +289,9 @@ export class HudManager {
     });
     el('result-endless').addEventListener('click', () => this.onEndless?.());
     el('result-title-btn').addEventListener('click', () => this.onTitle?.());
+    for (const b of Array.from(document.querySelectorAll<HTMLElement>('.drawer-close'))) {
+      b.addEventListener('click', () => this.toggleDrawer(b.dataset.drawer === 'protocol' ? 'protocol' : 'settings'));
+    }
     for (const id of ['settings', 'protocol', 'pause-panel', 'skill-modal', 'result']) {
       const p = document.getElementById(id);
       // Clicks inside menus never reach the pause overlay / canvas.
@@ -464,9 +474,37 @@ export class HudManager {
     }
   }
 
-  showPanels(settings: boolean, protocol: boolean): void {
-    el('settings').classList.toggle('hidden', !settings);
-    el('protocol').classList.toggle('hidden', !protocol);
+  /**
+   * `drawers` (title screen): both panels become right-side drawers, closed until a title button opens one.
+   * Otherwise the panels show in place (pause: settings only).
+   */
+  showPanels(settings: boolean, protocol: boolean, drawers = false): void {
+    const s = el('settings');
+    const p = el('protocol');
+    this.drawerMode = drawers;
+    this.drawerOpen = null;
+    for (const e of [s, p]) {
+      e.classList.toggle('drawer', drawers);
+      e.classList.remove('open');
+    }
+    s.classList.toggle('hidden', !drawers && !settings);
+    p.classList.toggle('hidden', !drawers && !protocol);
+    this.syncDrawerButtons();
+  }
+
+  /** Opens `name` (closing the other drawer) or closes it when already open. Returns the open drawer. */
+  toggleDrawer(name: 'settings' | 'protocol'): 'settings' | 'protocol' | null {
+    if (!this.drawerMode) return null;
+    this.drawerOpen = this.drawerOpen === name ? null : name;
+    el('settings').classList.toggle('open', this.drawerOpen === 'settings');
+    el('protocol').classList.toggle('open', this.drawerOpen === 'protocol');
+    this.syncDrawerButtons();
+    return this.drawerOpen;
+  }
+
+  private syncDrawerButtons(): void {
+    document.getElementById('title-settings-btn')?.classList.toggle('on', this.drawerOpen === 'settings');
+    document.getElementById('title-protocol-btn')?.classList.toggle('on', this.drawerOpen === 'protocol');
   }
 
   // =============================================================================================
@@ -675,8 +713,12 @@ export class HudManager {
       const r = 46 + (28 - 46) * zq;
       this.zoomBrackets.setAttribute('transform', `scale(${(r / 46).toFixed(3)})`);
       this.zoomBrackets.style.opacity = clamp((zq - 0.2) / 0.3, 0, 1).toFixed(2);
-      const ret = this.reticles[f.slot];
-      ret.setAttribute('transform', `scale(${(1 - 0.12 * zq).toFixed(3)})`);
+    }
+    // 5B-5 dynamic reticle: recoil / SMG bursts open it (up to +55 %), zoom tightens it (−12 %).
+    const kq = Math.round(clamp(f.reticleKick, 0, 1) * 50) / 50;
+    if (this.changed('rk', kq) || this.changed('rkz', zq) || this.changed('rks', f.slot)) {
+      const sc = (1 + 0.55 * kq) * (1 - 0.12 * zq);
+      this.reticles[f.slot].setAttribute('transform', `scale(${sc.toFixed(3)})`);
     }
     const sharp = z > 0.2;
     if (this.changed('zs', sharp) || this.changed('zsl', f.slot)) {

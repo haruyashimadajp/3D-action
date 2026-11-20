@@ -61,6 +61,7 @@ import {
   createRayHit,
 } from '../world/PhysicsWorld';
 import { BURST, type EffectsPool, type GrazeProbe, type ProjectileImpact, type ProjectileSpec } from './EffectsPool';
+import { getProceduralTextures } from '../engine/ProceduralTextures';
 
 // =============================================================================================
 // Public types
@@ -372,7 +373,12 @@ type V3 = readonly [number, number, number];
 const HUMANOID_ARMOR = COLORS.HUMANOID_MATTE;
 const UNDERSUIT = 0x0d1017;
 const BOSS_ARMOR = 0xd3d8e2;
-const BOSS_ACCENT = 0xff0055;
+/** 5B-4: VALKYRIE accents white in phase 1 → crimson in phase 2 (visor stays crimson). */
+const BOSS_ACCENT = 0xe8f6ff;
+const BOSS_VISOR = 0xff0055;
+const BOSS_ACCENT_P2 = 0xff0055;
+/** Enforcer accents are red (kind colour coding, 5B-4). */
+const ENFORCER_ACCENT = 0xff2a3c;
 
 interface HumanoidStyle {
   armor: number;
@@ -402,7 +408,8 @@ function buildHumanoidBody(b: RigBuilder, rig: Rig, st: HumanoidStyle, ghost: bo
   b.add(j.torso, 'taper', false, [0, 0.36, 0], st.chest, A, 1, 'ARMOR', [Math.PI, 0, 0], { ghost });
   b.add(j.torso, 'box', false, [0, 0.38, st.chest[2] * 0.48], [st.chest[0] * 0.72, 0.2, 0.06], A, 1, 'ARMOR');
   b.add(j.torso, 'box', false, [0, 0.36, -0.2], [0.3, 0.32, 0.14], U, 1, 'ARMOR');
-  b.add(j.torso, 'box', true, [0, 0.33, st.chest[2] * 0.48 + 0.035], [0.09, 0.035, 0.02], st.visor, 1.6, 'CORE');
+  // 5B-4 kind-coloured chest core (Enforcer red · Aegis orange · Veil crimson · Phantom violet · boss white→crimson).
+  b.add(j.torso, 'box', true, [0, 0.33, st.chest[2] * 0.48 + 0.035], [0.16, 0.05, 0.022], st.accent, 2.6, 'CORE');
   rig.chestRef.position.set(0, 0.0, 0);
   j.pelvis.add(rig.chestRef);
 
@@ -425,7 +432,7 @@ function buildHumanoidBody(b: RigBuilder, rig: Rig, st: HumanoidStyle, ghost: bo
     j.torso.add(arm);
     arm.position.set(side * 0.29, 0.46, 0);
     b.add(arm, 'box', false, [side * 0.02, 0.05, 0], st.shoulder, A, 1, 'ARMOR');
-    b.add(arm, 'box', true, [side * 0.02, 0.05 + st.shoulder[1] * 0.5 + 0.01, st.shoulder[2] * 0.3], [st.shoulder[0] * 0.85, 0.018, 0.022], st.accent, ACC, 'ACCENT');
+    b.add(arm, 'box', true, [side * 0.02, 0.05 + st.shoulder[1] * 0.5 + 0.01, st.shoulder[2] * 0.3], [st.shoulder[0] * 0.9, 0.028, 0.026], st.accent, ACC * 1.2, 'ACCENT');
     b.add(arm, 'cyl', false, [0, -0.17, 0], [0.11, 0.3, 0.11], U, 1, 'ARMOR', [0, 0, 0], { ghost });
     arm.add(fore);
     fore.position.set(0, -0.33, 0);
@@ -467,7 +474,7 @@ function addMuzzle(b: RigBuilder, rig: Rig, parent: THREE.Object3D, z: number, y
 
 function buildEnforcer(b: RigBuilder, rig: Rig): void {
   const visor = ENEMY_DEFS.ENFORCER.visorColor;
-  buildHumanoidBody(b, rig, { armor: HUMANOID_ARMOR, under: UNDERSUIT, visor, accent: COLORS.WALLRUN_CYAN, shoulder: [0.2, 0.12, 0.26], chest: [0.5, 0.34, 0.32], heavy: false }, false);
+  buildHumanoidBody(b, rig, { armor: HUMANOID_ARMOR, under: UNDERSUIT, visor, accent: ENFORCER_ACCENT, shoulder: [0.2, 0.12, 0.26], chest: [0.5, 0.34, 0.32], heavy: false }, false);
   const w = rig.joints.weapon;
   b.add(w, 'box', false, [0, 0.03, 0.12], [0.08, 0.13, 0.5], HUMANOID_ARMOR, 1, 'ARMOR');
   b.add(w, 'box', false, [0, -0.08, 0.06], [0.05, 0.14, 0.08], UNDERSUIT, 1, 'ARMOR');
@@ -570,7 +577,7 @@ function buildDrone(b: RigBuilder, rig: Rig): void {
 
 function buildValkyrie(b: RigBuilder, rig: Rig): void {
   const accent = BOSS_ACCENT;
-  buildHumanoidBody(b, rig, { armor: BOSS_ARMOR, under: 0x1a1f2a, visor: accent, accent, shoulder: [0.26, 0.15, 0.3], chest: [0.56, 0.38, 0.36], heavy: true }, false);
+  buildHumanoidBody(b, rig, { armor: BOSS_ARMOR, under: 0x1a1f2a, visor: BOSS_VISOR, accent, shoulder: [0.26, 0.15, 0.3], chest: [0.56, 0.38, 0.36], heavy: true }, false);
   const j = rig.joints;
   // Crest & armoured head cowl (deflects head shots unless downed).
   b.add(j.head, 'cone', false, [0, 0.2, -0.06], [0.12, 0.2, 0.3], BOSS_ARMOR, 1, 'ARMOR', [-0.4, 0, 0]);
@@ -1046,17 +1053,24 @@ export class EnemyManager {
       indices += geos[n].getIndex()?.count ?? 0;
     }
 
-    // Armour: matte carbon black PBR with an always-on thin cyan / red Fresnel rim (§6.1 enemy armour).
+    // Armour: matte carbon black PBR with an always-on cyan / red Fresnel rim (§6.1 enemy armour), now with the
+    // shared tactical tech maps (5B-4: albedo ≈ 0.48 linear → colour ×2.05, roughness compensated).
+    const tech = getProceduralTextures(renderer.renderer).tech;
     const armorMat = new THREE.MeshStandardMaterial({
-      color: 0xffffff,
-      roughness: MATERIALS.HUMANOID_MATTE.roughness,
+      color: new THREE.Color(1, 1, 1).multiplyScalar(2.05),
+      roughness: Math.min(1, MATERIALS.HUMANOID_MATTE.roughness / 0.45),
       metalness: MATERIALS.HUMANOID_MATTE.metalness,
       envMapIntensity: 1.15,
+      map: tech.map,
+      roughnessMap: tech.roughnessMap,
+      normalMap: tech.normalMap,
+      normalScale: new THREE.Vector2(0.9, 0.9),
     });
     armorMat.onBeforeCompile = (shader) => {
       shader.uniforms.uRimCyan = { value: new THREE.Color(COLORS.WALLRUN_CYAN) };
       shader.uniforms.uRimRed = { value: new THREE.Color(COLORS.ENEMY_DANGER) };
-      shader.uniforms.uRimStrength = { value: 0.55 };
+      // 5B-4: 0.55 → 1.05 — the silhouette cuts out against dark towers and cars.
+      shader.uniforms.uRimStrength = { value: 1.05 };
       shader.fragmentShader = shader.fragmentShader
         .replace('#include <common>', '#include <common>\nuniform vec3 uRimCyan;\nuniform vec3 uRimRed;\nuniform float uRimStrength;')
         .replace(
@@ -1067,8 +1081,9 @@ export class EnemyManager {
             float fr = pow(1.0 - clamp(abs(dot(normal, vd)), 0.0, 1.0), 3.0);
             vec3 rimCol = mix(uRimRed, uRimCyan, clamp(normal.y * 0.5 + 0.5, 0.0, 1.0));
             totalEmissiveRadiance += rimCol * fr * uRimStrength;
-            #if defined( USE_COLOR_ALPHA )
-            // Instance colours above 1.0 drive the white hit flash / digital glitch as emission.
+            #if defined( USE_BATCHING_COLOR ) || defined( USE_COLOR )
+            // Instance colours above 1.0 drive the white hit flash / cyan spawn glitch as emission (5B-4 fix:
+            // BatchedMesh colours define USE_BATCHING_COLOR, never USE_COLOR_ALPHA).
             totalEmissiveRadiance += max(vColor.rgb - 1.0, 0.0);
             #endif
           }`,
@@ -2911,6 +2926,12 @@ export class EnemyManager {
           break;
         case 'THRUSTER':
           _col.setHex(e.bossPhase === 2 ? VB.WING_COLOR_P2 : VB.WING_COLOR_P1).multiplyScalar(3.0 * thrusterK);
+          break;
+        case 'ACCENT':
+        case 'CORE':
+          // VALKYRIE: white accents turn crimson in phase 2 (same intensity).
+          if (e.isBoss && e.bossPhase === 2) _col.setHex(BOSS_ACCENT_P2).multiplyScalar(Math.max(p.base.r, p.base.g, p.base.b));
+          else _col.copy(p.base);
           break;
         default:
           _col.copy(p.base);
