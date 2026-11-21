@@ -3274,7 +3274,9 @@ export class CityBuilder {
           f.box(endA - 0.025, endA + 0.025, y, y + RAIL, LD / 2 - 0.025, LD / 2 + 0.025),
         );
         for (let a = l0; a <= l1 + 1e-3; a += LW / 3) G.steel.push(f.box(a - 0.025, a + 0.025, y, y + RAIL, LD - 0.05, LD));
-        f.coll(l0, l1, y, y + RAIL, LD - 0.08, LD);
+        // Front rail collider sits on / just outside the landing edge: a body centred in the outer stair lane
+        // (0.9 – 1.8 m) never clips it while stepping off the flight.
+        f.coll(l0, l1, y, y + RAIL, LD - 0.015, LD + 0.06);
         f.coll(endA - 0.05, endA + 0.05, y, y + RAIL, 0, LD);
         for (const a of [l0 + 0.25, l1 - 0.25]) G.steel.push(beam(f.P3(a, y - 1.3, 0.02), f.P3(a, y - 0.1, LD - 0.12), 0.07));
         // Caged amber lamp on the wall above every second landing.
