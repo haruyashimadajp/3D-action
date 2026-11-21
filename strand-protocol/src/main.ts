@@ -218,6 +218,10 @@ export class FlowSystem {
 // ---------------------------------------------------------------------------
 // Title-screen attract camera: arc-length-parameterised fly-through of the live district.
 // ---------------------------------------------------------------------------
+/** 7A-4: ADS target read-out cone (deg) and scratch. */
+const AIM_HP_MAX_DEG = 3.5;
+const _aimFwd = new THREE.Vector3();
+const _aimInfo = { hp: 0, maxHp: 1, name: '', dist: 0 };
 const _a = new THREE.Vector3();
 const _b = new THREE.Vector3();
 const _look = new THREE.Vector3();
@@ -411,6 +415,11 @@ class App {
       onJump: () => audio.jump(),
       onWallKick: () => audio.jump(),
       onSlideStart: () => audio.slide(),
+      onMantle: () => {
+        audio.mantle();
+        this.viewModel.onMantle();
+      },
+      onCrouch: (down) => audio.crouch(down),
       onLand: (fall, water) => {
         if (water) this.effects.burst(this.player.position, UP, BURST.LAND_SPLASH);
         else if (fall > 14) this.effects.burst(_feet.copy(this.player.position).setY(this.player.position.y + 0.05), UP, BURST.SPARK);
@@ -449,6 +458,10 @@ class App {
       onSwitchStart: (to) => audio.switchGear(to),
       onReloadStart: () => audio.reload(true),
       onReloadDone: () => audio.reload(false),
+      onReloadCue: (gun, cue) => {
+        audio.reloadCue(cue);
+        this.viewModel.onReloadCue(gun, cue);
+      },
       onHookFired: () => audio.strandFire(),
       onHookAttached: () => audio.strandAnchor(),
       onHookMissed: () => audio.strandMiss(),
@@ -518,6 +531,9 @@ class App {
       bossPhase: 1,
       bossDowned: false,
       zoom: 0,
+      aimVisible: false,
+      aimFrac: 1,
+      aimName: '',
       reticleKick: 0,
       buffPierce: 0,
       buffZero: false,
@@ -644,13 +660,16 @@ class App {
       case 'volume':
         this.audio.setVolume(s.volume);
         break;
+      case 'lowLatency':
+        this.renderer.setLowLatency(s.lowLatency);
+        break;
       default:
         break;
     }
   }
 
   private applyAllSettings(): void {
-    for (const k of ['sensitivity', 'shake', 'roll', 'centerDot', 'fov', 'quality', 'volume'] as const) this.applySetting(k);
+    for (const k of ['sensitivity', 'shake', 'roll', 'centerDot', 'fov', 'quality', 'volume', 'lowLatency'] as const) this.applySetting(k);
   }
 
   private onSettingChanged(key: keyof SaveSettings): void {
@@ -1234,6 +1253,7 @@ class App {
       fx.speedLines = 0;
       fx.overdrive = 0;
       fx.zoom = 0;
+      this.enemies.zoomScan.value = 0;
     } else {
       const frozen = this.state !== 'PLAYING';
       this.player.updateCamera(frozen ? 0 : realDt, alpha, cam);
@@ -1246,6 +1266,10 @@ class App {
       fx.bulletTime += ((this.player.btActive ? 1 : 0) - fx.bulletTime) * lerpFactor(14, realDt);
       fx.critical += ((this.player.isCritical && this.player.isAlive ? 1 : 0) - fx.critical) * lerpFactor(6, realDt);
       fx.zoom = this.equipment.zoomBlend;
+      // 7A-4: the optical scan rim follows the zoom blend smoothly (0 → 1).
+      const zs = this.enemies.zoomScan;
+      zs.value += ((this.player.isAlive ? this.equipment.zoomBlend : 0) - zs.value) * lerpFactor(12, realDt);
+      if (zs.value < 1e-3) zs.value = 0;
       this.applyFlowRank(realDt);
       // Speed lines (5B-5): from 18 m/s at every rank — faint 0.22 at D / C, stronger and denser B → SSS
       // (always on at SSS); +0.2 while sliding down an on-ramp.
@@ -1347,6 +1371,16 @@ class App {
     f.regenerating = p.isRegenerating;
     f.sinceShot = e.sinceShot;
     f.zoom = e.zoomBlend;
+    f.aimVisible = false;
+    if (e.zoomBlend > 0.3 && p.isAlive) {
+      const cam = this.renderer.camera;
+      cam.getWorldDirection(_aimFwd);
+      if (this.enemies.aimTarget(cam.position, _aimFwd, AIM_HP_MAX_DEG, _aimInfo)) {
+        f.aimVisible = true;
+        f.aimFrac = _aimInfo.hp / Math.max(_aimInfo.maxHp, 1e-3);
+        f.aimName = _aimInfo.name;
+      }
+    }
     f.reticleKick = e.reticleKick;
     f.buffPierce = e.momentumShotsLeft;
     f.buffZero = this.skills.SK_11 > 0 && p.speedBoostActive;
@@ -1439,7 +1473,7 @@ class App {
       `TOWERS ${st.towers}  CARS ${st.cars}  HIGHWAYS ${st.highways}  RAMPS ${st.ramps}  BRIDGES ${st.bridges}  SKYBRIDGES ${st.skybridges}  ` +
       `LAMPS ${st.lamps}  CITY-LIGHTS ${st.cityLights}\n` +
       `COLLIDERS ${this.layout.colliders.length}  ANCHORS ${this.layout.anchors.length}  RAMPS ${this.layout.ramps.length}\n` +
-      `ARCH A/B/C/D ${this.layout.stats.archetypes.join('/')}  BALCONIES ${this.layout.stats.balconies}  ESCAPES ${this.layout.stats.fireEscapes}  SHOPFRONTS ${this.layout.stats.shopfronts}\n` +
+      `ARCH A/B/C/D ${this.layout.stats.archetypes.join('/')}  BALCONIES ${this.layout.stats.balconies}  ESCAPES ${this.layout.stats.fireEscapes}  SHUTTERS ${this.layout.stats.shutterFronts}\n` +
       `PLAYER ${p.state}  POS ${p.position.x.toFixed(1)},${p.position.y.toFixed(2)},${p.position.z.toFixed(1)}  SPD ${p.speed.toFixed(1)}  ` +
       `GEAR ${this.equipment.activeSlot}/${this.equipment.state}  ROPE ${p.ropeAttached ? p.ropeLength.toFixed(1) : '-'}  BT ${p.btGauge.toFixed(0)}  HP ${p.hp.toFixed(0)}\n` +
       `ENEMIES  WAVE ${this.enemies.waveNumber}/${this.enemies.waveTotal}  REMAINING ${this.enemies.remaining}  ${this.enemies.isCleared ? 'CLEARED' : ''}  |  ` +

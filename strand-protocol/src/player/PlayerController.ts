@@ -34,6 +34,8 @@ export type MoveState =
   | 'SPAWN'
   | 'GROUNDED'
   | 'SLIDING'
+  | 'CROUCHING'
+  | 'MANTLING'
   | 'AIRBORNE'
   | 'WALL_RUN_L'
   | 'WALL_RUN_R'
@@ -67,6 +69,9 @@ export interface PlayerEvents {
   onSlideStart?(): void;
   onWallRunStart?(side: -1 | 1): void;
   onWallKick?(): void;
+  /** 7A-6 auto-mantle started (0.22 s pull-up onto a ledge). */
+  onMantle?(): void;
+  onCrouch?(down: boolean): void;
   onGrappleAttach?(): void;
   onGrappleDetach?(mode: RopeDetach): void;
   onBulletTime?(active: boolean): void;
@@ -111,6 +116,12 @@ const UP = new THREE.Vector3(0, 1, 0);
 const _along = new THREE.Vector3();
 const SIN_ENTRY = Math.sin((PHYSICS.WALLRUN_MAX_ENTRY_DEG * Math.PI) / 180);
 const SIN_VIEW = Math.sin((PHYSICS.WALLRUN_MAX_VIEW_DEG * Math.PI) / 180);
+const sstepP = (x: number): number => {
+  const t = clamp(x, 0, 1);
+  return t * t * (3 - 2 * t);
+};
+/** 7A-6 mantle camera lean (deg). */
+const MANTLE_ROLL_DEG = 3.5;
 const AIR_STATES: ReadonlySet<MoveState> = new Set<MoveState>(['AIRBORNE', 'WALL_RUN_L', 'WALL_RUN_R', 'GRAPPLE_SWING', 'GRAPPLE_PULL']);
 /** Rope attaches at the player's chest/winch height above the feet. */
 const ROPE_ATTACH_Y = 1.2;
@@ -171,6 +182,14 @@ export class PlayerController {
   private readonly wallCoyoteTangent = new THREE.Vector3();
   private wallCoyoteSpeed = 0;
   private slideReadyAt = 0;
+  // 7A-6 auto-mantle
+  private mantleT = 0;
+  private mantleExit = 0;
+  /** Highest point of the pull-up (rail top when vaulting onto a balcony / landing). */
+  private mantleApex = 0;
+  private readonly mantleFrom = new THREE.Vector3();
+  private readonly mantleTo = new THREE.Vector3();
+  private readonly mantleDir = new THREE.Vector3();
   private wallTime = 0;
   /** 6B-2: the wall face being run (copied from the dynamic detection; refreshed every step). */
   private readonly wallFace: WallFace = createWallFace();
@@ -293,6 +312,24 @@ export class PlayerController {
     return this.state === 'SLIDING';
   }
 
+  get isCrouching(): boolean {
+    return this.state === 'CROUCHING';
+  }
+
+  get isMantling(): boolean {
+    return this.state === 'MANTLING';
+  }
+
+  /** 0 → 1 progress of the running auto-mantle (−1 when not mantling). */
+  get mantleProgress(): number {
+    return this.state === 'MANTLING' ? clamp(this.mantleT / PHYSICS.MANTLE_DURATION_S, 0, 1) : -1;
+  }
+
+  /** 7A-6: sliding, crouching or stuck low under a ceiling — the 0.98 m body enemies aim at. */
+  get isLowProfile(): boolean {
+    return this.state === 'SLIDING' || this.state === 'CROUCHING' || this.colliderHeight < PLAYER.HEIGHT;
+  }
+
   get speed(): number {
     return this.velocity.length();
   }
@@ -402,7 +439,7 @@ export class PlayerController {
   /** External impulse (shotgun recoil jump). Leaves the ground if the impulse has an upward component. */
   addImpulse(v: THREE.Vector3): void {
     this.velocity.add(v);
-    if (v.y > 0.5 && (this.state === 'GROUNDED' || this.state === 'SLIDING')) {
+    if (v.y > 0.5 && (this.state === 'GROUNDED' || this.state === 'SLIDING' || this.state === 'CROUCHING')) {
       this.state = 'AIRBORNE';
       this.grounded = false;
     }
@@ -508,6 +545,12 @@ export class PlayerController {
       case 'SLIDING':
         this.stepSliding(dt);
         break;
+      case 'CROUCHING':
+        this.stepCrouching(dt);
+        break;
+      case 'MANTLING':
+        this.stepMantle(dt);
+        break;
       case 'AIRBORNE':
         this.stepAirborne(dt);
         break;
@@ -521,6 +564,12 @@ export class PlayerController {
         break;
       default:
         break;
+    }
+
+    // 7A-6: the mantle is kinematic (its path was verified free) — no integration / collision this step.
+    if (this.state === 'MANTLING') {
+      this.postMoveTransitions(this.grounded, dt);
+      return;
     }
 
     // Soft speed cap: only the excess above 34 m/s (SSS 40.1) is dragged at 1.8 /s.
@@ -563,7 +612,7 @@ export class PlayerController {
   }
 
   private runSpeed(): number {
-    let s = PHYSICS.RUN_SPEED;
+    let s: number = this.state === 'CROUCHING' ? PHYSICS.CROUCH_SPEED : PHYSICS.RUN_SPEED;
     if (this.inWater) s *= PHYSICS.CANAL_SPEED_MULT;
     if (this.isCritical) s *= 1 + this.modifiers.criticalMoveBonus;
     return s + this.activeBoost();
@@ -633,6 +682,39 @@ export class PlayerController {
     _hv.set(this.velocity.x, 0, this.velocity.z);
     if (_hv.length() >= PHYSICS.SLIDE_MIN_ENTER_SPEED && this.simTime >= this.slideReadyAt && this.input.consumeBuffered('SLIDE')) {
       this.startSlide();
+      return;
+    }
+    // 7A-6: below slide speed, holding Ctrl / C crouches.
+    if (_hv.length() < PHYSICS.CROUCH_MAX_ENTER_SPEED && this.input.isDown('SLIDE')) {
+      this.input.consumeBuffered('SLIDE');
+      this.startCrouch();
+    }
+  }
+
+  private startCrouch(): void {
+    this.state = 'CROUCHING';
+    this.colliderHeight = PLAYER.SLIDE_HEIGHT;
+    this.events.onCrouch?.(true);
+  }
+
+  /**
+   * 7A-6 crouch: 0.98 m body, 1.05 m eyes, 5.0 m/s; release Ctrl / C to stand once there is headroom
+   * (canStand). Space jumps (when standing room exists); a fresh Ctrl / C tap at slide speed slides.
+   */
+  private stepCrouching(dt: number): void {
+    this.colliderHeight = PLAYER.SLIDE_HEIGHT;
+    this.groundMove(dt);
+    const stand = this.canStand();
+    if (stand && this.input.consumeBuffered('JUMP')) {
+      this.colliderHeight = PLAYER.HEIGHT;
+      this.events.onCrouch?.(false);
+      this.doJump('GROUND');
+      return;
+    }
+    if (!this.input.isDown('SLIDE') && stand) {
+      this.state = 'GROUNDED';
+      this.colliderHeight = PLAYER.HEIGHT;
+      this.events.onCrouch?.(false);
     }
   }
 
@@ -693,8 +775,14 @@ export class PlayerController {
       return;
     }
     if ((speed < PHYSICS.SLIDE_EXIT_SPEED || !this.input.isDown('SLIDE')) && this.canStand()) {
-      this.state = 'GROUNDED';
-      this.colliderHeight = PLAYER.HEIGHT;
+      // 7A-6: a slide that runs out with Ctrl / C still held settles into a crouch.
+      if (this.input.isDown('SLIDE')) this.startCrouch();
+      else {
+        this.state = 'GROUNDED';
+        this.colliderHeight = PLAYER.HEIGHT;
+      }
+    } else if (speed < PHYSICS.SLIDE_EXIT_SPEED) {
+      this.startCrouch();
     }
   }
 
@@ -730,8 +818,57 @@ export class PlayerController {
       return;
     }
 
+    // 7A-6 auto-mantle: W or Space held and a ledge 0.55 … 2.15 m above the feet within 0.55 m ahead.
+    if ((this.input.moveZ > 0 || this.input.isDown('JUMP')) && !this.grounded && this.tryMantle()) return;
+
     // 6B-2 anywhere parallel wall-run: ② W held (① airborne, checked inside).
     if (this.input.moveZ > 0 && !this.grounded) this.tryStartWallRun();
+  }
+
+  /** 7A-6: probes for a ledge straight ahead (view yaw) and starts the 0.22 s pull-up onto it. */
+  private tryMantle(): boolean {
+    _fwd.set(-Math.sin(this.yaw), 0, -Math.cos(this.yaw));
+    const kind = this.physics.findLedge(this.position, _fwd, PLAYER.RADIUS, PLAYER.HEIGHT, PHYSICS.MANTLE_MIN_RISE, PHYSICS.MANTLE_MAX_RISE, PHYSICS.MANTLE_REACH, this.mantleTo);
+    if (!kind) return false;
+    this.mantleFrom.copy(this.position);
+    this.mantleApex = this.physics.ledgeApex;
+    this.mantleDir.copy(_fwd);
+    _hv.set(this.velocity.x, 0, this.velocity.z);
+    this.mantleExit = Math.max(PHYSICS.MANTLE_EXIT_SPEED, _hv.dot(_fwd));
+    this.mantleT = 0;
+    this.state = 'MANTLING';
+    this.colliderHeight = PLAYER.HEIGHT;
+    this.velocity.set(0, 0, 0);
+    this.wallCoyoteUntil = -1;
+    this.coyoteUntil = -1;
+    this.events.onMantle?.();
+    return true;
+  }
+
+  /**
+   * 7A-6 mantle: kinematic pull-up — height leads (ease-out), the forward step follows (ease-in), so the body
+   * clears the edge before moving over it. Ends grounded with ≥ 6.5 m/s forward.
+   */
+  private stepMantle(dt: number): void {
+    this.mantleT += dt;
+    const t = clamp(this.mantleT / PHYSICS.MANTLE_DURATION_S, 0, 1);
+    const u = Math.min(1, t / 0.7);
+    const ty = 1 - (1 - u) * (1 - u);
+    const w = clamp((t - 0.35) / 0.65, 0, 1);
+    const th = w * w * (3 - 2 * w);
+    const a = this.mantleFrom;
+    const b = this.mantleTo;
+    // Rise to the apex (ledge top, or the rail top when vaulting), then settle onto the standing height.
+    const apex = Math.max(this.mantleApex, b.y);
+    const y = t < 0.7 ? a.y + (apex - a.y) * ty : apex + (b.y - apex) * sstepP((t - 0.7) / 0.3);
+    _tmp.set(a.x + (b.x - a.x) * th, y, a.z + (b.z - a.z) * th);
+    this.velocity.subVectors(_tmp, this.position).divideScalar(Math.max(dt, 1e-4));
+    this.position.copy(_tmp);
+    if (t >= 1) {
+      this.position.copy(b);
+      this.velocity.copy(this.mantleDir).multiplyScalar(this.mantleExit);
+      this.velocity.y = 0;
+    }
   }
 
   /**
@@ -797,11 +934,14 @@ export class PlayerController {
     this.state = 'AIRBORNE';
   }
 
-  /** Wall-kick: vertical 11.2 + wall normal 9.5 + view-forward 4.5, keeping the along-wall speed. */
+  /**
+   * 7A-6 look-led wall-kick: vertical 11.2 + wall normal 7.5 + view-forward 8.8, keeping 85 % of the along-wall
+   * speed — the jump goes where you look (roofs, balconies, enemies) instead of straight off the wall.
+   */
   private wallKick(normal: THREE.Vector3, tangent: THREE.Vector3, alongSpeed: number): void {
     const k = 1 + this.modifiers.kickBoostBonus;
     _fwd.set(-Math.sin(this.yaw), 0, -Math.cos(this.yaw));
-    this.velocity.copy(tangent).multiplyScalar(alongSpeed);
+    this.velocity.copy(tangent).multiplyScalar(alongSpeed * PHYSICS.WALLKICK_TANGENT_KEEP);
     this.velocity.addScaledVector(normal, PHYSICS.WALLKICK_NORMAL * k).addScaledVector(_fwd, PHYSICS.WALLKICK_FORWARD * k);
     this.velocity.y = PHYSICS.WALLKICK_VERTICAL * k * (1 + this.modifiers.wallKickHeightBonus);
     this.wallCoyoteUntil = -1;
@@ -961,6 +1101,17 @@ export class PlayerController {
       return;
     }
 
+    if (this.state === 'MANTLING') {
+      // The pull-up path was verified free; finish on the ledge (or fall if something moved underneath).
+      if (this.mantleT >= PHYSICS.MANTLE_DURATION_S) {
+        this.grounded = this.physics.probeGround(this.position, PLAYER.RADIUS, 0.12) !== null;
+        this.move.grounded = this.grounded;
+        this.state = this.grounded ? 'GROUNDED' : 'AIRBORNE';
+        if (this.grounded) this.events.onLand?.(0, false);
+      } else this.grounded = false;
+      return;
+    }
+
     if (this.state === 'AIRBORNE' && nowGrounded) {
       this.grounded = true;
       this.land(wasGrounded);
@@ -974,13 +1125,16 @@ export class PlayerController {
       if ((this.input.isDown('SLIDE') || this.input.hasBuffered('SLIDE')) && _hv.length() >= PHYSICS.SLIDE_MIN_ENTER_SPEED && this.simTime >= this.slideReadyAt) {
         this.input.consumeBuffered('SLIDE');
         this.startSlide();
+      } else if (this.input.isDown('SLIDE') && _hv.length() < PHYSICS.CROUCH_MAX_ENTER_SPEED) {
+        this.startCrouch();
       } else {
         this.state = 'GROUNDED';
       }
       return;
     }
 
-    if ((this.state === 'GROUNDED' || this.state === 'SLIDING') && !nowGrounded) {
+    if ((this.state === 'GROUNDED' || this.state === 'SLIDING' || this.state === 'CROUCHING') && !nowGrounded) {
+      if (this.state === 'CROUCHING') this.events.onCrouch?.(false);
       // Walked / slid off an edge: coyote window.
       this.coyoteUntil = this.simTime + PHYSICS.COYOTE_LEDGE_MS / 1000;
       this.state = 'AIRBORNE';
@@ -1007,7 +1161,12 @@ export class PlayerController {
     this.recoilYawDeg = this.recoilYawDeg > 0 ? Math.max(0, this.recoilYawDeg - rec) : Math.min(0, this.recoilYawDeg + rec);
 
     // Eye height: 1.72 → 0.86 while sliding (lerp 16·dt).
-    const eyeTarget = this.state === 'SLIDING' ? PLAYER.SLIDE_EYE_HEIGHT : this.colliderHeight < PLAYER.HEIGHT ? PLAYER.SLIDE_EYE_HEIGHT : PLAYER.EYE_HEIGHT;
+    // 7A-6: crouch 1.05 m.
+    const eyeTarget =
+      this.state === 'SLIDING' ? PLAYER.SLIDE_EYE_HEIGHT
+      : this.state === 'CROUCHING' ? PLAYER.CROUCH_EYE_HEIGHT
+      : this.colliderHeight < PLAYER.HEIGHT ? PLAYER.SLIDE_EYE_HEIGHT
+      : PLAYER.EYE_HEIGHT;
     this.eyeHeight += (eyeTarget - this.eyeHeight) * lerpFactor(CAMERA.SLIDE_LERP, realDt);
 
     // Landing spring dip (k = 180, damping = 18), clamped to −0.28 m.
@@ -1027,6 +1186,10 @@ export class PlayerController {
     } else if (this.isSwinging) {
       rollTarget = this.swingRollTarget;
       rollRate = CAMERA.SWING_ROLL_LERP;
+    } else if (this.state === 'MANTLING') {
+      // 7A-6: a short lean into the pull-up.
+      rollTarget = MANTLE_ROLL_DEG;
+      rollRate = 22;
     }
     // Positive spec roll = tilt toward the right; camera Z rotation is counter-clockwise ⇒ negate.
     this.roll += (-rollTarget * rs * DEG2RAD - this.roll) * lerpFactor(rollRate, realDt);

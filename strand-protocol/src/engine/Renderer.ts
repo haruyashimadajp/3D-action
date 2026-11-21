@@ -367,6 +367,7 @@ export class Renderer {
   private envTarget: THREE.WebGLRenderTarget | null = null;
   private readonly lights: PooledLight[] = [];
   private quality: QualityPreset = 'HIGH';
+  private lowLatency = false;
   private chromaSpike = 0;
   private chromaSpikeDecayPerS = 0;
   private time = 0;
@@ -401,12 +402,13 @@ export class Renderer {
     this.viewModelCamera = new THREE.PerspectiveCamera(CAMERA.VIEWMODEL_FOV, 1, 0.01, 10);
 
     // --- Lights ------------------------------------------------------------------------------
-    this.moonLight = new THREE.DirectionalLight(COLORS.MOON, 0.55);
+    // 7A-4: moon 0.55 → 0.72, hemisphere 0.35 → 0.50 (sky 0x2b4070 / ground bounce 0x16223a) — no crushed blacks.
+    this.moonLight = new THREE.DirectionalLight(COLORS.MOON, 0.72);
     this.moonLight.position.set(-0.45, 0.62, -0.64).multiplyScalar(100);
     this.moonLight.castShadow = false;
     this.scene.add(this.moonLight);
     this.scene.add(this.moonLight.target);
-    this.hemiLight = new THREE.HemisphereLight(0x22325a, COLORS.FOG_ABYSS, 0.35);
+    this.hemiLight = new THREE.HemisphereLight(0x2b4070, 0x16223a, 0.5);
     this.scene.add(this.hemiLight);
     for (let i = 0; i < LIMITS.DYNAMIC_POINT_LIGHTS; i++) {
       const light = new THREE.PointLight(0xffffff, 0, 18, 2);
@@ -595,7 +597,7 @@ export class Renderer {
   setQuality(preset: QualityPreset): void {
     this.quality = preset;
     const def = QUALITY_PRESETS[preset];
-    const dpr = Math.min(window.devicePixelRatio || 1, def.dpr, RENDER.DPR_CAP);
+    const dpr = this.lowLatency ? 1 : Math.min(window.devicePixelRatio || 1, def.dpr, RENDER.DPR_CAP);
     this.renderer.setPixelRatio(dpr);
     this.composer.setPixelRatio(dpr);
     this.bloomPass.enabled = def.bloom;
@@ -604,6 +606,25 @@ export class Renderer {
     else delete mat.defines.LITE;
     mat.needsUpdate = true;
     this.resize();
+  }
+
+  /**
+   * 7A-2 LOW LATENCY: whatever the preset, render at DPR 1.0 and drop the composer's MSAA from 4 to 2 samples,
+   * so high-refresh / laptop GPUs keep the frame queue short.
+   */
+  setLowLatency(on: boolean): void {
+    this.lowLatency = on;
+    const samples = on ? RENDER.MSAA_SAMPLES_LOW_LATENCY : RENDER.MSAA_SAMPLES;
+    for (const rt of [this.composer.renderTarget1, this.composer.renderTarget2]) {
+      if (rt.samples === samples) continue;
+      rt.samples = samples;
+      rt.dispose();
+    }
+    this.setQuality(this.quality);
+  }
+
+  get isLowLatency(): boolean {
+    return this.lowLatency;
   }
 
   getQuality(): QualityPreset {

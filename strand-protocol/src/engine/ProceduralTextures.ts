@@ -3,7 +3,7 @@
  * Everything is generated once at boot with Canvas2D and cached; no external assets.
  *
  *  - Facade atlas (2048 × 1024, 6A-1): four archetype columns — glass curtain wall, cast-concrete
- *    residential, corrugated-metal industrial, commercial tenant — × typical / mechanical / ground floors.
+ *    residential, corrugated-metal industrial, commercial tenant — × typical / mechanical / solid ground floors.
  *    Albedo / Emissive (neutral room light + fixed neon) / packed glass mask · roughness · metalness /
  *    Normal; blinds, curtains, desk silhouettes, rain streaks, rust, panel joints, louvres
  *  - Wet rooftop / sidewalk concrete with cracks & puddles (512²): Albedo / Roughness (puddle 0.06, wet 0.42) / Normal
@@ -418,6 +418,62 @@ function generateFacadeAtlas(anisotropy: number): Required<PbrTextureSet> {
     }
   };
 
+  // 7A-3 street bases: every light on floor 0 is a FIXED saturated colour (warm downlights, cool slits, signs),
+  // never the neutral room-light grey — the base is never a lit room and carries no clear-glass mask.
+  const fixedLight = (hex: number, lum: number): string => {
+    const c = hexToLinearRgb(hex, [0, 0, 0]);
+    const k = Math.min(lum, 0.62) / Math.max(linLum(c[0], c[1], c[2]), 1e-4);
+    return rgbCss(linearToSrgbByte(c[0] * k), linearToSrgbByte(c[1] * k), linearToSrgbByte(c[2] * k));
+  };
+  const WARM_DOWN = 0xffb05e;
+  const COOL_SLIT = 0x86ceff;
+  /** Downlight pool washing the wall below (x, yTop): radial fixed-warm gradient on the emissive layer. */
+  const pool = (x: number, yTop: number, r: number, lum: number, hex = WARM_DOWN): void => {
+    const cx = clipX0 + x * PX;
+    const cy = clipY1 - yTop * PY;
+    const rr = r * PY;
+    emi.save();
+    emi.beginPath();
+    emi.rect(clipX0, clipY0, clipX1 - clipX0, clipY1 - clipY0);
+    emi.clip();
+    emi.translate(cx, cy);
+    emi.scale(0.7, 1);
+    const g = emi.createRadialGradient(0, 0, 0, 0, 0, rr);
+    g.addColorStop(0, fixedLight(hex, lum));
+    g.addColorStop(1, 'rgba(0,0,0,0)');
+    emi.fillStyle = g;
+    emi.fillRect(-rr, 0, rr * 2, rr);
+    emi.restore();
+  };
+  /** Spray-paint graffiti tag (albedo only, rough, matte) clipped to the current cell. */
+  const graffiti = (x0: number, x1: number, y0: number, y1: number): void => {
+    const cols = ['rgba(220,40,120,0.55)', 'rgba(40,200,230,0.5)', 'rgba(240,200,40,0.5)', 'rgba(250,250,250,0.45)', 'rgba(120,230,90,0.45)'];
+    alb.save();
+    alb.beginPath();
+    alb.rect(clipX0, clipY0, clipX1 - clipX0, clipY1 - clipY0);
+    alb.clip();
+    alb.lineCap = 'round';
+    alb.lineJoin = 'round';
+    for (let k = 0; k < 2; k++) {
+      alb.strokeStyle = cols[Math.floor(rng() * cols.length)];
+      alb.lineWidth = (0.06 + rng() * 0.08) * PY;
+      alb.beginPath();
+      let px = clipX0 + (x0 + rng() * 0.3) * PX;
+      let py = clipY1 - (y0 + (y1 - y0) * (0.3 + rng() * 0.4)) * PY;
+      alb.moveTo(px, py);
+      const n = 5 + Math.floor(rng() * 5);
+      for (let i = 0; i < n; i++) {
+        const nx = px + ((x1 - x0) / n) * PX * (0.6 + rng() * 0.8);
+        const ny = clipY1 - (y0 + (y1 - y0) * (0.15 + rng() * 0.7)) * PY;
+        alb.quadraticCurveTo((px + nx) / 2 + (rng() - 0.5) * 20, ny + (rng() - 0.5) * 30, nx, ny);
+        px = nx;
+        py = ny;
+      }
+      alb.stroke();
+    }
+    alb.restore();
+  };
+
   // ======================= Column A: glass curtain wall (1.5 m bays, 3 m rooms) =======================
   for (let row = 2; row < 8; row++) {
     cell(0, row);
@@ -446,18 +502,44 @@ function generateFacadeAtlas(anisotropy: number): Required<PbrTextureSet> {
     const x = 0.5 + rng() * 11;
     R(x, x + 0.06, 3.2, 3.26, { e: neon(i === 0 ? 3 : 4, 0.5) });
   }
-  cell(0, 0); // lobby: tall glass, entrance doors
-  R(0, TW, 0, 4, { a: '#131922', m: 0, r: 0.3, t: 0.85, h: 0.85 });
-  for (let b = 0; b < 4; b++) {
-    const x0 = b * 3 + 0.08;
-    R(x0, x0 + 2.84, 0.12, 3.55, { a: '#0a0f17', m: 1, r: 0.05, t: 0.9, h: 0.3 });
-    glow(x0, x0 + 2.84, 0.12, 3.55, 3);
+  cell(0, 0); // 7A-3 office base: dark polished granite, thick entrance pillars, frosted auto doors, slit lights
+  R(0, TW, 0, 4, { a: '#24272c', m: 0, r: 0.3, t: 0.12, h: 0.72, e: '#000' });
+  for (let i = 0; i < 320; i++) {
+    const x = rng() * TW;
+    const y = rng() * 3.4;
+    R(x, x + 0.03 + rng() * 0.07, y, y + 0.02 + rng() * 0.04, { a: rng() < 0.5 ? 'rgba(255,255,255,0.07)' : 'rgba(0,0,0,0.14)' });
   }
-  R(0, TW, 2.55, 2.61, { a: '#2a3140', m: 0, r: 0.3, t: 0.95, h: 0.95 });
-  for (const x of [3.9, 4.5, 5.1]) R(x - 0.03, x + 0.03, 0.12, 2.55, { a: '#3a4352', m: 0, r: 0.25, t: 0.95, h: 0.95 });
-  for (const x of [4.2, 4.8]) R(x - 0.12, x + 0.12, 1.0, 1.04, { a: '#8a95a6', m: 0, r: 0.2, t: 1, h: 1 });
-  for (let b = 0; b <= 4; b++) vbar(b * 3, 0.16, 0, 4, { a: '#2a3140', m: 0, r: 0.3, t: 0.95, h: 1.0 });
-  R(0, TW, 3.55, 4, { a: '#1a212c', m: 0, r: 0.35, t: 0.9, h: 0.95 });
+  for (let y = 1.1; y < 3.4; y += 0.8) R(0, TW, y - 0.008, y + 0.008, { a: 'rgba(0,0,0,0.5)', h: 0.55 });
+  for (let x = 0.6; x < TW; x += 1.2) R(x - 0.008, x + 0.008, 0.3, 3.4, { a: 'rgba(0,0,0,0.5)', h: 0.55 });
+  R(0, TW, 0, 0.3, { a: '#17191d', r: 0.26, t: 0.15, h: 0.9 });
+  for (const x of [0, 4, 8]) {
+    vbar(x, 0.84, 0, 3.4, { a: '#30343b', m: 0, r: 0.24, t: 0.14, h: 1.0 });
+    vbar(x - 0.4, 0.04, 0, 3.4, { a: 'rgba(0,0,0,0.45)', h: 0.7 });
+    vbar(x + 0.4, 0.04, 0, 3.4, { a: 'rgba(255,255,255,0.05)', h: 0.9 });
+  }
+  // Frosted dark automatic double door (opaque, reflective only) with a chrome frame and pull bars.
+  R(4.78, 7.22, 0.3, 2.74, { a: '#3c434c', r: 0.28, t: 0.9, h: 0.96 });
+  for (const [d0, d1] of [[4.86, 5.98], [6.02, 7.14]] as const) {
+    R(d0, d1, 0.33, 2.66, { a: '#1b2129', m: 0, r: 0.2, t: 0.6, h: 0.42 });
+    R(d0, d1, 0.33, 1.2, { a: 'rgba(160,175,190,0.06)' });
+    R(d0 + 0.06, d1 - 0.06, 1.0, 1.06, { a: 'rgba(200,210,220,0.18)', h: 0.5 });
+  }
+  for (const x of [5.9, 6.1]) R(x - 0.015, x + 0.015, 0.9, 1.9, { a: '#a8b2bf', r: 0.15, t: 1, h: 1 });
+  R(4.78, 7.22, 2.74, 3.32, { a: '#161a20', r: 0.32, t: 0.7, h: 0.86 });
+  R(5.35, 6.65, 2.88, 3.18, { a: '#0e1116', e: fixedLight(COOL_SLIT, 0.42) });
+  for (let x = 5.45; x < 6.55; x += 0.14) R(x, x + 0.07, 2.95, 3.11, { a: '#0e1116', e: '#000' });
+  // Vertical indirect-light slits in the solid bays + the canopy fascia with downlights.
+  for (const x of [1.4, 2.6, 9.4, 10.6]) {
+    R(x - 0.05, x + 0.05, 0.45, 3.25, { a: '#0d1014', r: 0.4, t: 0.4, h: 0.3 });
+    R(x - 0.025, x + 0.025, 0.5, 3.2, { e: fixedLight(COOL_SLIT, 0.55) });
+    pool(x, 3.25, 0.5, 0.06, COOL_SLIT);
+  }
+  R(0, TW, 3.4, 4, { a: '#14171c', m: 0, r: 0.36, t: 0.85, h: 0.95 });
+  R(0, TW, 3.4, 3.44, { a: '#2b313b', h: 1.0 });
+  for (let x = 0.75; x < TW; x += 1.5) {
+    R(x - 0.06, x + 0.06, 3.36, 3.4, { a: '#1a1a1a', e: fixedLight(WARM_DOWN, 0.62) });
+    pool(x, 3.36, 1.5, 0.11);
+  }
 
   // ======================= Column B: cast-concrete residential (6 m units = living + bedroom) ==========
   const concrete = (): void => {
@@ -512,22 +594,68 @@ function generateFacadeAtlas(anisotropy: number): Required<PbrTextureSet> {
   concrete();
   slab();
   for (let k = 0; k < 4; k++) louvre(k * 3 + 0.4, k * 3 + 2.6, 0.9, 2.9, '#3b3f44', '#1f2226');
-  cell(1, 0); // ground floor: entrance hall, letterboxes, corner shop
-  concrete();
-  R(0.3, 2.7, 0, 2.7, { a: '#6d747c', m: 0, r: 0.32, t: 0.9, h: 0.92 });
-  R(0.38, 2.62, 0.05, 2.62, { a: '#0b1118', m: 1, r: 0.05, t: 0.6, h: 0.3 });
-  glow(0.38, 2.62, 0.05, 2.62, 3);
-  R(1.47, 1.53, 0.05, 2.62, { a: '#6d747c', m: 0, r: 0.32, t: 0.9, h: 0.95 });
-  R(3.4, 5.6, 0.6, 2.2, { a: '#5f666e', r: 0.38, t: 0.85, h: 0.8 });
-  for (let x = 3.4; x <= 5.61; x += 0.44) R(x - 0.01, x + 0.01, 0.6, 2.2, { a: '#30353a', h: 0.5 });
-  for (let y = 0.6; y <= 2.21; y += 0.32) R(3.4, 5.6, y - 0.01, y + 0.01, { a: '#30353a', h: 0.5 });
-  R(6.2, 11.8, 0, 2.9, { a: '#6d747c', m: 0, r: 0.32, t: 0.9, h: 0.92 });
-  R(6.3, 11.7, 0.05, 2.8, { a: '#0b1118', m: 1, r: 0.05, t: 0.6, h: 0.3 });
-  glow(6.3, 11.7, 0.05, 2.8, 3);
+  cell(1, 0); // 7A-3 residential base (6 m podium, painted in real metres): tiles, canopy door, mailboxes, vents
   {
-    const ni = Math.floor(rng() * FIXED_NEON.length);
-    R(6.2, 11.8, 2.95, 3.5, { a: '#15181d', m: 0, r: 0.4, t: 0.5, h: 0.9, e: neon(ni, 0.3) });
-    for (let x = 6.6; x < 11.4; x += 0.55) R(x, x + 0.35, 3.05, 3.4, { e: neon(ni, 0.62) });
+    const S = FACADE.FLOOR_H_M / (FACADE.FLOOR_H_M + FACADE.FLOOR_BASE_M[1]);
+    const RB = (x0: number, x1: number, y0: number, y1: number, p: FacadePaint): void => R(x0, x1, y0 * S, y1 * S, p);
+    RB(0, TW, 0, 6, { a: '#57524b', m: 0, r: 0.5, t: 0.05, h: 0.62, e: '#000' });
+    for (let y = 0.5; y < 4.6; y += 0.15) RB(0, TW, y - 0.006, y + 0.006, { a: 'rgba(30,26,22,0.55)', h: 0.5 });
+    for (let row = 0; row * 0.15 + 0.5 < 4.6; row++) {
+      const off = (row % 2) * 0.15;
+      for (let x = off; x < TW; x += 0.3) RB(x - 0.006, x + 0.006, 0.5 + row * 0.15, 0.65 + row * 0.15, { a: 'rgba(30,26,22,0.55)', h: 0.5 });
+    }
+    for (let i = 0; i < 70; i++) {
+      const x = Math.floor(rng() * 40) * 0.3 + (rng() < 0.5 ? 0 : 0.15);
+      const y = 0.5 + Math.floor(rng() * 27) * 0.15;
+      RB(x, x + 0.3, y, y + 0.15, { a: rng() < 0.5 ? 'rgba(255,255,255,0.05)' : 'rgba(0,0,0,0.08)' });
+    }
+    RB(0, TW, 4.6, 6, { a: '#4a4c4f', r: 0.82, h: 0.62 });
+    for (let i = 0; i < 40; i++) {
+      const x = rng() * TW;
+      RB(x, x + 0.3 + rng(), 4.6 + rng() * 1.2, 6, { a: rng() < 0.5 ? 'rgba(255,255,255,0.03)' : 'rgba(0,0,0,0.05)' });
+    }
+    RB(0, TW, 4.6, 4.75, { a: '#3a3c3f', r: 0.8, h: 0.85 });
+    RB(0, TW, 0, 0.5, { a: '#3c3e41', m: 0, r: 0.85, t: 0, h: 0.8 });
+    // Entrance: recessed frame, panelled steel door with a frosted (opaque) slit, small canopy + downlight.
+    RB(1.05, 3.15, 0.5, 2.95, { a: '#24272b', r: 0.5, t: 0.4, h: 0.3 });
+    RB(1.2, 3.0, 0.5, 2.75, { a: '#3a3f45', r: 0.38, t: 0.85, h: 0.6 });
+    RB(1.3, 2.05, 0.6, 2.65, { a: '#4a5058', r: 0.34, t: 0.88, h: 0.66 });
+    RB(2.15, 2.9, 0.6, 2.65, { a: '#4a5058', r: 0.34, t: 0.88, h: 0.66 });
+    for (const x0 of [1.45, 2.3]) RB(x0, x0 + 0.45, 1.5, 2.4, { a: '#1c2127', m: 0, r: 0.24, t: 0.5, h: 0.45 });
+    RB(1.98, 2.0, 1.2, 1.7, { a: '#a8b0ba', t: 1, r: 0.2, h: 1 });
+    RB(2.2, 2.22, 1.2, 1.7, { a: '#a8b0ba', t: 1, r: 0.2, h: 1 });
+    RB(0.85, 3.35, 3.0, 3.2, { a: '#2c2f33', r: 0.5, t: 0.6, h: 1.0 });
+    RB(0.85, 3.35, 2.88, 3.0, { a: 'rgba(0,0,0,0.55)', h: 0.4 });
+    RB(1.95, 2.25, 2.95, 3.0, { a: '#222', e: fixedLight(WARM_DOWN, 0.62) });
+    pool(2.1, 2.95 * S, 1.3 * S * 1.3, 0.13);
+    // Building-name plate (backlit) and the intercom panel with its call LED.
+    RB(3.4, 4.6, 3.05, 3.35, { a: '#1a1c1f', e: fixedLight(0xffd6a0, 0.3) });
+    for (let x = 3.5; x < 4.5; x += 0.14) RB(x, x + 0.08, 3.12, 3.28, { a: '#1a1c1f', e: '#000' });
+    RB(3.3, 3.55, 1.25, 1.75, { a: '#6a7078', r: 0.3, t: 0.9, h: 0.9 });
+    RB(3.34, 3.51, 1.5, 1.7, { a: '#101418', r: 0.2, t: 0.6, h: 0.5 });
+    for (let k = 0; k < 6; k++) RB(3.36 + (k % 2) * 0.08, 3.42 + (k % 2) * 0.08, 1.3 + Math.floor(k / 2) * 0.06, 1.34 + Math.floor(k / 2) * 0.06, { a: '#2c3035', h: 0.8 });
+    RB(3.41, 3.44, 1.72, 1.74, { e: fixedLight(0x2fe8ff, 0.62) });
+    // Mailbox bank (3 × 5 brushed-steel boxes with slots and name tags).
+    RB(3.85, 5.75, 0.95, 2.15, { a: '#5e646c', r: 0.36, t: 0.9, h: 0.92 });
+    for (let c = 0; c < 5; c++) {
+      for (let r = 0; r < 3; r++) {
+        const x0 = 3.9 + c * 0.37;
+        const y0 = 1.0 + r * 0.38;
+        RB(x0, x0 + 0.34, y0, y0 + 0.35, { a: '#6c737c', r: 0.3, t: 0.92, h: 0.96 });
+        RB(x0 + 0.05, x0 + 0.29, y0 + 0.24, y0 + 0.26, { a: '#16191c', h: 0.4 });
+        RB(x0 + 0.1, x0 + 0.24, y0 + 0.08, y0 + 0.13, { a: '#d8d4c6', r: 0.7, t: 0, h: 0.9 });
+      }
+    }
+    // Ventilation louvres (garage / plant room) and a steel service door.
+    louvre(6.6, 8.6, 3.2 * S, 4.2 * S, '#4a4e53', '#1a1c1f');
+    louvre(10.4, 11.6, 2.9 * S, 3.6 * S, '#4a4e53', '#1a1c1f');
+    RB(10.3, 11.7, 0.5, 2.7, { a: '#2e3236', r: 0.45, t: 0.8, h: 0.95 });
+    RB(10.4, 11.6, 0.55, 2.62, { a: '#41474e', r: 0.42, t: 0.85, h: 0.66 });
+    RB(10.45, 11.55, 0.55, 0.85, { a: '#565c63', r: 0.3, t: 0.9, h: 0.75 });
+    RB(11.35, 11.45, 1.45, 1.5, { a: '#a8b0ba', t: 1, r: 0.2, h: 1 });
+    for (let i = 0; i < 10; i++) streak(rng() * TW, 4.6 * S, 0.4 + rng() * 0.8, 0.03 + rng() * 0.05, 0.14);
+    pool(11.0, 3.4 * S, 1.0, 0.07);
+    RB(10.92, 11.08, 3.36, 3.44, { a: '#222', e: fixedLight(WARM_DOWN, 0.5) });
   }
 
   // ======================= Column C: corrugated-metal industrial (6 m bays, ribbon windows) ============
@@ -594,9 +722,26 @@ function generateFacadeAtlas(anisotropy: number): Required<PbrTextureSet> {
     for (let x = x0; x < x0 + 4.4; x += 0.3) R(x, x + 0.15, 0, 0.18, { a: '#b8931e', r: 0.6, t: 0.1 });
     for (let i = 0; i < 5; i++) streak(x0 + rng() * 4.4, 3.4, 0.8 + rng() * 2, 0.05, 0.22, RUST);
   }
-  R(5.35, 6.25, 0, 2.15, { a: '#2f363d', r: 0.4, t: 0.85, h: 0.85 });
+  for (const x0 of [0.7, 6.9]) {
+    graffiti(x0 + 0.2, x0 + 4.2, 0.3, 2.4);
+    R(x0 + 2.05, x0 + 2.35, 0.06, 0.2, { a: '#8a8f94', r: 0.3, t: 1, h: 1 });
+  }
+  // 7A-3: heavy riveted steel service door (kick plate, closer) + caged amber lamp + a pipe / conduit box.
+  R(5.3, 6.3, 0, 2.25, { a: '#262b30', r: 0.45, t: 0.8, h: 0.95 });
+  R(5.36, 6.24, 0, 2.17, { a: '#363d44', r: 0.42, t: 0.86, h: 0.7 });
+  R(5.36, 6.24, 0, 0.32, { a: '#4d545b', r: 0.3, t: 0.92, h: 0.8 });
+  for (let y = 0.5; y < 2.1; y += 0.32) for (const x of [5.42, 6.18]) R(x - 0.015, x + 0.015, y, y + 0.03, { a: '#5a6168', h: 1 });
+  R(6.1, 6.18, 1.0, 1.06, { a: '#9aa2ab', t: 1, r: 0.25, h: 1 });
+  R(5.4, 5.75, 2.08, 2.14, { a: '#1c1f22', h: 1 });
   R(5.68, 5.92, 2.32, 2.52, { a: '#1a1d20', e: neon(2, 0.62) });
   R(5.64, 5.96, 2.3, 2.32, { a: '#2a2f34', h: 1 });
+  pool(5.8, 2.32, 1.1, 0.12, 0xffa21f);
+  R(11.42, 11.98, 0, 3.85, { a: '#3b4045', r: 0.5, t: 0.75, h: 0.9 });
+  for (const x of [11.55, 11.82]) {
+    R(x - 0.05, x + 0.05, 0, 3.85, { a: '#565d63', r: 0.35, t: 0.9, h: 1.0 });
+    for (let y = 0.6; y < 3.8; y += 0.9) R(x - 0.07, x + 0.07, y, y + 0.05, { a: '#2a2e32', h: 1.0 });
+  }
+  for (let i = 0; i < 3; i++) streak(11.45 + rng() * 0.5, 3.85, 1 + rng() * 2, 0.04, 0.25, RUST);
 
   // ======================= Column D: commercial tenants (3 m rooms, neon frames, posters) ==============
   for (let row = 2; row < 8; row++) {
@@ -639,23 +784,46 @@ function generateFacadeAtlas(anisotropy: number): Required<PbrTextureSet> {
   R(0, TW, 3.1, 3.2, { a: '#0d0f13', e: neon(1, 0.55) });
   R(0, TW, 3.2, 4, { a: '#181c23', r: 0.4, t: 0.6, h: 0.85 });
   R(0, TW, 2.7, 3.1, { a: '#14171d', r: 0.45, t: 0.5, h: 0.8 });
-  cell(3, 0); // shop interiors behind a recessed shopfront: interior-mapped in the shader, 2D on LOW
+  cell(3, 0); // 7A-3 commercial base: closed roll shutters, heavy pillars, sign band + warm downlights
+  R(0, TW, 0, 4, { a: '#2a2725', m: 0, r: 0.5, t: 0.1, h: 0.75, e: '#000' });
   for (let k = 0; k < 4; k++) {
-    const x0 = k * 3;
-    const kind = Math.floor(rng() * 3);
+    const x0 = k * 3 + 0.38;
+    const x1 = k * 3 + 2.62;
     const ni = Math.floor(rng() * FIXED_NEON.length);
-    R(x0, x0 + 3, 0, 3.3, { a: '#0b1017', m: 1, r: 0.06, t: 0.6, h: 0.3 });
-    glow(x0 + 0.05, x0 + 2.95, 0, 3.3, 3);
-    // LOW-quality hints only (dimmed): shelves / counter / lanterns.
-    if (kind === 0) for (const y of [0.5, 1.05, 1.6, 2.15]) R(x0 + 0.2, x0 + 2.8, y, y + 0.05, { e: 'rgba(0,0,0,0.45)' });
-    else if (kind === 1) R(x0, x0 + 3, 0, 1.0, { e: 'rgba(0,0,0,0.6)' });
-    else for (let x = x0 + 0.4; x < x0 + 2.6; x += 0.6) R(x, x + 0.26, 2.5, 2.95, { e: neon(3, 0.32) });
-    // Shop sign band inside the glass + thin dividers between tenants (opaque).
-    R(x0, x0 + 3, 3.3, 4, { a: '#0f1217', m: 0, r: 0.4, t: 0.5, h: 0.85, e: '#000' });
-    R(x0 + 0.4, x0 + 2.6, 3.4, 3.85, { e: neon(ni, 0.36) });
-    for (let x = x0 + 0.55; x < x0 + 2.45; x += 0.3) R(x, x + 0.18, 3.48, 3.77, { e: neon(ni, 0.62) });
+    // Shutter: housing box, guide rails, ribbed galvanised slats, bottom bar, padlock; a wicket door on some.
+    R(x0 - 0.06, x1 + 0.06, 2.86, 3.08, { a: '#3a3f45', r: 0.4, t: 0.85, h: 1.0 });
+    for (const x of [x0 - 0.06, x1]) R(x, x + 0.06, 0, 2.86, { a: '#30353a', r: 0.4, t: 0.9, h: 0.95 });
+    const tone = 92 + Math.floor(rng() * 26);
+    R(x0, x1, 0, 2.86, { a: `rgb(${tone},${tone + 4},${tone + 9})`, r: 0.44, t: 0.78, h: 0.6 });
+    for (let y = 0.08; y < 2.86; y += 0.085) {
+      R(x0, x1, y, y + 0.035, { a: 'rgba(255,255,255,0.07)', h: 0.86 });
+      R(x0, x1, y + 0.05, y + 0.065, { a: 'rgba(0,0,0,0.32)', h: 0.3 });
+    }
+    R(x0, x1, 0, 0.09, { a: '#3c4146', r: 0.4, t: 0.9, h: 0.9 });
+    R((x0 + x1) / 2 - 0.05, (x0 + x1) / 2 + 0.05, 0.04, 0.13, { a: '#b39a52', r: 0.35, t: 0.9, h: 1 });
+    if (rng() < 0.35) {
+      const wx = x0 + 0.3 + rng() * 1.0;
+      R(wx, wx + 0.7, 0.09, 1.95, { a: 'rgba(0,0,0,0.22)', h: 0.45 });
+      R(wx + 0.58, wx + 0.63, 0.95, 1.05, { a: '#9aa2ab', t: 1, h: 1 });
+    }
+    if (rng() < 0.55) graffiti(x0 + 0.1, x1 - 0.1, 0.25, 2.2);
+    for (let i = 0; i < 3; i++) streak(x0 + rng() * (x1 - x0), 2.86, 0.6 + rng() * 1.6, 0.03 + rng() * 0.04, 0.16);
+    // Sign band above the shutter (dark panel + fixed neon lettering) and warm downlights under it.
+    R(x0 - 0.06, x1 + 0.06, 3.1, 3.74, { a: '#121418', m: 0, r: 0.38, t: 0.55, h: 0.92, e: neon(ni, 0.18) });
+    for (let x = x0 + 0.18; x < x1 - 0.2; x += 0.26 + rng() * 0.1) R(x, x + 0.16, 3.22, 3.6, { e: neon(ni, 0.62) });
+    for (const dx of [0.55, 1.67]) {
+      const lx = x0 - 0.38 + dx + 0.38;
+      R(lx - 0.07, lx + 0.07, 3.04, 3.09, { a: '#1a1a1a', e: fixedLight(WARM_DOWN, 0.62) });
+      pool(lx, 3.04, 1.6, 0.12);
+    }
   }
-  for (let k = 0; k <= 4; k++) vbar(k * 3, 0.1, 0, 4, { a: '#20252e', m: 0, r: 0.35, t: 0.8, h: 0.95, e: '#000' });
+  // Heavy stone pillars between the tenants and the cornice band.
+  for (let k = 0; k <= 4; k++) {
+    vbar(k * 3, 0.76, 0, 3.8, { a: '#3a3633', m: 0, r: 0.42, t: 0.08, h: 1.0, e: '#000' });
+    vbar(k * 3 - 0.38, 0.04, 0, 3.8, { a: 'rgba(0,0,0,0.4)', h: 0.7 });
+    vbar(k * 3, 0.84, 0, 0.35, { a: '#2a2725', r: 0.5, h: 1.0 });
+  }
+  R(0, TW, 3.8, 4, { a: '#23211f', r: 0.45, t: 0.1, h: 0.95 });
 
   // Pack the mask / roughness / metalness layers into one RGB texture.
   const mD = msk.getImageData(0, 0, W, HT).data;

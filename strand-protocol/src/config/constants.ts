@@ -33,6 +33,8 @@ export const PLAYER = {
   MANUAL_RETRY_MS: 150,
   EYE_HEIGHT: 1.72,
   SLIDE_EYE_HEIGHT: 0.86,
+  /** 7A-6 crouch eye height (collider = SLIDE_HEIGHT). */
+  CROUCH_EYE_HEIGHT: 1.05,
   /** Player capsule. */
   RADIUS: 0.38,
   HEIGHT: 1.86,
@@ -112,9 +114,12 @@ export const CAMERA = {
   LANDING_DIP_MAX: 0.28,
   LANDING_SPRING_K: 180,
   LANDING_SPRING_DAMPING: 18,
-  SWAY_MAX: 0.035,
+  /** 7A-2: tighter, faster weapon sway (0.035 → 0.016 m, lerp 14 → 28 /s); ADS cuts it by 95 %. */
+  SWAY_MAX: 0.016,
   BOB_AMPLITUDE: 0.012,
-  SWAY_LERP: 14.0,
+  SWAY_LERP: 28.0,
+  /** 7A-2: fraction of sway / bob removed at full zoom. */
+  ADS_SWAY_CUT: 0.95,
   NEAR: 0.05,
   FAR: 2600,
   /** Accessibility: FOV base range (§3.6-7). */
@@ -181,7 +186,9 @@ export const FLOW_VISUALS = {
 // ---------------------------------------------------------------------------
 export const INPUT = {
   SENSITIVITY_MIN: 0.2,
-  SENSITIVITY_MAX: 3.0,
+  /** 7A-2: 0.20 … 10.00 in 0.05 steps (default 1.00). */
+  SENSITIVITY_MAX: 10.0,
+  SENSITIVITY_STEP: 0.05,
   SENSITIVITY_DEFAULT: 1.0,
   /** Radians per pixel at sensitivity 1.0. */
   BASE_RAD_PER_PIXEL: 0.0022,
@@ -251,9 +258,24 @@ export const PHYSICS = {
   WALLRUN_MAX_TIME: 1.8,
   /** Same collider & same normal (dot > 0.95): no re-attach for 0.5 s; any other wall chains immediately. */
   WALLRUN_SAME_WALL_COOLDOWN: 0.5,
+  /** 7A-6 look-led wall-kick: vertical 11.2 + wall normal 7.5 + view-forward 8.8, keeping 85 % of the along-wall speed. */
   WALLKICK_VERTICAL: 11.2,
-  WALLKICK_NORMAL: 9.5,
-  WALLKICK_FORWARD: 4.5,
+  WALLKICK_NORMAL: 7.5,
+  WALLKICK_FORWARD: 8.8,
+  WALLKICK_TANGENT_KEEP: 0.85,
+  /**
+   * 7A-6 auto-mantle: airborne with W or Space held, a ledge 0.55 … 2.15 m above the feet within 0.55 m ahead
+   * (BUILDING / BALCONY / CAR / HIGHWAY / BRIDGE / PROP) and room for the whole body on top ⇒ 0.22 s pull-up,
+   * leaving with ≥ 6.5 m/s forward.
+   */
+  MANTLE_MIN_RISE: 0.55,
+  MANTLE_MAX_RISE: 2.15,
+  MANTLE_REACH: 0.55,
+  MANTLE_DURATION_S: 0.22,
+  MANTLE_EXIT_SPEED: 6.5,
+  /** 7A-6 crouch: grounded below 7.5 m/s with Ctrl/C held — 0.98 m body, 1.05 m eyes, 5.0 m/s. */
+  CROUCH_MAX_ENTER_SPEED: 7.5,
+  CROUCH_SPEED: 5.0,
 
   /** User-tuned: 2.5× the spec value of 52 m. */
   GRAPPLE_RANGE: 130.0,
@@ -396,8 +418,11 @@ export const ROOF_WET_ROUGHNESS = 0.42;
 // §6.2 Rendering pipeline
 // ---------------------------------------------------------------------------
 export const RENDER = {
-  TONE_MAPPING_EXPOSURE: 1.15,
+  /** 7A-4: 1.15 → 1.28 (no crushed blacks; neon contrast kept). */
+  TONE_MAPPING_EXPOSURE: 1.28,
   MSAA_SAMPLES: 4,
+  /** 7A-2 LOW LATENCY composer MSAA. */
+  MSAA_SAMPLES_LOW_LATENCY: 2,
   ENV_CUBE_SIZE: 256,
   /** v1.1: FogExp2(0x0D1628, 0.0036) — the cloud-deck mesh is abolished. */
   FOG_DENSITY: 0.0036,
@@ -519,7 +544,6 @@ export const FACADE = {
   FLOOR_LIT_LOW: 0.12,
   FLOOR_LIT_MID: 0.35,
   FLOOR_LIT_HIGH: 0.626,
-  GROUND_LIT: 0.7,
   WARM_A: 0xe2be8e,
   WARM_B: 0xd4a56a,
   COOL_A: 0xc5d7ea,
@@ -530,7 +554,6 @@ export const FACADE = {
   LUM_WARM: [0.085, 0.16] as readonly number[],
   LUM_COOL: [0.13, 0.23] as readonly number[],
   LUM_ACCENT: [0.17, 0.26] as readonly number[],
-  LUM_SHOP: [0.14, 0.22] as readonly number[],
   /** Interior mapping: room box depth in room units (floor height), parallax drawn up to this distance. */
   INTERIOR_DEPTH: 0.55,
   PARALLAX_MAX_DIST_M: 170,
@@ -551,10 +574,17 @@ export const ARCHETYPE = {
   /** Type C wall ducts. */
   DUCT_W: 0.7,
   DUCT_OUT: 0.4,
-  /** Type D recessed shopfront (1–3 floors) + per-floor canopies. */
-  RECESS_DEPTH_M: 1.8,
-  RECESS_PILLAR_M: 0.7,
-  RECESS_PILLAR_SPACING_M: 7,
+  /**
+   * 7A-3 Type D street base (replaces the recessed glass shopfront): closed roll shutters in the facade atlas,
+   * heavy stone pillars (0.7 m wide, 0.36 m out ⇒ no collider) every ~6 m, a projecting sign fascia above the
+   * shutters with a warm downlight strip — then the per-floor canopies from the 2nd floor up.
+   */
+  SHUTTER_PILLAR_M: 0.7,
+  SHUTTER_PILLAR_OUT_M: 0.36,
+  SHUTTER_PILLAR_SPACING_M: 6,
+  SHUTTER_FASCIA_Y: [3.1, 3.72] as readonly number[],
+  SHUTTER_FASCIA_OUT_M: 0.22,
+  BASE_TOP_M: 4.2,
   FLOOR_CANOPY_DEPTH_M: 0.8,
   FLOOR_CANOPIES_MAX: 4,
 } as const;

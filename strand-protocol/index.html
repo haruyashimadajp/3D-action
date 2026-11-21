@@ -330,6 +330,9 @@
       #hitmarker.wing line { stroke: #ff8a1e; stroke-width: 3; filter: drop-shadow(0 0 5px rgba(255, 138, 30, 0.95)); }
       /* ---------------- Phase 5A: tactical zoom, BT denial, tracking, death cause, buffs ---------------- */
       #xh-zoom { opacity: 0; }
+      /* 7A-1: full ADS keeps only four hairline ticks ≥ 12 px out — the holo sight's dot is the single aim point. */
+      #xh-ads { opacity: 0; }
+      #xh-ads path { fill: none; stroke: rgba(240, 252, 255, 0.85); stroke-width: 1; vector-effect: non-scaling-stroke; filter: drop-shadow(0 0 1px #000); }
       #xh-zoom path { fill: none; stroke: #38f8ff; stroke-width: 1.1; vector-effect: non-scaling-stroke; filter: drop-shadow(0 0 2px rgba(0, 240, 255, 0.9)); }
       #xh .ret.sharp { stroke: #ffffff; stroke-width: 1.3; filter: drop-shadow(0 0 1px #000) drop-shadow(0 0 2px rgba(0, 240, 255, 0.55)); }
       #xh .arc.denied, #xh .track.denied { stroke: #2b313b !important; filter: none !important; animation: btdeny 0.35s steps(1, end) forwards; }
@@ -391,6 +394,11 @@
       }
       #sector-hud.open { color: #00ff9d; text-shadow: 0 0 12px rgba(0, 255, 157, 0.9); animation: gatepulse 1.2s ease-in-out infinite; }
       @keyframes gatepulse { 50% { text-shadow: 0 0 4px rgba(0, 255, 157, 0.4); } }
+      /* 7A-4: ADS target read-out under the crosshair (88 × 3 px tactical bar + lowercase name). */
+      #aim-hp { position: absolute; left: 50%; top: calc(50% + 42px); width: 88px; transform: translateX(-50%); opacity: 0; transition: opacity 0.12s linear; pointer-events: none; text-align: center; }
+      #aim-hp-name { font: 500 9px/1 'Rajdhani', 'Segoe UI', sans-serif; letter-spacing: 0.14em; text-transform: lowercase; color: rgba(235, 248, 255, 0.86); text-shadow: 0 0 2px #000; margin-bottom: 3px; white-space: nowrap; }
+      #aim-hp-bar { position: relative; height: 3px; background: rgba(10, 14, 20, 0.7); box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.6); }
+      #aim-hp-fill { position: absolute; left: 0; top: 0; bottom: 0; width: 100%; background: #ff3b5c; box-shadow: 0 0 4px rgba(255, 59, 92, 0.8); transform-origin: 0 50%; }
       #boss-hud { position: absolute; left: 50%; top: 46px; transform: translateX(-50%); width: 420px; display: none; text-align: center; }
       #boss-hud.on { display: block; }
       #boss-name { font-size: 11px; letter-spacing: 0.4em; color: #ffffff; text-shadow: 0 0 8px rgba(255, 0, 85, 0.9); }
@@ -561,14 +569,15 @@
       <div class="ptitle">SETTINGS // ACCESSIBILITY</div>
       <div class="row">
         <label for="sens-range">MOUSE SENSITIVITY</label>
-        <input id="sens-range" type="range" min="0.2" max="3" step="0.05" value="1" />
-        <input id="sens-num" type="number" min="0.2" max="3" step="0.05" value="1.00" />
+        <input id="sens-range" type="range" min="0.2" max="10" step="0.05" value="1" />
+        <input id="sens-num" type="number" min="0.2" max="10" step="0.05" value="1.00" />
         <button id="sens-reset" class="btn" type="button">DEFAULT</button>
       </div>
       <div class="row"><label>CAMERA SHAKE</label><div class="seg" id="set-shake"><button type="button" data-v="0">0%</button><button type="button" data-v="0.5">50%</button><button type="button" data-v="1">100%</button></div></div>
       <div class="row"><label>WALL-RUN / SWING ROLL</label><div class="seg" id="set-roll"><button type="button" data-v="0">0%</button><button type="button" data-v="0.5">50%</button><button type="button" data-v="1">100%</button></div></div>
       <div class="row"><label>CENTER ANCHOR DOT</label><div class="seg" id="set-dot"><button type="button" data-v="1">ON</button><button type="button" data-v="0">OFF</button></div></div>
       <div class="row"><label for="set-fov">BASE FOV</label><input id="set-fov" type="range" min="75" max="100" step="1" value="84" /><span class="val" id="set-fov-val">84°</span></div>
+      <div class="row"><label>LOW LATENCY</label><div class="seg" id="set-latency"><button type="button" data-v="1">ON</button><button type="button" data-v="0">OFF</button></div></div>
       <div class="row"><label>QUALITY</label><div class="seg" id="set-quality"><button type="button" data-v="HIGH">HIGH</button><button type="button" data-v="MEDIUM">MEDIUM</button><button type="button" data-v="LOW">LOW</button></div></div>
       <div class="row"><label for="set-vol">MASTER VOLUME</label><input id="set-vol" type="range" min="0" max="100" step="1" value="80" /><span class="val" id="set-vol-val">80</span></div>
     </div>
@@ -603,6 +612,7 @@
     <div id="hud">
       <div class="visor" id="visor-l"></div>
       <div class="visor" id="visor-r"></div>
+      <div id="aim-hp"><div id="aim-hp-name"></div><div id="aim-hp-bar"><div id="aim-hp-fill"></div></div></div>
       <svg id="xh" viewBox="-100 -100 200 200">
         <g id="ret-pistol" class="ret">
           <path d="M0 -5 V-12 M0 5 V12 M-5 0 H-12 M5 0 H12" />
@@ -620,6 +630,9 @@
         </g>
         <g id="xh-zoom">
           <path d="M -40 -11 H -46 V 11 H -40 M 40 -11 H 46 V 11 H 40" />
+        </g>
+        <g id="xh-ads">
+          <path d="M 0 -12 V -18 M 0 12 V 18 M -12 0 H -18 M 12 0 H 18" />
         </g>
         <path id="xh-bt-track" class="track" d="M 23.14 27.58 A 36 36 0 0 0 23.14 -27.58" />
         <path id="xh-bt-arc" class="arc ready" d="M 23.14 27.58 A 36 36 0 0 0 23.14 -27.58" />

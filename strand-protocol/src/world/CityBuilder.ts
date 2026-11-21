@@ -31,7 +31,7 @@
  *    interior mapping (parallax room boxes) behind clear glass; LOW quality falls back to 2D windows
  *  - 6A-2 archetypes 30 / 25 / 25 / 20 %: A glass towers (mullions, setback, crown) · B concrete residential
  *    (pilasters, balconies) · C industrial (fire escape, ducts, loading dock) · D commercial (recessed
- *    shopfronts behind glass, per-floor canopies, packed signage)
+ *    roll-shutter street base with stone pillars and a sign fascia, per-floor canopies, packed signage)
  *  - 6A-3 walkable balconies (slab + rail colliders ≤ 36 m) · 6A-4 climbable zig-zag fire escapes (landing
  *    boxes + RampCollider flights) · 6A-5 cyan wall-run cladding removed
  *  - 6B-2 no wall-run list any more: PhysicsWorld finds runnable faces on every BUILDING / HIGHWAY / BRIDGE /
@@ -129,11 +129,11 @@ export interface GateInfo {
 
 /** 6A: a 3D facade feature (centre of the face it occupies, outward normal) — tests / spawn logic. */
 export interface FacadeFeature {
-  readonly kind: 'BALCONY' | 'FIRE_ESCAPE' | 'SHOPFRONT';
+  readonly kind: 'BALCONY' | 'FIRE_ESCAPE' | 'SHUTTER_FRONT';
   readonly building: number;
   readonly center: THREE.Vector3;
   readonly normal: THREE.Vector3;
-  /** Top of the feature (highest balcony slab / landing, shopfront height). */
+  /** Top of the feature (highest balcony slab / landing, street-base height). */
   readonly top: number;
 }
 
@@ -181,7 +181,7 @@ export interface SectorLayout {
     readonly balconies: number;
     readonly fireEscapes: number;
     readonly escapeFlights: number;
-    readonly shopfronts: number;
+    readonly shutterFronts: number;
     /** 6A-1 rooms per night-light state on the rendered facades: dark · warm · cool · accent. */
     readonly facadeRooms: readonly number[];
   };
@@ -675,8 +675,6 @@ interface Building extends BuildingInfo {
   readonly lotHalfD: number;
   /** Setback terrace height (0 = single block). */
   readonly setbackY: number;
-  /** Type D recessed shopfront height (0 = none). */
-  recessTop: number;
 }
 
 interface CarSlot {
@@ -721,7 +719,7 @@ export class CityBuilder {
   private readonly waterMat: THREE.MeshStandardMaterial;
   private readonly hwConcreteMat: THREE.MeshStandardMaterial;
   private readonly stripMat: THREE.MeshBasicMaterial;
-  /** 6A: transparent tempered / shopfront glass (balcony rails, recessed shop windows) — one draw. */
+  /** 6A: transparent tempered glass (balcony rail panels) — one draw. */
   private readonly shopGlassMat: THREE.MeshStandardMaterial;
   private readonly steelMat: THREE.MeshStandardMaterial;
   private readonly glassMat: THREE.MeshStandardMaterial;
@@ -856,8 +854,7 @@ export class CityBuilder {
     const local = yb < F.FLOOR_H_M ? Math.max(y, 0) / (F.FLOOR_H_M + base) : yb / F.FLOOR_H_M - floor;
     const machine = isMachineFloor(si, floor);
     let rowV = local;
-    if (b.arch === ARCH_D && floor === 0) rowV = 2 + (Math.floor(si / 4096) % F.TYPICAL_ROWS) + local;
-    else if (floor > 0) {
+    if (floor > 0) {
       const c = F.MACHINE_EVERY_MIN + (Math.floor(si / 16) % F.MACHINE_EVERY_SPAN);
       const off = Math.floor(si / 256) % (c - 2);
       const m = (floor - 1 + off) % c;
@@ -917,12 +914,13 @@ export class CityBuilder {
 
   /**
    * 6A-1 tower material. Facade atlas with four archetype columns (aArch 0 A glass · 1 B residential ·
-   * 2 C industrial · 3 D commercial; +0.5 = shop-interior wall behind a recessed shopfront), world-space
+   * 2 C industrial · 3 D commercial; +0.25 = plain cladding of a structural add-on), world-space
    * 12 m tiles with a per-tower room offset, a dark mechanical floor every 7–9 storeys and per-room night
    * lighting (integer hash shared with FacadeLighting.ts: dark 65 % · warm 20 % · cool 13 % · accent 2 %).
    * Behind clear glass the view ray is taken into the facade's tangent space and intersected with a room
    * box (depth 0.55 floor units — ceiling panels, back wall, floor, side walls, furniture by archetype), so
    * the rooms shift with real parallax as the player swings past. STRAND_LITE (LOW) keeps the 2D windows.
+   * 7A-3: floor 0 (row 0) is the solid street base of every archetype — never a lit room, never interior-mapped.
    */
   private createBuildingMaterial(): THREE.MeshStandardMaterial {
     const f = this.tex.facades;
@@ -987,29 +985,15 @@ export class CityBuilder {
         vec2 L;
         if (st == 1) { c = mix(${hx(F.WARM_A)}, ${hx(F.WARM_B)}, h); L = ${v2(F.LUM_WARM)}; }
         else if (st == 2) { c = mix(${hx(F.COOL_A)}, ${hx(F.COOL_B)}, h); L = ${v2(F.LUM_COOL)}; }
-        else if (st == 3) { c = h < 0.5 ? ${hx(F.ACCENT_CYAN)} : ${hx(F.ACCENT_MAGENTA)}; L = ${v2(F.LUM_ACCENT)}; }
-        else {
-          c = h < 0.45 ? mix(${hx(F.WARM_A)}, ${hx(F.WARM_B)}, h * 2.0) : (h < 0.9 ? mix(${hx(F.COOL_A)}, ${hx(F.COOL_B)}, h) : (h < 0.95 ? ${hx(F.ACCENT_CYAN)} : ${hx(F.ACCENT_MAGENTA)}));
-          L = ${v2(F.LUM_SHOP)};
-        }
+        else { c = h < 0.5 ? ${hx(F.ACCENT_CYAN)} : ${hx(F.ACCENT_MAGENTA)}; L = ${v2(F.LUM_ACCENT)}; }
         float target = mix(L.x, L.y, fract(h * 7.31));
         // Fluorescent colour-temperature drift is in the mix above; ~1.5 % of offices flicker faintly.
         if (st == 2 && h > 0.985) target *= 0.72 + 0.28 * step(0.22, fract(uTime * 3.7 + h * 91.0));
         return c * (target / max(dot(c, vec3(0.2126, 0.7152, 0.0722)), 1e-4));
       }
       // Interior mapping: room box x∈[0,1] (room width), y∈[0,1] (floor height), z∈[-D,0] behind the glass.
-      // Shop shelving: product rows with hashed packaging colours (shop interiors, col 4).
-      vec3 strandShelves(vec2 w, float h) {
-        float row = floor(w.y * 4.5);
-        float board = step(fract(w.y * 4.5), 0.14) * step(w.y, 0.82);
-        vec2 slot = vec2(floor(w.x * 9.0), row);
-        float hs = fract(sin(dot(slot + h * 17.0, vec2(12.9898, 78.233))) * 43758.5453);
-        vec3 pack = mix(vec3(0.92, 0.9, 0.86), 0.5 + 0.5 * cos(6.2831 * (hs + vec3(0.0, 0.33, 0.67))), 0.55);
-        float gap = step(0.12, fract(w.x * 9.0)) * step(w.y, 0.82);
-        return mix(vec3(0.55), pack * (0.65 + 0.35 * gap), gap) * (1.0 - 0.7 * board);
-      }
       vec3 strandInterior(vec2 cell, vec3 d, vec3 light, float h, int col) {
-        float D = col == 4 ? 1.15 : ${D};
+        float D = ${D};
         vec3 p = vec3(cell, 0.0);
         float tx = d.x > 0.0 ? (1.0 - p.x) / d.x : (d.x < 0.0 ? -p.x / d.x : 1e5);
         float ty = d.y > 0.0 ? (1.0 - p.y) / d.y : (d.y < 0.0 ? -p.y / d.y : 1e5);
@@ -1017,21 +1001,6 @@ export class CityBuilder {
         vec3 q = p + d * min(min(tx, ty), tz);
         float depth = clamp(-q.z / D, 0.0, 1.0);
         float h2 = fract(h * 13.7);
-        if (col == 4) {
-          // Shop: shelving on the back and side walls, tiled floor, a grid of downlights.
-          vec3 c;
-          if (tz <= tx && tz <= ty) c = strandShelves(q.xy, h) * (0.75 + 0.15 * q.y);
-          else if (ty <= tx) {
-            if (d.y > 0.0) {
-              vec2 g = fract(vec2(q.x * 3.0, depth * 2.5)) - 0.5;
-              c = vec3(0.16 + 1.9 * exp(-dot(g, g) * 30.0));
-            } else {
-              vec2 t = fract(vec2(q.x * 4.0, depth * 4.0));
-              c = vec3(0.5 * (1.0 - 0.35 * depth)) * (1.0 - 0.3 * step(0.94, max(t.x, t.y)));
-            }
-          } else c = strandShelves(vec2(depth, q.y), h + 0.37) * (0.62 - 0.2 * depth);
-          return light * c;
-        }
         float k;
         if (tz <= tx && tz <= ty) {
           k = 0.62 - 0.22 * abs(q.x - 0.5) + 0.12 * q.y;
@@ -1110,19 +1079,17 @@ export class CityBuilder {
         .replace('#include <common>', `#include <common>\n${fragCommon}`)
         .replace('#include <map_fragment>', `
           int sCol = int(vArch);
-          bool sShop = fract(vArch) > 0.4;
           // aArch + 0.25: structural add-on (balcony slab, pilaster, shop pillar) — the archetype's plain cladding band.
           bool sPlain = abs(fract(vArch) - 0.25) < 0.05;
           int sSeedI = int(floor(vSeed * 65536.0));
           float sY = max(vStrandY, 0.0);
-          float sBase = sShop ? 0.0 : (sCol == 1 ? ${F.FLOOR_BASE_M[1].toFixed(1)} : 0.0);
+          float sBase = sCol == 1 ? ${F.FLOOR_BASE_M[1].toFixed(1)} : 0.0;
           float sYb = sY - sBase;
           int sFloor = sYb < ${FH} ? 0 : int(floor(sYb / ${FH}));
           float sLocal = sYb < ${FH} ? sY / (${FH} + sBase) : fract(sYb / ${FH});
           bool sMachine = false;
           float sRowV = sLocal;
-          if (!sShop && sFloor == 0 && sCol == 3) sRowV = 2.0 + float((sSeedI / 4096) % ${F.TYPICAL_ROWS}) + sLocal;
-          else if (!sShop && sFloor > 0) {
+          if (sFloor > 0) {
             int c = ${F.MACHINE_EVERY_MIN} + (sSeedI / 16) % ${F.MACHINE_EVERY_SPAN};
             int off = (sSeedI / 256) % (c - 2);
             int m = (sFloor - 1 + off) % c;
@@ -1147,7 +1114,7 @@ export class CityBuilder {
           int sState = 0;
           float sDrift = 0.0;
           if (vTop < 0.5 && !sMachine) {
-            sState = sShop ? 4 : strandRoomState(sSeedI, sFace, sRoomI, sFloor);
+            sState = strandRoomState(sSeedI, sFace, sRoomI, sFloor);
             sDrift = strandHash(sRoomI + 300000, sFloor + 5000, sSeedI);
           }
           vec3 sRoomLight = strandRoomLight(sState, sDrift);
@@ -1178,14 +1145,14 @@ export class CityBuilder {
             float sPat = dot(sEm, vec3(0.2126, 0.7152, 0.0722));
             vec3 sOut = sEm * (1.0 - sNeutral) * ${MATERIALS.BUILDING_GLASS.emissive.toFixed(2)} + sRoomLight * (sPat * sNeutral);
             #ifndef STRAND_LITE
-              if (sMask > 0.01 && !sMachine) {
+              if (sMask > 0.01 && !sMachine && sFloor > 0) {
                 float sDist = length(cameraPosition - vCityWorld);
                 if (sDist < ${PMAX}) {
                   vec3 sN = normalize(vFaceN);
                   vec3 sT = normalize(cross(vec3(0.0, 1.0, 0.0), sN));
                   vec3 sV = (vCityWorld - cameraPosition) / max(sDist, 1e-3);
                   vec3 sD = vec3(dot(sV, sT) / sRoomW, sV.y / ${FH}, dot(sV, sN) / ${FH});
-                  vec3 sInt = strandInterior(sCell, sD, sRoomLight, sDrift, sShop ? 4 : sCol);
+                  vec3 sInt = strandInterior(sCell, sD, sRoomLight, sDrift, sCol);
                   sInt *= 0.3 + 0.7 * smoothstep(0.04, 0.5, abs(dot(sV, sN)));
                   sOut = mix(sOut, sInt, sMask * (1.0 - smoothstep(${PMAX} * 0.7, ${PMAX}, sDist)));
                 }
@@ -1194,7 +1161,7 @@ export class CityBuilder {
             totalEmissiveRadiance = sOut * (1.0 - vTop) * mix(0.72, 1.0, strandAO);
           }`);
     };
-    mat.customProgramCacheKey = () => 'strand-building-v15';
+    mat.customProgramCacheKey = () => 'strand-building-v16';
     return mat;
   }
 
@@ -2939,7 +2906,6 @@ export class CityBuilder {
         lotHalfW,
         lotHalfD,
         setbackY,
-        recessTop: 0,
       };
     });
     const lowTopOf = (b: Building): number => (b.setbackY > 0 ? b.setbackY : b.roofY);
@@ -2947,14 +2913,14 @@ export class CityBuilder {
     // ------------------------------------------------------------------ 7. face roles
     // Alley faces and ≥ 2 faces per tower stay FLAT (clean runs for 6B-2's anywhere wall-run, which detects
     // every vertical collider face); the other faces carry the archetype's 3D features: B balconies, C the
-    // fire escape (+ ducts / loading dock), D the recessed shopfronts with per-floor canopies. A keeps every
-    // face flat behind its decorative mullions.
+    // fire escape (+ ducts / loading dock), D the solid roll-shutter street base (7A-3: no recessed glass) with
+    // per-floor canopies. A keeps every face flat behind its decorative mullions.
     const fkey = (b: Building, ax: Axis, sg: number): string => `${b.index}:${ax}:${sg}`;
     const faceLen = (b: Building, ax: Axis): number => (ax === 'x' ? b.lotHalfD : b.lotHalfW) * 2;
     const runFaces = new Set<string>();
     const balconyFaces = new Set<string>();
     const escapeFaces = new Set<string>();
-    const recessFaces = new Set<string>();
+    const shutterFaces = new Set<string>();
     const ductFaces = new Set<string>();
     buildings.forEach((b) => {
       let count = 0;
@@ -2992,45 +2958,20 @@ export class CityBuilder {
       } else if (b.arch === ARCH_C) {
         if (feature.length) ductFaces.add(fkey(b, feature[0][0], feature[0][1]));
       } else if (b.arch === ARCH_D && feature.length) {
-        const r = arng();
-        const floors = r < 0.4 ? 1 : r < 0.8 ? 2 : 3;
-        b.recessTop = Math.max(0, Math.min(floors * 4, Math.floor((lowTopOf(b) - 8) / 4) * 4));
-        if (b.recessTop > 0) for (const [ax, sg] of feature) recessFaces.add(fkey(b, ax, sg));
+        if (lowTopOf(b) >= 12) for (const [ax, sg] of feature) shutterFaces.add(fkey(b, ax, sg));
       }
     });
 
     // ------------------------------------------------------------------ 7b. tower bodies, roofs, crowns
     const roofRects: RectXZ[][] = buildings.map(() => []);
-    /** Tower body box: aSeed + aArch (+0.5 on faces that show a shop interior behind a recessed front). */
-    const bodyBox = (w: number, h: number, d: number, x: number, y: number, z: number, seed: number, arch: number, shop?: (nx: number, nz: number) => boolean): THREE.BufferGeometry => {
-      const g = withAttr1(boxAt(w, h, d, x, y, z), 'aSeed', seed);
-      const n = g.getAttribute('normal') as THREE.BufferAttribute;
-      const a = new Float32Array(n.count);
-      for (let i = 0; i < n.count; i++) a[i] = arch + (shop && shop(n.getX(i), n.getZ(i)) ? 0.5 : 0);
-      g.setAttribute('aArch', new THREE.BufferAttribute(a, 1));
-      return g;
-    };
+    /** Tower body box: aSeed + aArch. */
+    const bodyBox = (w: number, h: number, d: number, x: number, y: number, z: number, seed: number, arch: number): THREE.BufferGeometry =>
+      withAttr1(withAttr1(boxAt(w, h, d, x, y, z), 'aSeed', seed), 'aArch', arch);
     const TERRACE_NEON = [COLORS.WALLRUN_CYAN, COLORS.NEON_MAGENTA, COLORS.NEON_AMBER];
     buildings.forEach((b) => {
       const lowTop = lowTopOf(b);
       const top = lowTop - 0.45;
-      if (b.recessTop > 0) {
-        // Type D: the lower 1–3 floors step back 1.8 m behind the shopfront glass on the recessed faces.
-        const RD = AR.RECESS_DEPTH_M;
-        const ix0 = recessFaces.has(fkey(b, 'x', -1)) ? RD : 0;
-        const ix1 = recessFaces.has(fkey(b, 'x', 1)) ? RD : 0;
-        const iz0 = recessFaces.has(fkey(b, 'z', -1)) ? RD : 0;
-        const iz1 = recessFaces.has(fkey(b, 'z', 1)) ? RD : 0;
-        const x0 = b.rect.x0 + ix0;
-        const x1 = b.rect.x1 - ix1;
-        const z0 = b.rect.z0 + iz0;
-        const z1 = b.rect.z1 - iz1;
-        G.bodies.push(bodyBox(x1 - x0, b.recessTop, z1 - z0, (x0 + x1) / 2, b.recessTop / 2, (z0 + z1) / 2, b.seed, ARCH_D,
-          (nx, nz) => (nx > 0.5 && ix1 > 0) || (nx < -0.5 && ix0 > 0) || (nz > 0.5 && iz1 > 0) || (nz < -0.5 && iz0 > 0)));
-        G.bodies.push(bodyBox(b.lotHalfW * 2, top - b.recessTop, b.lotHalfD * 2, b.cx, (top + b.recessTop) / 2, b.cz, b.seed, ARCH_D));
-      } else {
-        G.bodies.push(bodyBox(b.lotHalfW * 2, top, b.lotHalfD * 2, b.cx, top / 2, b.cz, b.seed, b.arch));
-      }
+      G.bodies.push(bodyBox(b.lotHalfW * 2, top, b.lotHalfD * 2, b.cx, top / 2, b.cz, b.seed, b.arch));
       if (b.setbackY > 0) {
         // Terrace: wet concrete cap + steel lip + a thin neon edge line, then the slimmer crown tier.
         G.concrete.push(worldUvBox(b.lotHalfW * 2 + 0.3, 0.5, b.lotHalfD * 2 + 0.3, b.cx, b.setbackY - 0.25, b.cz, RENDER.ROOF_TILE_M));
@@ -3338,27 +3279,31 @@ export class CityBuilder {
       }
     };
 
-    /** Type D: recessed shopfront (1.8 m deep, 1–3 floors) + per-floor canopies with wide banners. */
-    const shopfront = (b: Building, ax: Axis, sg: number): void => {
+    /**
+     * 7A-3 Type D street base (the recessed glass shopfront is gone): closed roll shutters come from the facade
+     * atlas; heavy stone pillars (0.36 m out, no collider) every ~6 m, a projecting sign fascia over the shutters
+     * with a warm downlight strip and its spill on the pavement — then per-floor canopies with wide banners.
+     */
+    const shutterFront = (b: Building, ax: Axis, sg: number): void => {
       const f = faceFrame(b, ax, sg);
-      const RT = b.recessTop;
-      const RD = AR.RECESS_DEPTH_M;
-      const PW = AR.RECESS_PILLAR_M;
-      facadeFeatures.push({ kind: 'SHOPFRONT', building: b.index, center: f.P3(f.c, 0, 0), normal: new THREE.Vector3(f.nx, 0, f.nz), top: RT });
-      G.bodies.push(plainBody(f.box(f.a0, f.a0 + PW, 0, RT, -RD, 0), b.seed, ARCH_D), plainBody(f.box(f.a1 - PW, f.a1, 0, RT, -RD, 0), b.seed, ARCH_D));
-      const inner = f.len - 2 * PW;
-      const bays = Math.max(1, Math.round(inner / AR.RECESS_PILLAR_SPACING_M));
-      const bw = inner / bays;
-      for (let k = 1; k < bays; k++) {
-        const a = f.a0 + PW + k * bw;
-        G.bodies.push(plainBody(f.box(a - PW / 2, a + PW / 2, 0, RT, -PW, 0), b.seed, ARCH_D));
+      const RT = AR.BASE_TOP_M;
+      const PW = AR.SHUTTER_PILLAR_M;
+      const PO = AR.SHUTTER_PILLAR_OUT_M;
+      facadeFeatures.push({ kind: 'SHUTTER_FRONT', building: b.index, center: f.P3(f.c, 0, 0), normal: new THREE.Vector3(f.nx, 0, f.nz), top: RT });
+      const bays = Math.max(1, Math.round((f.len - PW) / AR.SHUTTER_PILLAR_SPACING_M));
+      const bw = (f.len - PW) / bays;
+      for (let k = 0; k <= bays; k++) {
+        const a = f.a0 + PW / 2 + k * bw;
+        G.bodies.push(plainBody(f.box(a - PW / 2, a + PW / 2, 0, RT, 0, PO), b.seed, ARCH_D));
+        G.steel.push(f.box(a - PW / 2 - 0.03, a + PW / 2 + 0.03, 0, 0.32, 0, PO + 0.04));
       }
-      // Highly reflective glass in front of the lit shop interior (two layers, 1.8 m apart).
-      G.glassT.push(stripUv(f.box(f.a0 + PW, f.a1 - PW, 0.05, RT - 0.08, -0.04, -0.01)));
-      for (let y = 0; y < RT - 0.1; y += 4) G.steel.push(f.box(f.a0 + PW, f.a1 - PW, y + 2.6, y + 2.66, -0.06, 0.0), f.box(f.a0 + PW, f.a1 - PW, y, y + 0.06, -0.06, 0.02));
-      for (let a = f.a0 + PW + 2.3; a < f.a1 - PW - 0.5; a += 2.3) G.steel.push(f.box(a - 0.03, a + 0.03, 0, RT, -0.06, 0.0));
-      // Soffit downlights behind the glass + their spill on the pavement.
-      G.strips.push(withColor(f.box(f.a0 + PW + 0.2, f.a1 - PW - 0.2, RT - 0.05, RT - 0.01, -0.5, -0.38), COLORS.STREET_LAMP, 1.05));
+      // Sign fascia over the shutters (dark steel box, neon edge) + the warm downlight strip on its soffit.
+      const [fy0, fy1] = AR.SHUTTER_FASCIA_Y;
+      const FO = AR.SHUTTER_FASCIA_OUT_M;
+      G.steel.push(f.box(f.a0 + PW, f.a1 - PW, fy0, fy1, 0, FO));
+      const tintF = NEON_TINTS[Math.floor(srng() * NEON_TINTS.length)];
+      G.strips.push(withColor(f.box(f.a0 + PW + 0.1, f.a1 - PW - 0.1, fy1 - 0.05, fy1 - 0.02, FO, FO + 0.02), tintF, 1.1));
+      G.strips.push(withColor(f.box(f.a0 + PW + 0.25, f.a1 - PW - 0.25, fy0 - 0.03, fy0, 0.04, FO - 0.04), COLORS.STREET_LAMP, 1.05));
       const sp = f.P3(f.c, 2.6, 0.9);
       addLight(sp.x, sp.y, sp.z, FACADE.WARM_A, 1.3);
       // Horizontal canopy on every floor above the shopfront (dense wide banners).
@@ -3388,7 +3333,7 @@ export class CityBuilder {
         if (balconyFaces.has(key)) balconies(b, ax, sg);
         if (escapeFaces.has(key)) fireEscape(b, ax, sg);
         if (ductFaces.has(key)) ductsAndDock(b, ax, sg);
-        if (recessFaces.has(key)) shopfront(b, ax, sg);
+        if (shutterFaces.has(key)) shutterFront(b, ax, sg);
       }
     });
 
@@ -3509,10 +3454,10 @@ export class CityBuilder {
       const lowTop = lowTopOf(b);
       const busyFaces = new Set<string>();
       // 5B-3: 1F canopy (Y 4.2 m, 1.4 m deep) with an under-glow strip and a wide banner above it — never on the
-      // flat wall-run faces, the fire escape or a recessed shopfront (D has its own per-floor canopies).
+      // flat wall-run faces, the fire escape or a Type D shutter front (D has its own per-floor canopies).
       for (const [ax, sg] of streetFaces) {
         const key = fkey(b, ax, sg);
-        if (runFaces.has(key) || escapeFaces.has(key) || recessFaces.has(key) || srng() < 0.22) continue;
+        if (runFaces.has(key) || escapeFaces.has(key) || shutterFaces.has(key) || srng() < 0.22) continue;
         const len = (ax === 'x' ? b.lotHalfD : b.lotHalfW) * 2;
         const cl = len - 3;
         if (cl < 4) continue;
@@ -3632,7 +3577,7 @@ export class CityBuilder {
     buildings.forEach((b) => {
       const top = lowTopOf(b) - 0.45;
       for (const [ax, sg] of FACES) {
-        const y0 = recessFaces.has(fkey(b, ax, sg)) ? b.recessTop : 0;
+        const y0 = 0;
         if (ax === 'x') censusFace(b, sg, 0, b.rect.z0, b.rect.z1, y0, top);
         else censusFace(b, 0, sg, b.rect.x0, b.rect.x1, y0, top);
         if (b.setbackY > 0) {
@@ -3975,7 +3920,7 @@ export class CityBuilder {
         balconies: balconyCount,
         fireEscapes: escapeCount,
         escapeFlights: flightCount,
-        shopfronts: recessFaces.size,
+        shutterFronts: shutterFaces.size,
         facadeRooms,
       },
     };

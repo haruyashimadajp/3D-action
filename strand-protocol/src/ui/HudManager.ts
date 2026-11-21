@@ -33,7 +33,7 @@
  *    the side panels + faint edge scales, title SETTINGS / PROTOCOL as right-side drawers
  * DOM is written only when values change (no per-frame layout churn).
  */
-import { BULLET_TIME, FLOW_RANKS, JUICE, PLAYER, SAVE_KEY, TELEGRAPH, clamp } from '../config/constants';
+import { BULLET_TIME, FLOW_RANKS, INPUT, JUICE, PLAYER, SAVE_KEY, TELEGRAPH, clamp } from '../config/constants';
 import {
   ENERGY_COLORS,
   MODIFIERS,
@@ -95,6 +95,10 @@ export interface HudFrame {
   bossDowned: boolean;
   /** 0..1 tactical-zoom blend. */
   zoom: number;
+  /** 7A-4 ADS target mini HP bar: shown, HP fraction, enemy name. */
+  aimVisible: boolean;
+  aimFrac: number;
+  aimName: string;
   /** 0..1 recoil bloom of the reticle (shots open it, it closes again — 5B-5 dynamic reticle). */
   reticleKick: number;
   /** Active buffs: SK_02 piercing shots left (0 = none), SK_11 boost, SK_14 adrenaline. */
@@ -200,6 +204,10 @@ export class HudManager {
   private readonly ammoName = el('ammo-name');
   private readonly hitmarker = el<SVGGElement>('hitmarker');
   private readonly zoomBrackets = el<SVGGElement>('xh-zoom');
+  private readonly adsTicks = el<SVGGElement>('xh-ads');
+  private readonly aimHp = el('aim-hp');
+  private readonly aimHpName = el('aim-hp-name');
+  private readonly aimHpFill = el('aim-hp-fill');
   private btDeniedT = 0;
   private readonly alertEl = el('hud-alert');
   private alertT = 0;
@@ -515,7 +523,9 @@ export class HudManager {
     const range = el<HTMLElement>('sens-range') as unknown as HTMLInputElement;
     const num = el<HTMLElement>('sens-num') as unknown as HTMLInputElement;
     const setSens = (v: number, fromNum: boolean): void => {
-      const value = Math.round(clamp(Number.isFinite(v) ? v : 1, 0.2, 3) * 100) / 100;
+      // 7A-2: 0.20 … 10.00 in 0.05 steps.
+      const st = INPUT.SENSITIVITY_STEP;
+      const value = Math.round(Math.round(clamp(Number.isFinite(v) ? v : 1, INPUT.SENSITIVITY_MIN, INPUT.SENSITIVITY_MAX) / st) * st * 100) / 100;
       s.sensitivity = value;
       range.value = String(value);
       if (!fromNum || document.activeElement !== num) num.value = value.toFixed(2);
@@ -557,6 +567,10 @@ export class HudManager {
     seg('set-dot', s.centerDot ? '1' : '0', (v) => {
       s.centerDot = v === '1';
       onChange('centerDot');
+    });
+    seg('set-latency', s.lowLatency ? '1' : '0', (v) => {
+      s.lowLatency = v === '1';
+      onChange('lowLatency');
     });
     seg('set-quality', s.quality, (v) => {
       s.quality = v === 'LOW' ? 'LOW' : v === 'MEDIUM' ? 'MEDIUM' : 'HIGH';
@@ -719,8 +733,19 @@ export class HudManager {
     if (this.changed('rk', kq) || this.changed('rkz', zq) || this.changed('rks', f.slot)) {
       const sc = (1 + 0.55 * kq) * (1 - 0.12 * zq);
       this.reticles[f.slot].setAttribute('transform', `scale(${sc.toFixed(3)})`);
-      // 6B-1: in full ADS the physical holo sight's collimated dot is the aiming reference — the HUD reticle fades.
-      this.reticles[f.slot].style.opacity = (1 - 0.8 * clamp((zq - 0.45) / 0.45, 0, 1)).toFixed(2);
+      // 7A-1: past 60 % zoom the physical holo sight's collimated dot is the only aim point — the weapon reticle
+      // and the centre dot fade out, four hairline ticks (12 → 18 px from the centre) stay as a frame.
+      const ads = clamp((zq - 0.45) / 0.15, 0, 1);
+      this.reticles[f.slot].style.opacity = (1 - ads).toFixed(2);
+      this.adsTicks.style.opacity = ads.toFixed(2);
+      this.dot.style.opacity = (1 - ads).toFixed(2);
+    }
+    // 7A-4: target mini HP bar (zoom > 0.3, ≤ 3.5° from the aim point, visible, not the boss).
+    if (this.changed('aimV', f.aimVisible)) this.aimHp.style.opacity = f.aimVisible ? '1' : '0';
+    if (f.aimVisible) {
+      if (this.changed('aimN', f.aimName)) this.aimHpName.textContent = f.aimName.toLowerCase();
+      const fq = Math.round(clamp(f.aimFrac, 0, 1) * 88) / 88;
+      if (this.changed('aimF', fq)) this.aimHpFill.style.transform = `scaleX(${fq.toFixed(3)})`;
     }
     const sharp = z > 0.2;
     if (this.changed('zs', sharp) || this.changed('zsl', f.slot)) {

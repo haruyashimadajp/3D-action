@@ -6,7 +6,8 @@
  *  - A new strand requires switching to GRAPPLE (Q / 4 / wheel): holster 110 ms + draw 110 ms.
  *  - While the strand is ATTACHED it is locked to the left-arm winch: switching to a gun keeps the
  *    player hanging / swinging (and able to shoot); switching back to GRAPPLE does NOT cut it.
- *    Only Space (release), Ctrl/C (cut) or a new LMB launch with GRAPPLE active cut the strand.
+ *    Only Space (release) or Ctrl/C (cut) cut the strand — 7A-6: LMB with GRAPPLE active while attached reels in
+ *    safely and never re-fires / cuts.
  *  - Reel-in (LMB held) only while GRAPPLE is in hand; with a gun it is a pure pendulum.
  * 5-state gear FSM: IDLE · HOLSTERING · DRAWING · FIRING_RECOVERY · RELOADING (switch cancels reload and
  * interrupts recovery). Clicks up to 150 ms before a switch completes are buffered and fired on completion.
@@ -18,7 +19,7 @@
  */
 import * as THREE from 'three';
 import { COLORS, DEG2RAD, EQUIP, MATERIALS, PHYSICS, clamp } from '../config/constants';
-import { GRAPPLE, GUNS, SLOT_ORDER, type GunDef, type GunId, type SlotId, isGun } from '../config/weapons';
+import { GRAPPLE, GUNS, RELOAD_BEATS, SLOT_ORDER, type GunDef, type GunId, type ReloadCue, type SlotId, isGun, shellCycles } from '../config/weapons';
 import { SKILL_BY_ID, SKILL_CONSTANTS } from '../config/skills';
 import type { InputManager, DiscreteAction } from '../engine/InputManager';
 import type { Renderer } from '../engine/Renderer';
@@ -61,6 +62,11 @@ export interface EquipmentEvents {
   onSwitchDone?(slot: SlotId): void;
   onReloadStart?(gun: GunId): void;
   onReloadDone?(gun: GunId): void;
+  /**
+   * 7A-5 three-stage reload SE, fired at the exact animation beats: pistol / SMG MAG_OUT 0.14 → MAG_IN 0.54 →
+   * SLIDE 0.72; shotgun one SHELL per loaded shell (0.16 … 0.72) → PUMP 0.78.
+   */
+  onReloadCue?(gun: GunId, cue: ReloadCue): void;
   onHookFired?(): void;
   onHookAttached?(point: THREE.Vector3, snapped: boolean): void;
   onHookMissed?(): void;
@@ -173,6 +179,7 @@ export class EquipmentManager {
     phase: 'IDLE',
     phaseT: 0,
     reloadT: -1,
+    reloadFrom: 0,
     ammo: 0,
     magazine: 0,
     hookInFlight: false,
@@ -377,13 +384,41 @@ export class EquipmentManager {
     this.stateDuration = duration;
   }
 
+  /** 7A-5: rounds in the magazine when the reload started, and the next reload cue to fire. */
+  private reloadFrom = 0;
+  private reloadCue = 0;
+
   startReload(): void {
     if (!isGun(this.activeSlot)) return;
     if (this.state !== 'IDLE' && this.state !== 'FIRING_RECOVERY') return;
     const gun = GUNS[this.activeSlot];
     if (this.ammo[gun.id] >= gun.magazine) return;
     this.enter('RELOADING', gun.reloadS * this.modifiers.reloadTimeMultiplier);
+    this.reloadFrom = this.ammo[gun.id];
+    this.reloadCue = 0;
     this.events.onReloadStart?.(gun.id);
+  }
+
+  /** 7A-5: emits the reload SE cues whose beat the reload progress has crossed (each exactly once). */
+  private fireReloadCues(gun: GunId): void {
+    const t = this.stateTime / Math.max(this.stateDuration, 1e-4);
+    const B = RELOAD_BEATS;
+    if (gun === 'SHOTGUN') {
+      const n = shellCycles(this.reloadFrom, GUNS[gun].magazine);
+      const span = (B.SHELL_END - B.SHELL_START) / n;
+      while (this.reloadCue < n && t >= B.SHELL_START + (this.reloadCue + B.SHELL_CLICK) * span) {
+        this.reloadCue++;
+        this.events.onReloadCue?.(gun, 'SHELL');
+      }
+      if (this.reloadCue === n && t >= B.PUMP) {
+        this.reloadCue++;
+        this.events.onReloadCue?.(gun, 'PUMP');
+      }
+      return;
+    }
+    const beats = [B.MAG_OUT, B.MAG_IN, B.SLIDE] as const;
+    const cues: readonly ReloadCue[] = ['MAG_OUT', 'MAG_IN', 'SLIDE'];
+    while (this.reloadCue < 3 && t >= beats[this.reloadCue]) this.events.onReloadCue?.(gun, cues[this.reloadCue++]);
   }
 
   /** Instant magazine refill (skill hooks: SK_04 wall overclock, SK_09 shield break). */
@@ -470,6 +505,7 @@ export class EquipmentManager {
         }
         break;
       case 'RELOADING':
+        if (isGun(this.activeSlot)) this.fireReloadCues(this.activeSlot);
         if (this.stateTime >= this.stateDuration && isGun(this.activeSlot)) {
           this.ammo[this.activeSlot] = GUNS[this.activeSlot].magazine;
           this.enter('IDLE', 0);
@@ -501,8 +537,12 @@ export class EquipmentManager {
         // 5A-4: clicks while the hook is flying are swallowed — never a self-cancel, never a stale re-fire
         // that would cut the strand the moment it lands.
         this.input.consumeBuffered('FIRE');
-      } else if (this.player.ropeAttached || this.simTime >= this.grappleReadyAt) {
-        // GRAPPLE: a new launch (cuts any attached strand first). Cooldown applies only when not attached.
+      } else if (this.player.ropeAttached) {
+        // 7A-6 safe reel: with a strand attached, LMB never cuts it — the press / hold reels in (GRAPPLE_PULL via
+        // stepContext). Releasing is Space (boost) or Ctrl / C (pure cut) only.
+        this.input.consumeBuffered('FIRE');
+      } else if (this.simTime >= this.grappleReadyAt) {
+        // GRAPPLE: a new launch once the 0.65 s re-use cooldown has passed.
         this.input.consumeBuffered('FIRE');
         this.fireHook(camera);
       }
@@ -578,7 +618,7 @@ export class EquipmentManager {
   // Grapple
   // ===============================================================================================
   private fireHook(camera: THREE.PerspectiveCamera): void {
-    // A new launch always cuts the current strand (hit or miss).
+    // Launches only happen without an attached strand (7A-6); kept as a guard for skill-driven launches.
     if (this.player.ropeAttached) {
       this.suppressCooldown = true;
       this.player.detachRope('REFIRE');
@@ -696,6 +736,7 @@ export class EquipmentManager {
     f.phase = this.state === 'HOLSTERING' ? 'HOLSTER' : this.state === 'DRAWING' ? 'DRAW' : 'IDLE';
     f.phaseT = total > 0 ? clamp(this.stateTime / total, 0, 1) : 0;
     f.reloadT = this.state === 'RELOADING' ? clamp(this.stateTime / Math.max(total, 1e-4), 0, 1) : -1;
+    f.reloadFrom = this.reloadFrom;
     f.ammo = isGun(this.activeSlot) ? this.ammo[this.activeSlot] : 0;
     f.magazine = isGun(this.activeSlot) ? GUNS[this.activeSlot].magazine : 0;
     f.hookInFlight = this.hookInFlight;

@@ -22,7 +22,7 @@
 import * as THREE from 'three';
 import { CAMERA, COLORS, MATERIALS, clamp, lerpFactor } from '../config/constants';
 import type { ProceduralTextureLibrary } from '../engine/ProceduralTextures';
-import { SLOT_ORDER, type GunId, type SlotId } from '../config/weapons';
+import { RELOAD_BEATS, SLOT_ORDER, type GunId, type ReloadCue, type SlotId, shellCycles } from '../config/weapons';
 import {
   MeshKit,
   type PartOpts,
@@ -51,6 +51,8 @@ export interface ViewModelFrame {
   phaseT: number;
   /** 0..1 reload progress (−1 when not reloading). */
   reloadT: number;
+  /** 7A-5: rounds loaded when the reload started (shotgun shell cycles, side-saddle refill). */
+  reloadFrom: number;
   ammo: number;
   magazine: number;
   hookInFlight: boolean;
@@ -93,6 +95,42 @@ const T = {
   LASER: 0xff2a3c,
   GAUGE: 0xd8f4ff,
 } as const;
+
+/** 7A-5 / 7A-6 view-model helpers. */
+interface ReloadPose {
+  roll: number;
+  pitch: number;
+  lift: number;
+  shift: number;
+  /** Slide / bolt travel (× slideTravel) and pump stroke (0..1) driven by the hand. */
+  slide: number;
+  pump: number;
+  /** Ammo-bar override (0 mag out, 1 fresh mag, −1 none) and visible side-saddle shells. */
+  bar: number;
+  shells: number;
+  /** Shell in the left glove (shotgun). */
+  handShell: number;
+  /** The left hand follows `reloadHand` / `reloadQuat`. */
+  hand: boolean;
+}
+const sstep = (a: number, b: number, x: number): number => {
+  const t = clamp((x - a) / (b - a), 0, 1);
+  return t * t * (3 - 2 * t);
+};
+const _X = new THREE.Vector3(1, 0, 0);
+const _ra = new THREE.Vector3();
+const _rb = new THREE.Vector3();
+const _qa = new THREE.Quaternion();
+/** Left glove wrapped around a vertical magazine (grip axis down the mag, forearm down-left-back). */
+const _qMagGrip = new THREE.Quaternion().setFromEuler(new THREE.Euler(Math.PI / 2, Math.PI / 2, 0, 'YXZ'));
+/** Slingshot rack: palm on the left flank of the slide / receiver, fingers round the back, forearm down-left. */
+const _qRack = new THREE.Quaternion().setFromEuler(new THREE.Euler(1.963, 1.963, 0.262, 'YXZ'));
+/** Mantle: palm slapped down on the ledge, forearm back-left. */
+const _qMantle = new THREE.Quaternion().setFromEuler(new THREE.Euler(2.487, 1.963, -0.131, 'YXZ'));
+const MANTLE_HAND_S = 0.3;
+
+/** 7A-1: holo dot colour gain — every channel stays ≤ 0.82, under the 0.92 bloom threshold. */
+const HOLO_DOT_GAIN = 0.82;
 
 const _v = new THREE.Vector3();
 const _v2 = new THREE.Vector3();
@@ -151,7 +189,11 @@ interface WeaponRig {
   readonly kickPitch: number;
 }
 
-/** Holo lens: coated glass + collimated reticle (dot + broken ring) drawn where the sight axis meets infinity. */
+/**
+ * 7A-1 holo lens: practically clear glass (alpha 0.02 in the window, ≤ 0.12 only at the very rim) and a single
+ * pin-point collimated dot (radius 0.0022 → 0.0038 NDC·aspect) drawn where the sight axis meets infinity. The dot
+ * colour stays below the bloom threshold (≤ 0.82) so it never blooms over a target's head; no ring, no glint.
+ */
 function createLensMaterial(color: THREE.Color): THREE.ShaderMaterial {
   return new THREE.ShaderMaterial({
     transparent: true,
@@ -179,18 +221,12 @@ function createLensMaterial(color: THREE.Color): THREE.ShaderMaterial {
       varying vec2 vNdc;
       void main() {
         vec2 d = (vNdc - uReticle) * vec2(uAspect, 1.0);
-        float r = length(d);
-        float dotR = 1.0 - smoothstep(0.0035, 0.0065, r);
-        float ring = (1.0 - smoothstep(0.0018, 0.0042, abs(r - 0.034)));
-        float ang = atan(d.y, d.x);
-        ring *= step(0.16, abs(sin(ang * 2.0 + 0.785)));
+        float dotR = 1.0 - smoothstep(0.0022, 0.0038, length(d));
         vec2 e = abs(vUv - 0.5) * 2.0;
-        float edge = smoothstep(0.55, 1.0, max(e.x, e.y));
-        vec3 glass = mix(vec3(0.05, 0.11, 0.12), vec3(0.16, 0.08, 0.2), vUv.y) * (0.6 + 0.8 * edge);
-        float glint = smoothstep(0.08, 0.0, abs(vUv.x - vUv.y * 0.7 - 0.12)) * 0.35;
-        vec3 col = glass + vec3(glint) + uColor * (dotR * 3.2 + ring * 1.9);
-        float a = clamp(0.16 + 0.3 * edge + glint * 0.4 + dotR + ring * 0.85, 0.0, 1.0);
-        gl_FragColor = vec4(col, a);
+        float edge = smoothstep(0.85, 1.0, max(e.x, e.y));
+        vec3 glass = vec3(0.03, 0.06, 0.065);
+        float a = mix(0.02 + 0.10 * edge, 0.92, dotR);
+        gl_FragColor = vec4(mix(glass, uColor, dotR), a);
       }
     `,
   });
@@ -280,6 +316,15 @@ export class ViewModelRenderer {
   private time = 0;
   private lastSlot: SlotId = 'PISTOL';
   private ejectPending = false;
+  // 7A-5 reload / 7A-6 mantle state
+  private reloadPrevT = -1;
+  private jolt = 0;
+  private joltV = 0;
+  private mantleT = 10;
+  private mantleDip = 0;
+  private readonly reloadHand = new THREE.Vector3();
+  private readonly reloadQuat = new THREE.Quaternion();
+  private readonly pose: ReloadPose = { roll: 0, pitch: 0, lift: 0, shift: 0, slide: 0, pump: 0, bar: -1, shells: 4, handShell: 0, hand: false };
   private readonly leftPos = new THREE.Vector3(-0.25, -0.3, -0.42);
   private readonly leftQuat = new THREE.Quaternion();
   private rimLight!: THREE.DirectionalLight;
@@ -297,7 +342,7 @@ export class ViewModelRenderer {
 
     this.hardMat = kitMaterial(textures.gun, this.hardU, 'hard', 1.0);
     this.gearMat = kitMaterial(textures.glove, this.gearU, 'gear', 0.9);
-    this.lensMat = createLensMaterial(new THREE.Color(COLORS.PLAYER_STRAND).multiplyScalar(1.6));
+    this.lensMat = createLensMaterial(new THREE.Color(COLORS.PLAYER_STRAND).multiplyScalar(HOLO_DOT_GAIN));
     this.applyEnergyUniforms();
 
     // Dedicated view-model lighting: cool key from the upper left, strand-cyan rim from behind-right, warm
@@ -349,7 +394,7 @@ export class ViewModelRenderer {
     const c = new THREE.Color(this.plasma ? 0xdcf2ff : this.energyHex);
     this.hardU.uEnergy.value.copy(c);
     this.gearU.uEnergy.value.copy(c);
-    (this.lensMat.uniforms.uColor.value as THREE.Color).copy(c).multiplyScalar(1.6);
+    (this.lensMat.uniforms.uColor.value as THREE.Color).copy(c).multiplyScalar(HOLO_DOT_GAIN);
   }
 
   /** §8.3 weapon energy colour: every energy-lit part, the holo reticles, the muzzle flash and the rim light. */
@@ -922,6 +967,9 @@ export class ViewModelRenderer {
       fl.translate(s, 0, 0);
       drumKit.add(fl, { tint: T.GUNMETAL, zone: 0 });
     }
+    // 7A-5: shotgun shell held in the fingers while loading (shown only through uHand — no extra draw call).
+    hard.add(lathe([[0.0, 0.0], [0.0092, 0.0], [0.0092, 0.011], [0.0, 0.011]], 14), { tint: T.BRASS, zone: 0, anim: [0, 0, 0, 2] }, at(-0.008, 0.014, 0.03, -Math.PI / 2));
+    hard.add(lathe([[0.0086, 0.011], [0.0086, 0.056], [0.006, 0.058], [0.0, 0.058]], 14), { tint: T.SHELL, zone: 2, rough: 0.8, anim: [0, 0, 0, 2] }, at(-0.008, 0.014, 0.03, -Math.PI / 2));
     this.mesh(gear, this.gearMat, 'LeftHand', this.leftArm);
     this.mesh(hard, this.hardMat, 'LeftArmor', this.leftArm);
     this.leftArm.add(drumHolder);
@@ -955,6 +1003,124 @@ export class ViewModelRenderer {
     this.ejectPending = true;
   }
 
+  /** 7A-5: each loaded shotgun shell makes the gun twitch as it clicks home. */
+  onReloadCue(_gun: GunId, cue: ReloadCue): void {
+    if (cue === 'SHELL') {
+      this.joltV += 0.32;
+      this.kickVP += 0.45;
+    } else if (cue === 'PUMP') {
+      this.kickVZ += 0.6;
+    }
+  }
+
+  /** 7A-6: auto-mantle started — left-hand push on the ledge, weapon dips. */
+  onMantle(): void {
+    this.mantleT = 0;
+  }
+
+  /**
+   * 7A-5 reload timeline at progress t (−1 = not reloading). Fills `this.pose` plus the left-hand target
+   * (`reloadHand` in gun space, `reloadQuat` gun-relative) when the hand is part of the move.
+   *  Pistol / SMG — 0–0.24 roll +0.48 rad, lift; the left hand grabs the magazine and strips it downward ·
+   *  0.24–0.56 hand out of view at the pouch (0.30–0.40), back with a fresh magazine, slammed home 0.46–0.56 ·
+   *  0.56–0.82 the hand racks the slide (pistol, overhand) / charging handle (SMG) back and lets it snap ·
+   *  0.82–1 back to the ready pose.
+   *  Shotgun — 0–0.16 roll −0.52 / pitch +0.32 showing the loading port · 0.16–0.72 n = 2…4 shells pushed in
+   *  from the belt one by one · 0.72–0.90 one full pump stroke · 0.90–1 ready.
+   */
+  private reloadPose(rig: WeaponRig, f: ViewModelFrame, t: number): ReloadPose {
+    const P = this.pose;
+    P.roll = 0;
+    P.pitch = 0;
+    P.lift = 0;
+    P.shift = 0;
+    P.slide = 0;
+    P.pump = 0;
+    P.bar = -1;
+    P.shells = 4;
+    P.handShell = 0;
+    P.hand = false;
+    if (rig.mag && rig.magRest && rig.magAxis) rig.mag.position.copy(rig.magRest);
+    if (rig.mag) rig.mag.visible = true;
+    if (t < 0) return P;
+    const B = RELOAD_BEATS;
+    if (rig.shells) {
+      // ----- K-12 shotgun -----
+      const A = sstep(0, 0.16, t) * (1 - sstep(0.72, 0.8, t));
+      const C = sstep(0.72, 0.8, t) * (1 - sstep(0.9, 1, t));
+      P.roll = -0.52 * A - 0.12 * C;
+      P.pitch = 0.32 * A + 0.06 * C;
+      P.lift = 0.08 * A + 0.02 * C;
+      P.shift = -0.06 * A;
+      const n = shellCycles(f.reloadFrom, f.magazine);
+      const span = (B.SHELL_END - B.SHELL_START) / n;
+      const k = Math.floor((t - B.SHELL_START) / span);
+      const loaded = t < B.SHELL_START ? 0 : Math.min(n, Math.floor((t - B.SHELL_START) / span + (1 - B.SHELL_CLICK)));
+      P.shells = Math.min(4, f.reloadFrom + loaded);
+      if (t >= B.SHELL_START && t < B.SHELL_END) {
+        // One shell cycle: up from the belt (0–0.35) · push into the port (0.35–0.72, click) · back down.
+        const u = (t - B.SHELL_START) / span - k;
+        const up = u < 0.35 ? sstep(0, 0.35, u) : u < B.SHELL_CLICK ? 1 : 1 - sstep(B.SHELL_CLICK, 1, u);
+        const push = u < 0.35 ? 0 : u < B.SHELL_CLICK ? sstep(0.35, B.SHELL_CLICK, u) : 1;
+        this.reloadHand.set(-0.004, -0.25 + 0.2 * up + 0.012 * push, 0.03 - 0.045 * push);
+        this.reloadQuat.identity();
+        P.handShell = u < B.SHELL_CLICK ? 1 : 0;
+        P.hand = true;
+      } else if (t >= B.SHELL_END && t < 0.9) {
+        // Pump: hand onto the fore-end, one full stroke (back 0.74 → 0.78, forward 0.80 → 0.85).
+        P.pump = sstep(0.74, 0.78, t) * (1 - sstep(0.8, 0.85, t));
+        if (rig.support) this.reloadHand.set(rig.support.x, rig.support.y, -0.24 + P.pump * 0.07);
+        this.reloadQuat.identity();
+        P.hand = t < 0.88 || !rig.support;
+      } else if (t < B.SHELL_START) {
+        this.reloadHand.set(-0.004, -0.25, 0.03);
+        this.reloadQuat.identity();
+        P.handShell = sstep(0.06, 0.12, t) > 0.5 ? 1 : 0;
+        P.hand = t > 0.05;
+      }
+      return P;
+    }
+    if (!rig.mag || !rig.magRest || !rig.magAxis) return P;
+    // ----- MK-IV pistol / VX-9 SMG -----
+    const A = sstep(0, 0.12, t) * (1 - sstep(0.56, 0.64, t));
+    const C = sstep(0.56, 0.64, t) * (1 - sstep(0.82, 1, t));
+    P.roll = 0.48 * A + 0.16 * C;
+    P.pitch = 0.1 * A + 0.04 * C;
+    P.lift = 0.13 * A + 0.05 * C;
+    P.shift = -0.07 * A - 0.03 * C;
+    // Magazine travel along its axis: strip (0.10–0.30) · pouch (0.30–0.40) · return (0.40–0.46) · seat.
+    const drop =
+      t < 0.1 ? 0
+      : t < 0.3 ? 0.55 * sstep(0.1, 0.3, t) * sstep(0.1, 0.3, t)
+      : t < 0.4 ? 0.55
+      : t < 0.46 ? 0.55 - 0.48 * sstep(0.4, 0.46, t)
+      : t < B.SEATED ? 0.07 * (1 - Math.pow(sstep(0.46, B.SEATED, t), 2))
+      : 0;
+    rig.mag.position.copy(rig.magRest).addScaledVector(rig.magAxis, drop);
+    P.bar = t >= B.MAG_OUT && t < B.SEATED ? 0 : t >= B.SEATED ? 1 : -1;
+    // Slide / charging handle: held back 0.60–0.70 (locked open stays back), released at 0.72 — snaps forward.
+    const locked = f.slot === 'PISTOL' && f.reloadFrom <= 0 ? 1 : 0;
+    const back = t < 0.6 ? locked : t < 0.7 ? locked + (1.08 - locked) * sstep(0.6, 0.7, t) : t < B.SLIDE ? 1.08 : 1.08 * (1 - sstep(B.SLIDE, B.SLIDE + 0.025, t));
+    P.slide = back;
+    // Left hand: on the magazine (grab → strip → pouch → fresh mag → seat) until 0.58, then on the slide.
+    const tilt = Math.atan2(-rig.magAxis.z, -rig.magAxis.y);
+    _qa.setFromAxisAngle(_X, tilt).multiply(_qMagGrip);
+    const isPistol = f.slot === 'PISTOL';
+    const grip = isPistol ? 0.03 : 0.04;
+    _ra.copy(rig.mag.position).addScaledVector(rig.magAxis, grip);
+    _ra.x -= 0.006;
+    if (isPistol) _rb.set(0, 0.024, 0.034 + rig.slideTravel * back);
+    else _rb.set(0.024, 0.04, 0.004 + rig.slideTravel * back);
+    const toSlide = sstep(0.56, 0.6, t);
+    const away = sstep(B.SLIDE, 0.8, t);
+    this.reloadHand.copy(_ra).lerp(_rb, toSlide);
+    this.reloadHand.y += 0.04 * away;
+    this.reloadHand.x -= 0.05 * away;
+    this.reloadQuat.copy(_qa).slerp(_qRack, toSlide);
+    P.hand = t > 0.02 && t < 0.82;
+    return P;
+  }
+
   // =============================================================================================
   // Per frame
   // =============================================================================================
@@ -973,7 +1139,7 @@ export class ViewModelRenderer {
     else if (f.phase === 'DRAW') hp = 1 - f.phaseT;
     const ease = hp * hp * (3 - 2 * hp);
 
-    // Look sway (lags behind mouse, max ±0.035 m).
+    // Look sway (7A-2: max ±0.016 m, 28 /s follow — sharp, and cut by 95 % in ADS below).
     const sx = clamp(-f.lookYaw * 0.9, -CAMERA.SWAY_MAX, CAMERA.SWAY_MAX);
     const sy = clamp(f.lookPitch * 0.9, -CAMERA.SWAY_MAX, CAMERA.SWAY_MAX);
     const k = lerpFactor(CAMERA.SWAY_LERP, realDt);
@@ -998,34 +1164,34 @@ export class ViewModelRenderer {
     this.tilt += (tiltTarget - this.tilt) * lerpFactor(10, realDt);
     this.lower += ((f.sliding ? 0.03 : 0) - this.lower) * lerpFactor(10, realDt);
 
-    // Reload: roll, dip and magazine drop along its own axis.
-    let reloadRoll = 0;
-    let reloadDip = 0;
-    if (f.reloadT >= 0) {
-      const t = f.reloadT;
-      const env = Math.sin(Math.min(1, t) * Math.PI);
-      reloadRoll = env * 0.55;
-      reloadDip = env * 0.06;
+    // 7A-5 two-handed tactical reload choreography (gun pose, magazine / shells, slide / bolt / pump, left hand).
+    const rt = f.slot === 'GRAPPLE' ? -1 : f.reloadT;
+    const R = this.reloadPose(rig, f, rt);
+    if (rt < 0) this.reloadPrevT = -1;
+    else {
+      // Magazine seated (0.56): the gun takes a small upward jolt.
+      if (rig.mag && this.reloadPrevT < RELOAD_BEATS.SEATED && rt >= RELOAD_BEATS.SEATED) {
+        this.joltV += 0.55;
+        this.kickVP += 1.1;
+      }
+      this.reloadPrevT = rt;
     }
-    if (rig.mag && rig.magRest && rig.magAxis) {
-      const t = f.reloadT;
-      const drop = t < 0 ? 0 : t < 0.45 ? t / 0.45 : t < 0.55 ? 1 : 1 - (t - 0.55) / 0.45;
-      rig.mag.position.copy(rig.magRest).addScaledVector(rig.magAxis, drop * 0.14);
-      rig.mag.visible = !(t > 0.42 && t < 0.58);
-    }
+    this.joltV += (-320 * this.jolt - 24 * this.joltV) * realDt;
+    this.jolt += this.joltV * realDt;
 
     // Blowback: the slide / bolt / pistons snap back in 18 ms and return in 62 ms (pistol slide locks open
-    // on an empty magazine); the shotgun pump cycles 280 ms after the shot.
+    // on an empty magazine); the shotgun pump cycles 280 ms after the shot. Reloads drive them by hand.
     if (rig.slide) {
       const a = f.sinceShot;
       let s = a < 0.018 ? a / 0.018 : a < 0.08 ? 1 - (a - 0.018) / 0.062 : 0;
-      if (f.slot === 'PISTOL' && f.ammo <= 0 && f.reloadT < 0) s = 1;
+      if (f.slot === 'PISTOL' && f.ammo <= 0 && rt < 0) s = 1;
+      if (rt >= 0 && f.slot !== 'GRAPPLE') s = R.slide;
       rig.slide.position.z = s * rig.slideTravel;
     }
     if (rig.pump) {
       const t = f.sinceShot - 0.28;
       const pumpT = t > 0 && t < 0.22 ? Math.sin((t / 0.22) * Math.PI) : 0;
-      rig.pump.position.z = -0.24 + pumpT * 0.07;
+      rig.pump.position.z = -0.24 + (rt >= 0 ? R.pump : pumpT) * 0.07;
     }
     // Ejection spark at the port (shotgun: on the pump stroke).
     if (this.ejectPending && rig.ejectAt >= 0 && f.sinceShot >= rig.ejectAt) {
@@ -1042,8 +1208,9 @@ export class ViewModelRenderer {
     // Shader-driven parts: ammo bar length / colour, shells, pistol coil charge, SMG emitter flicker.
     const u = this.hardU;
     const frac = f.magazine > 0 ? clamp(f.ammo / f.magazine, 0, 1) : 1;
-    u.uAmmo.value = rig.hasBar ? frac : 1;
-    u.uShells.value = rig.shells ? f.ammo : 4;
+    u.uAmmo.value = rig.hasBar ? (rt >= 0 && R.bar >= 0 ? R.bar : frac) : 1;
+    u.uShells.value = rig.shells ? (rt >= 0 ? R.shells : f.ammo) : 4;
+    u.uHand.value = rt >= 0 ? R.handShell : 0;
     const low = f.ammo <= Math.max(1, Math.floor(f.magazine * 0.25));
     if (rig.hasBar && f.magazine > 0 && f.ammo <= 0) u.uBarColor.value.setRGB(0, 0, 0);
     else if (low) u.uBarColor.value.setHex(COLORS.ENEMY_DANGER).multiplyScalar(Math.sin(this.time * 18) > 0 ? 2.6 : 0.9);
@@ -1069,20 +1236,32 @@ export class ViewModelRenderer {
     const adsX = -zr.sight.x;
     const adsY = -zr.sight.y;
     const adsZ = -zr.adsDist - zr.sight.z;
-    const calm = 1 - 0.55 * z;
+    const calm = 1 - CAMERA.ADS_SWAY_CUT * z;
     const p = this.weaponPivot;
     p.position.set(
-      0.21 + (adsX - 0.21) * z + (this.swayX + bobX) * calm,
-      -0.2 + (adsY + 0.2) * z + (this.swayY + bobY) * calm - ease * 0.32 - reloadDip - this.lower,
+      0.21 + (adsX - 0.21) * z + (this.swayX + bobX) * calm + R.shift,
+      -0.2 + (adsY + 0.2) * z + (this.swayY + bobY) * calm - ease * 0.32 + R.lift + this.jolt - this.lower - this.mantleDip,
       -0.42 + (adsZ + 0.42) * z + this.kickZ + ease * 0.05,
     );
-    p.rotation.set(this.kickP + ease * 0.95 + this.swayY * 2 * calm, this.swayX * 2.5 * calm, (-this.tilt - ease * 0.35 + reloadRoll) * (1 - 0.6 * z), 'XYZ');
+    p.rotation.set(this.kickP + ease * 0.95 + this.swayY * 2 * calm + R.pitch, this.swayX * 2.5 * calm, (-this.tilt - ease * 0.35 + R.roll) * (1 - 0.6 * z), 'XYZ');
     p.updateMatrix();
 
     // Left arm: supports the SMG / shotgun fore-end, thrusts the winch forward while the strand is out,
     // otherwise rests low-left. Poses blend smoothly (position lerp + quaternion slerp).
     const strandOut = f.ropeAttached || f.hookInFlight;
-    if (strandOut) {
+    // 7A-6 mantle: the free hand slaps down on the ledge and pushes (0.3 s).
+    this.mantleT += realDt;
+    const mt = this.mantleT / MANTLE_HAND_S;
+    const mantling = mt < 1;
+    this.mantleDip = mantling ? Math.sin(Math.min(1, mt) * Math.PI) * 0.07 : 0;
+    if (R.hand) {
+      _p.copy(this.reloadHand).applyMatrix4(p.matrix);
+      _q.copy(p.quaternion).multiply(this.reloadQuat);
+    } else if (mantling) {
+      const push = Math.sin(Math.min(1, mt) * Math.PI);
+      _p.set(-0.16, -0.24 - 0.1 * push, -0.5 + 0.06 * push);
+      _q.copy(_qMantle);
+    } else if (strandOut) {
       _p.set(-0.2 + this.swayX * 0.7, -0.2 + this.swayY * 0.7 - this.lower, -0.5);
       _q.setFromEuler(_e.set(0.15, 0.12, 0.35 + this.tilt * 0.5));
     } else if (rig.support && hp < 0.5) {
@@ -1095,7 +1274,7 @@ export class ViewModelRenderer {
       _p.set(-0.25 + this.swayX * 0.7 + bobX * 0.6, -0.31 + this.swayY * 0.7 + bobY - this.lower, -0.43);
       _q.setFromEuler(_e.set(0.32, 0.32, 0.35 + this.tilt * 0.5));
     }
-    const lk = lerpFactor(rig.support && !strandOut ? 16 : 9, realDt);
+    const lk = lerpFactor(R.hand ? 30 : mantling ? 26 : rig.support && !strandOut ? 16 : 9, realDt);
     this.leftPos.lerp(_p, lk);
     this.leftQuat.slerp(_q, lk);
     this.leftArm.position.copy(this.leftPos);
@@ -1132,12 +1311,15 @@ export class ViewModelRenderer {
     }
 
     // Holo reticle: project a point 50 m down the sight axis (collimated at infinity) to the lens shader.
+    // 7A-2: from half zoom on the dot is locked to the screen centre — the camera / shot axis itself — so it
+    // never trails the (sway-lagged) gun by a frame; below that it blends smoothly from the sight axis.
     this.root.updateMatrixWorld(true);
     rig.lens.getWorldPosition(_v);
     rig.group.getWorldQuaternion(_q2);
     _v2.set(0, 0, -50).applyQuaternion(_q2).add(_v);
     _ndc.copy(_v2).applyMatrix4(this.vmCamera.projectionMatrix);
-    (this.lensMat.uniforms.uReticle.value as THREE.Vector2).set(_ndc.x, _ndc.y);
+    const lock = z >= 0.5 ? 1 : z <= 0 ? 0 : (z / 0.5) * (z / 0.5) * (3 - (2 * z) / 0.5);
+    (this.lensMat.uniforms.uReticle.value as THREE.Vector2).set(_ndc.x * (1 - lock), _ndc.y * (1 - lock));
     this.lensMat.uniforms.uAspect.value = this.vmCamera.aspect;
   }
 

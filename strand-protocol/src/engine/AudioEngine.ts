@@ -732,17 +732,74 @@ export class AudioEngine {
     this.tone(c, 'square', 3000, 2200, 0.012, 0.12, this.seBus, c.currentTime, 0.001);
   }
 
+  /**
+   * 7A-5: reload start = a soft cloth / grip rustle only (the metal sounds come from `reloadCue` at the exact
+   * animation beats); done = a quiet ready tick.
+   */
   reload(start: boolean): void {
     const c = this.can();
     if (!c) return;
     const t = c.currentTime;
-    if (start) {
-      this.noise(c, 'lowpass', 1200, 500, 0.7, 0.07, 0.16, this.seBus, t);
-      this.tone(c, 'triangle', 1400, 900, 0.03, 0.12, this.seBus, t + 0.05);
-    } else {
-      this.tone(c, 'triangle', 1800, 1800, 0.025, 0.16, this.seBus, t);
-      this.tone(c, 'triangle', 2400, 2400, 0.03, 0.16, this.seBus, t + 0.07);
+    if (start) this.noise(c, 'bandpass', 900, 600, 0.8, 0.09, 0.06, this.seBus, t, 0.01);
+    else this.tone(c, 'triangle', 2600, 2600, 0.018, 0.07, this.seBus, t);
+  }
+
+  /**
+   * 7A-5 three-stage reload SE: MAG_OUT metallic release click (カチャッ) · MAG_IN heavy lock (ガツン!) ·
+   * SLIDE bolt / slide release (シャキン!) · SHELL loading-port click (カチッ) · PUMP heavy two-part pump
+   * (ガシャン・ガシャッ).
+   */
+  reloadCue(cue: 'MAG_OUT' | 'MAG_IN' | 'SLIDE' | 'SHELL' | 'PUMP'): void {
+    const c = this.can();
+    if (!c) return;
+    const t = c.currentTime;
+    const B = this.seBus;
+    switch (cue) {
+      case 'MAG_OUT':
+        this.tone(c, 'square', 3200, 2100, 0.014, 0.1, B, t, 0.001);
+        this.noise(c, 'highpass', 4200, 2600, 0.9, 0.05, 0.12, B, t + 0.008);
+        this.noise(c, 'lowpass', 900, 400, 0.7, 0.12, 0.08, B, t + 0.03, 0.01);
+        break;
+      case 'MAG_IN':
+        this.noise(c, 'lowpass', 2200, 300, 1.2, 0.09, 0.32, B, t, 0.001);
+        this.tone(c, 'triangle', 170, 70, 0.11, 0.34, B, t, 0.001);
+        this.fm(c, 1450, 2050, 2.2, 0.06, 0.12, B, t + 0.004);
+        break;
+      case 'SLIDE':
+        this.noise(c, 'bandpass', 2600, 5200, 2.5, 0.06, 0.16, B, t, 0.004);
+        this.fm(c, 2300, 3300, 3.0, 0.1, 0.16, B, t + 0.055);
+        this.tone(c, 'square', 2900, 1900, 0.012, 0.14, B, t + 0.055, 0.001);
+        break;
+      case 'SHELL':
+        this.tone(c, 'triangle', 2400, 1500, 0.016, 0.16, B, t, 0.001);
+        this.noise(c, 'bandpass', 1800, 900, 1.4, 0.05, 0.12, B, t + 0.006);
+        break;
+      case 'PUMP':
+        this.noise(c, 'lowpass', 2400, 500, 1.0, 0.09, 0.3, B, t, 0.002);
+        this.tone(c, 'triangle', 210, 90, 0.08, 0.28, B, t, 0.001);
+        this.noise(c, 'lowpass', 3000, 600, 1.0, 0.08, 0.32, B, t + 0.13, 0.002);
+        this.fm(c, 1300, 1850, 2.4, 0.07, 0.16, B, t + 0.13);
+        break;
+      default:
+        break;
     }
+  }
+
+  /** 7A-6 auto-mantle: glove grip slap on the ledge + a short body scrape. */
+  mantle(): void {
+    const c = this.can();
+    if (!c) return;
+    const t = c.currentTime;
+    this.noise(c, 'lowpass', 1600, 300, 0.8, 0.08, 0.26, this.seBus, t, 0.002);
+    this.tone(c, 'triangle', 150, 70, 0.09, 0.2, this.seBus, t, 0.001);
+    this.noise(c, 'bandpass', 700, 1500, 0.9, 0.16, 0.08, this.seBus, t + 0.06, 0.02);
+  }
+
+  /** 7A-6 crouch down / up: cloth rustle. */
+  crouch(down: boolean): void {
+    const c = this.can();
+    if (!c) return;
+    this.noise(c, 'bandpass', down ? 1100 : 1400, down ? 600 : 900, 0.8, 0.12, 0.07, this.seBus, c.currentTime, 0.015);
   }
 
   /** Two-stage switch: holster (LP noise 800 Hz 45 ms) → 90 ms later load click 1600 → 2400 Hz; reel FM 3100 Hz into the strand. */

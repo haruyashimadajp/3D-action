@@ -124,3 +124,25 @@ export const GRAPPLE = {
 export function isGun(slot: SlotId): slot is GunId {
   return slot !== 'GRAPPLE';
 }
+
+/** 7A-5 three-stage reload SE cues. */
+export type ReloadCue = 'MAG_OUT' | 'MAG_IN' | 'SLIDE' | 'SHELL' | 'PUMP';
+
+/** 7A-5 reload timeline (fractions of the reload). */
+export const RELOAD_BEATS = {
+  MAG_OUT: 0.14,
+  MAG_IN: 0.54,
+  /** Magazine seated: the gun takes its upward jolt. */
+  SEATED: 0.56,
+  SLIDE: 0.72,
+  SHELL_START: 0.16,
+  SHELL_END: 0.72,
+  /** Click position inside each shell cycle. */
+  SHELL_CLICK: 0.72,
+  PUMP: 0.78,
+} as const;
+
+/** Shotgun shell cycles for a reload starting with `ammo` of `magazine` (min 2, max 4). */
+export function shellCycles(ammo: number, magazine: number): number {
+  return Math.max(2, Math.min(4, magazine - ammo));
+}

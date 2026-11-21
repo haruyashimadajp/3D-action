@@ -5,7 +5,7 @@
  * handed to the player, equipment and enemy systems, run-rank evaluation, energy-colour unlocks and the
  * persistent save schema (`localStorage` key strand_protocol_save_v1).
  */
-import { PLAYER, type FlowRankDef } from './constants';
+import { INPUT, PLAYER, type FlowRankDef } from './constants';
 
 // ---------------------------------------------------------------------------
 // §8.1 Sector structure
@@ -473,6 +473,8 @@ export interface SaveSettings {
   fov: number;
   quality: 'HIGH' | 'MEDIUM' | 'LOW';
   volume: number;
+  /** 7A-2 LOW LATENCY: DPR 1.0 + lighter MSAA regardless of the quality preset. */
+  lowLatency: boolean;
 }
 
 export interface SaveData {
@@ -501,7 +503,7 @@ export function defaultSave(): SaveData {
     bestRank: null,
     cleared: false,
     activeModifiers: [],
-    settings: { sensitivity: 1, shake: 1, roll: 1, centerDot: true, fov: 84, quality: 'HIGH', volume: 0.8 },
+    settings: { sensitivity: 1, shake: 1, roll: 1, centerDot: true, fov: 84, quality: 'HIGH', volume: 0.8, lowLatency: false },
   };
 }
 
@@ -542,13 +544,14 @@ export function sanitizeSave(raw: unknown): SaveData {
     cleared,
     activeModifiers: cleared && Array.isArray(r.activeModifiers) ? [...new Set(r.activeModifiers.filter((m): m is ModifierId => (modIds as string[]).includes(m as string)))] : [],
     settings: {
-      sensitivity: num(st.sensitivity, d.settings.sensitivity, 0.2, 3),
+      sensitivity: num(st.sensitivity, d.settings.sensitivity, INPUT.SENSITIVITY_MIN, INPUT.SENSITIVITY_MAX),
       shake: tri(st.shake),
       roll: tri(st.roll),
       centerDot: typeof st.centerDot === 'boolean' ? st.centerDot : d.settings.centerDot,
       fov: Math.round(num(st.fov, d.settings.fov, 75, 100)),
       quality: pick(st.quality, ['HIGH', 'MEDIUM', 'LOW'] as const, 'HIGH'),
       volume: num(st.volume, d.settings.volume, 0, 1),
+      lowLatency: st.lowLatency === true,
     },
   };
 }

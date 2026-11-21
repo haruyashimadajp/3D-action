@@ -6,6 +6,7 @@
  * compute bit-identical results, so the layout stats can report the exact distribution of the city that
  * is on screen: dark 65 % · warm bulb 20 % · cool office 13 % · cyber accent 2 %, clustered per floor
  * (tenants) and never repeating with the 12 m texture tile.
+ * 7A-3: floor 0 (the solid street base: stone, shutters, steel doors) is never a lit window room.
  */
 import { FACADE } from '../config/constants';
 
@@ -70,15 +71,9 @@ export function isMachineFloor(si: number, n: number): boolean {
 
 /** Lighting state of one room. `floorN` = floor(Y / 4), `roomI` = room column along the face (with offset). */
 export function facadeRoomState(si: number, face: number, roomI: number, floorN: number): RoomState {
+  if (floorN <= 0) return 0;
   const hf = hash3(floorN + 1000, face, si);
-  const pLit =
-    floorN === 0
-      ? FACADE.GROUND_LIT
-      : hf < FACADE.FLOOR_TIER_LOW
-        ? FACADE.FLOOR_LIT_LOW
-        : hf < FACADE.FLOOR_TIER_MID
-          ? FACADE.FLOOR_LIT_MID
-          : FACADE.FLOOR_LIT_HIGH;
+  const pLit = hf < FACADE.FLOOR_TIER_LOW ? FACADE.FLOOR_LIT_LOW : hf < FACADE.FLOOR_TIER_MID ? FACADE.FLOOR_LIT_MID : FACADE.FLOOR_LIT_HIGH;
   const h1 = hash3(roomI + 100000, floorN + 1000, si * 8 + face);
   if (h1 >= pLit) return 0;
   const h2 = hash3(roomI + 200000, floorN + 3000, si * 8 + face);
@@ -105,10 +100,10 @@ export const GLSL_FACADE = /* glsl */ `
     return (n - 1 + off) % c == c - 1;
   }
   int strandRoomState(int si, int face, int roomI, int floorN) {
+    if (floorN <= 0) return 0;
     float hf = strandHash(floorN + 1000, face, si);
-    float pLit = floorN == 0 ? ${f(FACADE.GROUND_LIT)}
-      : (hf < ${f(FACADE.FLOOR_TIER_LOW)} ? ${f(FACADE.FLOOR_LIT_LOW)}
-      : (hf < ${f(FACADE.FLOOR_TIER_MID)} ? ${f(FACADE.FLOOR_LIT_MID)} : ${f(FACADE.FLOOR_LIT_HIGH)}));
+    float pLit = hf < ${f(FACADE.FLOOR_TIER_LOW)} ? ${f(FACADE.FLOOR_LIT_LOW)}
+      : (hf < ${f(FACADE.FLOOR_TIER_MID)} ? ${f(FACADE.FLOOR_LIT_MID)} : ${f(FACADE.FLOOR_LIT_HIGH)});
     float h1 = strandHash(roomI + 100000, floorN + 1000, si * 8 + face);
     if (h1 >= pLit) return 0;
     float h2 = strandHash(roomI + 200000, floorN + 3000, si * 8 + face);

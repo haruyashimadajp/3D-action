@@ -985,6 +985,7 @@ const DISSOLVE_S = 0.6;
 const LINE_IGNORE_NONE = undefined;
 const PLAYER_R = 0.38;
 const GRAPPLE_HOOK_DAMAGE = 15;
+const _aim = new THREE.Vector3();
 const PLAYER_STAND_H = 1.86;
 const PLAYER_SLIDE_H = 0.98;
 
@@ -1067,12 +1068,13 @@ export class EnemyManager {
       normalScale: new THREE.Vector2(0.9, 0.9),
     });
     armorMat.onBeforeCompile = (shader) => {
+      shader.uniforms.uZoomScan = this.zoomScan;
       shader.uniforms.uRimCyan = { value: new THREE.Color(COLORS.WALLRUN_CYAN) };
       shader.uniforms.uRimRed = { value: new THREE.Color(COLORS.ENEMY_DANGER) };
       // 5B-4: 0.55 → 1.05 — the silhouette cuts out against dark towers and cars.
       shader.uniforms.uRimStrength = { value: 1.05 };
       shader.fragmentShader = shader.fragmentShader
-        .replace('#include <common>', '#include <common>\nuniform vec3 uRimCyan;\nuniform vec3 uRimRed;\nuniform float uRimStrength;')
+        .replace('#include <common>', '#include <common>\nuniform vec3 uRimCyan;\nuniform vec3 uRimRed;\nuniform float uRimStrength;\nuniform float uZoomScan;')
         .replace(
           '#include <emissivemap_fragment>',
           `#include <emissivemap_fragment>
@@ -1081,6 +1083,13 @@ export class EnemyManager {
             float fr = pow(1.0 - clamp(abs(dot(normal, vd)), 0.0, 1.0), 3.0);
             vec3 rimCol = mix(uRimRed, uRimCyan, clamp(normal.y * 0.5 + 0.5, 0.0, 1.0));
             totalEmissiveRadiance += rimCol * fr * uRimStrength;
+            // 7A-4 optical scan: while aiming down sights a sharper crimson → cyan neon edge outlines every
+            // armour part (troopers, Aegis, drones, the Valkyrie's wings) — 1.45 at full zoom, 0 otherwise.
+            if (uZoomScan > 0.001) {
+              float scanRim = pow(1.0 - clamp(abs(dot(normal, vd)), 0.0, 1.0), 2.1);
+              vec3 scanCol = mix(vec3(1.0, 0.16, 0.34), vec3(0.15, 0.92, 1.0), clamp(normal.y * 0.5 + 0.5, 0.0, 1.0));
+              totalEmissiveRadiance += scanCol * scanRim * (1.45 * uZoomScan);
+            }
             #if defined( USE_BATCHING_COLOR ) || defined( USE_COLOR )
             // Instance colours above 1.0 drive the white hit flash / cyan spawn glitch as emission (5B-4 fix:
             // BatchedMesh colours define USE_BATCHING_COLOR, never USE_COLOR_ALPHA).
@@ -1303,6 +1312,36 @@ export class EnemyManager {
    * 5A-5 tactical tracking markers: with ≤ 3 enemies left, every alive enemy; VALKYRIE always while alive.
    * Writes chest positions into `out` and 1 (boss) / 0 into `boss`; returns the count (≤ out.length).
    */
+  /** 7A-4: ADS optical-scan strength shared by every armour part (0 … 1, smoothed by the caller). */
+  readonly zoomScan = { value: 0 };
+
+  /**
+   * 7A-4 ADS target read-out: the nearest alive enemy whose chest is within `maxDeg` of the view axis and in
+   * line of sight from `eye`. Bosses are skipped (they have their own HUD). Returns null when none qualifies.
+   */
+  aimTarget(eye: THREE.Vector3, forward: THREE.Vector3, maxDeg: number, out: { hp: number; maxHp: number; name: string; dist: number }): boolean {
+    const cosMax = Math.cos(maxDeg * DEG2RAD);
+    let best: Enemy | null = null;
+    let bestD = Infinity;
+    for (const e of this.enemies) {
+      if (!e.active || !e.alive || e.isBoss) continue;
+      _aim.addVectors(e.pos, e.bodyOff).sub(eye);
+      const d = _aim.length();
+      if (d < 0.5 || d >= bestD) continue;
+      if (_aim.dot(forward) / d < cosMax) continue;
+      _aim.add(eye);
+      if (!this.physics.lineOfSight(eye, _aim, 0.9)) continue;
+      best = e;
+      bestD = d;
+    }
+    if (!best) return false;
+    out.hp = Math.max(0, best.hp);
+    out.maxHp = best.maxHp;
+    out.name = best.def.name;
+    out.dist = bestD;
+    return true;
+  }
+
   trackedTargets(out: THREE.Vector3[], boss: Uint8Array): number {
     const all = this.remaining <= TRACK_REMAINING_MAX;
     let n = 0;
@@ -1637,7 +1676,8 @@ export class EnemyManager {
 
   private updatePlayerTarget(): void {
     const p = this.player;
-    const h = p.isSliding ? PLAYER_SLIDE_H : PLAYER_STAND_H;
+    // 7A-6: sliding and crouching both shrink the hit body to the 0.98 m low profile.
+    const h = p.isLowProfile ? PLAYER_SLIDE_H : PLAYER_STAND_H;
     const t = this.playerTarget;
     t.alive = p.isAlive;
     t.bodyHalf.set(PLAYER_R, h / 2, PLAYER_R);

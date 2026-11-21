@@ -8,7 +8,7 @@
  *   aSurf  — roughness multiplier · metalness multiplier · self-glow (vertex colour as emissive)
  *   aZone  — texture zone 0–3 of the 512² zoned PBR set
  *   aGlow  — energy glow (constant · charge-modulated) · ammo-bar glow
- *   aAnim  — ammo bar (rear z, flag) · shell (index, flag) / claw (flag −1)
+ *   aAnim  — ammo bar (rear z, flag) · shell (index, flag) / claw (flag −1) · hand-held shell (flag 2)
  * UVs are box-proportional (metres / tile from the dominant normal axis), so tiny parts never stretch.
  */
 import * as THREE from 'three';
@@ -217,6 +217,8 @@ export interface KitUniforms {
   uShells: { value: number };
   /** Anchor claw opening 0..1. */
   uClaw: { value: number };
+  /** 7A-5: shotgun shell held in the left glove (visible ≥ 0.5). */
+  uHand: { value: number };
 }
 
 export function createKitUniforms(): KitUniforms {
@@ -227,6 +229,7 @@ export function createKitUniforms(): KitUniforms {
     uAmmo: { value: 1 },
     uShells: { value: 4 },
     uClaw: { value: 0 },
+    uHand: { value: 0 },
   };
 }
 
@@ -257,7 +260,8 @@ export function kitMaterial(tex: PbrTextureSet, u: KitUniforms, key: string, nor
         varying vec2 vKitUv;
         uniform float uAmmo;
         uniform float uShells;
-        uniform float uClaw;`)
+        uniform float uClaw;
+        uniform float uHand;`)
       .replace('#include <begin_vertex>', `#include <begin_vertex>
         vSurf = aSurf;
         vZone = aZone;
@@ -266,7 +270,8 @@ export function kitMaterial(tex: PbrTextureSet, u: KitUniforms, key: string, nor
         // Diegetic ammo bar: length follows the magazine (anchored at its rear end).
         if (aAnim.y > 0.5) transformed.z = aAnim.x + (transformed.z - aAnim.x) * max(uAmmo, 1e-4);
         // Side-saddle shells beyond the loaded count collapse out of sight.
-        if (aAnim.w > 0.5 && aAnim.z > uShells - 0.5) transformed = vec3(0.0, -50.0, 0.0);
+        if (aAnim.w > 1.5) { if (uHand < 0.5) transformed = vec3(0.0, -50.0, 0.0); }
+        else if (aAnim.w > 0.5 && aAnim.z > uShells - 0.5) transformed = vec3(0.0, -50.0, 0.0);
         // Anchor claws open radially (tips more than roots).
         if (aAnim.w < -0.5) transformed.xy *= 1.0 + uClaw * clamp(-transformed.z * 22.0, 0.0, 1.6);`);
     shader.fragmentShader = shader.fragmentShader

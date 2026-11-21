@@ -165,6 +165,7 @@ const WALL_KINDS: ReadonlySet<ColliderKind> = new Set<ColliderKind>(['BUILDING',
 const MAX_WALL_FACES = 6;
 const _down = new THREE.Vector3(0, -1, 0);
 const _origin = new THREE.Vector3();
+const _ledgeP = new THREE.Vector3();
 
 export class PhysicsWorld {
   private layout: SectorLayout | null = null;
@@ -605,6 +606,41 @@ export class PhysicsWorld {
     _origin.set(pos.x, pos.y + 0.05, pos.z);
     this.raycast(_origin, _down, maxCheck + 0.05, _hit);
     return _hit.hit ? Math.max(0, _hit.distance - 0.05) : Infinity;
+  }
+
+  /**
+   * 7A-6 auto-mantle ledge probe. Marches forward from the body surface (≤ `reach` m) casting rays straight
+   * down from `maxRise` above the feet to `minRise`: the first upward-facing top of a mantle-able collider
+   * (not WATER / BARRIER) is the ledge. The body (half-width r, height h) must fit on top one radius past the
+   * edge and the column above the current position must be clear up to the ledge height. A thin top with
+   * a lower floor right behind it (balcony / fire-escape rail) is vaulted: the body passes over the rail top
+   * (`ledgeApex`) and lands on the slab beyond. Writes the standing position (feet) into `out` and returns
+   * the collider kind, or null.
+   */
+  ledgeApex = 0;
+  findLedge(pos: THREE.Vector3, fwd: THREE.Vector3, r: number, h: number, minRise: number, maxRise: number, reach: number, out: THREE.Vector3): ColliderKind | 'RAMP' | null {
+    const span = maxRise - minRise;
+    for (let s = r + 0.04; s <= r + reach + 1e-6; s += 0.08) {
+      _origin.set(pos.x + fwd.x * s, pos.y + maxRise + 0.02, pos.z + fwd.z * s);
+      this.raycast(_origin, _down, span + 0.02, _hit);
+      if (!_hit.hit) continue;
+      if (_hit.normal.y < 0.7) return null;
+      const kind = _hit.kind;
+      if (kind === 'WATER' || kind === 'BARRIER') return null;
+      const ly = _hit.point.y;
+      // Headroom above us at ledge height (the pull-up path), then the standing spot on top.
+      _ledgeP.set(pos.x, ly + 0.05, pos.z);
+      if (!this.boxFree(_ledgeP, r, h)) return null;
+      out.set(pos.x + fwd.x * (s + r + 0.06), ly + 0.05, pos.z + fwd.z * (s + r + 0.06));
+      if (!this.boxFree(out, r, h)) return null;
+      const g = this.probeGround(out, r, ly + 0.05 - (pos.y + 0.3));
+      if (g === null) return null;
+      out.y = g + 0.01;
+      if (g < ly - 0.3 && !this.boxFree(out, r, h)) return null;
+      this.ledgeApex = ly + 0.05;
+      return kind ?? 'RAMP';
+    }
+    return null;
   }
 
   // ===============================================================================================
