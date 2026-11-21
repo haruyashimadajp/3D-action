@@ -583,7 +583,7 @@ const GLSL_HEIGHT_FOG = /* glsl */ `
     float hfY = vCityWorld.y;
     float hfH = hfY <= ${RENDER.HEIGHT_FOG_FULL_Y.toFixed(1)} ? 1.0
       : exp(-(hfY - ${RENDER.HEIGHT_FOG_FULL_Y.toFixed(1)}) / 9.0) * (1.0 - smoothstep(${(RENDER.HEIGHT_FOG_CLEAR_Y - 10).toFixed(1)}, ${RENDER.HEIGHT_FOG_CLEAR_Y.toFixed(1)}, hfY));
-    float hfA = ${RENDER.HEIGHT_FOG_MAX.toFixed(3)} * hfH * smoothstep(${RENDER.HEIGHT_FOG_NEAR_M.toFixed(1)}, ${RENDER.HEIGHT_FOG_FAR_M.toFixed(1)}, hfD);
+    float hfA = ${RENDER.HEIGHT_FOG_MAX.toFixed(3)} * uHeightFog * hfH * smoothstep(${RENDER.HEIGHT_FOG_NEAR_M.toFixed(1)}, ${RENDER.HEIGHT_FOG_FAR_M.toFixed(1)}, hfD);
     gl_FragColor.rgb = mix(gl_FragColor.rgb, vec3(${HFOG.r.toFixed(5)}, ${HFOG.g.toFixed(5)}, ${HFOG.b.toFixed(5)}), hfA);
   }
   #endif
@@ -648,6 +648,8 @@ const GLSL_CITY_LIGHTS = /* glsl */ `
   uniform vec3 uCityLightPos[${MAX_LIGHTS}];
   uniform vec3 uCityLightCol[${MAX_LIGHTS}];
   uniform int uCityLightCount;
+  uniform float uStreakGain;
+  uniform float uHeightFog;
   varying vec3 vCityWorld;
   vec3 strandCityLights(vec3 P, vec3 N, vec3 V, vec3 albedo, float rough, float metal) {
     vec3 acc = vec3(0.0);
@@ -685,7 +687,7 @@ const GLSL_CITY_LIGHTS = /* glsl */ `
         float dA = th * th / (ax * ax) + bh * bh / (ay * ay) + NdH * NdH;
         float Da = min(1.0 / (3.14159 * ax * ay * dA * dA), 60.0);
         float wet = 1.0 - smoothstep(${(RENDER.STREAK_MAX_ROUGHNESS * 0.65).toFixed(3)}, ${RENDER.STREAK_MAX_ROUGHNESS.toFixed(2)}, rough);
-        spec += F * Da * Vis * wet * ${RENDER.STREAK_GAIN.toFixed(2)};
+        spec += F * Da * Vis * wet * ${RENDER.STREAK_GAIN.toFixed(2)} * uStreakGain;
       }
       vec3 diff = albedo * (1.0 - metal) * 0.31831;
       acc += uCityLightCol[i] * att * NdL * (diff + spec);
@@ -824,6 +826,8 @@ export class CityBuilder {
   private readonly lampHalos: THREE.InstancedMesh;
   /** 7B-3 / 7B-4 / 7B-5 set pieces (one draw each). */
   private readonly lampCones: THREE.InstancedMesh;
+  /** 7B-1 / 7B-2 A/B switches (1 = on; verification only). */
+  readonly fxDebug = { streak: { value: 1 }, heightFog: { value: 1 } };
   /** 7B-4 cable bundle midpoints (verification / camera framing). */
   readonly cableDebug: Array<{ x: number; y: number; z: number; axis: Axis }> = [];
   private readonly signals: THREE.InstancedMesh;
@@ -969,6 +973,8 @@ export class CityBuilder {
    */
   private injectCityLights(shader: THREE.WebGLProgramParametersWithUniforms, apply: string = GLSL_CITY_LIGHTS_APPLY): void {
     shader.uniforms.uCityLightPos = this.uCityLightPos;
+    shader.uniforms.uStreakGain = this.fxDebug.streak;
+    shader.uniforms.uHeightFog = this.fxDebug.heightFog;
     shader.uniforms.uCityLightCol = this.uCityLightCol;
     shader.uniforms.uCityLightCount = this.uCityLightCount;
     shader.vertexShader = shader.vertexShader

@@ -23,6 +23,7 @@ import {
   RENDER,
   ROOF_PUDDLE_ROUGHNESS,
   ROOF_WET_ROUGHNESS,
+  ROAD_WET_ROUGHNESS,
   createRng,
   srgbToLinear,
   clamp,
@@ -1069,7 +1070,7 @@ function generateRoadAtlas(anisotropy: number): PbrTextureSet {
         albD.data[i + 1] = linearToSrgbByte(gg);
         albD.data[i + 2] = linearToSrgbByte(bb);
         albD.data[i + 3] = 255;
-        const rv = Math.round(ROOF_WET_ROUGHNESS * 255);
+        const rv = Math.round(ROAD_WET_ROUGHNESS * 255);
         rghD.data[i] = rghD.data[i + 1] = rghD.data[i + 2] = rv;
         rghD.data[i + 3] = 255;
         const hv = Math.round(clamp(0.55 + (g - 0.5) * 0.3 + (speck - 0.5) * 0.15, 0, 1) * 255);

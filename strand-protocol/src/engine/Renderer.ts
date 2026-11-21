@@ -120,6 +120,8 @@ const KineticPostFXShader = {
     uGlitch: { value: 0 },
     uFade: { value: 0 },
     uFadeColor: { value: new THREE.Color(0x000000) },
+    /** 7B-2 film grain strength (display-referred). */
+    uGrain: { value: RENDER.FILM_GRAIN as number },
   },
   vertexShader: /* glsl */ `
     varying vec2 vUv;
@@ -156,7 +158,7 @@ const KineticPostFXShader = {
     const vec3 GRADE_SHADOW = ${v3(RENDER.GRADE_SHADOW_TINT)};
     const vec3 GRADE_HIGH = ${v3(RENDER.GRADE_HIGHLIGHT_TINT)};
     const float GRADE_CURVE = ${RENDER.GRADE_S_CURVE.toFixed(3)};
-    const float FILM_GRAIN = ${RENDER.FILM_GRAIN.toFixed(4)};
+    uniform float uGrain;
 
     float hash12(vec2 p) {
       vec3 p3 = fract(vec3(p.xyx) * 0.1031);
@@ -315,7 +317,7 @@ const KineticPostFXShader = {
         // Temporal interleaved-gradient grain (blue-noise-like): kills 8-bit banding in the night sky / fog.
         vec2 gp = gl_FragCoord.xy + vec2(47.0, 17.0) * floor(uTime * 60.0);
         float ign = fract(52.9829189 * fract(dot(gp, vec2(0.06711056, 0.00583715))));
-        s += (ign - 0.5) * 2.0 * FILM_GRAIN;
+        s += (ign - 0.5) * 2.0 * uGrain;
         col = pow(max(s, vec3(0.0)), vec3(2.2));
       }
       #endif

@@ -1392,11 +1392,11 @@ class App {
     f.regenerating = p.isRegenerating;
     f.sinceShot = e.sinceShot;
     f.zoom = e.zoomBlend;
-    // 7B-8 adaptive HUD: calm once the sector is cleared — or 4 s after the last shot / hit / telegraph lock
-    // with full HP — while slower than 18 m/s and not aiming down sights.
+    // 7B-8 adaptive HUD: calm 4 s after the last shot / hit / telegraph lock — with full HP, or with the sector
+    // cleared — while slower than 18 m/s and not aiming down sights; any of those wakes it at once.
     {
       const since = p.clockS - Math.max(p.lastAttackTime, p.lastDamageTime, this.lastLockAt);
-      const quiet = this.enemies.isCleared || (since >= ADAPTIVE_HUD_QUIET_S && p.hp >= p.maxHp);
+      const quiet = since >= ADAPTIVE_HUD_QUIET_S && (this.enemies.isCleared || p.hp >= p.maxHp);
       f.calm = p.isAlive && quiet && p.speed < RENDER.SPEEDLINE_MIN_SPEED && e.zoomBlend < 0.05;
     }
     f.aimVisible = false;
