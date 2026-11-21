@@ -176,6 +176,13 @@ export class PlayerController {
   private readonly wallFace: WallFace = createWallFace();
   private wallLostFor = 0;
   private readonly prevPos = new THREE.Vector3();
+  /**
+   * 6B-2 ④: a steep (> 35° off parallel) airborne impact taints that wall normal until the player leaves the
+   * wall or lands — collision response alone would otherwise turn a head-on hit into a parallel slide that
+   * passes the angle test on the next step.
+   */
+  private bonkActive = false;
+  private readonly bonkNormal = new THREE.Vector3();
   private readonly wallNormal = new THREE.Vector3();
   private readonly wallTangent = new THREE.Vector3();
   private wallSpeed = 0;
@@ -252,6 +259,7 @@ export class PlayerController {
     this.fov = this.settings.baseFov;
     this.lastWallCollider = -1;
     this.wallLostFor = 0;
+    this.bonkActive = false;
     this.hoverUntil = -1;
     this.boostUntil = -1;
   }
@@ -738,6 +746,11 @@ export class PlayerController {
     const hs = _hv.length();
     if (hs < PHYSICS.WALLRUN_MIN_ALONG_SPEED) return;
     const n = this.physics.findWallFaces(this.position, this.colliderHeight, _right);
+    if (this.bonkActive) {
+      let still = false;
+      for (let i = 0; i < n; i++) if (this.physics.wallFace(i).normal.dot(this.bonkNormal) > 0.95) still = true;
+      if (!still) this.bonkActive = false;
+    }
     if (n === 0) return;
     if (this.physics.groundClearance(this.position, 1.0) < PHYSICS.WALLRUN_MIN_GROUND_CLEARANCE) return;
     _fwd.set(-Math.sin(this.yaw), 0, -Math.cos(this.yaw));
@@ -750,6 +763,7 @@ export class PlayerController {
       if (Math.abs(vn) / hs > SIN_ENTRY) continue;
       const fn = _fwd.x * f.normal.x + _fwd.z * f.normal.z;
       if (Math.abs(fn) > SIN_VIEW || _fwd.x * _along.x + _fwd.z * _along.z <= 0) continue;
+      if (this.bonkActive && f.normal.dot(this.bonkNormal) > 0.95) continue;
       const sameWall = f.collider === this.lastWallCollider && f.normal.dot(this.lastWallNormal) > 0.95;
       if (sameWall && this.simTime - this.lastWallEndedAt < PHYSICS.WALLRUN_SAME_WALL_COOLDOWN) continue;
       this.startWallRun(f, along);
@@ -817,9 +831,11 @@ export class PlayerController {
     // Keep the tangent aligned with the look direction's side of travel.
     _fwd.set(-Math.sin(this.yaw), 0, -Math.cos(this.yaw));
     if (_fwd.dot(this.wallTangent) < -0.2) this.wallTangent.negate();
-    // Along-wall speed is maintained (inertia preserved), slight stick force into the wall.
-    this.velocity.x = this.wallTangent.x * this.wallSpeed - this.wallNormal.x * 1.0;
-    this.velocity.z = this.wallTangent.z * this.wallSpeed - this.wallNormal.z * 1.0;
+    // Along-wall speed is maintained (inertia preserved), slight stick force into the wall — none while
+    // crossing a seam / gap (grace period), so the body never drifts into a slot between colliders.
+    const stick = this.wallLostFor > 0 ? 0 : 1.0;
+    this.velocity.x = this.wallTangent.x * this.wallSpeed - this.wallNormal.x * stick;
+    this.velocity.z = this.wallTangent.z * this.wallSpeed - this.wallNormal.z * stick;
     // Apparent gravity: 0 for the first 0.25 s, then −2.8 m/s².
     if (this.wallTime > PHYSICS.WALLRUN_ZERO_G_TIME) this.velocity.y += PHYSICS.WALLRUN_GRAVITY * dt;
     else this.velocity.y = Math.max(this.velocity.y - 6 * dt, 0);
@@ -903,7 +919,15 @@ export class PlayerController {
     if (m.hitCeiling && this.velocity.y > 0) this.velocity.y = 0;
     if (m.hitWall) {
       const vn = this.velocity.dot(m.wallNormal);
-      if (vn < 0) this.velocity.addScaledVector(m.wallNormal, -vn);
+      if (vn < 0) {
+        // Steep airborne impact (outside ±35° of parallel): no wall-run on this wall until we leave it.
+        const hs = Math.hypot(this.velocity.x, this.velocity.z);
+        if (this.state === 'AIRBORNE' && hs > 2 && -vn / hs > SIN_ENTRY) {
+          this.bonkActive = true;
+          this.bonkNormal.copy(m.wallNormal);
+        }
+        this.velocity.addScaledVector(m.wallNormal, -vn);
+      }
     }
   }
 
@@ -965,6 +989,7 @@ export class PlayerController {
   }
 
   private land(wasGrounded: boolean): void {
+    this.bonkActive = false;
     if (wasGrounded) return;
     const fall = Math.max(0, this.fallSpeedBeforeLanding);
     if (fall > HARD_LANDING_SPEED) this.addTrauma(SHAKE.HARD_LANDING);

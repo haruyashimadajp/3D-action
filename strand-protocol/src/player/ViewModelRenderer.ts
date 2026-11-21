@@ -937,6 +937,7 @@ export class ViewModelRenderer {
   /** `kickScale` < 1 while zoomed (−10 … −20 % visual recoil). */
   onFire(slot: SlotId, kickScale = 1): void {
     const r = this.rigs[slot];
+    this.lastSlot = slot;
     this.kickVZ += r.kickBack * 28 * kickScale;
     this.kickVP += r.kickPitch * 28 * kickScale;
     this.triggerT = 0;
