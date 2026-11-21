@@ -395,7 +395,7 @@ function buildHumanoidBody(b: RigBuilder, rig: Rig, st: HumanoidStyle, ghost: bo
   const j = rig.joints;
   const A = st.armor;
   const U = st.under;
-  const ACC = MATERIALS.WALLRUN_PANEL.emissive; // accent line intensity (2.2)
+  const ACC = MATERIALS.ACCENT_LINE.emissive; // accent line intensity (2.2)
   rig.root.add(j.pelvis);
   j.pelvis.position.set(0, 1.0, 0);
   b.add(j.pelvis, 'box', false, [0, 0, 0], [0.34, 0.18, 0.24], A, 1, 'ARMOR', [0, 0, 0], { ghost });

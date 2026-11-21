@@ -4,7 +4,8 @@
  *  Layer 0  (Y −2.4 … 0)  wet avenues / streets / alleys (road atlas: lanes, centre line, dashes, crosswalks,
  *                          manholes, puddles), parked cyber-cars (3 variants), canal with ripple/flow water,
  *                          towpaths, guard-rails and neon truss bridges (gold anchors on truss apexes)
- *  Layer 1  (Y 9.5)        elevated expressway: 2+2 lanes, median, guard walls (outer face wall-runnable),
+ *  Layer 1  (Y 9.5)        elevated expressway: 2+2 lanes, median, guard walls (bare concrete, edge-line lit,
+ *                          outer face wall-runnable),
  *                          piers every 24–28 m, underside industrial light strips, ground on-ramps,
  *                          clearance ≥ 7.8 m so it can be slid / swung under freely
  *  Layer 2  (Y 18–35)      sky-bridges between towers, projecting neon blade signs, gold anchors
@@ -21,12 +22,23 @@
  *    trails 1.55, aviation 1.60, underside strips 1.60) + an instanced rain-haze halo on every lamp head
  *  - 5B-2 tower walls: city lights, ground contact AO (0 → 2.6 m), violet low-rise bounce (0–16 m) and a
  *    cold moonlight lift (40–95 m); parked cars take the city lights too
- *  - 5B-3 two-tier setback towers (two colliders), roof crowns (≥ 50 m), 1F canopies with under-glow, facade
- *    fins, signs in three formats (blade / wide banner + LED ticker / emblem hologram), 40–60 steam billboards
+ *  - 5B-3 two-tier setback towers (two colliders), roof crowns, 1F canopies with under-glow, facade fins, signs
+ *    in three formats (blade / wide banner + LED ticker / emblem hologram), 40–60 steam billboards
+ *
+ * Phase 6A architecture pass (still one merged draw per material):
+ *  - 6A-1 facade atlas with four archetype columns, per-room night lighting (dark 65 / warm 20 / cool 13 /
+ *    accent 2 %, integer hash shared with FacadeLighting.ts), mechanical floors every 7–9 storeys and
+ *    interior mapping (parallax room boxes) behind clear glass; LOW quality falls back to 2D windows
+ *  - 6A-2 archetypes 30 / 25 / 25 / 20 %: A glass towers (mullions, setback, crown) · B concrete residential
+ *    (pilasters, balconies) · C industrial (fire escape, ducts, loading dock) · D commercial (recessed
+ *    shopfronts behind glass, per-floor canopies, packed signage)
+ *  - 6A-3 walkable balconies (slab + rail colliders ≤ 36 m) · 6A-4 climbable zig-zag fire escapes (landing
+ *    boxes + RampCollider flights) · 6A-5 cyan wall-run cladding removed (flat faces keep invisible surfaces)
  */
 import * as THREE from 'three';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
-import { CITY_SHADING, COLORS, LEVEL, LIMITS, MATERIALS, NEON_BLOOM, RENDER, SILHOUETTE, createRng, clamp } from '../config/constants';
+import { ARCHETYPE, BALCONY, CITY_SHADING, COLORS, FACADE, FIRE_ESCAPE, LEVEL, LIMITS, MATERIALS, NEON_BLOOM, RENDER, SILHOUETTE, createRng, clamp } from '../config/constants';
+import { ARCH_A, ARCH_B, ARCH_C, ARCH_D, GLSL_FACADE, facadeFloorY, facadeRoomState, faceKey, isMachineFloor, roomOffset, roomsPerTile, seedInt } from './FacadeLighting';
 import { SECTORS, type SectorDef } from '../config/skills';
 import { ROAD_ATLAS, SIGN_ATLAS, type AtlasRegion, type ProceduralTextureLibrary } from '../engine/ProceduralTextures';
 
@@ -66,6 +78,8 @@ export interface RampCollider {
   readonly yStart: number;
   readonly yEnd: number;
   readonly thickness: number;
+  /** 6A-4 open steel stair flight (fire escape): slab contacts use a slimmer body so the 0.9 m lanes don't snag. */
+  readonly steel?: boolean;
 }
 
 export interface WallRunSurface {
@@ -92,6 +106,8 @@ export interface BuildingInfo {
   readonly halfW: number;
   readonly halfD: number;
   readonly roofY: number;
+  /** 6A-2 archetype: 0 A glass tower · 1 B residential · 2 C industrial · 3 D commercial. */
+  readonly arch: number;
 }
 
 export type CityLayer = 0 | 1 | 2 | 3;
@@ -119,6 +135,16 @@ export interface GateInfo {
   open: boolean;
 }
 
+/** 6A: a 3D facade feature (centre of the face it occupies, outward normal) — tests / spawn logic. */
+export interface FacadeFeature {
+  readonly kind: 'BALCONY' | 'FIRE_ESCAPE' | 'SHOPFRONT';
+  readonly building: number;
+  readonly center: THREE.Vector3;
+  readonly normal: THREE.Vector3;
+  /** Top of the feature (highest balcony slab / landing, shopfront height). */
+  readonly top: number;
+}
+
 export interface SectorLayout {
   readonly sector: SectorDef;
   readonly loop: number;
@@ -127,6 +153,7 @@ export interface SectorLayout {
   readonly ramps: readonly RampCollider[];
   readonly wallRunSurfaces: readonly WallRunSurface[];
   readonly anchors: readonly GrappleAnchor[];
+  readonly facadeFeatures: readonly FacadeFeature[];
   /** Canal water rectangles (water surface Y = −2.4 m): grounded here ⇒ shallow-water speed × 0.55. */
   readonly canalWater: readonly RectXZ[];
   readonly playerSpawn: THREE.Vector3;
@@ -158,6 +185,14 @@ export interface SectorLayout {
     readonly skybridges: number;
     readonly lamps: number;
     readonly cityLights: number;
+    /** 6A-2 tower count per archetype (A · B · C · D). */
+    readonly archetypes: readonly number[];
+    readonly balconies: number;
+    readonly fireEscapes: number;
+    readonly escapeFlights: number;
+    readonly shopfronts: number;
+    /** 6A-1 rooms per night-light state on the rendered facades: dark · warm · cool · accent. */
+    readonly facadeRooms: readonly number[];
   };
 }
 
@@ -621,12 +656,13 @@ const GLSL_PUDDLE_RIPPLES = /* glsl */ `
 // Capacities (pre-allocated once; counts set per sector)
 // =============================================================================================
 const CAP = {
-  AC: 150,
+  /** Roof units + 6A-3 balcony outdoor units. */
+  AC: 300,
   DUCT: 60,
   FENCE: 240,
   ANTENNA: 44,
   AVIATION: 280,
-  NEON: 320,
+  NEON: 420,
   SEARCH: 20,
   MACHINE_ROOM: 26,
   BEACON: 220,
@@ -648,6 +684,8 @@ interface Building extends BuildingInfo {
   readonly lotHalfD: number;
   /** Setback terrace height (0 = single block). */
   readonly setbackY: number;
+  /** Type D recessed shopfront height (0 = none). */
+  recessTop: number;
 }
 
 interface CarSlot {
@@ -692,7 +730,8 @@ export class CityBuilder {
   private readonly waterMat: THREE.MeshStandardMaterial;
   private readonly hwConcreteMat: THREE.MeshStandardMaterial;
   private readonly stripMat: THREE.MeshBasicMaterial;
-  private readonly panelMat: THREE.MeshStandardMaterial;
+  /** 6A: transparent tempered / shopfront glass (balcony rails, recessed shop windows) — one draw. */
+  private readonly shopGlassMat: THREE.MeshStandardMaterial;
   private readonly steelMat: THREE.MeshStandardMaterial;
   private readonly glassMat: THREE.MeshStandardMaterial;
   private readonly beaconMat: THREE.MeshStandardMaterial;
@@ -726,6 +765,8 @@ export class CityBuilder {
   private readonly gatePillar: THREE.Mesh;
 
   private layout: SectorLayout | null = null;
+  /** Tower records of the current sector (facade probe). */
+  private towers: readonly Building[] = [];
 
   constructor(private readonly tex: ProceduralTextureLibrary) {
     this.root.name = 'City';
@@ -737,16 +778,14 @@ export class CityBuilder {
     this.waterMat = this.createWaterMaterial();
     this.hwConcreteMat = this.createHighwayConcreteMaterial();
     this.stripMat = new THREE.MeshBasicMaterial({ vertexColors: true, toneMapped: true });
-    this.panelMat = new THREE.MeshStandardMaterial({
-      color: 0xffffff,
-      map: tex.wallPanel.map,
-      roughness: 1.0,
-      roughnessMap: tex.wallPanel.roughnessMap,
-      metalness: MATERIALS.WALLRUN_PANEL.metalness,
-      normalMap: tex.wallPanel.normalMap,
-      emissive: new THREE.Color(COLORS.WALLRUN_CYAN),
-      emissiveMap: tex.wallPanel.emissiveMap,
-      emissiveIntensity: MATERIALS.WALLRUN_PANEL.emissive,
+    this.shopGlassMat = new THREE.MeshStandardMaterial({
+      color: 0x9fb6cc,
+      roughness: 0.04,
+      metalness: 0.7,
+      transparent: true,
+      opacity: 0.24,
+      depthWrite: false,
+      envMapIntensity: 1.5,
     });
     this.steelMat = new THREE.MeshStandardMaterial({ color: 0x2a303b, roughness: 0.42, metalness: 0.85 });
     this.glassMat = new THREE.MeshStandardMaterial({ color: 0x0a1018, roughness: 0.06, metalness: 0.9 });
@@ -757,6 +796,7 @@ export class CityBuilder {
     this.sky = this.createSky();
     this.farTowers = new THREE.InstancedMesh(new THREE.BoxGeometry(1, 1, 1), this.buildingMat, LIMITS.FAR_BUILDINGS);
     this.farTowers.geometry.setAttribute('aSeed', new THREE.InstancedBufferAttribute(new Float32Array(LIMITS.FAR_BUILDINGS), 1));
+    this.farTowers.geometry.setAttribute('aArch', new THREE.InstancedBufferAttribute(new Float32Array(LIMITS.FAR_BUILDINGS), 1));
     this.farTowers.name = 'FarTowers';
     this.hoverTrails = this.createHoverTrails();
     this.persistent.add(this.sky, this.farTowers, this.hoverTrails);
@@ -806,6 +846,44 @@ export class CityBuilder {
     return this.layout;
   }
 
+  /**
+   * CPU mirror of the tower shader's facade mapping (verification / debug): the night-light state of the room
+   * at world point (x, y, z) on face (nx, nz) of tower `index`, plus the facade-atlas uv the shader samples.
+   */
+  facadeProbe(index: number, nx: number, nz: number, x: number, y: number, z: number): { state: number; machine: boolean; floor: number; room: number; u: number; v: number } | null {
+    const b = this.towers[index];
+    if (!b) return null;
+    const F = FACADE;
+    const si = seedInt(b.seed);
+    const roomW = F.TILE_W_M / roomsPerTile(b.arch);
+    const along = Math.abs(nx) > Math.abs(nz) ? -z * Math.sign(nx) : x * Math.sign(nz);
+    const alongM = along + roomOffset(si, b.arch) * roomW;
+    const room = Math.floor(alongM / roomW);
+    const base = F.FLOOR_BASE_M[b.arch];
+    const yb = Math.max(y, 0) - base;
+    const floor = yb < F.FLOOR_H_M ? 0 : Math.floor(yb / F.FLOOR_H_M);
+    const local = yb < F.FLOOR_H_M ? Math.max(y, 0) / (F.FLOOR_H_M + base) : yb / F.FLOOR_H_M - floor;
+    const machine = isMachineFloor(si, floor);
+    let rowV = local;
+    if (b.arch === ARCH_D && floor === 0) rowV = 2 + (Math.floor(si / 4096) % F.TYPICAL_ROWS) + local;
+    else if (floor > 0) {
+      const c = F.MACHINE_EVERY_MIN + (Math.floor(si / 16) % F.MACHINE_EVERY_SPAN);
+      const off = Math.floor(si / 256) % (c - 2);
+      const m = (floor - 1 + off) % c;
+      rowV = m === c - 1 ? 1 + local : 2 + ((m + Math.floor((floor - 1 + off) / c) * 5 + (Math.floor(si / 4096) % F.TYPICAL_ROWS)) % F.TYPICAL_ROWS) + local;
+    }
+    const tiles = alongM / F.TILE_W_M;
+    const rowI = Math.floor(rowV);
+    return {
+      state: machine ? 0 : facadeRoomState(si, faceKey(nx, nz), room, floor),
+      machine,
+      floor,
+      room,
+      u: (b.arch + 0.003 + (tiles - Math.floor(tiles)) * 0.994) / F.COLUMNS,
+      v: (rowI + 0.012 + (rowV - rowI) * 0.976) / F.ROWS,
+    };
+  }
+
   // ===========================================================================================
   // Materials
   // ===========================================================================================
@@ -834,52 +912,67 @@ export class CityBuilder {
       .replace('#include <opaque_fragment>', apply);
   }
 
-  /** LOW quality skips the per-fragment city lights on tower walls (the costliest 5B-2 term). */
+  /** LOW quality skips the per-fragment city lights on tower walls and the interior mapping (STRAND_LITE). */
   setQuality(preset: 'HIGH' | 'MEDIUM' | 'LOW'): void {
     this.uWallLights.value = preset === 'LOW' ? 0 : 1;
+    const lite = preset === 'LOW';
+    const defs = this.buildingMat.defines as Record<string, string>;
+    if (lite !== ('STRAND_LITE' in defs)) {
+      if (lite) defs.STRAND_LITE = '';
+      else delete defs.STRAND_LITE;
+      this.buildingMat.needsUpdate = true;
+    }
   }
 
   /**
-   * Glass tower material: world-space window atlas. Rows 0–4 (office) repeat every 20 m above Y 12 m;
-   * rows 5–7 (shops 3F/2F/1F) cover Y 0–12 m. textureGrad on the continuous UV avoids mip seams at wraps.
+   * 6A-1 tower material. Facade atlas with four archetype columns (aArch 0 A glass · 1 B residential ·
+   * 2 C industrial · 3 D commercial; +0.5 = shop-interior wall behind a recessed shopfront), world-space
+   * 12 m tiles with a per-tower room offset, a dark mechanical floor every 7–9 storeys and per-room night
+   * lighting (integer hash shared with FacadeLighting.ts: dark 65 % · warm 20 % · cool 13 % · accent 2 %).
+   * Behind clear glass the view ray is taken into the facade's tangent space and intersected with a room
+   * box (depth 0.55 floor units — ceiling panels, back wall, floor, side walls, furniture by archetype), so
+   * the rooms shift with real parallax as the player swings past. STRAND_LITE (LOW) keeps the 2D windows.
    */
   private createBuildingMaterial(): THREE.MeshStandardMaterial {
-    const w = this.tex.windows;
+    const f = this.tex.facades;
     const mat = new THREE.MeshStandardMaterial({
       color: 0xffffff,
-      map: w.map,
+      map: f.map,
       roughness: 1.0,
-      roughnessMap: w.roughnessMap,
-      metalness: MATERIALS.BUILDING_GLASS.metalness,
-      normalMap: w.normalMap,
+      roughnessMap: f.roughnessMap,
+      metalness: 1.0,
+      normalMap: f.normalMap,
       normalScale: new THREE.Vector2(0.8, 0.8),
       emissive: new THREE.Color(0xffffff),
-      emissiveMap: w.emissiveMap,
-      emissiveIntensity: MATERIALS.BUILDING_GLASS.emissive,
+      emissiveMap: f.emissiveMap,
+      emissiveIntensity: 1.0,
     });
-    const tileW = RENDER.WINDOW_TILE_WIDTH_M.toFixed(2);
-    const rowH = RENDER.WINDOW_FLOOR_HEIGHT_M;
-    const texH = (rowH * RENDER.WINDOW_ROWS).toFixed(2); // 32 m of texture height
-    const shopTop = (rowH * RENDER.WINDOW_SHOP_ROWS).toFixed(2); // 12 m
-    const officeH = (rowH * RENDER.WINDOW_OFFICE_ROWS).toFixed(2); // 20 m
-    const shopFrac = (RENDER.WINDOW_SHOP_ROWS / RENDER.WINDOW_ROWS).toFixed(4); // 0.375
-    const officeFrac = (RENDER.WINDOW_OFFICE_ROWS / RENDER.WINDOW_ROWS).toFixed(4); // 0.625
-    const officeRows = RENDER.WINDOW_OFFICE_ROWS.toFixed(1);
+    const F = FACADE;
+    const TW = F.TILE_W_M.toFixed(1);
+    const FH = F.FLOOR_H_M.toFixed(1);
+    const TEX_H = (F.FLOOR_H_M * F.ROWS).toFixed(1);
     const roofCol = new THREE.Color(COLORS.ROOF_WET);
     const CS = CITY_SHADING;
     const bounce = new THREE.Color(CS.BOUNCE_COLOR);
     const moon = new THREE.Color(CS.MOON_COLOR);
     const v3 = (c: THREE.Color): string => `vec3(${c.r.toFixed(4)}, ${c.g.toFixed(4)}, ${c.b.toFixed(4)})`;
+    const hx = (h: number): string => v3(new THREE.Color(h));
+    const v2 = (r: readonly number[]): string => `vec2(${r[0].toFixed(3)}, ${r[1].toFixed(3)})`;
+    const D = F.INTERIOR_DEPTH.toFixed(3);
+    const PMAX = F.PARALLAX_MAX_DIST_M.toFixed(1);
     // 5B-2: walls up to 40 m take the street-lamp / neon city lights; 0–16 m add a violet-magenta street
     // bounce and 40–95 m a cold moonlight lift (vertical gradient); ground contact AO multiplies the albedo.
     const wallApply = /* glsl */ `
       {
         vec3 strandNw = transformNormalByInverseViewMatrix(normal, viewMatrix);
+        vec3 strandV = normalize(cameraPosition - vCityWorld);
         if (uWallLights > 0.5 && vStrandY < ${CS.WALL_LIGHT_MAX_Y.toFixed(1)}) {
-          vec3 strandV = normalize(cameraPosition - vCityWorld);
           outgoingLight += strandCityLights(vCityWorld, strandNw, strandV, diffuseColor.rgb, roughnessFactor, metalnessFactor);
         }
         float side = 1.0 - vTop;
+        // 6A-1: dark glass mirrors the violet night-sky glow at grazing angles (Fresnel), never at normal incidence.
+        float strandFres = pow(1.0 - clamp(abs(dot(strandNw, strandV)), 0.0, 1.0), 4.0);
+        outgoingLight += vec3(0.05, 0.038, 0.1) * strandFres * metalnessFactor * (1.0 - roughnessFactor) * side;
         float low = 1.0 - smoothstep(0.0, ${CS.BOUNCE_TOP_M.toFixed(1)}, vStrandY);
         float high = smoothstep(${CS.MOON_FROM_M.toFixed(1)}, ${CS.MOON_TO_M.toFixed(1)}, vStrandY);
         vec3 lift = (diffuseColor.rgb * 0.6 + vec3(0.032)) * side;
@@ -887,16 +980,115 @@ export class CityBuilder {
       }
       #include <opaque_fragment>
     `;
+    const fragCommon = /* glsl */ `
+      uniform float uWallLights;
+      uniform float uTime;
+      varying vec2 vStrandUv;
+      varying float vStrandY;
+      varying float vTop;
+      flat varying float vSeed;
+      flat varying float vArch;
+      varying vec3 vFaceN;
+      ${GLSL_FACADE}
+      vec3 strandRoomLight(int st, float h) {
+        if (st == 0) return vec3(0.0);
+        vec3 c;
+        vec2 L;
+        if (st == 1) { c = mix(${hx(F.WARM_A)}, ${hx(F.WARM_B)}, h); L = ${v2(F.LUM_WARM)}; }
+        else if (st == 2) { c = mix(${hx(F.COOL_A)}, ${hx(F.COOL_B)}, h); L = ${v2(F.LUM_COOL)}; }
+        else if (st == 3) { c = h < 0.5 ? ${hx(F.ACCENT_CYAN)} : ${hx(F.ACCENT_MAGENTA)}; L = ${v2(F.LUM_ACCENT)}; }
+        else {
+          c = h < 0.45 ? mix(${hx(F.WARM_A)}, ${hx(F.WARM_B)}, h * 2.0) : (h < 0.9 ? mix(${hx(F.COOL_A)}, ${hx(F.COOL_B)}, h) : (h < 0.95 ? ${hx(F.ACCENT_CYAN)} : ${hx(F.ACCENT_MAGENTA)}));
+          L = ${v2(F.LUM_SHOP)};
+        }
+        float target = mix(L.x, L.y, fract(h * 7.31));
+        // Fluorescent colour-temperature drift is in the mix above; ~1.5 % of offices flicker faintly.
+        if (st == 2 && h > 0.985) target *= 0.72 + 0.28 * step(0.22, fract(uTime * 3.7 + h * 91.0));
+        return c * (target / max(dot(c, vec3(0.2126, 0.7152, 0.0722)), 1e-4));
+      }
+      // Interior mapping: room box x∈[0,1] (room width), y∈[0,1] (floor height), z∈[-D,0] behind the glass.
+      // Shop shelving: product rows with hashed packaging colours (shop interiors, col 4).
+      vec3 strandShelves(vec2 w, float h) {
+        float row = floor(w.y * 4.5);
+        float board = step(fract(w.y * 4.5), 0.14) * step(w.y, 0.82);
+        vec2 slot = vec2(floor(w.x * 9.0), row);
+        float hs = fract(sin(dot(slot + h * 17.0, vec2(12.9898, 78.233))) * 43758.5453);
+        vec3 pack = mix(vec3(0.92, 0.9, 0.86), 0.5 + 0.5 * cos(6.2831 * (hs + vec3(0.0, 0.33, 0.67))), 0.55);
+        float gap = step(0.12, fract(w.x * 9.0)) * step(w.y, 0.82);
+        return mix(vec3(0.55), pack * (0.65 + 0.35 * gap), gap) * (1.0 - 0.7 * board);
+      }
+      vec3 strandInterior(vec2 cell, vec3 d, vec3 light, float h, int col) {
+        float D = col == 4 ? 1.15 : ${D};
+        vec3 p = vec3(cell, 0.0);
+        float tx = d.x > 0.0 ? (1.0 - p.x) / d.x : (d.x < 0.0 ? -p.x / d.x : 1e5);
+        float ty = d.y > 0.0 ? (1.0 - p.y) / d.y : (d.y < 0.0 ? -p.y / d.y : 1e5);
+        float tz = D / max(-d.z, 1e-4);
+        vec3 q = p + d * min(min(tx, ty), tz);
+        float depth = clamp(-q.z / D, 0.0, 1.0);
+        float h2 = fract(h * 13.7);
+        if (col == 4) {
+          // Shop: shelving on the back and side walls, tiled floor, a grid of downlights.
+          vec3 c;
+          if (tz <= tx && tz <= ty) c = strandShelves(q.xy, h) * (0.75 + 0.15 * q.y);
+          else if (ty <= tx) {
+            if (d.y > 0.0) {
+              vec2 g = fract(vec2(q.x * 3.0, depth * 2.5)) - 0.5;
+              c = vec3(0.16 + 1.9 * exp(-dot(g, g) * 30.0));
+            } else {
+              vec2 t = fract(vec2(q.x * 4.0, depth * 4.0));
+              c = vec3(0.5 * (1.0 - 0.35 * depth)) * (1.0 - 0.3 * step(0.94, max(t.x, t.y)));
+            }
+          } else c = strandShelves(vec2(depth, q.y), h + 0.37) * (0.62 - 0.2 * depth);
+          return light * c;
+        }
+        float k;
+        if (tz <= tx && tz <= ty) {
+          k = 0.62 - 0.22 * abs(q.x - 0.5) + 0.12 * q.y;
+          if (col == 0) {
+            k *= 1.0 - 0.7 * step(q.y, 0.29) * step(0.16, fract(q.x * 2.0 + h));
+            k += 1.4 * step(abs(q.y - 0.36), 0.05) * step(abs(fract(q.x * 2.0 + h) - 0.55), 0.12);
+            k += 0.5 * step(abs(q.x - 0.25 - 0.5 * h2), 0.14) * step(abs(q.y - 0.55), 0.09);
+          } else if (col == 1) {
+            k *= 1.0 - 0.6 * step(q.y, 0.2) * step(abs(q.x - 0.5), 0.32);
+            k *= 1.0 - 0.45 * step(abs(q.x - 0.3 - 0.4 * h2), 0.09) * step(abs(q.y - 0.5), 0.07);
+            vec2 lp = q.xy - vec2(0.12 + 0.76 * step(0.5, h2), 0.3);
+            k += 0.9 * exp(-dot(lp, lp) * 60.0);
+          } else if (col == 2) {
+            float rack = step(0.82, fract(q.x * 4.0 + h)) + step(abs(fract(q.y * 3.0) - 0.5), 0.04) * step(q.y, 0.75);
+            k *= 1.0 - 0.55 * clamp(rack, 0.0, 1.0);
+          } else {
+            k *= 1.0 - 0.6 * step(q.y, 0.24);
+            k += 1.6 * step(abs(q.y - 0.7), 0.012);
+          }
+        } else if (ty <= tx) {
+          if (d.y > 0.0) {
+            float panel = step(abs(q.x - 0.5), 0.3) * step(abs(fract(depth * 1.6 + 0.2) - 0.5), 0.2);
+            k = 0.2 + panel * (col == 1 ? 0.6 : 1.55);
+          } else {
+            k = 0.34 * (1.0 - 0.35 * depth);
+            k *= 1.0 - 0.45 * step(0.45, depth) * step(0.35, fract(q.x * 2.0 + h));
+          }
+        } else {
+          k = 0.44 * (1.0 - 0.4 * depth) + 0.1 * q.y;
+          k *= 1.0 - 0.35 * step(q.y, 0.5) * step(0.55, depth) * step(0.5, fract(h * 5.3));
+        }
+        return vec3(0.0035, 0.0045, 0.007) * (1.6 - depth) + light * k;
+      }
+    `;
     mat.onBeforeCompile = (shader) => {
       shader.uniforms.uWallLights = this.uWallLights;
+      shader.uniforms.uTime = this.uTime;
       this.injectCityLights(shader, wallApply);
       shader.vertexShader = shader.vertexShader
         .replace('#include <common>', `#include <common>
           attribute float aSeed;
+          attribute float aArch;
           varying vec2 vStrandUv;
           varying float vStrandY;
           varying float vTop;
-          varying float vSeed;`)
+          flat varying float vSeed;
+          flat varying float vArch;
+          varying vec3 vFaceN;`)
         .replace('#include <uv_vertex>', `#include <uv_vertex>
           {
             #ifdef USE_INSTANCING
@@ -906,42 +1098,79 @@ export class CityBuilder {
             #endif
             vec4 strandWp = strandWm * vec4(position, 1.0);
             vec3 strandWn = normalize(mat3(strandWm) * normal);
+            vFaceN = strandWn;
             if (abs(strandWn.y) > 0.5) {
               vTop = 1.0;
-              vStrandUv = strandWp.xz / ${tileW};
+              vStrandUv = strandWp.xz / ${TW};
             } else {
               vTop = 0.0;
               float along = abs(strandWn.x) > abs(strandWn.z) ? -strandWp.z * sign(strandWn.x) : strandWp.x * sign(strandWn.z);
-              vStrandUv = vec2(along / ${tileW} + floor(aSeed * 8.0) / 8.0, strandWp.y / ${texH});
+              float rooms = float(strandRoomsPerTileV(int(aArch)));
+              vStrandUv = vec2(along / ${TW} + mod(floor(aSeed * 65536.0), rooms) / rooms, strandWp.y / ${TEX_H});
             }
             vStrandY = strandWp.y;
             vSeed = aSeed;
+            vArch = aArch;
             vNormalMapUv = vStrandUv;
-          }`);
-      shader.fragmentShader = shader.fragmentShader
-        .replace('#include <common>', `#include <common>
-          uniform float uWallLights;
-          varying vec2 vStrandUv;
-          varying float vStrandY;
-          varying float vTop;
-          varying float vSeed;
-          vec2 strandWindowUv() {
-            if (vTop > 0.5) return vStrandUv;
-            if (vStrandY < ${shopTop}) return vec2(vStrandUv.x, clamp(vStrandY / ${texH}, 0.002, ${shopFrac} - 0.002));
-            float floorsOff = floor(fract(vSeed * 13.7) * ${officeRows}) / ${officeRows};
-            return vec2(vStrandUv.x, ${shopFrac} + 0.002 + fract((vStrandY - ${shopTop}) / ${officeH} + floorsOff) * (${officeFrac} - 0.004));
           }`)
+        .replace('#include <common>', `#include <common>
+          int strandRoomsPerTileV(int col) { return col == 2 ? ${F.ROOMS_PER_TILE[2]} : ${F.ROOMS_PER_TILE[0]}; }`);
+      shader.fragmentShader = shader.fragmentShader
+        .replace('#include <common>', `#include <common>\n${fragCommon}`)
         .replace('#include <map_fragment>', `
-          vec2 sWUv = strandWindowUv();
-          vec2 sWGX = dFdx(vStrandUv);
-          vec2 sWGY = dFdy(vStrandUv);
+          int sCol = int(vArch);
+          bool sShop = fract(vArch) > 0.4;
+          // aArch + 0.25: structural add-on (balcony slab, pilaster, shop pillar) — the archetype's plain cladding band.
+          bool sPlain = abs(fract(vArch) - 0.25) < 0.05;
+          int sSeedI = int(floor(vSeed * 65536.0));
+          float sY = max(vStrandY, 0.0);
+          float sBase = sShop ? 0.0 : (sCol == 1 ? ${F.FLOOR_BASE_M[1].toFixed(1)} : 0.0);
+          float sYb = sY - sBase;
+          int sFloor = sYb < ${FH} ? 0 : int(floor(sYb / ${FH}));
+          float sLocal = sYb < ${FH} ? sY / (${FH} + sBase) : fract(sYb / ${FH});
+          bool sMachine = false;
+          float sRowV = sLocal;
+          if (!sShop && sFloor == 0 && sCol == 3) sRowV = 2.0 + float((sSeedI / 4096) % ${F.TYPICAL_ROWS}) + sLocal;
+          else if (!sShop && sFloor > 0) {
+            int c = ${F.MACHINE_EVERY_MIN} + (sSeedI / 16) % ${F.MACHINE_EVERY_SPAN};
+            int off = (sSeedI / 256) % (c - 2);
+            int m = (sFloor - 1 + off) % c;
+            if (m == c - 1) { sMachine = true; sRowV = 1.0 + sLocal; }
+            else sRowV = 2.0 + float((m + ((sFloor - 1 + off) / c) * 5 + (sSeedI / 4096) % ${F.TYPICAL_ROWS}) % ${F.TYPICAL_ROWS}) + sLocal;
+          }
+          if (sPlain) {
+            vec2 band = sCol == 0 ? vec2(0.05, 0.6) : (sCol == 1 ? vec2(2.7, 1.25) : (sCol == 2 ? vec2(2.8, 1.15) : vec2(3.52, 0.45)));
+            sRowV = 2.0 + (band.x + fract(sY / ${FH}) * band.y) / ${FH};
+            sMachine = true;
+          }
+          float sRowI = floor(sRowV);
+          vec2 sWUv = vTop > 0.5 ? vStrandUv
+            : vec2((float(sCol) + 0.003 + fract(vStrandUv.x) * 0.994) * ${(1 / F.COLUMNS).toFixed(4)}, (sRowI + 0.012 + (sRowV - sRowI) * 0.976) / ${F.ROWS.toFixed(1)});
+          vec2 sWGX = dFdx(vStrandUv) * vec2(${(1 / F.COLUMNS).toFixed(4)}, 1.0);
+          vec2 sWGY = dFdy(vStrandUv) * vec2(${(1 / F.COLUMNS).toFixed(4)}, 1.0);
+          float sRoomW = ${TW} / float(strandRoomsPerTile(sCol));
+          float sAlongM = vStrandUv.x * ${TW};
+          int sRoomI = int(floor(sAlongM / sRoomW));
+          vec2 sCell = vec2(fract(sAlongM / sRoomW), sLocal);
+          int sFace = int(dot(step(vec2(0.5), vFaceN.xz), vec2(1.0, 2.0)) + dot(step(vec2(0.5), -vFaceN.xz), vec2(3.0, 5.0)));
+          int sState = 0;
+          float sDrift = 0.0;
+          if (vTop < 0.5 && !sMachine) {
+            sState = sShop ? 4 : strandRoomState(sSeedI, sFace, sRoomI, sFloor);
+            sDrift = strandHash(sRoomI + 300000, sFloor + 5000, sSeedI);
+          }
+          vec3 sRoomLight = strandRoomLight(sState, sDrift);
           diffuseColor *= textureGrad(map, sWUv, sWGX, sWGY);
           diffuseColor.rgb = mix(diffuseColor.rgb, vec3(${roofCol.r.toFixed(4)}, ${roofCol.g.toFixed(4)}, ${roofCol.b.toFixed(4)}), vTop);
           // Ground contact AO (0 → 2.6 m): the towers sit heavily on the wet street.
           float strandAO = mix(${CS.AO_MIN.toFixed(2)}, 1.0, mix(smoothstep(0.0, ${CS.AO_HEIGHT_M.toFixed(2)}, vStrandY), 1.0, vTop));
           diffuseColor.rgb *= strandAO;`)
         .replace('#include <roughnessmap_fragment>', `
-          float roughnessFactor = roughness * textureGrad(roughnessMap, sWUv, sWGX, sWGY).g;`)
+          vec4 sRM = textureGrad(roughnessMap, sWUv, sWGX, sWGY);
+          float sMask = sRM.r * (1.0 - vTop);
+          float roughnessFactor = mix(roughness * sRM.g, 0.7, vTop);`)
+        .replace('#include <metalnessmap_fragment>', `
+          float metalnessFactor = mix(metalness * sRM.b, 0.15, vTop);`)
         .replace('#include <normal_fragment_maps>', `
           {
             vec3 mapN = textureGrad(normalMap, sWUv, sWGX, sWGY).xyz * 2.0 - 1.0;
@@ -949,10 +1178,32 @@ export class CityBuilder {
             normal = normalize(tbn * mapN);
           }`)
         .replace('#include <emissivemap_fragment>', `
-          totalEmissiveRadiance *= textureGrad(emissiveMap, sWUv, sWGX, sWGY).rgb;
-          totalEmissiveRadiance *= (1.0 - vTop) * (0.72 + 0.28 * fract(vSeed * 91.7)) * mix(0.72, 1.0, strandAO);`);
+          {
+            vec3 sEm = textureGrad(emissiveMap, sWUv, sWGX, sWGY).rgb;
+            float sMx = max(max(sEm.r, sEm.g), sEm.b);
+            float sMn = min(min(sEm.r, sEm.g), sEm.b);
+            // Neutral grey = room light (tinted per room), saturated = fixed neon (× 0.45, as before).
+            float sNeutral = 1.0 - smoothstep(0.08, 0.22, (sMx - sMn) / max(sMx, 1e-3));
+            float sPat = dot(sEm, vec3(0.2126, 0.7152, 0.0722));
+            vec3 sOut = sEm * (1.0 - sNeutral) * ${MATERIALS.BUILDING_GLASS.emissive.toFixed(2)} + sRoomLight * (sPat * sNeutral);
+            #ifndef STRAND_LITE
+              if (sMask > 0.01 && !sMachine) {
+                float sDist = length(cameraPosition - vCityWorld);
+                if (sDist < ${PMAX}) {
+                  vec3 sN = normalize(vFaceN);
+                  vec3 sT = normalize(cross(vec3(0.0, 1.0, 0.0), sN));
+                  vec3 sV = (vCityWorld - cameraPosition) / max(sDist, 1e-3);
+                  vec3 sD = vec3(dot(sV, sT) / sRoomW, sV.y / ${FH}, dot(sV, sN) / ${FH});
+                  vec3 sInt = strandInterior(sCell, sD, sRoomLight, sDrift, sShop ? 4 : sCol);
+                  sInt *= 0.3 + 0.7 * smoothstep(0.04, 0.5, abs(dot(sV, sN)));
+                  sOut = mix(sOut, sInt, sMask * (1.0 - smoothstep(${PMAX} * 0.7, ${PMAX}, sDist)));
+                }
+              }
+            #endif
+            totalEmissiveRadiance = sOut * (1.0 - vTop) * mix(0.72, 1.0, strandAO);
+          }`);
     };
-    mat.customProgramCacheKey = () => 'strand-building-v12';
+    mat.customProgramCacheKey = () => 'strand-building-v15';
     return mat;
   }
 
@@ -1956,7 +2207,7 @@ export class CityBuilder {
       water: [] as THREE.BufferGeometry[],
       hw: [] as THREE.BufferGeometry[],
       strips: [] as THREE.BufferGeometry[],
-      panels: [] as THREE.BufferGeometry[],
+      glassT: [] as THREE.BufferGeometry[],
       steel: [] as THREE.BufferGeometry[],
       glass: [] as THREE.BufferGeometry[],
       bodies: [] as THREE.BufferGeometry[],
@@ -2427,7 +2678,7 @@ export class CityBuilder {
         if (c1 > c0) colliders.push(colliderAL(h.axis, c0, c1, h.coord - HW, h.coord + HW, UNDER, DECK, 'HIGHWAY'));
       }
 
-      // Guard walls with openings (junctions, ramps); outer faces are cyan wall-run cladding.
+      // Guard walls with openings (junctions, ramps); outer faces stay wall-runnable (invisible surfaces).
       for (const side of [-1, 1]) {
         const openings: Array<[number, number]> = [];
         plan.highways.forEach((o, oi) => {
@@ -2449,14 +2700,14 @@ export class CityBuilder {
             if (!inArea(q.x, q.z, -30)) continue;
             addNeon(q.x, q.y, q.z, h.axis === 'z' ? side : 0, h.axis === 'x' ? side : 0, 7, 1.0, Math.floor(srng() * SIGN_ATLAS.WIDE_ROWS), 1);
           }
-          const o = 0.03 * side;
+          // 6A-5: bare concrete outer face with restrained architectural edge lines (no chevron cladding).
           const n = pt(h.axis, 0, 0, side, new THREE.Vector3());
-          const tile = RENDER.WALLRUN_CHEVRON_TILE_M;
-          G.panels.push(quad(
-            [pt(h.axis, w0, UNDER, wallOuter + o), pt(h.axis, w1, UNDER, wallOuter + o), pt(h.axis, w1, GUARD_TOP, wallOuter + o), pt(h.axis, w0, GUARD_TOP, wallOuter + o)],
-            [w0 / tile, 0, w1 / tile, 0, w1 / tile, 1, w0 / tile, 1],
-            n,
-          ));
+          const e0 = Math.min(wallOuter, wallOuter + side * 0.04);
+          const e1 = Math.max(wallOuter, wallOuter + side * 0.04);
+          G.strips.push(
+            withColor(boxGeoWorld(h.axis, w0, w1, e0, e1, GUARD_TOP - 0.2, GUARD_TOP - 0.16), COLORS.STREET_LAMP, 0.95),
+            withColor(boxGeoWorld(h.axis, w0, w1, e0, e1, UNDER + 0.12, UNDER + 0.15), COLORS.STREET_LAMP, 0.95),
+          );
           const c0 = Math.max(w0, -H);
           const c1 = Math.min(w1, H);
           if (c1 > c0 + 1) {
@@ -2629,9 +2880,47 @@ export class CityBuilder {
     });
     if (iMin >= 0) heights[iMin] = sector.heightMin;
 
-    // 5B-3: ~60 % of the ≥ 45 m towers become two-tier — a slimmer crown tier (65–78 % footprint) rises from
-    // a terrace at 65–80 % of the height (always above every sky-bridge / Layer-2 sign, ≥ 36 m). Own RNG
-    // stream, so the rest of the deterministic layout is unchanged.
+    // ------------------------------------------------------------------ 6A-2 archetypes
+    // Shares 30 / 25 / 25 / 20 (largest remainder) by height rank: the tallest towers become A glass
+    // corporate towers, the next B residential blocks, the low-rise remainder C industrial (lots with a
+    // street face long enough for a fire escape first) / D commercial. Heights are then clamped into each
+    // archetype's band. Own RNG stream (arng) so the streets / cars / lamps stay where they were.
+    const arng = createRng(0xa7c4 + sector.index * 131 + loop * 1009);
+    const alleyFaces = new Set<string>();
+    for (const al of alleyRecs) alleyFaces.add(`${al.a}:${al.axis}:1`).add(`${al.b}:${al.axis}:-1`);
+    const FACES: ReadonlyArray<readonly [Axis, number]> = [['x', 1], ['x', -1], ['z', 1], ['z', -1]];
+    const FE = FIRE_ESCAPE;
+    const AR = ARCHETYPE;
+    const escapeNeed = 2 * FE.LANDING_WIDTH_M + FE.RUN_MIN_M + 1.2;
+    const lotFaceLen = (r: RectXZ, ax: Axis): number => (ax === 'x' ? r.z1 - r.z0 : r.x1 - r.x0);
+    const hasEscapeFace = (i: number): boolean => FACES.some(([ax, sg]) => !alleyFaces.has(`${i}:${ax}:${sg}`) && lotFaceLen(chosen[i], ax) >= escapeNeed);
+    const quota = AR.SHARES.map((sh) => sh * N);
+    const archCount = quota.map((q) => Math.floor(q));
+    const remOrder = quota.map((q, i) => ({ i, r: q - archCount[i] })).sort((p, o) => o.r - p.r || p.i - o.i);
+    for (let k = 0; archCount.reduce((s, v) => s + v, 0) < N; k++) archCount[remOrder[k % 4].i]++;
+    const archOf: number[] = new Array<number>(N).fill(ARCH_D);
+    const byHeight = heights.map((h, i) => ({ i, h, roll: arng() })).sort((p, o) => o.h - p.h || p.roll - o.roll);
+    byHeight.forEach((o, k) => {
+      if (k < archCount[0]) archOf[o.i] = ARCH_A;
+      else if (k < archCount[0] + archCount[1]) archOf[o.i] = ARCH_B;
+    });
+    byHeight
+      .slice(archCount[0] + archCount[1])
+      .map((o) => ({ i: o.i, pref: hasEscapeFace(o.i) ? 1 : 0, roll: arng() }))
+      .sort((p, o) => o.pref - p.pref || p.roll - o.roll)
+      .forEach((o, k) => (archOf[o.i] = k < archCount[2] ? ARCH_C : ARCH_D));
+    heights.forEach((h, i) => {
+      const a = archOf[i];
+      const lo = Math.max(AR.MIN_H[a], sector.heightMin);
+      const hi = Math.min(AR.MAX_H[a], sector.heightMax);
+      let v = q2(clamp(h, lo, hi));
+      // Low-rise Type C: whole 4 m storeys, so its fire escape lands flush on the roof.
+      if (a === ARCH_C && v <= FE.ROOF_ACCESS_MAX_Y) v = clamp(Math.round(v / FE.LEVEL_H_M) * FE.LEVEL_H_M, Math.ceil(lo / FE.LEVEL_H_M) * FE.LEVEL_H_M, hi);
+      heights[i] = v;
+    });
+
+    // 5B-3 / 6A-2: ~60 % of the Type A towers (≥ 45 m) become two-tier — a slimmer crown tier (65–78 %
+    // footprint) rises from a terrace at 65–80 % of the height (above every sky-bridge / Layer-2 sign).
     const SB = SILHOUETTE;
     const buildings: Building[] = chosen.map((r, i) => {
       const lotHalfW = (r.x1 - r.x0) / 2;
@@ -2640,7 +2929,7 @@ export class CityBuilder {
       let setbackY = 0;
       let kw = 1;
       let kd = 1;
-      if (roof >= SB.SETBACK_MIN_ROOF_M && srng() < SB.SETBACK_CHANCE) {
+      if (archOf[i] === ARCH_A && roof >= SB.SETBACK_MIN_ROOF_M && srng() < SB.SETBACK_CHANCE) {
         const lo = Math.max(roof * SB.SETBACK_AT_MIN, SB.SETBACK_MIN_Y);
         const hi = Math.min(roof * SB.SETBACK_AT_MAX, roof - SB.SETBACK_MIN_UPPER_M);
         const kwr = SB.SETBACK_SCALE_MIN + srng() * (SB.SETBACK_SCALE_MAX - SB.SETBACK_SCALE_MIN);
@@ -2660,26 +2949,104 @@ export class CityBuilder {
         halfW: lotHalfW * kw,
         halfD: lotHalfD * kd,
         roofY: roof,
+        arch: archOf[i],
         rect: r,
         seed: rng(),
         lotHalfW,
         lotHalfD,
         setbackY,
+        recessTop: 0,
       };
     });
+    const lowTopOf = (b: Building): number => (b.setbackY > 0 ? b.setbackY : b.roofY);
 
-    // ------------------------------------------------------------------ 7. towers, alleys, panels, sky-bridges
+    // ------------------------------------------------------------------ 7. face roles
+    // Alley faces and ≥ 2 faces per tower stay FLAT and carry the wall-run surfaces (the cyan panels are
+    // gone — 6A-5); the other faces carry the archetype's 3D features: B balconies, C the fire escape
+    // (+ ducts / loading dock), D the recessed shopfronts with per-floor canopies. A keeps every face flat
+    // behind its mullions.
+    const fkey = (b: Building, ax: Axis, sg: number): string => `${b.index}:${ax}:${sg}`;
+    const faceLen = (b: Building, ax: Axis): number => (ax === 'x' ? b.lotHalfD : b.lotHalfW) * 2;
+    const runFaces = new Set<string>();
+    const balconyFaces = new Set<string>();
+    const escapeFaces = new Set<string>();
+    const recessFaces = new Set<string>();
+    const ductFaces = new Set<string>();
+    buildings.forEach((b) => {
+      let count = 0;
+      for (const [ax, sg] of FACES) {
+        if (!alleyFaces.has(fkey(b, ax, sg))) continue;
+        runFaces.add(fkey(b, ax, sg));
+        count++;
+      }
+      let escape = '';
+      if (b.arch === ARCH_C) {
+        const cands = FACES.filter(([ax, sg]) => !runFaces.has(fkey(b, ax, sg)) && faceLen(b, ax) >= escapeNeed);
+        if (cands.length) {
+          const [ax, sg] = cands[Math.floor(arng() * cands.length)];
+          escape = fkey(b, ax, sg);
+          escapeFaces.add(escape);
+        }
+      }
+      let k = Math.floor(rng() * 4);
+      let guard = 0;
+      while (count < 2 && guard++ < 8) {
+        const [ax, sg] = FACES[k++ % 4];
+        const key = fkey(b, ax, sg);
+        if (runFaces.has(key) || key === escape) continue;
+        runFaces.add(key);
+        count++;
+      }
+      const feature = FACES.filter(([ax, sg]) => !runFaces.has(fkey(b, ax, sg)) && fkey(b, ax, sg) !== escape);
+      if (b.arch === ARCH_B) {
+        const cands = feature
+          .filter(([ax]) => faceLen(b, ax) >= BALCONY.WIDTH_MIN_M + 2)
+          .map((f) => ({ f, roll: arng() }))
+          .sort((p, o) => faceLen(b, o.f[0]) - faceLen(b, p.f[0]) || p.roll - o.roll);
+        const n = Math.min(cands.length, arng() < 0.45 ? 2 : 1);
+        for (let i = 0; i < n; i++) balconyFaces.add(fkey(b, cands[i].f[0], cands[i].f[1]));
+      } else if (b.arch === ARCH_C) {
+        if (feature.length) ductFaces.add(fkey(b, feature[0][0], feature[0][1]));
+      } else if (b.arch === ARCH_D && feature.length) {
+        const r = arng();
+        const floors = r < 0.4 ? 1 : r < 0.8 ? 2 : 3;
+        b.recessTop = Math.max(0, Math.min(floors * 4, Math.floor((lowTopOf(b) - 8) / 4) * 4));
+        if (b.recessTop > 0) for (const [ax, sg] of feature) recessFaces.add(fkey(b, ax, sg));
+      }
+    });
+
+    // ------------------------------------------------------------------ 7b. tower bodies, roofs, crowns
     const roofRects: RectXZ[][] = buildings.map(() => []);
-    const panelFaces = new Set<string>();
-    const alleyFaces = new Set<string>();
-    for (const al of alleyRecs) alleyFaces.add(`${al.a}:${al.axis}:1`).add(`${al.b}:${al.axis}:-1`);
-
+    /** Tower body box: aSeed + aArch (+0.5 on faces that show a shop interior behind a recessed front). */
+    const bodyBox = (w: number, h: number, d: number, x: number, y: number, z: number, seed: number, arch: number, shop?: (nx: number, nz: number) => boolean): THREE.BufferGeometry => {
+      const g = withAttr1(boxAt(w, h, d, x, y, z), 'aSeed', seed);
+      const n = g.getAttribute('normal') as THREE.BufferAttribute;
+      const a = new Float32Array(n.count);
+      for (let i = 0; i < n.count; i++) a[i] = arch + (shop && shop(n.getX(i), n.getZ(i)) ? 0.5 : 0);
+      g.setAttribute('aArch', new THREE.BufferAttribute(a, 1));
+      return g;
+    };
     const TERRACE_NEON = [COLORS.WALLRUN_CYAN, COLORS.NEON_MAGENTA, COLORS.NEON_AMBER];
     buildings.forEach((b) => {
-      const lowTop = b.setbackY > 0 ? b.setbackY : b.roofY;
-      const body = new THREE.BoxGeometry(b.lotHalfW * 2, lowTop - 0.45, b.lotHalfD * 2);
-      body.translate(b.cx, (lowTop - 0.45) / 2, b.cz);
-      G.bodies.push(withAttr1(body, 'aSeed', b.seed));
+      const lowTop = lowTopOf(b);
+      const top = lowTop - 0.45;
+      if (b.recessTop > 0) {
+        // Type D: the lower 1–3 floors step back 1.8 m behind the shopfront glass on the recessed faces.
+        const RD = AR.RECESS_DEPTH_M;
+        const ix0 = recessFaces.has(fkey(b, 'x', -1)) ? RD : 0;
+        const ix1 = recessFaces.has(fkey(b, 'x', 1)) ? RD : 0;
+        const iz0 = recessFaces.has(fkey(b, 'z', -1)) ? RD : 0;
+        const iz1 = recessFaces.has(fkey(b, 'z', 1)) ? RD : 0;
+        const x0 = b.rect.x0 + ix0;
+        const x1 = b.rect.x1 - ix1;
+        const z0 = b.rect.z0 + iz0;
+        const z1 = b.rect.z1 - iz1;
+        G.bodies.push(bodyBox(x1 - x0, b.recessTop, z1 - z0, (x0 + x1) / 2, b.recessTop / 2, (z0 + z1) / 2, b.seed, ARCH_D,
+          (nx, nz) => (nx > 0.5 && ix1 > 0) || (nx < -0.5 && ix0 > 0) || (nz > 0.5 && iz1 > 0) || (nz < -0.5 && iz0 > 0)));
+        G.bodies.push(bodyBox(b.lotHalfW * 2, top - b.recessTop, b.lotHalfD * 2, b.cx, (top + b.recessTop) / 2, b.cz, b.seed, ARCH_D));
+      } else {
+        G.bodies.push(bodyBox(b.lotHalfW * 2, top, b.lotHalfD * 2, b.cx, top / 2, b.cz, b.seed, b.arch));
+      }
       if (b.setbackY > 0) {
         // Terrace: wet concrete cap + steel lip + a thin neon edge line, then the slimmer crown tier.
         G.concrete.push(worldUvBox(b.lotHalfW * 2 + 0.3, 0.5, b.lotHalfD * 2 + 0.3, b.cx, b.setbackY - 0.25, b.cz, RENDER.ROOF_TILE_M));
@@ -2692,9 +3059,8 @@ export class CityBuilder {
         const tn = TERRACE_NEON[Math.floor(srng() * TERRACE_NEON.length)];
         for (const sz of [-1, 1]) G.strips.push(withColor(boxAt(b.lotHalfW * 2 + 0.3, 0.06, 0.06, b.cx, b.setbackY - 0.6, b.cz + sz * (b.lotHalfD + 0.18)), tn, 1.3));
         for (const sx of [-1, 1]) G.strips.push(withColor(boxAt(0.06, 0.06, b.lotHalfD * 2 + 0.3, b.cx + sx * (b.lotHalfW + 0.18), b.setbackY - 0.6, b.cz), tn, 1.3));
-        const upper = new THREE.BoxGeometry(b.halfW * 2, b.roofY - 0.45 - b.setbackY, b.halfD * 2);
-        upper.translate(b.cx, b.setbackY + (b.roofY - 0.45 - b.setbackY) / 2, b.cz);
-        G.bodies.push(withAttr1(upper, 'aSeed', b.seed));
+        const uh = b.roofY - 0.45 - b.setbackY;
+        G.bodies.push(bodyBox(b.halfW * 2, uh, b.halfD * 2, b.cx, b.setbackY + uh / 2, b.cz, b.seed, b.arch));
       }
       G.concrete.push(worldUvBox(b.halfW * 2 + 0.3, 0.5, b.halfD * 2 + 0.3, b.cx, b.roofY - 0.25, b.cz, RENDER.ROOF_TILE_M));
       G.steel.push(
@@ -2708,8 +3074,8 @@ export class CityBuilder {
       if (b.setbackY > 0) {
         colliders.push({ min: new THREE.Vector3(b.cx - b.halfW, b.setbackY, b.cz - b.halfD), max: new THREE.Vector3(b.cx + b.halfW, b.roofY, b.cz + b.halfD), kind: 'BUILDING', building: b.index });
       }
-      // Roof crown (≥ 50 m): steel corner posts + two horizontal neon rings — a sharp, lit skyline.
-      if (b.roofY >= SB.CROWN_MIN_ROOF_M) {
+      // Type A roof crown: steel corner posts + two horizontal neon rings — a sharp, lit skyline.
+      if (b.arch === ARCH_A) {
         const cn = TERRACE_NEON[Math.floor(srng() * TERRACE_NEON.length)];
         const ix = b.halfW - 0.35;
         const iz = b.halfD - 0.35;
@@ -2746,70 +3112,326 @@ export class CityBuilder {
       }
     });
 
-    /** Wall-run panel on face (axis, sign) of building b between y0 and y1. */
-    const addPanel = (b: Building, axis: Axis, sign: number, y0: number, y1: number, frac: number): void => {
-      if (y1 - y0 < 3) return;
-      const sideLen = axis === 'x' ? b.lotHalfD * 2 : b.lotHalfW * 2;
-      const pw = Math.min(24, sideLen * frac);
-      const ph = y1 - y0;
-      const plane = new THREE.PlaneGeometry(pw, ph);
-      const uv = plane.getAttribute('uv') as THREE.BufferAttribute;
-      for (let i = 0; i < uv.count; i++) uv.setX(i, (uv.getX(i) * pw) / RENDER.WALLRUN_CHEVRON_TILE_M);
-      const off = 0.06;
-      const normal = new THREE.Vector3();
-      let px: number;
-      let pz: number;
-      if (axis === 'x') {
-        plane.rotateY(sign > 0 ? Math.PI / 2 : -Math.PI / 2);
-        px = b.cx + sign * (b.lotHalfW + off);
-        pz = b.cz;
-        normal.set(sign, 0, 0);
-      } else {
-        plane.rotateY(sign > 0 ? 0 : Math.PI);
-        px = b.cx;
-        pz = b.cz + sign * (b.lotHalfD + off);
-        normal.set(0, 0, sign);
-      }
-      const cy = (y0 + y1) / 2;
-      plane.translate(px, cy, pz);
-      G.panels.push(plane);
-      const fr = 0.18;
-      if (axis === 'x') {
-        G.steel.push(boxAt(0.2, fr, pw + fr * 2, px, y1 + fr / 2, pz), boxAt(0.2, fr, pw + fr * 2, px, y0 - fr / 2, pz), boxAt(0.2, ph, fr, px, cy, pz - pw / 2 - fr / 2), boxAt(0.2, ph, fr, px, cy, pz + pw / 2 + fr / 2));
-      } else {
-        G.steel.push(boxAt(pw + fr * 2, fr, 0.2, px, y1 + fr / 2, pz), boxAt(pw + fr * 2, fr, 0.2, px, y0 - fr / 2, pz), boxAt(fr, ph, 0.2, px - pw / 2 - fr / 2, cy, pz), boxAt(fr, ph, 0.2, px + pw / 2 + fr / 2, cy, pz));
-      }
-      const face = axis === 'x' ? b.cx + sign * b.lotHalfW : b.cz + sign * b.lotHalfD;
+    // ------------------------------------------------------------------ 7c. wall-run surfaces (flat faces)
+    // 6A-5: no visible cladding any more — every flat face (alleys + ≥ 2 per tower, all crown-tier faces)
+    // keeps an invisible wall-run surface until 6B's anywhere wall-run replaces the list.
+    const addRunSurface = (axis: Axis, face: number, sign: number, a0: number, a1: number, y0: number, y1: number, building: number): void => {
+      if (y1 - y0 < 3 || a1 - a0 < 2.5) return;
       wallRun.push({
-        min: new THREE.Vector3(axis === 'x' ? face : b.cx - pw / 2, y0, axis === 'x' ? b.cz - pw / 2 : face),
-        max: new THREE.Vector3(axis === 'x' ? face : b.cx + pw / 2, y1, axis === 'x' ? b.cz + pw / 2 : face),
-        normal,
-        building: b.index,
+        min: axis === 'x' ? new THREE.Vector3(face, y0, a0) : new THREE.Vector3(a0, y0, face),
+        max: axis === 'x' ? new THREE.Vector3(face, y1, a1) : new THREE.Vector3(a1, y1, face),
+        normal: axis === 'x' ? new THREE.Vector3(sign, 0, 0) : new THREE.Vector3(0, 0, sign),
+        building,
       });
-      panelFaces.add(`${b.index}:${axis}:${sign}`);
     };
-
-    const faces: Array<[Axis, number]> = [['x', 1], ['x', -1], ['z', 1], ['z', -1]];
     buildings.forEach((b) => {
-      let count = 0;
-      // Alley faces: low + mid-level panels (wall-run alleys).
-      for (const [ax, sg] of faces) {
-        if (!alleyFaces.has(`${b.index}:${ax}:${sg}`)) continue;
-        addPanel(b, ax, sg, 1.6, 11.5, 0.72);
-        count++;
-        if (b.roofY >= 36) {
-          addPanel(b, ax, sg, LEVEL.SKYBRIDGE_Y_MIN + 1, Math.min(LEVEL.SKYBRIDGE_Y_MAX - 3, b.roofY - 6), 0.6);
-          count++;
+      for (const [ax, sg] of FACES) {
+        if (runFaces.has(fkey(b, ax, sg))) {
+          const c = ax === 'x' ? b.cz : b.cx;
+          const half = (ax === 'x' ? b.lotHalfD : b.lotHalfW) - 0.6;
+          addRunSurface(ax, ax === 'x' ? b.cx + sg * b.lotHalfW : b.cz + sg * b.lotHalfD, sg, c - half, c + half, 1.6, lowTopOf(b) - 0.5, b.index);
+        }
+        if (b.setbackY > 0) {
+          const c = ax === 'x' ? b.cz : b.cx;
+          const half = (ax === 'x' ? b.halfD : b.halfW) - 0.6;
+          addRunSurface(ax, ax === 'x' ? b.cx + sg * b.halfW : b.cz + sg * b.halfD, sg, c - half, c + half, b.setbackY + 0.6, b.roofY - 0.5, b.index);
         }
       }
-      // Street faces: guarantee at least two panels per tower.
-      let k = Math.floor(rng() * 4);
-      let guard = 0;
-      while (count < 2 && guard++ < 8) {
-        const [ax, sg] = faces[k++ % 4];
-        if (panelFaces.has(`${b.index}:${ax}:${sg}`)) continue;
-        addPanel(b, ax, sg, 2.0, Math.min(12.5, b.roofY - 2), 0.66);
-        count++;
+    });
+
+    // ------------------------------------------------------------------ 7d. archetype 3D details
+    /** Structural add-on drawn with the tower material in its archetype's plain cladding band (one draw). */
+    const plainBody = (g: THREE.BufferGeometry, seed: number, col: number): THREE.BufferGeometry => withAttr1(withAttr1(g, 'aSeed', seed), 'aArch', col + 0.25);
+    /** Point in a face frame: `al` along the face, `y` up, `d` metres out from the wall (negative = inside). */
+    const faceFrame = (b: Building, ax: Axis, sg: number) => {
+      const face = ax === 'x' ? b.cx + sg * b.lotHalfW : b.cz + sg * b.lotHalfD;
+      const P3 = (al: number, y: number, d: number): THREE.Vector3 => (ax === 'x' ? new THREE.Vector3(face + sg * d, y, al) : new THREE.Vector3(al, y, face + sg * d));
+      const box = (a0: number, a1: number, y0: number, y1: number, d0: number, d1: number): THREE.BufferGeometry => {
+        const lo = P3(a0, y0, d0);
+        const hi = P3(a1, y1, d1);
+        return boxAt(Math.abs(hi.x - lo.x), y1 - y0, Math.abs(hi.z - lo.z), (lo.x + hi.x) / 2, (y0 + y1) / 2, (lo.z + hi.z) / 2);
+      };
+      const coll = (a0: number, a1: number, y0: number, y1: number, d0: number, d1: number): void => {
+        const lo = P3(a0, y0, d0);
+        const hi = P3(a1, y1, d1);
+        colliders.push({
+          min: new THREE.Vector3(Math.min(lo.x, hi.x), y0, Math.min(lo.z, hi.z)),
+          max: new THREE.Vector3(Math.max(lo.x, hi.x), y1, Math.max(lo.z, hi.z)),
+          kind: 'PROP',
+          building: b.index,
+        });
+      };
+      const c = ax === 'x' ? b.cz : b.cx;
+      const len = faceLen(b, ax);
+      return { face, P3, box, coll, c, len, a0: c - len / 2, a1: c + len / 2, nx: ax === 'x' ? sg : 0, nz: ax === 'z' ? sg : 0 };
+    };
+
+    /** Type A: vertical aluminium mullions on every 3 m room line + corner columns (decorative, no collider). */
+    const mullions = (cx: number, cz: number, hw: number, hd: number, y0: number, y1: number): void => {
+      if (y1 - y0 < 2) return;
+      const S = AR.MULLION_SPACING_M;
+      const h = y1 - y0;
+      const cy = (y0 + y1) / 2;
+      for (const [ax, sg] of FACES) {
+        const c = ax === 'x' ? cz : cx;
+        const half = ax === 'x' ? hd : hw;
+        for (let a = Math.ceil((c - half + 0.6) / S) * S; a <= c + half - 0.6; a += S) {
+          if (ax === 'x') G.steel.push(boxAt(AR.MULLION_D, h, AR.MULLION_W, cx + sg * (hw + AR.MULLION_D / 2), cy, a));
+          else G.steel.push(boxAt(AR.MULLION_W, h, AR.MULLION_D, a, cy, cz + sg * (hd + AR.MULLION_D / 2)));
+        }
+      }
+      for (const [sx, sz] of CORNERS_4) G.steel.push(boxAt(AR.MULLION_D + 0.1, h, AR.MULLION_D + 0.1, cx + sx * (hw + 0.02), cy, cz + sz * (hd + 0.02)));
+    };
+
+    /** Type B: thick cast-concrete corner pilasters. */
+    const pilasters = (b: Building): void => {
+      const P = AR.PILASTER_W;
+      const O = AR.PILASTER_OUT;
+      const top = lowTopOf(b) + 0.4;
+      for (const [sx, sz] of CORNERS_4) {
+        const x = b.cx + sx * (b.lotHalfW + O - P / 2);
+        const z = b.cz + sz * (b.lotHalfD + O - P / 2);
+        G.bodies.push(plainBody(boxAt(P, top, P, x, top / 2, z), b.seed, ARCH_B));
+        colliders.push({ min: new THREE.Vector3(x - P / 2, 0, z - P / 2), max: new THREE.Vector3(x + P / 2, top, z + P / 2), kind: 'BUILDING', building: b.index });
+      }
+    };
+
+    const facadeFeatures: FacadeFeature[] = [];
+    /** 6A-3 walkable balcony: 1.8 m concrete slab, 1.1 m rail (tempered glass or bars), AC unit, lamp. */
+    let balconyCount = 0;
+    const balcony = (b: Building, ax: Axis, sg: number, along: number, y: number, w: number, glass: boolean): void => {
+      const B = BALCONY;
+      const f = faceFrame(b, ax, sg);
+      const D = B.DEPTH_M;
+      const a0 = along - w / 2;
+      const a1 = along + w / 2;
+      const rt = y + B.RAIL_H_M;
+      G.bodies.push(plainBody(f.box(a0, a1, y - B.SLAB_M, y, 0, D), b.seed, ARCH_B));
+      G.steel.push(
+        f.box(a0, a1, rt - 0.05, rt, D - 0.06, D),
+        f.box(a0, a0 + 0.06, rt - 0.05, rt, 0, D),
+        f.box(a1 - 0.06, a1, rt - 0.05, rt, 0, D),
+        f.box(a0, a1, y + 0.06, y + 0.1, D - 0.05, D - 0.01),
+        f.box(a0, a0 + 0.05, y, rt, D / 2 - 0.03, D / 2 + 0.03),
+        f.box(a1 - 0.05, a1, y, rt, D / 2 - 0.03, D / 2 + 0.03),
+      );
+      const posts = Math.max(2, Math.round(w / 1.5));
+      for (let k = 0; k <= posts; k++) {
+        const a = a0 + 0.03 + (k * (w - 0.06)) / posts;
+        G.steel.push(f.box(a - 0.03, a + 0.03, y, rt, D - 0.06, D));
+      }
+      if (glass) {
+        G.glassT.push(
+          stripUv(f.box(a0 + 0.05, a1 - 0.05, y + 0.12, rt - 0.07, D - 0.04, D - 0.02)),
+          stripUv(f.box(a0 + 0.01, a0 + 0.03, y + 0.12, rt - 0.07, 0.05, D - 0.06)),
+          stripUv(f.box(a1 - 0.03, a1 - 0.01, y + 0.12, rt - 0.07, 0.05, D - 0.06)),
+        );
+      } else {
+        for (let a = a0 + 0.15; a < a1 - 0.1; a += 0.3) G.steel.push(f.box(a - 0.015, a + 0.015, y + 0.1, rt - 0.05, D - 0.04, D - 0.01));
+        for (let d = 0.25; d < D - 0.1; d += 0.3) G.steel.push(f.box(a0 + 0.01, a0 + 0.04, y + 0.1, rt - 0.05, d - 0.015, d + 0.015), f.box(a1 - 0.04, a1 - 0.01, y + 0.1, rt - 0.05, d - 0.015, d + 0.015));
+      }
+      // Walkable slab always; the rails become cover up to the mid-rise limit.
+      f.coll(a0, a1, y - B.SLAB_M, y, 0, D);
+      if (y <= B.COLLIDER_MAX_Y) {
+        f.coll(a0, a1, y, rt, D - 0.1, D);
+        f.coll(a0, a0 + 0.1, y, rt, 0, D);
+        f.coll(a1 - 0.1, a1, y, rt, 0, D);
+      }
+      if (arng() < B.AC_CHANCE && counts.ac < CAP.AC) {
+        const p = f.P3(a1 - 0.8, y, 0.42);
+        placeInstance(this.acUnits, counts.ac++, p.x, p.y, p.z, ax === 'x' ? Math.PI / 2 : 0, 0.5, 0.5, 0.5);
+      }
+      if (arng() < B.LAMP_CHANCE) {
+        const p = f.P3(along, y + 2.3, 0.05);
+        G.strips.push(withColor(boxAt(ax === 'x' ? 0.08 : 0.2, 0.1, ax === 'x' ? 0.2 : 0.08, p.x, p.y, p.z), B.LAMP_COLOR, B.LAMP_INTENSITY));
+        if (y < 30) addLight(p.x + f.nx * 0.6, p.y, p.z + f.nz * 0.6, B.LAMP_COLOR, 0.9);
+      }
+      balconyCount++;
+    };
+    // The sector budget is shared evenly by every balcony face (tall slabs switch to 8 m spacing first,
+    // then keep their lowest — playable — levels).
+    const balconyBudget = Math.floor(BALCONY.MAX_PER_SECTOR / Math.max(1, balconyFaces.size));
+    const balconies = (b: Building, ax: Axis, sg: number): void => {
+      const f = faceFrame(b, ax, sg);
+      const B = BALCONY;
+      const w = Math.min(B.WIDTH_MIN_M + arng() * (B.WIDTH_MAX_M - B.WIDTH_MIN_M), f.len - 1.6);
+      const gap = 1.2 + arng() * 1.3;
+      const n = Math.max(1, Math.floor((f.len - 1.6 + gap) / (w + gap)));
+      const total = n * w + (n - 1) * gap;
+      let spacing = arng() < 0.5 ? 4 : 8;
+      const glass = arng() < 0.7;
+      const room = lowTopOf(b) - 3.5 - B.FIRST_Y;
+      if (n * (Math.floor(room / spacing) + 1) > balconyBudget) spacing = 8;
+      const levels = Math.min(Math.floor(room / spacing) + 1, Math.max(1, Math.floor(balconyBudget / n)));
+      let lastY = 0;
+      for (let l = 0; l < levels; l++) {
+        const y = B.FIRST_Y + l * spacing;
+        for (let k = 0; k < n && balconyCount < B.MAX_PER_SECTOR; k++) balcony(b, ax, sg, f.c - total / 2 + w / 2 + k * (w + gap), y, w, glass);
+        lastY = y;
+      }
+      if (lastY > 0) facadeFeatures.push({ kind: 'BALCONY', building: b.index, center: f.P3(f.c, B.FIRST_Y, 0), normal: new THREE.Vector3(f.nx, 0, f.nz), top: lastY });
+      // Drain pipe down each balcony stack.
+      if (lastY > 0) {
+        for (let k = 0; k < n; k++) {
+          const a = f.c - total / 2 + k * (w + gap) + 0.14;
+          G.steel.push(f.box(a - 0.04, a + 0.04, 0.2, lastY + 1.0, B.DEPTH_M - 0.2, B.DEPTH_M - 0.12));
+        }
+      }
+    };
+
+    /** 6A-4 zig-zag steel fire escape: landings every 4 m (RampCollider flights between them). */
+    let escapeCount = 0;
+    let flightCount = 0;
+    const roofEscapes = new Set<string>();
+    const fireEscape = (b: Building, ax: Axis, sg: number): void => {
+      const f = faceFrame(b, ax, sg);
+      const LH = FE.LEVEL_H_M;
+      const LW = FE.LANDING_WIDTH_M;
+      const LD = FE.LANDING_DEPTH_M;
+      const RAIL = FE.RAIL_H_M;
+      const lowTop = lowTopOf(b);
+      const run = clamp(f.len - 1.2 - 2 * LW, FE.RUN_MIN_M, FE.RUN_MAX_M);
+      const span = 2 * LW + run;
+      const nearA = f.c - span / 2 + (arng() * 2 - 1) * Math.max(0, (f.len - 1.2 - span) / 2);
+      const farA = nearA + LW + run;
+      const toRoof = lowTop <= FE.ROOF_ACCESS_MAX_Y;
+      const top = toRoof ? lowTop : LH * (3 + Math.floor(arng() * 4));
+      const K = Math.round(top / LH);
+      if (toRoof) roofEscapes.add(fkey(b, ax, sg));
+      facadeFeatures.push({ kind: 'FIRE_ESCAPE', building: b.index, center: f.P3(farA, 0, LD * 0.75), normal: new THREE.Vector3(f.nx, 0, f.nz), top: K * LH });
+      const alongAxis: Axis = ax === 'x' ? 'z' : 'x';
+      for (let k = 1; k <= K; k++) {
+        const y = k * LH;
+        const near = k % 2 === 1;
+        const l0 = near ? nearA : farA;
+        const l1 = l0 + LW;
+        const endA = near ? l0 : l1;
+        G.steel.push(f.box(l0, l1, y - 0.08, y, 0, LD));
+        for (let d = 0.3; d < LD; d += 0.3) G.steel.push(f.box(l0, l1, y - 0.12, y - 0.08, d - 0.02, d + 0.02));
+        f.coll(l0, l1, y - 0.12, y, 0, LD);
+        // Safety rail: front + outer end (the wall side and the flight side stay open).
+        G.steel.push(
+          f.box(l0, l1, y + RAIL - 0.05, y + RAIL, LD - 0.05, LD),
+          f.box(l0, l1, y + 0.5, y + 0.54, LD - 0.04, LD - 0.01),
+          f.box(endA - 0.025, endA + 0.025, y + RAIL - 0.05, y + RAIL, 0, LD),
+          f.box(endA - 0.025, endA + 0.025, y + 0.5, y + 0.54, 0, LD),
+          f.box(endA - 0.025, endA + 0.025, y, y + RAIL, LD / 2 - 0.025, LD / 2 + 0.025),
+        );
+        for (let a = l0; a <= l1 + 1e-3; a += LW / 3) G.steel.push(f.box(a - 0.025, a + 0.025, y, y + RAIL, LD - 0.05, LD));
+        f.coll(l0, l1, y, y + RAIL, LD - 0.08, LD);
+        f.coll(endA - 0.05, endA + 0.05, y, y + RAIL, 0, LD);
+        for (const a of [l0 + 0.25, l1 - 0.25]) G.steel.push(beam(f.P3(a, y - 1.3, 0.02), f.P3(a, y - 0.1, LD - 0.12), 0.07));
+        // Caged amber lamp on the wall above every second landing.
+        if (k % 2 === 0) {
+          const m = (l0 + l1) / 2;
+          const p = f.P3(m, y + 2.5, 0.1);
+          G.strips.push(withColor(boxAt(0.16, 0.2, 0.16, p.x, p.y, p.z), FE.CAGE_LIGHT, FE.CAGE_INTENSITY));
+          G.steel.push(f.box(m - 0.13, m + 0.13, y + 2.37, y + 2.4, 0, 0.24), f.box(m - 0.13, m + 0.13, y + 2.6, y + 2.63, 0, 0.24), f.box(m - 0.015, m + 0.015, y + 2.37, y + 2.63, 0.2, 0.23));
+          addLight(p.x + f.nx * 0.6, p.y - 0.4, p.z + f.nz * 0.6, FE.CAGE_LIGHT, 1.6);
+        }
+      }
+      // Flights: even k climb far → near on the outer lane, odd k near → far on the inner lane.
+      const steps = Math.round(LH / FE.STEP_RISE_M);
+      for (let k = 0; k < K; k++) {
+        const y0 = k * LH;
+        const y1 = y0 + LH;
+        const outer = k % 2 === 0;
+        const d0 = outer ? LD / 2 : 0.04;
+        const d1 = outer ? LD : LD / 2;
+        const aLow = outer ? farA : nearA + LW;
+        const aHigh = outer ? nearA + LW : farA;
+        const lat0 = f.face + sg * d0;
+        const lat1 = f.face + sg * d1;
+        rampColliders.push({ axis: alongAxis, lateralMin: Math.min(lat0, lat1), lateralMax: Math.max(lat0, lat1), alongStart: aHigh, alongEnd: aLow, yStart: y1, yEnd: y0, thickness: FE.RAMP_THICKNESS_M, steel: true });
+        for (const d of [d0 + 0.03, d1 - 0.03]) G.steel.push(beam(f.P3(aLow, y0 - 0.12, d), f.P3(aHigh, y1 - 0.12, d), 0.05, 0.22));
+        const half = Math.abs(aHigh - aLow) / steps / 2 + 0.03;
+        for (let i = 0; i < steps; i++) {
+          const a = aLow + ((aHigh - aLow) * (i + 0.5)) / steps;
+          const ty = y0 + ((i + 1) * LH) / steps - 0.02;
+          G.steel.push(f.box(a - half, a + half, ty - 0.05, ty, d0 + 0.05, d1 - 0.05));
+        }
+        const dr = outer ? LD - 0.03 : LD / 2;
+        G.steel.push(beam(f.P3(aLow, y0 + 1.0, dr), f.P3(aHigh, y1 + 1.0, dr), 0.05));
+        for (const [a, yy] of [[aLow, y0], [aHigh, y1]] as const) G.steel.push(f.box(a - 0.025, a + 0.025, yy, yy + 1.0, dr - 0.025, dr + 0.025));
+        flightCount++;
+      }
+      escapeCount++;
+    };
+
+    /** Type C: thick wall ducts with hoods, cable / drain pipes and a loading dock with bumpers. */
+    const ductsAndDock = (b: Building, ax: Axis, sg: number): void => {
+      const f = faceFrame(b, ax, sg);
+      const lowTop = lowTopOf(b);
+      const n = f.len > 14 ? 2 : 1;
+      const W2 = AR.DUCT_W / 2;
+      const O = AR.DUCT_OUT;
+      for (let k = 0; k < n; k++) {
+        const a = f.c + (n === 1 ? (arng() - 0.5) * f.len * 0.4 : (k === 0 ? -1 : 1) * f.len * 0.3);
+        G.steel.push(f.box(a - W2, a + W2, 0.4, lowTop + 0.9, 0, O), f.box(a - W2 - 0.15, a + W2 + 0.15, lowTop + 0.9, lowTop + 1.15, -0.1, O + 0.2));
+        for (let y = 3; y < lowTop; y += 3) G.steel.push(f.box(a - W2 - 0.05, a + W2 + 0.05, y, y + 0.08, 0, O + 0.04));
+        f.coll(a - W2, a + W2, 0.4, lowTop, 0, O);
+        for (const off of [W2 + 0.25, W2 + 0.45]) G.steel.push(f.box(a + off - 0.05, a + off + 0.05, 0, lowTop + 0.3, 0.12, 0.22));
+      }
+      if (f.len >= 10) {
+        const a = f.c + (arng() - 0.5) * (f.len - 8);
+        G.bodies.push(plainBody(f.box(a - 3, a + 3, 0, 1.1, 0, 1.6), b.seed, ARCH_B));
+        f.coll(a - 3, a + 3, 0, 1.1, 0, 1.6);
+        for (const s of [-2, 2]) G.steel.push(f.box(a + s - 0.18, a + s + 0.18, 0.35, 0.95, 1.6, 1.75));
+        G.strips.push(withColor(f.box(a - 3, a + 3, 1.06, 1.1, 1.58, 1.62), 0xffb020, 0.35));
+      }
+    };
+
+    /** Type D: recessed shopfront (1.8 m deep, 1–3 floors) + per-floor canopies with wide banners. */
+    const shopfront = (b: Building, ax: Axis, sg: number): void => {
+      const f = faceFrame(b, ax, sg);
+      const RT = b.recessTop;
+      const RD = AR.RECESS_DEPTH_M;
+      const PW = AR.RECESS_PILLAR_M;
+      facadeFeatures.push({ kind: 'SHOPFRONT', building: b.index, center: f.P3(f.c, 0, 0), normal: new THREE.Vector3(f.nx, 0, f.nz), top: RT });
+      G.bodies.push(plainBody(f.box(f.a0, f.a0 + PW, 0, RT, -RD, 0), b.seed, ARCH_D), plainBody(f.box(f.a1 - PW, f.a1, 0, RT, -RD, 0), b.seed, ARCH_D));
+      const inner = f.len - 2 * PW;
+      const bays = Math.max(1, Math.round(inner / AR.RECESS_PILLAR_SPACING_M));
+      const bw = inner / bays;
+      for (let k = 1; k < bays; k++) {
+        const a = f.a0 + PW + k * bw;
+        G.bodies.push(plainBody(f.box(a - PW / 2, a + PW / 2, 0, RT, -PW, 0), b.seed, ARCH_D));
+      }
+      // Highly reflective glass in front of the lit shop interior (two layers, 1.8 m apart).
+      G.glassT.push(stripUv(f.box(f.a0 + PW, f.a1 - PW, 0.05, RT - 0.08, -0.04, -0.01)));
+      for (let y = 0; y < RT - 0.1; y += 4) G.steel.push(f.box(f.a0 + PW, f.a1 - PW, y + 2.6, y + 2.66, -0.06, 0.0), f.box(f.a0 + PW, f.a1 - PW, y, y + 0.06, -0.06, 0.02));
+      for (let a = f.a0 + PW + 2.3; a < f.a1 - PW - 0.5; a += 2.3) G.steel.push(f.box(a - 0.03, a + 0.03, 0, RT, -0.06, 0.0));
+      // Soffit downlights behind the glass + their spill on the pavement.
+      G.strips.push(withColor(f.box(f.a0 + PW + 0.2, f.a1 - PW - 0.2, RT - 0.05, RT - 0.01, -0.5, -0.38), COLORS.STREET_LAMP, 1.05));
+      const sp = f.P3(f.c, 2.6, 0.9);
+      addLight(sp.x, sp.y, sp.z, FACADE.WARM_A, 1.3);
+      // Horizontal canopy on every floor above the shopfront (dense wide banners).
+      const tint = NEON_TINTS[Math.floor(srng() * NEON_TINTS.length)];
+      const floors = Math.min(AR.FLOOR_CANOPIES_MAX, Math.floor((lowTopOf(b) - RT - 3) / 4) + 1);
+      const DD = AR.FLOOR_CANOPY_DEPTH_M;
+      for (let j = 0; j < floors; j++) {
+        const y = RT + 0.06 + j * 4;
+        G.steel.push(f.box(f.a0 + 0.3, f.a1 - 0.3, y - 0.07, y + 0.07, 0, DD));
+        if (j === 0) G.strips.push(withColor(f.box(f.a0 + 0.5, f.a1 - 0.5, y - 0.1, y - 0.07, DD - 0.12, DD - 0.06), tint, 1.3));
+        if (y <= BALCONY.COLLIDER_MAX_Y) f.coll(f.a0 + 0.3, f.a1 - 0.3, y - 0.07, y + 0.07, 0, DD);
+        if (j === 0 || srng() < 0.55) {
+          const p = f.P3(f.c + (srng() - 0.5) * f.len * 0.3, y + 0.95, 0.1);
+          addNeon(p.x, p.y, p.z, f.nx, f.nz, Math.min(f.len * 0.7, 9), 0.85, Math.floor(srng() * SIGN_ATLAS.WIDE_ROWS), 1);
+        }
+      }
+    };
+
+    buildings.forEach((b) => {
+      const lowTop = lowTopOf(b);
+      if (b.arch === ARCH_A) {
+        mullions(b.cx, b.cz, b.lotHalfW, b.lotHalfD, 4.0, lowTop - 0.45);
+        if (b.setbackY > 0) mullions(b.cx, b.cz, b.halfW, b.halfD, b.setbackY + 0.05, b.roofY - 0.45);
+      } else if (b.arch === ARCH_B) pilasters(b);
+      for (const [ax, sg] of FACES) {
+        const key = fkey(b, ax, sg);
+        if (balconyFaces.has(key)) balconies(b, ax, sg);
+        if (escapeFaces.has(key)) fireEscape(b, ax, sg);
+        if (ductFaces.has(key)) ductsAndDock(b, ax, sg);
+        if (recessFaces.has(key)) shopfront(b, ax, sg);
       }
     });
 
@@ -2841,6 +3463,7 @@ export class CityBuilder {
       skybridgeSpawns.push({ position: top.clone(), layer: 2, building: -1 });
       skybridgeCount++;
     }
+
 
     // ------------------------------------------------------------------ 8. rooftop details, signs, vending
     const tryPlace = (b: Building, hw: number, hd: number, margin: number): RectXZ | null => {
@@ -2897,9 +3520,10 @@ export class CityBuilder {
           colliders.push({ min: new THREE.Vector3(r.x0, b.roofY, r.z0), max: new THREE.Vector3(r.x1, b.roofY + 1.5, r.z1), kind: 'PROP', building: b.index });
         }
       }
-      // Roof fences on edges that are not alley sides (alley edges stay open for jumps).
-      for (const [ax, sg] of faces) {
-        if (alleyFaces.has(`${b.index}:${ax}:${sg}`) || rng() < 0.4) continue;
+      // Roof fences on edges that are not alley sides (alley edges stay open for jumps) nor the roof exit of a
+      // fire escape.
+      for (const [ax, sg] of FACES) {
+        if (alleyFaces.has(fkey(b, ax, sg)) || rng() < 0.4 || roofEscapes.has(fkey(b, ax, sg))) continue;
         const len = ax === 'x' ? b.halfD * 2 : b.halfW * 2;
         const segs = Math.floor((len - 5) / 3);
         if (segs <= 0) continue;
@@ -2921,15 +3545,17 @@ export class CityBuilder {
       }
 
       // Street-facing faces: 1F canopies + wide banners, low-rise shop blade signs, Layer-2 projecting signs,
-      // emblem holograms, vertical facade fins, vending machines.
-      const streetFaces = faces.filter(([ax, sg]) => !alleyFaces.has(`${b.index}:${ax}:${sg}`));
-      const lowTop = b.setbackY > 0 ? b.setbackY : b.roofY;
+      // emblem holograms, vertical facade fins, vending machines. Balcony and fire-escape faces keep their
+      // 3D structure clear of projecting signs.
+      const streetFaces = FACES.filter(([ax, sg]) => !alleyFaces.has(fkey(b, ax, sg)));
+      const signFaces = streetFaces.filter(([ax, sg]) => !balconyFaces.has(fkey(b, ax, sg)) && !escapeFaces.has(fkey(b, ax, sg)));
+      const lowTop = lowTopOf(b);
       const busyFaces = new Set<string>();
-      // 5B-3: 1F canopy (Y 4.2 m, 1.4 m deep) with an under-glow strip and a wide banner above it — never on
-      // faces with wall-run panels (it would block the run).
+      // 5B-3: 1F canopy (Y 4.2 m, 1.4 m deep) with an under-glow strip and a wide banner above it — never on the
+      // flat wall-run faces, the fire escape or a recessed shopfront (D has its own per-floor canopies).
       for (const [ax, sg] of streetFaces) {
-        const key = `${b.index}:${ax}:${sg}`;
-        if (panelFaces.has(key) || srng() < 0.22) continue;
+        const key = fkey(b, ax, sg);
+        if (runFaces.has(key) || escapeFaces.has(key) || recessFaces.has(key) || srng() < 0.22) continue;
         const len = (ax === 'x' ? b.lotHalfD : b.lotHalfW) * 2;
         const cl = len - 3;
         if (cl < 4) continue;
@@ -2952,11 +3578,14 @@ export class CityBuilder {
           addNeon(b.cx, cy + 1.0, fz + sg * 0.1, 0, sg, Math.min(cl * 0.8, 9), 0.85, Math.floor(srng() * SIGN_ATLAS.WIDE_ROWS), 1);
         }
       }
-      const shopSigns = sector.denseNeon ? 3 + Math.floor(rng() * 3) : 1 + Math.floor(rng() * 2);
+      // Blade signs: Type D commercial streets are packed (3–5, dense-neon sectors 4–6).
+      const shopSigns = b.arch === ARCH_D
+        ? (sector.denseNeon ? 4 : 3) + Math.floor(rng() * 3)
+        : sector.denseNeon ? 3 + Math.floor(rng() * 3) : 1 + Math.floor(rng() * 2);
       const fp = new THREE.Vector3();
-      for (let s = 0; s < shopSigns && streetFaces.length; s++) {
-        const [ax, sg] = streetFaces[Math.floor(rng() * streetFaces.length)];
-        busyFaces.add(`${b.index}:${ax}:${sg}`);
+      for (let s = 0; s < shopSigns && signFaces.length; s++) {
+        const [ax, sg] = signFaces[Math.floor(rng() * signFaces.length)];
+        busyFaces.add(fkey(b, ax, sg));
         facePoint(b, ax, sg, 0.12 + rng() * 0.76, fp);
         const w = 1.7;
         const hgt = 5 + rng() * 4;
@@ -2969,9 +3598,9 @@ export class CityBuilder {
           G.steel.push(boxAt(Math.abs(nx) * (w + 0.3) + 0.08, 0.08, Math.abs(nz) * (w + 0.3) + 0.08, fp.x + (nx * (w + 0.3)) / 2, yy, fp.z + (nz * (w + 0.3)) / 2));
         }
       }
-      if (b.roofY >= 36 && streetFaces.length) {
-        const [ax, sg] = streetFaces[Math.floor(rng() * streetFaces.length)];
-        busyFaces.add(`${b.index}:${ax}:${sg}`);
+      if (b.roofY >= 36 && signFaces.length) {
+        const [ax, sg] = signFaces[Math.floor(rng() * signFaces.length)];
+        busyFaces.add(fkey(b, ax, sg));
         facePoint(b, ax, sg, 0.2 + rng() * 0.6, fp);
         const w = 2.6;
         const hgt = 11 + rng() * 4;
@@ -2985,49 +3614,73 @@ export class CityBuilder {
         if (rng() < 0.6) addBeacon(new THREE.Vector3(cx, y + hgt / 2 + 0.9, cz), 'SIGN');
       }
       // 5B-3 emblem / geometric hologram on the mid floors (14 m … below the terrace / 42 m).
-      if (lowTop >= 26 && streetFaces.length && srng() < 0.42) {
-        const [ax, sg] = streetFaces[Math.floor(srng() * streetFaces.length)];
-        busyFaces.add(`${b.index}:${ax}:${sg}`);
+      if (lowTop >= 26 && signFaces.length && srng() < 0.42) {
+        const [ax, sg] = signFaces[Math.floor(srng() * signFaces.length)];
+        busyFaces.add(fkey(b, ax, sg));
         const sz = 4.5 + srng() * 2.5;
         const top = Math.min(lowTop - 6, 42);
         const y = 14 + sz / 2 + srng() * Math.max(0, top - 14 - sz);
         facePoint(b, ax, sg, 0.3 + srng() * 0.4, fp);
         const nx = ax === 'x' ? sg : 0;
         const nz = ax === 'z' ? sg : 0;
-        addNeon(fp.x + nx * 0.12, y, fp.z + nz * 0.12, nx, nz, sz, sz, Math.floor(srng() * SIGN_ATLAS.EMBLEMS), 2);
+        addNeon(fp.x + nx * (b.arch === ARCH_A ? AR.MULLION_D + 0.12 : 0.12), y, fp.z + nz * (b.arch === ARCH_A ? AR.MULLION_D + 0.12 : 0.12), nx, nz, sz, sz, Math.floor(srng() * SIGN_ATLAS.EMBLEMS), 2);
       }
-      // 5B-3 vertical facade fins on plain street faces (no panels / signs / emblems), above the canopy.
-      if (lowTop >= 16) {
+      // 5B-3 vertical concrete fins on Type B street faces without balconies (decorative, ≤ 0.45 m: no collider).
+      if (b.arch === ARCH_B && lowTop >= 16) {
         for (const [ax, sg] of streetFaces) {
-          const key = `${b.index}:${ax}:${sg}`;
-          if (panelFaces.has(key) || busyFaces.has(key) || srng() < 0.45) continue;
+          const key = fkey(b, ax, sg);
+          if (runFaces.has(key) || balconyFaces.has(key) || busyFaces.has(key) || srng() < 0.45) continue;
           const len = (ax === 'x' ? b.lotHalfD : b.lotHalfW) * 2;
           const n = 3 + Math.floor(srng() * 3);
           const y0 = SB.CANOPY_Y + 0.9;
           const y1 = lowTop - 1.2;
           for (let k = 0; k < n; k++) {
             const along = -len / 2 + len * (0.15 + (0.7 * k) / Math.max(1, n - 1));
-            if (ax === 'x') {
-              const fx = b.cx + sg * (b.lotHalfW + 0.21);
-              G.steel.push(boxAt(0.42, y1 - y0, 0.2, fx, (y0 + y1) / 2, b.cz + along));
-              colliders.push({ min: new THREE.Vector3(fx - 0.21, y0, b.cz + along - 0.1), max: new THREE.Vector3(fx + 0.21, y1, b.cz + along + 0.1), kind: 'BUILDING', building: b.index });
-            } else {
-              const fz = b.cz + sg * (b.lotHalfD + 0.21);
-              G.steel.push(boxAt(0.2, y1 - y0, 0.42, b.cx + along, (y0 + y1) / 2, fz));
-              colliders.push({ min: new THREE.Vector3(b.cx + along - 0.1, y0, fz - 0.21), max: new THREE.Vector3(b.cx + along + 0.1, y1, fz + 0.21), kind: 'BUILDING', building: b.index });
-            }
+            if (ax === 'x') G.bodies.push(plainBody(boxAt(0.42, y1 - y0, 0.2, b.cx + sg * (b.lotHalfW + 0.21), (y0 + y1) / 2, b.cz + along), b.seed, ARCH_B));
+            else G.bodies.push(plainBody(boxAt(0.2, y1 - y0, 0.42, b.cx + along, (y0 + y1) / 2, b.cz + sg * (b.lotHalfD + 0.21)), b.seed, ARCH_B));
           }
         }
       }
-      if (streetFaces.length && rng() < 0.75) {
-        const [ax, sg] = streetFaces[Math.floor(rng() * streetFaces.length)];
+      const vendFaces = streetFaces.filter(([ax, sg]) => !escapeFaces.has(fkey(b, ax, sg)) && !ductFaces.has(fkey(b, ax, sg)));
+      if (vendFaces.length && rng() < 0.75) {
+        const [ax, sg] = vendFaces[Math.floor(rng() * vendFaces.length)];
         facePoint(b, ax, sg, 0.2 + rng() * 0.5, fp);
         const yaw = ax === 'x' ? (sg > 0 ? Math.PI / 2 : -Math.PI / 2) : sg > 0 ? 0 : Math.PI;
         const n = 2 + Math.floor(rng() * 2);
+        const off = 0.45;
         for (let k = 0; k < n; k++) {
-          const x = fp.x + (ax === 'x' ? sg * 0.45 : k * 1.05);
-          const z = fp.z + (ax === 'z' ? sg * 0.45 : k * 1.05);
+          const x = fp.x + (ax === 'x' ? sg * off : k * 1.05);
+          const z = fp.z + (ax === 'z' ? sg * off : k * 1.05);
           if (inArea(x, z, 2)) addVending(x, z, yaw);
+        }
+      }
+    });
+
+    // 6A-1: exact night-light census of the rendered facades (same integer hash as the tower shader):
+    // every room cell on every full typical floor of every tower face, mechanical floors excluded.
+    const facadeRooms = [0, 0, 0, 0];
+    const censusFace = (b: Building, nx: number, nz: number, w0: number, w1: number, y0: number, y1: number): void => {
+      const si = seedInt(b.seed);
+      const roomW = FACADE.TILE_W_M / roomsPerTile(b.arch);
+      const off = roomOffset(si, b.arch) * roomW;
+      const [a0, a1] = nx > 0.5 || nz < -0.5 ? [-w1, -w0] : [w0, w1];
+      const r0 = Math.floor((a0 + off) / roomW + 1e-6);
+      const r1 = Math.floor((a1 + off) / roomW - 1e-6);
+      const face = faceKey(nx, nz);
+      for (let n = 1; facadeFloorY(b.arch, n) + FACADE.FLOOR_H_M <= y1 + 1e-3; n++) {
+        if (facadeFloorY(b.arch, n) < y0 - 1e-3 || isMachineFloor(si, n)) continue;
+        for (let r = r0; r <= r1; r++) facadeRooms[facadeRoomState(si, face, r, n)]++;
+      }
+    };
+    buildings.forEach((b) => {
+      const top = lowTopOf(b) - 0.45;
+      for (const [ax, sg] of FACES) {
+        const y0 = recessFaces.has(fkey(b, ax, sg)) ? b.recessTop : 0;
+        if (ax === 'x') censusFace(b, sg, 0, b.rect.z0, b.rect.z1, y0, top);
+        else censusFace(b, 0, sg, b.rect.x0, b.rect.x1, y0, top);
+        if (b.setbackY > 0) {
+          if (ax === 'x') censusFace(b, sg, 0, b.cz - b.halfD, b.cz + b.halfD, b.setbackY, b.roofY - 0.45);
+          else censusFace(b, 0, sg, b.cx - b.halfW, b.cx + b.halfW, b.setbackY, b.roofY - 0.45);
         }
       }
     });
@@ -3261,9 +3914,9 @@ export class CityBuilder {
     mk(G.water, this.waterMat, 'CanalWater');
     mk(G.hw, this.hwConcreteMat, 'ExpresswayBridgeConcrete');
     mk(G.strips, this.stripMat, 'LightStrips');
-    mk(G.panels, this.panelMat, 'WallRunPanels');
     mk(G.steel.map(stripUv), this.steelMat, 'Steel');
     mk(G.glass, this.glassMat, 'SkybridgeGlass');
+    mk(G.glassT, this.shopGlassMat, 'BalconyShopGlass');
     mk(G.bodies, this.buildingMat, 'Towers');
     mk(G.barrier, this.barrierMat, 'LockdownBarrier', 8).frustumCulled = false;
 
@@ -3334,11 +3987,12 @@ export class CityBuilder {
     this.layout = {
       sector,
       loop,
-      buildings: buildings.map(({ index, cx, cz, halfW, halfD, roofY }) => ({ index, cx, cz, halfW, halfD, roofY })),
+      buildings: buildings.map(({ index, cx, cz, halfW, halfD, roofY, arch }) => ({ index, cx, cz, halfW, halfD, roofY, arch })),
       colliders,
       ramps: rampColliders,
       wallRunSurfaces: wallRun,
       anchors,
+      facadeFeatures,
       canalWater,
       playerSpawn,
       playerSpawnYaw,
@@ -3361,8 +4015,15 @@ export class CityBuilder {
         skybridges: skybridgeCount,
         lamps: counts.lamp,
         cityLights: this.lightCount,
+        archetypes: [ARCH_A, ARCH_B, ARCH_C, ARCH_D].map((a) => buildings.filter((b) => b.arch === a).length),
+        balconies: balconyCount,
+        fireEscapes: escapeCount,
+        escapeFlights: flightCount,
+        shopfronts: recessFaces.size,
+        facadeRooms,
       },
     };
+    this.towers = buildings;
     this.setGateOpen(false);
     return this.layout;
   }
@@ -3445,6 +4106,7 @@ export class CityBuilder {
   /** Far-field ring: towers capping every corridor that leaves the district, then up to 100 in total. */
   private layoutFarTowers(rng: () => number, plan: DistrictPlan): void {
     const seedAttr = this.farTowers.geometry.getAttribute('aSeed') as THREE.InstancedBufferAttribute;
+    const archAttr = this.farTowers.geometry.getAttribute('aArch') as THREE.InstancedBufferAttribute;
     this.farInfo.length = 0;
     const corridors: Array<{ axis: Axis; l0: number; l1: number }> = [];
     plan.streets.forEach((s) => corridors.push({ axis: s.axis, l0: s.coord - corridorHalf(s), l1: s.coord + corridorHalf(s) }));
@@ -3459,7 +4121,11 @@ export class CityBuilder {
       _scl.set(w, top, d);
       _m4.compose(_pos, _quat, _scl);
       this.farTowers.setMatrixAt(i, _m4);
-      seedAttr.setX(i, rng());
+      const seed = rng();
+      seedAttr.setX(i, seed);
+      // Distant supertalls: mostly glass corporate towers, some residential slabs and industrial blocks.
+      const h = (seed * 13.37) % 1;
+      archAttr.setX(i, top < 70 ? (h < 0.5 ? ARCH_B : ARCH_C) : h < 0.62 ? ARCH_A : h < 0.9 ? ARCH_B : ARCH_D);
       this.farInfo.push({ x, z, w, d, top });
     };
     // Corridor caps just past the visual extent so no street / canal / expressway runs into the void.
@@ -3489,6 +4155,7 @@ export class CityBuilder {
     this.farTowers.count = this.farInfo.length;
     this.farTowers.instanceMatrix.needsUpdate = true;
     seedAttr.needsUpdate = true;
+    archAttr.needsUpdate = true;
     this.farTowers.computeBoundingSphere();
   }
 

@@ -358,7 +358,8 @@ export const MATERIALS = {
   /** Parked cyber-car body; LED bands 2.2 … 2.8. */
   CAR_BODY: { roughness: 0.22, metalness: 0.78, emissive: 2.2, emissiveMax: 2.8 },
   BUILDING_GLASS: { roughness: 0.15, metalness: 0.85, emissive: 0.45 },
-  WALLRUN_PANEL: { roughness: 0.2, metalness: 0.6, emissive: 2.2 },
+  /** Cyan / accent light lines (enemy armour seams). */
+  ACCENT_LINE: { roughness: 0.2, metalness: 0.6, emissive: 2.2 },
   GRAPPLE_ANCHOR: { roughness: 0.25, metalness: 0.8, emissive: 2.8 },
   PLAYER_STRAND: { roughness: 0, metalness: 0, emissive: 3.2 },
   ENEMY_ARMOR: { roughness: 0.5, metalness: 0.65, emissive: 0.0 },
@@ -372,8 +373,6 @@ export const MATERIALS = {
 
 /** Max linear luminance of background architecture (keeps it below the HDR bloom threshold). */
 export const BACKGROUND_MAX_LUMINANCE = 0.28;
-/** Warm : cool window ratio = 3 : 7. */
-export const WINDOW_WARM_RATIO = 0.3;
 /** Puddle mirror roughness and wet-surface roughness (§6.2-2). */
 export const ROOF_PUDDLE_ROUGHNESS = 0.06;
 export const ROOF_WET_ROUGHNESS = 0.42;
@@ -398,24 +397,12 @@ export const RENDER = {
   SPEEDLINE_MIN_SPEED: 18,
   SPEEDLINE_INNER_RADIUS: 0.62,
   DPR_CAP: 1.5,
-  WINDOW_TEX_SIZE: 1024,
   ROOF_TEX_SIZE: 512,
   ROAD_TEX_SIZE: 512,
-  /**
-   * Window atlas: 8 rows × 4 m. Rows 0–4 (top of canvas) = office floors, repeating every 20 m above 12 m.
-   * Rows 5–7 (bottom) = low-rise shop floors (1F–3F, Y 0–12 m) with neon shop frames. 8 bays × 3 m.
-   */
-  WINDOW_TILE_WIDTH_M: 24,
-  WINDOW_FLOOR_HEIGHT_M: 4,
-  WINDOW_ROWS: 8,
-  WINDOW_OFFICE_ROWS: 5,
-  WINDOW_SHOP_ROWS: 3,
-  WINDOW_BAYS_PER_TILE: 8,
   ROOF_TILE_M: 14,
   /** City-light reflections (street lamps / bridge neon / highway strips) evaluated in ground, road & water shaders. */
   CITY_LIGHTS_MAX: 24,
   CITY_LIGHT_RANGE_M: 20,
-  WALLRUN_CHEVRON_TILE_M: 4,
   AVIATION_BLINK_HZ: 1.2,
 } as const;
 
@@ -474,7 +461,7 @@ export const SILHOUETTE = {
   SETBACK_AT_MAX: 0.8,
   SETBACK_SCALE_MIN: 0.65,
   SETBACK_SCALE_MAX: 0.78,
-  /** Upper tier must start above every sky-bridge / mid-level panel / Layer-2 sign (≤ 35 m). */
+  /** Upper tier must start above every sky-bridge / Layer-2 sign (≤ 35 m). */
   SETBACK_MIN_Y: 36,
   SETBACK_MIN_UPPER_M: 9,
   CROWN_MIN_ROOF_M: 50,
@@ -482,6 +469,112 @@ export const SILHOUETTE = {
   CANOPY_DEPTH_M: 1.4,
   STEAM_MIN: 40,
   STEAM_MAX: 60,
+} as const;
+
+/**
+ * 6A-1 facade atlas (2048 × 1024): four archetype columns (A glass curtain wall · B cast-concrete
+ * residential · C corrugated-metal industrial · D commercial tenant) × 8 floor rows of 4 m. Rows from the
+ * bottom of the texture: 0 ground floor, 1 dark mechanical floor (louvres), 2–7 typical floors.
+ * Room lighting is decided per room in the shader with an integer hash that `facadeRoomState()` mirrors
+ * exactly on the CPU (stats / verification).
+ */
+export const FACADE = {
+  TEX_W: 2048,
+  TEX_H: 1024,
+  COLUMNS: 4,
+  TILE_W_M: 12,
+  FLOOR_H_M: 4,
+  ROWS: 8,
+  TYPICAL_ROWS: 6,
+  /** Floor grid offset: Type B residential has a 6 m podium, so its balcony floors sit at 6, 10, 14 m … */
+  FLOOR_BASE_M: [0, 2, 0, 0] as readonly number[],
+  /** Rooms per 12 m tile: A 3 m · B 3 m · C 6 m · D 3 m. */
+  ROOMS_PER_TILE: [4, 4, 2, 4] as readonly number[],
+  /** A mechanical floor every 7–9 floors (6–8 typical floors between), never below floor 3. */
+  MACHINE_EVERY_MIN: 7,
+  MACHINE_EVERY_SPAN: 3,
+  /** Night distribution: dark 65 % · warm bulb 20 % · cool office 13 % · cyber accent 2 %. */
+  SHARE_DARK: 0.65,
+  SHARE_WARM: 0.2,
+  SHARE_COOL: 0.13,
+  SHARE_ACCENT: 0.02,
+  /** Tenant clustering: floor occupancy tiers (mean lit share = 0.35). */
+  FLOOR_TIER_LOW: 0.3,
+  FLOOR_TIER_MID: 0.75,
+  FLOOR_LIT_LOW: 0.12,
+  FLOOR_LIT_MID: 0.35,
+  FLOOR_LIT_HIGH: 0.626,
+  GROUND_LIT: 0.7,
+  WARM_A: 0xe2be8e,
+  WARM_B: 0xd4a56a,
+  COOL_A: 0xc5d7ea,
+  COOL_B: 0xdce8f5,
+  ACCENT_CYAN: 0x58e8f0,
+  ACCENT_MAGENTA: 0xe864b8,
+  /** Final linear luminance of a lit room: warm stays dim, offices brighter; all below the bloom threshold. */
+  LUM_WARM: [0.085, 0.16] as readonly number[],
+  LUM_COOL: [0.13, 0.23] as readonly number[],
+  LUM_ACCENT: [0.17, 0.26] as readonly number[],
+  LUM_SHOP: [0.14, 0.22] as readonly number[],
+  /** Interior mapping: room box depth in room units (floor height), parallax drawn up to this distance. */
+  INTERIOR_DEPTH: 0.55,
+  PARALLAX_MAX_DIST_M: 170,
+} as const;
+
+/** 6A-2 archetypes (shares of the playable towers and their height bands). */
+export const ARCHETYPE = {
+  SHARES: [0.3, 0.25, 0.25, 0.2] as readonly number[],
+  MIN_H: [45, 24, 18, 18] as readonly number[],
+  MAX_H: [95, 65, 48, 55] as readonly number[],
+  /** Type A vertical aluminium mullions (decorative, no collider). */
+  MULLION_W: 0.25,
+  MULLION_D: 0.35,
+  MULLION_SPACING_M: 3,
+  /** Type B corner pilasters (protrusion ≤ 0.45 m ⇒ no collider). */
+  PILASTER_W: 0.9,
+  PILASTER_OUT: 0.4,
+  /** Type C wall ducts. */
+  DUCT_W: 0.7,
+  DUCT_OUT: 0.4,
+  /** Type D recessed shopfront (1–3 floors) + per-floor canopies. */
+  RECESS_DEPTH_M: 1.8,
+  RECESS_PILLAR_M: 0.7,
+  RECESS_PILLAR_SPACING_M: 7,
+  FLOOR_CANOPY_DEPTH_M: 0.8,
+  FLOOR_CANOPIES_MAX: 4,
+} as const;
+
+/** 6A-3 walkable balconies (Type B). */
+export const BALCONY = {
+  FIRST_Y: 6,
+  DEPTH_M: 1.8,
+  WIDTH_MIN_M: 4.5,
+  WIDTH_MAX_M: 7.5,
+  SLAB_M: 0.26,
+  RAIL_H_M: 1.1,
+  /** Colliders on every balcony up to this floor height (slab + rails); above it only the slab. */
+  COLLIDER_MAX_Y: 36,
+  AC_CHANCE: 0.4,
+  LAMP_CHANCE: 0.12,
+  LAMP_COLOR: 0xffc884,
+  LAMP_INTENSITY: 0.85,
+  MAX_PER_SECTOR: 240,
+} as const;
+
+/** 6A-4 climbable external fire escapes (Type C). */
+export const FIRE_ESCAPE = {
+  LEVEL_H_M: 4,
+  LANDING_DEPTH_M: 1.8,
+  LANDING_WIDTH_M: 3.2,
+  RAIL_H_M: 1.1,
+  RUN_MIN_M: 4.6,
+  RUN_MAX_M: 7,
+  STEP_RISE_M: 0.2,
+  /** Reach the roof on towers up to this height, otherwise stop at 12–24 m. */
+  ROOF_ACCESS_MAX_Y: 28,
+  CAGE_LIGHT: 0xffa84c,
+  CAGE_INTENSITY: 1.15,
+  RAMP_THICKNESS_M: 0.25,
 } as const;
 
 /** 5B-4: hot impact scorch decals. */

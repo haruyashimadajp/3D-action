@@ -4,8 +4,8 @@
  *  - Uniform XZ grid broadphase over the district's static AABBs (rebuilt per sector, never per frame).
  *  - Swept AABB player movement resolved axis by axis: the move is clamped to the first contact along
  *    each axis, so even 40 m/s motion cannot tunnel through 0.1 m fences. Step-up 0.45 m. Depenetration.
- *  - Sloped on-ramps as analytic ground surfaces (with a solid slab underneath).
- *  - Wall-run detection against cyan wall-run surfaces only (distance ≤ 0.95 m).
+ *  - Sloped on-ramps and fire-escape stair flights (6A-4) as analytic ground surfaces (with a slab underneath).
+ *  - Wall-run detection against the flat-face wall-run surfaces (distance ≤ 0.95 m; panels removed in 6A-5).
  *  - Ray / segment casts against world colliders (grapple, bullets, line of sight).
  *  - 6° grapple anchor snap (movement assist only — guns never get aim assist).
  *  - Head-sphere / body-OBB hitbox ray tests for humanoids (targets supplied by the enemy system).
@@ -124,6 +124,8 @@ const _rampN = new THREE.Vector3();
 type Axis3 = 'x' | 'y' | 'z';
 const AXES_XZ = ['x', 'z'] as const;
 const CORNERS: ReadonlyArray<readonly [number, number]> = [[-1, -1], [1, -1], [-1, 1], [1, 1]];
+/** 6A-4: body half-width used against open steel stair flights (0.9 m lanes side by side). */
+const STEEL_FLIGHT_BODY_R = 0.22;
 
 export class PhysicsWorld {
   private layout: SectorLayout | null = null;
@@ -410,9 +412,10 @@ export class PhysicsWorld {
     const head = pos.y + h;
     for (let i = 0; i < this.ramps.length; i++) {
       const rp = this.ramps[i];
+      const rr = rp.steel ? Math.min(r, STEEL_FLIGHT_BODY_R) : r;
       for (let c = -1; c < CORNERS.length; c++) {
-        const x = c < 0 ? pos.x : pos.x + CORNERS[c][0] * r;
-        const z = c < 0 ? pos.z : pos.z + CORNERS[c][1] * r;
+        const x = c < 0 ? pos.x : pos.x + CORNERS[c][0] * rr;
+        const z = c < 0 ? pos.z : pos.z + CORNERS[c][1] * rr;
         const y = this.rampHeightAt(rp, x, z);
         if (y === null) continue;
         const bottom = y - rp.thickness;
@@ -429,8 +432,9 @@ export class PhysicsWorld {
     const nx = axis === 'x' ? pos.x + d : pos.x;
     const nz = axis === 'z' ? pos.z + d : pos.z;
     for (const rp of this.ramps) {
+      const rr = rp.steel ? Math.min(r, STEEL_FLIGHT_BODY_R) : r;
       for (const [cx, cz] of CORNERS) {
-        const y = this.rampHeightAt(rp, nx + cx * r, nz + cz * r);
+        const y = this.rampHeightAt(rp, nx + cx * rr, nz + cz * rr);
         if (y === null) continue;
         const slabBottom = y - rp.thickness;
         // Standing on / just above the surface is fine; the body intersecting the slab is not.
@@ -467,7 +471,7 @@ export class PhysicsWorld {
   // Wall-run detection
   // ===============================================================================================
   /**
-   * Finds the nearest cyan wall-run surface within 0.95 m of the player centre, overlapping the body.
+   * Finds the nearest wall-run surface within 0.95 m of the player centre, overlapping the body.
    * `right` is the player's horizontal right vector (to classify left / right walls).
    */
   findWallRun(pos: THREE.Vector3, h: number, right: THREE.Vector3, out: WallRunContact): WallRunContact {
