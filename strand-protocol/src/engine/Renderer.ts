@@ -90,6 +90,9 @@ const HdrSanitizeShader = {
 // ---------------------------------------------------------------------------
 // Pass 4: KineticPostFX (single fragment shader to save draw calls)
 // ---------------------------------------------------------------------------
+/** 7B-2 helper: GLSL vec3 literal from a 3-number array. */
+const v3 = (a: readonly number[]): string => `vec3(${a.map((x) => x.toFixed(4)).join(', ')})`;
+
 const KineticPostFXShader = {
   name: 'KineticPostFX',
   defines: {} as Record<string, string | number>,
@@ -150,6 +153,10 @@ const KineticPostFXShader = {
     uniform float uFade;
     uniform vec3 uFadeColor;
     varying vec2 vUv;
+    const vec3 GRADE_SHADOW = ${v3(RENDER.GRADE_SHADOW_TINT)};
+    const vec3 GRADE_HIGH = ${v3(RENDER.GRADE_HIGHLIGHT_TINT)};
+    const float GRADE_CURVE = ${RENDER.GRADE_S_CURVE.toFixed(3)};
+    const float FILM_GRAIN = ${RENDER.FILM_GRAIN.toFixed(4)};
 
     float hash12(vec2 p) {
       vec3 p3 = fract(vec3(p.xyx) * 0.1031);
@@ -296,6 +303,22 @@ const KineticPostFXShader = {
         vec3 gcol = mix(vec3(1.6, 0.08, 0.15), vec3(1.6), step(0.5, hash12(vec2(band, frame * 1.7))));
         col = mix(col, gcol, hit * 0.85);
       }
+      // --- 7B-2 cinematic grade + film grain (display-referred approximation, before tone mapping) -----
+      #ifndef LITE
+      {
+        vec3 s = pow(max(col, vec3(0.0)), vec3(1.0 / 2.2));
+        float l = dot(s, vec3(0.2126, 0.7152, 0.0722));
+        // Cold teal in the shadows (< 0.25), clear warm lift in the highlights (> 0.65), gentle S-curve.
+        s += GRADE_SHADOW * (1.0 - smoothstep(0.0, 0.25, l)) + GRADE_HIGH * smoothstep(0.65, 1.0, l);
+        vec3 sc = clamp(s, 0.0, 1.0);
+        s = mix(s, sc * sc * (3.0 - 2.0 * sc), GRADE_CURVE * step(s, vec3(1.0)));
+        // Temporal interleaved-gradient grain (blue-noise-like): kills 8-bit banding in the night sky / fog.
+        vec2 gp = gl_FragCoord.xy + vec2(47.0, 17.0) * floor(uTime * 60.0);
+        float ign = fract(52.9829189 * fract(dot(gp, vec2(0.06711056, 0.00583715))));
+        s += (ign - 0.5) * 2.0 * FILM_GRAIN;
+        col = pow(max(s, vec3(0.0)), vec3(2.2));
+      }
+      #endif
       col = mix(col, uFadeColor, clamp(uFade, 0.0, 1.0));
 
       gl_FragColor = vec4(col, 1.0);

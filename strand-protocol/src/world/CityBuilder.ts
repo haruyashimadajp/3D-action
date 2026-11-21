@@ -39,10 +39,10 @@
  */
 import * as THREE from 'three';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
-import { ARCHETYPE, BALCONY, CITY_SHADING, COLORS, FACADE, FIRE_ESCAPE, LEVEL, LIMITS, MATERIALS, NEON_BLOOM, RENDER, SILHOUETTE, createRng, clamp } from '../config/constants';
+import { ARCHETYPE, BALCONY, CITY_FX, CITY_SHADING, COLORS, FACADE, FIRE_ESCAPE, LEVEL, LIMITS, MATERIALS, NEON_BLOOM, RENDER, SILHOUETTE, createRng, clamp } from '../config/constants';
 import { ARCH_A, ARCH_B, ARCH_C, ARCH_D, GLSL_FACADE, facadeFloorY, facadeRoomState, faceKey, isMachineFloor, roomOffset, roomsPerTile, seedInt } from './FacadeLighting';
 import { SECTORS, type SectorDef } from '../config/skills';
-import { ROAD_ATLAS, SIGN_ATLAS, type AtlasRegion, type ProceduralTextureLibrary } from '../engine/ProceduralTextures';
+import { NEON_STRIP_GLOW, ROAD_ATLAS, SIGN_ATLAS, type AtlasRegion, type ProceduralTextureLibrary } from '../engine/ProceduralTextures';
 
 // =============================================================================================
 // Public layout data (consumed by PhysicsWorld / PlayerController / EnemyManager / HUD)
@@ -182,6 +182,12 @@ export interface SectorLayout {
     readonly fireEscapes: number;
     readonly escapeFlights: number;
     readonly shutterFronts: number;
+    /** Phase 7B set pieces. */
+    readonly signals: number;
+    readonly lampCones: number;
+    readonly cableBundles: number;
+    readonly carPaints: number[];
+    readonly carPools: number;
     /** 6A-1 rooms per night-light state on the rendered facades: dark · warm · cool · accent. */
     readonly facadeRooms: readonly number[];
   };
@@ -375,6 +381,8 @@ const _up = new THREE.Vector3(0, 1, 0);
 const _dir = new THREE.Vector3();
 const _euler = new THREE.Euler();
 const _col = new THREE.Color();
+const _colB = new THREE.Color();
+const _white = new THREE.Color(1, 1, 1);
 
 function rectFrom(ax: number, az: number, bx: number, bz: number): RectXZ {
   return { x0: Math.min(ax, bx), z0: Math.min(az, bz), x1: Math.max(ax, bx), z1: Math.max(az, bz) };
@@ -563,6 +571,24 @@ const GLSL_FOG_FADE = /* glsl */ `
   }
 `;
 
+/**
+ * 7B-2 height fog (after the regular exp² fog): low street haze that thickens toward Y ≤ 26 m and clears above
+ * 50 m — tower feet sink into the wet neon mist, the tops pierce the night sky.
+ */
+const HFOG = new THREE.Color(RENDER.HEIGHT_FOG_COLOR);
+const GLSL_HEIGHT_FOG = /* glsl */ `
+  #ifdef USE_FOG
+  {
+    float hfD = length(vCityWorld - cameraPosition);
+    float hfY = vCityWorld.y;
+    float hfH = hfY <= ${RENDER.HEIGHT_FOG_FULL_Y.toFixed(1)} ? 1.0
+      : exp(-(hfY - ${RENDER.HEIGHT_FOG_FULL_Y.toFixed(1)}) / 9.0) * (1.0 - smoothstep(${(RENDER.HEIGHT_FOG_CLEAR_Y - 10).toFixed(1)}, ${RENDER.HEIGHT_FOG_CLEAR_Y.toFixed(1)}, hfY));
+    float hfA = ${RENDER.HEIGHT_FOG_MAX.toFixed(3)} * hfH * smoothstep(${RENDER.HEIGHT_FOG_NEAR_M.toFixed(1)}, ${RENDER.HEIGHT_FOG_FAR_M.toFixed(1)}, hfD);
+    gl_FragColor.rgb = mix(gl_FragColor.rgb, vec3(${HFOG.r.toFixed(5)}, ${HFOG.g.toFixed(5)}, ${HFOG.b.toFixed(5)}), hfA);
+  }
+  #endif
+`;
+
 /** Expanding rain-drop rings (gradient), used in puddles and canal water. */
 const GLSL_RIPPLES = /* glsl */ `
   vec2 strandRipples(vec2 p, float t) {
@@ -584,6 +610,35 @@ const GLSL_RIPPLES = /* glsl */ `
     return grad;
   }
 `;
+
+/** 7B-5 blimp orbit at sim time t (also used by tests): position + heading. */
+export function blimpPose(b: { radius: number; y: number; speed: number; phase: number }, t: number, out: { x: number; y: number; z: number; yaw: number }): void {
+  const a = b.phase + (b.speed / b.radius) * t;
+  out.x = Math.cos(a) * b.radius;
+  out.z = Math.sin(a) * b.radius;
+  out.y = b.y + Math.sin(t * 0.07 + b.phase) * 2.5;
+  // Velocity direction d/dt (cos a, sin a) · sign(speed) → heading for +Z forward.
+  const vx = -Math.sin(a) * Math.sign(b.speed);
+  const vz = Math.cos(a) * Math.sign(b.speed);
+  out.yaw = Math.atan2(vx, vz);
+}
+const _bp = { x: 0, y: 0, z: 0, yaw: 0 };
+
+/**
+ * 7B-5 distant lightning schedule (mirrors the sky shader): one strike per ~22 s cycle k at
+ * k·22 + 11 + jitter(k) with jitter ∈ ±2 s ⇒ 18–26 s apart; azimuth per cycle. Pattern: 0.08 s flash →
+ * 0.10 s dark → 0.14 s second flash. Returns the strike intensity (0 … 1) at time t.
+ */
+export function lightningAt(t: number): { k: number; start: number; azimuth: number; intensity: number } {
+  const P = CITY_FX.LIGHTNING_PERIOD_S;
+  const k = Math.floor(t / P);
+  const g = (x: number): number => x - Math.floor(x);
+  const start = k * P + P * 0.5 + (g(k * 0.618034 + 0.137) - 0.5) * 2 * CITY_FX.LIGHTNING_JITTER_S;
+  const az = g(k * 0.754877 + 0.31) * Math.PI * 2;
+  const d = t - start;
+  const intensity = d >= 0 && d < 0.08 ? 1 - (d / 0.08) * 0.3 : d >= 0.18 && d < 0.32 ? 0.85 * (1 - (d - 0.18) / 0.14) : 0;
+  return { k, start, azimuth: az, intensity };
+}
 
 const MAX_LIGHTS = RENDER.CITY_LIGHTS_MAX;
 const CORNERS_4: ReadonlyArray<readonly [number, number]> = [[1, 1], [1, -1], [-1, 1], [-1, -1]];
@@ -615,6 +670,23 @@ const GLSL_CITY_LIGHTS = /* glsl */ `
       vec3 F = F0 + (1.0 - F0) * pow(1.0 - max(dot(V, Hh), 0.0), 5.0);
       float Vis = 0.25 / max(NdL * NdV, 0.06);
       vec3 spec = F * D * Vis;
+      // 7B-1: wet horizontal surfaces (street, puddles, canal) add an anisotropic GGX lobe stretched along the
+      // horizontal view direction — lights smear into long vertical streaks toward the camera, and the rain
+      // ripple normals make them waver.
+      if (N.y > 0.75 && rough < ${RENDER.STREAK_MAX_ROUGHNESS.toFixed(2)}) {
+        vec3 Ta = vec3(V.x, 0.0, V.z);
+        Ta = normalize(Ta + vec3(1e-4, 0.0, 0.0));
+        vec3 Ba = normalize(cross(N, Ta));
+        Ta = cross(Ba, N);
+        float ax = max(rough * 2.6, 0.28);
+        float ay = max(rough * 0.42, 0.035);
+        float th = dot(Hh, Ta);
+        float bh = dot(Hh, Ba);
+        float dA = th * th / (ax * ax) + bh * bh / (ay * ay) + NdH * NdH;
+        float Da = min(1.0 / (3.14159 * ax * ay * dA * dA), 60.0);
+        float wet = 1.0 - smoothstep(${(RENDER.STREAK_MAX_ROUGHNESS * 0.65).toFixed(3)}, ${RENDER.STREAK_MAX_ROUGHNESS.toFixed(2)}, rough);
+        spec += F * Da * Vis * wet * ${RENDER.STREAK_GAIN.toFixed(2)};
+      }
       vec3 diff = albedo * (1.0 - metal) * 0.31831;
       acc += uCityLightCol[i] * att * NdL * (diff + spec);
     }
@@ -660,7 +732,8 @@ const CAP = {
   LAMP: 170,
   VENDING: 90,
   GUARDRAIL: 220,
-  CITY_LIGHTS: 420,
+  /** 7B-1: lamps, crowns, balconies, neon signs, car head / tail lights, vending fronts. */
+  CITY_LIGHTS: 1100,
   STEAM: SILHOUETTE.STEAM_MAX,
 } as const;
 
@@ -749,6 +822,14 @@ export class CityBuilder {
   private readonly halos: THREE.InstancedMesh;
   /** 5B-1: soft rain-haze glow around every street-lamp head (one instanced draw). */
   private readonly lampHalos: THREE.InstancedMesh;
+  /** 7B-3 / 7B-4 / 7B-5 set pieces (one draw each). */
+  private readonly lampCones: THREE.InstancedMesh;
+  /** 7B-4 cable bundle midpoints (verification / camera framing). */
+  readonly cableDebug: Array<{ x: number; y: number; z: number; axis: Axis }> = [];
+  private readonly signals: THREE.InstancedMesh;
+  private readonly carPools: THREE.InstancedMesh;
+  private readonly blimpHull: THREE.InstancedMesh;
+  private readonly blimpBanner: THREE.InstancedMesh;
   /** 5B-3: low steam from manholes / ducts and canal mist (one instanced draw, animated on the GPU). */
   private readonly steam: THREE.InstancedMesh;
   private readonly gatePillar: THREE.Mesh;
@@ -803,6 +884,7 @@ export class CityBuilder {
     this.cars = ([0, 1, 2] as const).map((v) => {
       const g = this.createCarGeometry(v);
       g.setAttribute('aCar', new THREE.InstancedBufferAttribute(new Float32Array(LIMITS.PARKED_CARS * 4), 4));
+      g.setAttribute('aPaint', new THREE.InstancedBufferAttribute(new Float32Array(LIMITS.PARKED_CARS), 1));
       return this.makeInstanced(g, carMat, LIMITS.PARKED_CARS, `ParkedCars_${['Coupe', 'Sedan', 'Van'][v]}`);
     });
     const lampGeo = this.createLampGeometry();
@@ -823,11 +905,16 @@ export class CityBuilder {
     this.beacons = this.makeInstanced(this.createBeaconGeometry(), this.beaconMat, CAP.BEACON, 'GoldAnchors');
     this.halos = this.createAnchorHalos();
     this.lampHalos = this.createLampHalos();
+    this.lampCones = this.createLampCones();
+    this.signals = this.createSignals();
+    this.carPools = this.createCarPools();
+    [this.blimpHull, this.blimpBanner] = this.createBlimps();
     this.steam = this.createSteam();
     this.gatePillar = this.createGatePillar();
     this.persistent.add(
       ...this.cars, this.lamps, this.vending, this.guardrails, this.acUnits, this.ducts, this.fences, this.antennas,
       this.machineRooms, this.aviation, this.neonSigns, this.searchlights, this.beacons, this.halos, this.lampHalos, this.steam, this.gatePillar,
+      this.lampCones, this.signals, this.carPools, this.blimpHull, this.blimpBanner,
     );
   }
 
@@ -897,7 +984,8 @@ export class CityBuilder {
       );
     shader.fragmentShader = shader.fragmentShader
       .replace('#include <common>', `#include <common>\n${GLSL_CITY_LIGHTS}`)
-      .replace('#include <opaque_fragment>', apply);
+      .replace('#include <opaque_fragment>', apply)
+      .replace('#include <fog_fragment>', `#include <fog_fragment>\n${GLSL_HEIGHT_FOG}`);
   }
 
   /** LOW quality skips the per-fragment city lights on tower walls and the interior mapping (STRAND_LITE). */
@@ -1320,18 +1408,32 @@ export class CityBuilder {
       // 5B-2: lamps and neon light up the bodywork (instanced world position).
       this.injectCityLights(shader);
       shader.vertexShader = shader.vertexShader
-        .replace('#include <common>', '#include <common>\nattribute float aPart;\nattribute vec4 aCar;\nvarying float vPart;\nvarying vec4 vCar;')
-        .replace('#include <uv_vertex>', '#include <uv_vertex>\nvPart = aPart;\nvCar = aCar;');
+        .replace('#include <common>', '#include <common>\nattribute float aPart;\nattribute vec4 aCar;\nattribute float aPaint;\nvarying float vPart;\nvarying vec4 vCar;\nvarying float vPaint;')
+        .replace('#include <uv_vertex>', '#include <uv_vertex>\nvPart = aPart;\nvCar = aCar;\nvPaint = aPaint;')
+        // 7B-4: the taxi roof sign only exists on cyber-taxi paint.
+        .replace('#include <begin_vertex>', `#include <begin_vertex>
+          if (aPart > 4.5 && aPaint < ${(CITY_FX.CAR_TAXI - 0.5).toFixed(1)}) transformed = vec3(0.0);`);
       shader.fragmentShader = shader.fragmentShader
-        .replace('#include <common>', '#include <common>\nuniform float uTime;\nvarying float vPart;\nvarying vec4 vCar;')
+        .replace('#include <common>', `#include <common>
+          uniform float uTime;
+          varying float vPart;
+          varying vec4 vCar;
+          varying float vPaint;
+          vec3 strandPaint(float k) {
+            ${CITY_FX.CAR_PAINTS.map((h, i) => { const c = new THREE.Color(h); return `if (k < ${i + 0.5}) return vec3(${c.r.toFixed(4)}, ${c.g.toFixed(4)}, ${c.b.toFixed(4)});`; }).join('\n            ')}
+            return vec3(0.02);
+          }`)
         .replace('#include <map_fragment>', `#include <map_fragment>
           float sPart = floor(vPart + 0.5);
+          // 7B-4: six body paints per instance (the weathered pearl gets a dusty, rougher coat).
+          if (sPart == 0.0) diffuseColor.rgb = strandPaint(vPaint);
           if (sPart == 1.0) diffuseColor.rgb = vec3(0.006, 0.008, 0.012);
           else if (sPart == 4.0) diffuseColor.rgb = vec3(0.012, 0.012, 0.014);
           else if (sPart >= 2.0) diffuseColor.rgb = vec3(0.05);`)
         .replace('#include <roughnessmap_fragment>', `#include <roughnessmap_fragment>
           if (sPart == 1.0) roughnessFactor = 0.05;
-          else if (sPart == 4.0) roughnessFactor = 0.78;`)
+          else if (sPart == 4.0) roughnessFactor = 0.78;
+          else if (sPart == 0.0 && abs(vPaint - 3.0) < 0.5) roughnessFactor = min(1.0, roughnessFactor + 0.22);`)
         .replace('#include <metalnessmap_fragment>', `#include <metalnessmap_fragment>
           if (sPart == 1.0) metalnessFactor = 0.9;
           else if (sPart == 4.0) metalnessFactor = 0.1;`)
@@ -1341,10 +1443,11 @@ export class CityBuilder {
             vec3 led = vec3(0.0);
             if (sPart == 2.0) led = vCar.z > 0.5 ? ${v3(COLORS.CAR_HAZARD)} * blink : mix(${v3(COLORS.CAR_LED_WHITE)}, ${v3(COLORS.CAR_LED_CYAN)}, vCar.x);
             else if (sPart == 3.0) led = ${v3(COLORS.CAR_LED_REAR)} * (vCar.z > 0.5 ? (0.25 + 0.75 * blink) : 1.0);
+            else if (sPart == 5.0) led = ${v3(0xffb020)} * 0.55;
             totalEmissiveRadiance = led * vCar.y;
           }`);
     };
-    mat.customProgramCacheKey = () => 'strand-car-v12';
+    mat.customProgramCacheKey = () => 'strand-car-v13';
     return mat;
   }
 
@@ -1470,6 +1573,10 @@ export class CityBuilder {
   // Persistent backdrop
   // ===========================================================================================
   private createSky(): THREE.Mesh {
+    const skyGlow = (h: number): string => {
+      const c = new THREE.Color(h);
+      return `vec3(${c.r.toFixed(4)}, ${c.g.toFixed(4)}, ${c.b.toFixed(4)})`;
+    };
     const geo = new THREE.SphereGeometry(2400, 64, 32);
     const moonDir = new THREE.Vector3(-0.45, 0.62, -0.64).normalize();
     const mat = new THREE.ShaderMaterial({
@@ -1495,6 +1602,9 @@ export class CityBuilder {
         uniform vec3 uZenith; uniform vec3 uHorizon; uniform vec3 uMoonDir; uniform vec3 uMoonColor; uniform float uTime;
         varying vec3 vDir;
         ${GLSL_HASH}
+        const vec3 GLOW_MAGENTA = ${skyGlow(CITY_FX.SKY_GLOW_MAGENTA)};
+        const vec3 GLOW_CYAN = ${skyGlow(CITY_FX.SKY_GLOW_CYAN)};
+        const vec3 GLOW_AMBER = ${skyGlow(CITY_FX.SKY_GLOW_AMBER)};
         void main() {
           vec3 d = normalize(vDir);
           float y = d.y;
@@ -1502,10 +1612,35 @@ export class CityBuilder {
           vec3 col = mix(uHorizon, uZenith, smoothstep(0.0, 0.42, y));
           // City light pollution: magenta / violet haze above the skyline.
           col += vec3(0.022, 0.009, 0.036) * exp(-max(y, 0.0) * 7.0) * smoothstep(-0.06, 0.05, y);
-          // Storm-cloud streaks lit from below.
+          // 7B-5: heavy 3-octave storm deck, its belly lit from below by the city's light pollution (slowly
+          // drifting magenta / cyan / amber zones), thinning toward the zenith.
           vec2 cp = d.xz / max(y + 0.15, 0.05) * 1.6 + vec2(uTime * 0.004, uTime * 0.002);
-          float cloud = smoothstep(0.55, 0.85, sNoise(cp) * 0.65 + sNoise(cp * 2.7) * 0.35);
-          col = mix(col, vec3(0.02, 0.015, 0.032), cloud * smoothstep(0.02, 0.25, y) * 0.8);
+          float fb = sNoise(cp) * 0.55 + sNoise(cp * 2.3 + 7.1) * 0.3 + sNoise(cp * 5.1 + 3.3) * 0.15;
+          float cloud = smoothstep(0.42, 0.8, fb);
+          float deck = cloud * smoothstep(0.02, 0.25, y);
+          vec2 zp = d.xz / max(y + 0.3, 0.1) * 0.35 + uTime * 0.0015;
+          float zm = sNoise(zp);
+          float zc = sNoise(zp + 17.3);
+          vec3 glow = mix(mix(GLOW_AMBER, GLOW_MAGENTA, smoothstep(0.3, 0.7, zm)), GLOW_CYAN, smoothstep(0.45, 0.8, zc));
+          float under = (1.0 - smoothstep(0.05, 0.55, y)) * (0.35 + 0.65 * (1.0 - fb));
+          col = mix(col, vec3(0.018, 0.014, 0.028), deck * 0.82);
+          col += glow * 0.11 * deck * under;
+          // 7B-5: distant lightning — one strike per ~22 s (18–26 s apart), a pale double flash deep inside the
+          // clouds above a random stretch of the skyline.
+          {
+            float P = ${CITY_FX.LIGHTNING_PERIOD_S.toFixed(1)};
+            float k = floor(uTime / P);
+            float st = k * P + P * 0.5 + (fract(k * 0.618034 + 0.137) - 0.5) * ${(2 * CITY_FX.LIGHTNING_JITTER_S).toFixed(1)};
+            float az = fract(k * 0.754877 + 0.31) * 6.2831853;
+            float dt = uTime - st;
+            float fl = (dt >= 0.0 && dt < 0.08) ? 1.0 - dt / 0.08 * 0.3 : ((dt >= 0.18 && dt < 0.32) ? 0.85 * (1.0 - (dt - 0.18) / 0.14) : 0.0);
+            if (fl > 0.0) {
+              vec2 hd = normalize(d.xz + vec2(1e-4));
+              float dirW = pow(max(dot(hd, vec2(cos(az), sin(az))), 0.0), 7.0);
+              float band = smoothstep(0.0, 0.07, y) * (1.0 - smoothstep(0.18, 0.6, y));
+              col += vec3(0.5, 0.58, 0.82) * fl * dirW * band * (0.2 + cloud) * 0.5;
+            }
+          }
           vec2 sp = vec2(atan(d.z, d.x) * 180.0, y * 260.0);
           float star = step(0.9965, sHash12(floor(sp))) * smoothstep(0.12, 0.5, y) * (1.0 - cloud);
           col += vec3(0.16, 0.18, 0.24) * star * (0.6 + 0.4 * sin(uTime * 3.0 + sHash12(floor(sp)) * 40.0));
@@ -1644,6 +1779,9 @@ export class CityBuilder {
     if (p.roof) parts.push(extrude(p.roof, p.width - 0.3, 0));
     parts.push(part(boxAt(p.width - 0.25, 0.07, 0.06, 0, p.ledF, p.len / 2 + 0.02), 2));
     parts.push(part(boxAt(p.width - 0.2, 0.08, 0.06, 0, p.ledR, -p.len / 2 - 0.02), 3));
+    // 7B-4: cyber-taxi roof sign (shown only for the amber paint).
+    const roofTop = [[1.16, -0.85], [1.39, -0.58], [1.93, -0.3]][variant];
+    parts.push(part(boxAt(0.52, 0.13, 0.22, 0, roofTop[0] + 0.065, roofTop[1]), 5));
     for (const sx of [-1, 1]) {
       for (const sz of [-1, 1]) {
         const w = new THREE.CylinderGeometry(0.34, 0.34, 0.26, 14);
@@ -1981,6 +2119,364 @@ export class CityBuilder {
   }
 
   /**
+   * 7B-3 volumetric lamp cones: an open cone from each lamp head (6.2 m, r 0.35) to 0.2 m (r 2.8), additive.
+   * Vertical fade pow(1 − t, 1.8) · smoothstep(0, 0.08, t), silhouette-free view-edge fade |n·v|^2.2, faded close to
+   * the camera (2 → 6 m) and with the fog; cool white with a hint of the pole's neon (≤ 0.11).
+   */
+  private createLampCones(): THREE.InstancedMesh {
+    const C = CITY_FX;
+    const geo = new THREE.CylinderGeometry(C.CONE_R_TOP, C.CONE_R_BOTTOM, C.CONE_HEIGHT, 28, 1, true);
+    geo.translate(0, -C.CONE_HEIGHT / 2, 0);
+    geo.setAttribute('aTint', new THREE.InstancedBufferAttribute(new Float32Array(CAP.LAMP * 3), 3));
+    const mat = new THREE.ShaderMaterial({
+      transparent: true,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+      uniforms: { uColor: { value: new THREE.Color(COLORS.STREET_LAMP) }, uFogDensity: this.uFogDensity },
+      vertexShader: /* glsl */ `
+        attribute vec3 aTint;
+        varying vec3 vWorld; varying vec3 vN; varying float vAlong; varying vec3 vTint;
+        void main() {
+          vec4 w = modelMatrix * instanceMatrix * vec4(position, 1.0);
+          vWorld = w.xyz;
+          vN = normalize(mat3(modelMatrix * instanceMatrix) * normal);
+          vAlong = clamp(-position.y / ${C.CONE_HEIGHT.toFixed(1)}, 0.0, 1.0);
+          vTint = aTint;
+          gl_Position = projectionMatrix * viewMatrix * w;
+        }
+      `,
+      fragmentShader: /* glsl */ `
+        uniform vec3 uColor; uniform float uFogDensity;
+        varying vec3 vWorld; varying vec3 vN; varying float vAlong; varying vec3 vTint;
+        ${GLSL_FOG_FADE}
+        void main() {
+          vec3 toCam = cameraPosition - vWorld;
+          float dist = length(toCam);
+          float vert = pow(1.0 - vAlong, 1.8) * smoothstep(0.0, 0.08, vAlong);
+          float edge = pow(abs(dot(normalize(vN), toCam / max(dist, 1e-3))), 2.2);
+          float a = ${C.CONE_OPACITY.toFixed(3)} * vert * edge * smoothstep(2.0, 6.0, dist) * strandFogFade(dist, uFogDensity * 0.7);
+          gl_FragColor = vec4(mix(uColor, vTint, 0.18) * a, 1.0);
+          #include <tonemapping_fragment>
+          #include <colorspace_fragment>
+        }
+      `,
+    });
+    const m = new THREE.InstancedMesh(geo, mat, CAP.LAMP);
+    m.count = 0;
+    m.frustumCulled = false;
+    m.name = 'LampCones';
+    m.renderOrder = 5;
+    return m;
+  }
+
+  /**
+   * 7B-4 cantilever traffic signals: pole, arm over the lanes, horizontal three-lamp head (double-faced).
+   * aPart 1 red · 2 yellow · 3 green; per instance aPhase (s): the cycle green 10 s → yellow 2.5 s → red 12.5 s
+   * runs entirely in the shader; the crossing axis is offset by 12.5 s so red / green invert in sync.
+   */
+  private createSignals(): THREE.InstancedMesh {
+    const C = CITY_FX;
+    const parts: THREE.BufferGeometry[] = [];
+    const add = (g: THREE.BufferGeometry, id: number): void => {
+      const ng = g.index ? g.toNonIndexed() : g;
+      if (ng.getAttribute('uv')) ng.deleteAttribute('uv');
+      parts.push(withAttr1(ng, 'aPart', id));
+    };
+    const pole = new THREE.CylinderGeometry(0.085, 0.1, C.SIGNAL_POLE_H, 10);
+    pole.translate(0, C.SIGNAL_POLE_H / 2, 0);
+    add(pole, 0);
+    const base = new THREE.CylinderGeometry(0.16, 0.2, 0.3, 10);
+    base.translate(0, 0.15, 0);
+    add(base, 0);
+    const armY = C.SIGNAL_POLE_H - 0.25;
+    add(boxAt(C.SIGNAL_ARM, 0.12, 0.12, C.SIGNAL_ARM / 2, armY, 0), 0);
+    const brace = new THREE.BoxGeometry(1.4, 0.06, 0.06);
+    brace.rotateZ(0.55);
+    brace.translate(0.6, armY - 0.38, 0);
+    add(brace, 0);
+    const hx = C.SIGNAL_ARM - 0.75;
+    const hy = armY - 0.36;
+    add(boxAt(0.08, 0.16, 0.08, hx, armY - 0.1, 0), 0);
+    add(boxAt(1.36, 0.46, 0.34, hx, hy, 0), 0);
+    const order = [3, 2, 1];
+    for (let k = 0; k < 3; k++) {
+      const x = hx + (k - 1) * 0.42;
+      for (const sz of [-1, 1]) {
+        const lens = new THREE.CylinderGeometry(0.15, 0.15, 0.03, 18);
+        lens.rotateX(Math.PI / 2);
+        lens.translate(x, hy, sz * 0.18);
+        add(lens, order[k]);
+        add(boxAt(0.36, 0.03, 0.16, x, hy + 0.17, sz * 0.25), 0);
+      }
+    }
+    const geo = mergeOrEmpty(parts);
+    geo.setAttribute('aPhase', new THREE.InstancedBufferAttribute(new Float32Array(C.SIGNALS_MAX), 1));
+    const mat = new THREE.MeshStandardMaterial({ color: 0x2a2f37, roughness: 0.45, metalness: 0.8, emissive: new THREE.Color(0xffffff) });
+    const cyc = C.SIGNAL_GREEN_S + C.SIGNAL_YELLOW_S + C.SIGNAL_RED_S;
+    const red = new THREE.Color(0xff2430);
+    const yel = new THREE.Color(0xffb020);
+    const grn = new THREE.Color(0x1ff0b0);
+    const c3 = (c: THREE.Color): string => `vec3(${c.r.toFixed(4)}, ${c.g.toFixed(4)}, ${c.b.toFixed(4)})`;
+    mat.onBeforeCompile = (shader) => {
+      shader.uniforms.uTime = this.uTime;
+      shader.vertexShader = shader.vertexShader
+        .replace('#include <common>', '#include <common>\nattribute float aPart;\nattribute float aPhase;\nvarying float vPart;\nvarying float vPhase;')
+        .replace('#include <begin_vertex>', '#include <begin_vertex>\nvPart = aPart;\nvPhase = aPhase;');
+      shader.fragmentShader = shader.fragmentShader
+        .replace('#include <common>', '#include <common>\nuniform float uTime;\nvarying float vPart;\nvarying float vPhase;')
+        .replace('#include <map_fragment>', `#include <map_fragment>
+          float sp = floor(vPart + 0.5);
+          if (sp > 0.5) diffuseColor.rgb = vec3(0.02, 0.022, 0.026);`)
+        .replace('#include <emissivemap_fragment>', `#include <emissivemap_fragment>
+          {
+            float t = mod(uTime + vPhase, ${cyc.toFixed(2)});
+            float g = step(t, ${C.SIGNAL_GREEN_S.toFixed(2)});
+            float y = step(${C.SIGNAL_GREEN_S.toFixed(2)}, t) * step(t, ${(C.SIGNAL_GREEN_S + C.SIGNAL_YELLOW_S).toFixed(2)});
+            float r = 1.0 - g - y;
+            vec3 e = vec3(0.0);
+            if (sp == 1.0) e = ${c3(red)} * mix(0.035, ${C.SIGNAL_LENS.toFixed(2)}, r);
+            else if (sp == 2.0) e = ${c3(yel)} * mix(0.035, ${C.SIGNAL_LENS.toFixed(2)}, y);
+            else if (sp == 3.0) e = ${c3(grn)} * mix(0.035, ${C.SIGNAL_LENS.toFixed(2)}, g);
+            totalEmissiveRadiance = e;
+          }`);
+    };
+    mat.customProgramCacheKey = () => 'strand-signal-v1';
+    const m = new THREE.InstancedMesh(geo, mat, C.SIGNALS_MAX);
+    m.count = 0;
+    m.frustumCulled = false;
+    m.name = 'TrafficSignals';
+    return m;
+  }
+
+  /**
+   * 7B-4 head / tail light pools: soft additive quads on the road in front of (white / cyan, 4.5 m) and behind
+   * (red, 2.8 m) every parked car; hazard cars blink in sync with their LEDs (same clock and phase as the car).
+   * Per instance aPool = (r, g, b, gain) and aPoolB = (hazard, phase, front, 0).
+   */
+  private createCarPools(): THREE.InstancedMesh {
+    const geo = new THREE.PlaneGeometry(1, 1);
+    geo.rotateX(-Math.PI / 2);
+    const n = LIMITS.PARKED_CARS * 2;
+    geo.setAttribute('aPool', new THREE.InstancedBufferAttribute(new Float32Array(n * 4), 4));
+    geo.setAttribute('aPoolB', new THREE.InstancedBufferAttribute(new Float32Array(n * 4), 4));
+    const mat = new THREE.ShaderMaterial({
+      transparent: true,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+      polygonOffset: true,
+      polygonOffsetFactor: -4,
+      polygonOffsetUnits: -8,
+      uniforms: { uTime: this.uTime, uFogDensity: this.uFogDensity, uHazard: { value: new THREE.Color(COLORS.CAR_HAZARD) } },
+      vertexShader: /* glsl */ `
+        attribute vec4 aPool; attribute vec4 aPoolB;
+        varying vec2 vUv; varying vec4 vPool; varying vec4 vPoolB; varying float vDist;
+        void main() {
+          vUv = uv; vPool = aPool; vPoolB = aPoolB;
+          vec4 w = modelMatrix * instanceMatrix * vec4(position, 1.0);
+          vDist = length(w.xyz - cameraPosition);
+          gl_Position = projectionMatrix * viewMatrix * w;
+        }
+      `,
+      fragmentShader: /* glsl */ `
+        uniform float uTime; uniform float uFogDensity; uniform vec3 uHazard;
+        varying vec2 vUv; varying vec4 vPool; varying vec4 vPoolB; varying float vDist;
+        ${GLSL_FOG_FADE}
+        void main() {
+          float along = 1.0 - vUv.y;
+          float across = (vUv.x - 0.5) * 2.0;
+          float w = 0.42 + 0.58 * along;
+          float a = pow(1.0 - smoothstep(0.0, 1.0, along), 1.3) * exp(-across * across / (w * w) * 2.6) * smoothstep(0.0, 0.06, along);
+          float blink = step(0.5, fract(uTime * 1.5 + vPoolB.y));
+          vec3 c = vPool.rgb;
+          if (vPoolB.x > 0.5) c = vPoolB.z > 0.5 ? uHazard * blink : c * (0.25 + 0.75 * blink);
+          gl_FragColor = vec4(c * a * vPool.a * strandFogFade(vDist, uFogDensity), 1.0);
+          #include <tonemapping_fragment>
+          #include <colorspace_fragment>
+        }
+      `,
+    });
+    const m = new THREE.InstancedMesh(geo, mat, n);
+    m.count = 0;
+    m.frustumCulled = false;
+    m.name = 'CarLightPools';
+    m.renderOrder = 2;
+    return m;
+  }
+
+  /**
+   * 7B-5 two advertising blimps on a slow orbit over the far skyline (Y 125–165 m, r 230–340 m).
+   * Hull mesh (one draw for both): lathed envelope, four tail fins, gondola with a warm window strip, nav /
+   * strobe lights, cyan running lines and a downward searchlight cone (soft alpha). Banner mesh (one draw):
+   * a huge holographic ticker on each flank, scrolling the wide sign-atlas rows with scanlines and flicker.
+   */
+  private createBlimps(): [THREE.InstancedMesh, THREE.InstancedMesh] {
+    const C = CITY_FX;
+    const L = C.BLIMP_LENGTH;
+    const R = C.BLIMP_RADIUS;
+    const parts: THREE.BufferGeometry[] = [];
+    const add = (g: THREE.BufferGeometry, id: number): void => {
+      const ng = g.index ? g.toNonIndexed() : g;
+      if (ng.getAttribute('uv')) ng.deleteAttribute('uv');
+      parts.push(withAttr1(ng, 'aPart', id));
+    };
+    const prof: THREE.Vector2[] = [];
+    for (let i = 0; i <= 28; i++) {
+      const t = i / 28;
+      const y = (t - 0.5) * L;
+      const u = (2 * y) / L;
+      const r = R * Math.sqrt(Math.max(0, 1 - u * u)) * (u < 0 ? 1 - 0.18 * u * u : 1);
+      prof.push(new THREE.Vector2(Math.max(r, 0.01), y));
+    }
+    const hull = new THREE.LatheGeometry(prof, 36);
+    hull.rotateX(Math.PI / 2);
+    add(hull, 0);
+    // Tail fins (+Z forward, so the tail is at −Z).
+    const finZ = -L / 2 + 11;
+    const FH = R * 0.9;
+    add(boxAt(0.8, FH, L * 0.16, 0, R * 0.5 + FH / 2, finZ), 1);
+    add(boxAt(0.8, FH, L * 0.16, 0, -R * 0.5 - FH / 2, finZ), 1);
+    add(boxAt(FH, 0.8, L * 0.16, R * 0.5 + FH / 2, 0, finZ), 1);
+    add(boxAt(FH, 0.8, L * 0.16, -R * 0.5 - FH / 2, 0, finZ), 1);
+    // Gondola + window strip.
+    add(boxAt(4.2, 3.2, 17, 0, -R - 1.3, 4), 1);
+    add(boxAt(4.35, 0.7, 14, 0, -R - 0.9, 4.5), 5);
+    // Nav lights (red port / green starboard fin tips, white strobes) and cyan running lines.
+    add(boxAt(1, 1, 1, -R * 0.5 - FH, 0, finZ), 2);
+    add(boxAt(1, 1, 1, R * 0.5 + FH, 0, finZ), 3);
+    add(boxAt(1, 1, 1, 0, R * 0.5 + FH, finZ), 4);
+    add(boxAt(0.8, 0.8, 0.8, 0, -R - 3.0, 12), 4);
+    for (const sx of [-1, 1]) {
+      const run = new THREE.CylinderGeometry(0.22, 0.22, L * 0.72, 6);
+      run.rotateX(Math.PI / 2);
+      run.translate(sx * (R * 0.98), R * 0.22, 2);
+      add(run, 7);
+    }
+    // Searchlight cone hanging from the gondola, tilted forward.
+    const cone = new THREE.CylinderGeometry(0.7, 15, 130, 20, 1, true);
+    cone.translate(0, -65, 0);
+    cone.rotateX(0.42);
+    cone.translate(0, -R - 3, 10);
+    add(cone, 6);
+    const geo = mergeOrEmpty(parts);
+    const glow = (h: number): string => {
+      const c = new THREE.Color(h);
+      return `vec3(${c.r.toFixed(4)}, ${c.g.toFixed(4)}, ${c.b.toFixed(4)})`;
+    };
+    const hullMat = new THREE.ShaderMaterial({
+      transparent: true,
+      depthWrite: true,
+      uniforms: { uTime: this.uTime, uFogDensity: this.uFogDensity, uFogColor: { value: new THREE.Color(COLORS.FOG_ABYSS) } },
+      vertexShader: /* glsl */ `
+        attribute float aPart;
+        varying vec3 vWorld; varying vec3 vN; varying float vPart; varying float vConeT;
+        void main() {
+          vPart = aPart;
+          vConeT = clamp((-${(R + 3).toFixed(1)} - position.y) / 120.0, 0.0, 1.0);
+          vec4 w = modelMatrix * instanceMatrix * vec4(position, 1.0);
+          vWorld = w.xyz;
+          vN = normalize(mat3(modelMatrix * instanceMatrix) * normal);
+          gl_Position = projectionMatrix * viewMatrix * w;
+        }
+      `,
+      fragmentShader: /* glsl */ `
+        uniform float uTime; uniform float uFogDensity; uniform vec3 uFogColor;
+        varying vec3 vWorld; varying vec3 vN; varying float vPart; varying float vConeT;
+        ${GLSL_FOG_FADE}
+        void main() {
+          float p = floor(vPart + 0.5);
+          vec3 n = normalize(vN);
+          vec3 v = normalize(cameraPosition - vWorld);
+          float dist = length(cameraPosition - vWorld);
+          float fog = strandFogFade(dist, uFogDensity * 0.42);
+          if (p == 6.0) {
+            // Searchlight: soft beam, brightest at the lamp, no silhouette edge.
+            float edge = pow(abs(dot(n, v)), 1.6);
+            float a = 0.07 * pow(1.0 - vConeT, 1.3) * edge * fog;
+            gl_FragColor = vec4(vec3(0.75, 0.9, 1.0), a);
+            return;
+          }
+          vec3 base = p == 0.0 ? vec3(0.030, 0.034, 0.044) : vec3(0.014, 0.016, 0.02);
+          // Moon key + the city's magenta / cyan glow on the belly + a cool fresnel rim.
+          float key = max(dot(n, normalize(vec3(-0.45, 0.62, -0.64))), 0.0);
+          float belly = max(-n.y, 0.0);
+          float rim = pow(1.0 - max(dot(n, v), 0.0), 3.0);
+          vec3 col = base * (0.25 + key * 0.9) + belly * (${glow(C.SKY_GLOW_MAGENTA)} * 0.22 + ${glow(C.SKY_GLOW_CYAN)} * 0.18) + rim * vec3(0.03, 0.05, 0.08);
+          // Panel seams along the envelope.
+          if (p == 0.0) col *= 0.85 + 0.15 * step(0.08, fract(atan(n.y, n.x) * 2.546));
+          float blink = step(0.82, fract(uTime * 0.9));
+          if (p == 2.0) col = vec3(1.6, 0.06, 0.08);
+          else if (p == 3.0) col = vec3(0.05, 1.5, 0.4);
+          else if (p == 4.0) col = vec3(2.4) * blink;
+          else if (p == 5.0) col = vec3(1.1, 0.62, 0.26);
+          else if (p == 7.0) col = vec3(0.1, 0.95, 1.2) * (0.75 + 0.25 * sin(uTime * 2.0 + vWorld.x * 0.05));
+          col = mix(uFogColor, col, fog);
+          gl_FragColor = vec4(col, 1.0);
+          #include <tonemapping_fragment>
+          #include <colorspace_fragment>
+        }
+      `,
+    });
+    const hullMesh = new THREE.InstancedMesh(geo, hullMat, C.BLIMPS.length);
+    hullMesh.frustumCulled = false;
+    hullMesh.name = 'BlimpHulls';
+    hullMesh.renderOrder = -1;
+    // Banners: one plane per flank, facing outward.
+    const bparts: THREE.BufferGeometry[] = [];
+    for (const sx of [-1, 1]) {
+      const pl = new THREE.PlaneGeometry(L * 0.56, R * 0.85);
+      pl.rotateY(sx * Math.PI / 2);
+      if (sx < 0) {
+        // Keep the text reading front-to-back on both flanks (mirror the uv).
+        const uv = pl.getAttribute('uv') as THREE.BufferAttribute;
+        for (let i = 0; i < uv.count; i++) uv.setX(i, 1 - uv.getX(i));
+      }
+      pl.translate(sx * (R + 0.9), 1.5, 4);
+      bparts.push(withAttr1(pl, 'aSide', sx));
+    }
+    const bgeo = mergeOrEmpty(bparts);
+    bgeo.setAttribute('aRow', new THREE.InstancedBufferAttribute(new Float32Array([6, 7]), 1));
+    const bannerMat = new THREE.ShaderMaterial({
+      transparent: true,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+      side: THREE.DoubleSide,
+      uniforms: { uTime: this.uTime, uSigns: { value: this.tex.signAtlas }, uFogDensity: this.uFogDensity },
+      vertexShader: /* glsl */ `
+        attribute float aRow;
+        varying vec2 vUv; varying float vRow; varying float vDist;
+        void main() {
+          vUv = uv; vRow = aRow;
+          vec4 w = modelMatrix * instanceMatrix * vec4(position, 1.0);
+          vDist = length(w.xyz - cameraPosition);
+          gl_Position = projectionMatrix * viewMatrix * w;
+        }
+      `,
+      fragmentShader: /* glsl */ `
+        uniform float uTime; uniform sampler2D uSigns; uniform float uFogDensity;
+        varying vec2 vUv; varying float vRow; varying float vDist;
+        ${GLSL_FOG_FADE}
+        void main() {
+          float u = vUv.x * 2.0 + uTime * 0.05 * (vRow > 6.5 ? -1.0 : 1.0);
+          vec2 auv = vec2(u, 1.0 - (vRow + 1.0 - clamp(vUv.y, 0.04, 0.96)) / 16.0);
+          vec3 t = texture2D(uSigns, auv).rgb;
+          float scan = 0.72 + 0.28 * sin(vUv.y * 140.0 + uTime * 9.0);
+          float flick = 0.88 + 0.12 * step(0.5, fract(sin(floor(uTime * 12.0) * 12.9898) * 43758.55));
+          float frame = smoothstep(0.0, 0.015, vUv.x) * smoothstep(0.0, 0.015, 1.0 - vUv.x) * smoothstep(0.0, 0.05, vUv.y) * smoothstep(0.0, 0.05, 1.0 - vUv.y);
+          vec3 col = (t * 1.25 + vec3(0.02, 0.06, 0.09)) * scan * flick * frame;
+          gl_FragColor = vec4(col * strandFogFade(vDist, uFogDensity * 0.42), 1.0);
+          #include <tonemapping_fragment>
+          #include <colorspace_fragment>
+        }
+      `,
+    });
+    const bannerMesh = new THREE.InstancedMesh(bgeo, bannerMat, C.BLIMPS.length);
+    bannerMesh.frustumCulled = false;
+    bannerMesh.name = 'BlimpBanners';
+    bannerMesh.renderOrder = 7;
+    return [hullMesh, bannerMesh];
+  }
+
+  /**
    * 5B-1 lamp halo: camera-facing soft disc (radius 2.2 m) at each lamp head, alpha 0.28 · exp(−r² · 3.5),
    * additive — the light scattering in the wet night air.
    */
@@ -2182,11 +2678,32 @@ export class CityBuilder {
     const searchBase = this.searchlights.geometry.getAttribute('aBase') as THREE.InstancedBufferAttribute;
     const searchParams = this.searchlights.geometry.getAttribute('aParams') as THREE.InstancedBufferAttribute;
     const lampTint = this.lamps.geometry.getAttribute('aTint') as THREE.InstancedBufferAttribute;
+    const coneTint = this.lampCones.geometry.getAttribute('aTint') as THREE.InstancedBufferAttribute;
+    const signalPhase = this.signals.geometry.getAttribute('aPhase') as THREE.InstancedBufferAttribute;
+    const poolA = this.carPools.geometry.getAttribute('aPool') as THREE.InstancedBufferAttribute;
+    const poolB = this.carPools.geometry.getAttribute('aPoolB') as THREE.InstancedBufferAttribute;
+    let signalCount = 0;
+    /** 7B-4 paint stream (independent of the prop stream so paints stay evenly spread). */
+    const prng = createRng(0xc0105 + sector.index * 17 + loop * 131);
+    let poolCount = 0;
+    let cableBundles = 0;
+    const paintCounts = [0, 0, 0, 0, 0, 0];
     const vendTint = this.vending.geometry.getAttribute('aTint') as THREE.InstancedBufferAttribute;
 
     const inArea = (x: number, z: number, m = 0): boolean => Math.abs(x) <= H - m && Math.abs(z) <= H - m;
 
     // ------------------------------------------------------------------ writers
+    /** True when a registered light lies within r of (x, y, z) (7B-1 density balance). */
+    const lightNear = (x: number, y: number, z: number, r: number): boolean => {
+      const r2 = r * r;
+      for (let i = 0; i < this.lightCount; i++) {
+        const dx = this.lightPos[i * 3] - x;
+        const dy = this.lightPos[i * 3 + 1] - y;
+        const dz = this.lightPos[i * 3 + 2] - z;
+        if (dx * dx + dy * dy + dz * dz < r2) return true;
+      }
+      return false;
+    };
     const addLight = (x: number, y: number, z: number, hex: number, intensity: number): void => {
       if (this.lightCount >= CAP.CITY_LIGHTS) return;
       _col.setHex(hex);
@@ -2219,6 +2736,13 @@ export class CityBuilder {
      */
     const addNeon = (x: number, y: number, z: number, nx: number, nz: number, w: number, h: number, strip: number, format: 0 | 1 | 2 = 0): void => {
       if (counts.neon >= CAP.NEON) return;
+      // 7B-1: low / mid-rise signs light the wet street (sign colour), one light per ~3.5 m.
+      if (y < 30) {
+        const hex = format === 0 ? NEON_STRIP_GLOW[strip % NEON_STRIP_GLOW.length] : NEON_TINTS[strip % NEON_TINTS.length];
+        const lx = x + nx * 0.7;
+        const lz = z + nz * 0.7;
+        if (!lightNear(lx, y, lz, 3.5)) addLight(lx, y, lz, hex, Math.min(2.4, 0.9 + 0.12 * w * h));
+      }
       _pos.set(x, y, z);
       _euler.set(0, Math.atan2(nx, nz), 0);
       _quat.setFromEuler(_euler);
@@ -2258,13 +2782,22 @@ export class CityBuilder {
       addLight(x + Math.sin(yaw) * 2.05, 6.2, z + Math.cos(yaw) * 2.05, COLORS.STREET_LAMP, 4.0);
       _m4.makeTranslation(x + Math.sin(yaw) * 2.05, 6.22, z + Math.cos(yaw) * 2.05);
       this.lampHalos.setMatrixAt(counts.lamp - 1, _m4);
+      // 7B-3: volumetric cone under the head.
+      _m4.makeTranslation(x + Math.sin(yaw) * 2.05, CITY_FX.CONE_TOP_Y, z + Math.cos(yaw) * 2.05);
+      this.lampCones.setMatrixAt(counts.lamp - 1, _m4);
+      coneTint.setXYZ(counts.lamp - 1, _col.r, _col.g, _col.b);
     };
     const addVending = (x: number, z: number, yaw: number, scale = 1): void => {
       if (counts.vend >= CAP.VENDING) return;
       placeInstance(this.vending, counts.vend, x, 0, z, yaw, scale, scale, scale);
-      _col.setHex(NEON_TINTS[Math.floor(rng() * NEON_TINTS.length)]);
+      const vHex = NEON_TINTS[Math.floor(rng() * NEON_TINTS.length)];
+      _col.setHex(vHex);
       vendTint.setXYZ(counts.vend, _col.r, _col.g, _col.b);
       counts.vend++;
+      // 7B-1: the lit front panel (+Z) spills on the wet pavement.
+      const fx = x + Math.sin(yaw) * 0.7 * scale;
+      const fz = z + Math.cos(yaw) * 0.7 * scale;
+      if (!lightNear(fx, 1.2, fz, 2.5)) addLight(fx, 1.2 * scale, fz, _colB.setHex(vHex).lerp(_white, 0.45).getHex(), 1.25);
       const hw = 0.5 * scale + 0.05;
       const hd = 0.4 * scale + 0.05;
       const ax = Math.abs(Math.sin(yaw)) > 0.5;
@@ -3337,6 +3870,49 @@ export class CityBuilder {
       }
     });
 
+    // 7B-4: sagging catenary cable bundles (2–3 thin cables, 6 segments each, sag 0.6–1.4 m) strung diagonally
+    // across the alleys at 5.5–18 m — visual only (no collider); one in four bundles carries a faint optic fibre.
+    {
+      const C = CITY_FX;
+      const cat = (t: number, k = 1.25): number => (Math.cosh(k * (2 * t - 1)) - Math.cosh(k)) / (1 - Math.cosh(k));
+      const a0x = (al: { axis: Axis; gap0: number; gap1: number }, o1: number, o2: number): number => (al.axis === 'x' ? (al.gap0 + al.gap1) / 2 : (o1 + o2) / 2);
+      const a0z = (al: { axis: Axis; gap0: number; gap1: number }, o1: number, o2: number): number => (al.axis === 'x' ? (o1 + o2) / 2 : (al.gap0 + al.gap1) / 2);
+      this.cableDebug.length = 0;
+      for (const al of alleyRecs) {
+        const A = buildings[al.a];
+        const B = buildings[al.b];
+        const top = Math.min(C.CABLE_Y[1], lowTopOf(A) - 1.5, lowTopOf(B) - 1.5);
+        if (top < C.CABLE_Y[0] + 0.5 || al.gap1 - al.gap0 > 14) continue;
+        const span = al.ov1 - al.ov0;
+        const bundles = Math.min(3, 1 + Math.floor(span / 9));
+        for (let k = 0; k < bundles; k++) {
+          const o1 = al.ov0 + ((k + 0.5) / bundles) * span + (srng() - 0.5) * 2;
+          const o2 = Math.min(al.ov1 - 0.5, Math.max(al.ov0 + 0.5, o1 + (srng() - 0.5) * 5));
+          const y1 = C.CABLE_Y[0] + srng() * (top - C.CABLE_Y[0]);
+          const y2 = Math.min(top, Math.max(C.CABLE_Y[0], y1 + (srng() - 0.5) * 3));
+          const nCab = 2 + (srng() < 0.5 ? 1 : 0);
+          const fibre = srng() < 0.25;
+          for (let c = 0; c < nCab; c++) {
+            const sag = C.CABLE_SAG[0] + srng() * (C.CABLE_SAG[1] - C.CABLE_SAG[0]);
+            const dy = c * 0.11;
+            const dz = (c - (nCab - 1) / 2) * 0.09;
+            const a = al.axis === 'x' ? new THREE.Vector3(al.gap0, y1 - dy, o1 + dz) : new THREE.Vector3(o1 + dz, y1 - dy, al.gap0);
+            const b = al.axis === 'x' ? new THREE.Vector3(al.gap1, y2 - dy, o2 + dz) : new THREE.Vector3(o2 + dz, y2 - dy, al.gap1);
+            const pts: THREE.Vector3[] = [];
+            for (let i = 0; i <= C.CABLE_SEGMENTS; i++) {
+              const t = i / C.CABLE_SEGMENTS;
+              pts.push(a.clone().lerp(b, t).setY(a.y + (b.y - a.y) * t - sag * cat(t)));
+            }
+            const tube = new THREE.TubeGeometry(new THREE.CatmullRomCurve3(pts), C.CABLE_SEGMENTS, c === 0 && fibre ? C.CABLE_RADIUS * 0.8 : C.CABLE_RADIUS, 3, false);
+            if (c === 0 && fibre) G.strips.push(withColor(tube, NEON_TINTS[Math.floor(srng() * NEON_TINTS.length)], 0.55));
+            else G.steel.push(tube);
+          }
+          cableBundles++;
+          this.cableDebug.push({ x: (a0x(al, o1, o2)), y: (y1 + y2) / 2, z: a0z(al, o1, o2), axis: al.axis });
+        }
+      }
+    }
+
     // Sky-bridges (Layer 2) across the selected alleys.
     let skybridgeCount = 0;
     for (const rec of skyAlleys) {
@@ -3605,6 +4181,40 @@ export class CityBuilder {
       crosswalkZones.some((r) => insideRect(x, z, r, m)) ||
       rampRects.some((r) => insideRect(x, z, r, m)) ||
       pierRects.some((r) => insideRect(x, z, r, m + 1));
+    // 7B-4: cantilever traffic signals on the corners of every street junction (4 on avenue crossings, else 2),
+    // ≤ 32 per sector. The arm reaches over the lanes it controls; the crossing axis runs 12.5 s out of phase.
+    {
+      const C = CITY_FX;
+      const cyc = C.SIGNAL_GREEN_S + C.SIGNAL_YELLOW_S + C.SIGNAL_RED_S;
+      const junctions: Array<{ r: RectXZ; plaza: boolean }> = intersectionSquares.map((r) => ({ r, plaza: false }));
+      if (plan.plaza) junctions.unshift({ r: plan.plaza, plaza: true });
+      for (const { r, plaza } of junctions) {
+        if (signalCount >= C.SIGNALS_MAX) break;
+        const cx = (r.x0 + r.x1) / 2;
+        const cz = (r.z0 + r.z1) / 2;
+        if (!inArea(cx, cz, 4)) continue;
+        const hx = (r.x1 - r.x0) / 2;
+        const hz = (r.z1 - r.z0) / 2;
+        const big = plaza || (hx * 2 >= LEVEL.AVENUE_WIDTH_M - 0.1 && hz * 2 >= LEVEL.AVENUE_WIDTH_M - 0.1);
+        // The scramble plaza's corners carry light masts: its signals stand 2.5 m further along the kerb.
+        const extra = plaza ? 2.5 : 0;
+        const off = srng() * cyc;
+        const corners: Array<[number, number, 'z' | 'x']> = big
+          ? [[1, 1, 'z'], [-1, -1, 'z'], [1, -1, 'x'], [-1, 1, 'x']]
+          : [[1, 1, 'z'], [-1, -1, 'x']];
+        for (const [sx, sz, ctl] of corners) {
+          if (signalCount >= C.SIGNALS_MAX) break;
+          const px = cx + sx * (hx + 0.85 + (ctl === 'x' ? extra : 0));
+          const pz = cz + sz * (hz + 0.85 + (ctl === 'z' ? extra : 0));
+          // Arm over the controlled street: z-traffic → across x toward the centre; x-traffic → across z.
+          const yaw = ctl === 'z' ? (sx > 0 ? Math.PI : 0) : (sz > 0 ? Math.PI / 2 : -Math.PI / 2);
+          placeInstance(this.signals, signalCount, px, 0, pz, yaw);
+          signalPhase.setX(signalCount, off + (ctl === 'x' ? C.SIGNAL_GREEN_S + C.SIGNAL_YELLOW_S : 0));
+          colliders.push({ min: new THREE.Vector3(px - 0.13, 0, pz - 0.13), max: new THREE.Vector3(px + 0.13, C.SIGNAL_POLE_H, pz + 0.13), kind: 'PROP', building: -1 });
+          signalCount++;
+        }
+      }
+    }
     streets.forEach((s, si) => {
       const lh = laneHalf(s.kind);
       for (const [a0, a1] of segmentsByStreet[si]) {
@@ -3675,6 +4285,36 @@ export class CityBuilder {
         rng() < 0.2 ? 1 : 0,
         rng(),
       );
+      // 7B-1: head lights (white / cyan, amber when the hazards run) and red tail lights reflect on the road.
+      {
+        const aCar = mesh.geometry.getAttribute('aCar') as THREE.InstancedBufferAttribute;
+        const cyan = aCar.getX(idx) > 0.5;
+        const hazard = aCar.getZ(idx) > 0.5;
+        const phase = aCar.getW(idx);
+        const half = carDims[variant][2] / 2 + 0.6;
+        const sx = Math.sin(c.yaw);
+        const sz = Math.cos(c.yaw);
+        addLight(c.x + sx * half, c.y + 0.75, c.z + sz * half, hazard ? COLORS.CAR_HAZARD : cyan ? COLORS.CAR_LED_CYAN : COLORS.CAR_LED_WHITE, hazard ? 1.3 : 1.8);
+        addLight(c.x - sx * half, c.y + 0.8, c.z - sz * half, COLORS.CAR_LED_REAR, 1.4);
+        // 7B-4: six paints (one in ~6 is a cyber-taxi).
+        const paint = Math.floor(prng() * CITY_FX.CAR_PAINTS.length);
+        (mesh.geometry.getAttribute('aPaint') as THREE.InstancedBufferAttribute).setX(idx, paint);
+        paintCounts[paint]++;
+        // 7B-4: head / tail light pools on the road surface (front 4.5 m, rear 2.8 m).
+        const C = CITY_FX;
+        const L2 = carDims[variant][2] / 2;
+        for (const front of [true, false]) {
+          const len = front ? C.POOL_FRONT_LEN : C.POOL_REAR_LEN;
+          const wid = front ? C.POOL_FRONT_W : C.POOL_REAR_W;
+          const dir = front ? 1 : -1;
+          const d = L2 - 0.15 + len / 2;
+          placeInstance(this.carPools, poolCount, c.x + sx * d * dir, c.y + 0.03, c.z + sz * d * dir, front ? c.yaw : c.yaw + Math.PI, wid, 1, len);
+          _col.setHex(front ? (cyan ? COLORS.CAR_LED_CYAN : COLORS.CAR_LED_WHITE) : COLORS.CAR_LED_REAR);
+          poolA.setXYZW(poolCount, _col.r, _col.g, _col.b, front ? C.POOL_FRONT_GAIN : C.POOL_REAR_GAIN);
+          poolB.setXYZW(poolCount, hazard ? 1 : 0, phase, front ? 1 : 0, 0);
+          poolCount++;
+        }
+      }
       const [w, hgt, l] = carDims[variant];
       const alongZ = Math.abs(Math.cos(c.yaw)) > 0.5;
       const hx = (alongZ ? w : l) / 2;
@@ -3829,7 +4469,13 @@ export class CityBuilder {
     this.cars.forEach((m, i) => {
       commit(m, carCounts[i]);
       (m.geometry.getAttribute('aCar') as THREE.InstancedBufferAttribute).needsUpdate = true;
+      (m.geometry.getAttribute('aPaint') as THREE.InstancedBufferAttribute).needsUpdate = true;
     });
+    commit(this.carPools, poolCount);
+    poolA.needsUpdate = true;
+    poolB.needsUpdate = true;
+    commit(this.signals, signalCount);
+    signalPhase.needsUpdate = true;
     // 5B-3 steam: ~40 % canal mist just above the water, the rest from street manholes / curbside ducts.
     let steamN = 0;
     const steamTotal = SB.STEAM_MIN + Math.floor(srng() * (SB.STEAM_MAX - SB.STEAM_MIN + 1));
@@ -3861,6 +4507,8 @@ export class CityBuilder {
 
     commit(this.lamps, counts.lamp);
     commit(this.lampHalos, counts.lamp);
+    commit(this.lampCones, counts.lamp);
+    coneTint.needsUpdate = true;
     lampTint.needsUpdate = true;
     commit(this.vending, counts.vend);
     vendTint.needsUpdate = true;
@@ -3921,6 +4569,11 @@ export class CityBuilder {
         fireEscapes: escapeCount,
         escapeFlights: flightCount,
         shutterFronts: shutterFaces.size,
+        signals: signalCount,
+        lampCones: counts.lamp,
+        cableBundles,
+        carPaints: paintCounts,
+        carPools: poolCount,
         facadeRooms,
       },
     };
@@ -4093,6 +4746,17 @@ export class CityBuilder {
   update(simTime: number, cameraPos: THREE.Vector3): void {
     this.uTime.value = simTime;
     this.sky.position.copy(cameraPos);
+    // 7B-5: the two blimps cruise slow circles over the far skyline (heading along the orbit tangent).
+    CITY_FX.BLIMPS.forEach((b, i) => {
+      blimpPose(b, simTime, _bp);
+      _euler.set(0, _bp.yaw, Math.sin(simTime * 0.11 + i) * 0.02);
+      _quat.setFromEuler(_euler);
+      _m4.compose(_pos.set(_bp.x, _bp.y, _bp.z), _quat, _scl.set(1, 1, 1));
+      this.blimpHull.setMatrixAt(i, _m4);
+      this.blimpBanner.setMatrixAt(i, _m4);
+    });
+    this.blimpHull.instanceMatrix.needsUpdate = true;
+    this.blimpBanner.instanceMatrix.needsUpdate = true;
 
     // Nearest-N city light selection (allocation-free partial selection).
     const n = this.lightCount;

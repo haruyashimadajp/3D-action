@@ -1127,6 +1127,8 @@ export class ViewModelRenderer {
   // =============================================================================================
   update(realDt: number, f: ViewModelFrame): void {
     this.time += realDt;
+    this.hardU.uWetTime.value = this.time;
+    this.gearU.uWetTime.value = this.time;
     for (const id of SLOT_KEYS) this.rigs[id].group.visible = id === f.slot;
     const rig = this.rigs[f.slot];
     if (f.slot !== this.lastSlot) {
@@ -1329,6 +1331,10 @@ export class ViewModelRenderer {
   /** Keeps the view-model's PMREM reflections consistent with the main view orientation. */
   syncEnvironment(cameraEuler: THREE.Euler): void {
     this.scene.environmentRotation.set(-cameraEuler.x, -cameraEuler.y, 0, 'YXZ');
+    // 7B-7: world up in view space for the wet gloss (pitch only; the view-model ignores roll).
+    const up = this.hardU.uUpView.value;
+    up.set(0, Math.cos(cameraEuler.x), -Math.sin(cameraEuler.x));
+    this.gearU.uUpView.value.copy(up);
   }
 
   /** Reticle position (NDC) of the active holo sight — verification / HUD. */

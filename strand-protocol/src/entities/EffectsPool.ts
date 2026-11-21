@@ -21,7 +21,8 @@
  *    0.85 s of simulation time — all colour / fade work is done in the shader.
  */
 import * as THREE from 'three';
-import { COLORS, JUICE, LIMITS, RENDER, SCORCH, TELEGRAPH, createRng } from '../config/constants';
+import { COLORS, JUICE, LIMITS, RENDER, SCORCH, TELEGRAPH, VFX7, createRng } from '../config/constants';
+import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 import {
   type HitboxTarget,
   type HitRegion,
@@ -68,6 +69,8 @@ export interface ProjectileSpec {
   readonly tag: number;
   /** Passes through shields and bodies (each body is hit once); stops at world geometry (SK_02). */
   readonly pierce?: boolean;
+  /** 7B-7: leaves a plasma smoke trail (pistol, shotgun, sniper and boss heavy rounds). */
+  readonly smoke?: boolean;
 }
 
 export interface ProjectileImpact {
@@ -215,6 +218,29 @@ export class EffectsPool {
   private sNext = 0;
   private readonly rng = createRng(0x5a4c);
 
+  // ---- 7B-7 rain micro-splashes (ground-probed respawns, shader-animated) ----
+  readonly splashes: THREE.InstancedMesh;
+  private readonly splashAttr: THREE.InstancedBufferAttribute;
+  private readonly splashStart = new Float32Array(VFX7.SPLASHES);
+  private readonly splashPeriod = new Float32Array(VFX7.SPLASHES);
+  private readonly vfxTime = { value: 0 };
+  private groundQuery: ((x: number, y: number, z: number) => number | null) | null = null;
+  /** Splashes that found ground on their last respawn (verification). */
+  splashLive = 0;
+
+  // ---- 7B-7 plasma smoke trails (48-ribbon ring) ----
+  readonly smoke: THREE.InstancedMesh;
+  private readonly smA: THREE.InstancedBufferAttribute;
+  private readonly smB: THREE.InstancedBufferAttribute;
+  private readonly smC: THREE.InstancedBufferAttribute;
+  private smNext = 0;
+  private smStepCount = 0;
+  private smStepAt = -1;
+  /** Smoke trail of each round (−1 none). */
+  private readonly pSmoke = new Int16Array(P_CAP).fill(-1);
+  /** Trails spawned so far (verification). */
+  smokeSpawned = 0;
+
   // ---- GRAZE tracking per round ----
   private readonly pGrazeMin = new Float32Array(P_CAP);
   private readonly pGrazeDone = new Uint8Array(P_CAP);
@@ -344,6 +370,138 @@ export class EffectsPool {
     }
     this.rain.instanceMatrix.needsUpdate = true;
     scene.add(this.rain);
+
+    // 7B-7 rain micro-splashes: a crown billboard (aKind 0) + a flat ripple ring (aKind 1) per instance; each
+    // lives 0.18 s from its start time (aSplash = start, size, seed, live). Positions respawn on the CPU on the
+    // ground level found under a random point within 18 m (5–6 short probes per frame), the animation is GPU-only.
+    {
+      const crown = new THREE.PlaneGeometry(1, 1);
+      const ring = new THREE.PlaneGeometry(1, 1);
+      ring.rotateX(-Math.PI / 2);
+      const kind = (g: THREE.BufferGeometry, k: number): THREE.BufferGeometry => {
+        g.setAttribute('aKind', new THREE.BufferAttribute(new Float32Array(g.getAttribute('position').count).fill(k), 1));
+        return g;
+      };
+      const sg = mergeGeometries([kind(crown, 0), kind(ring, 1)]) as THREE.BufferGeometry;
+      this.splashAttr = new THREE.InstancedBufferAttribute(new Float32Array(VFX7.SPLASHES * 4), 4);
+      sg.setAttribute('aSplash', this.splashAttr);
+      const smat = new THREE.ShaderMaterial({
+        transparent: true,
+        depthWrite: false,
+        blending: THREE.AdditiveBlending,
+        side: THREE.DoubleSide,
+        uniforms: { uTime: this.vfxTime, uFogDensity: { value: RENDER.FOG_DENSITY } },
+        vertexShader: /* glsl */ `
+          attribute vec4 aSplash; attribute float aKind;
+          uniform float uTime;
+          varying vec2 vUv; varying float vT; varying float vKind; varying float vDist; varying float vSeed;
+          void main() {
+            float t = (uTime - aSplash.x) / ${VFX7.SPLASH_LIFE_S.toFixed(3)};
+            vT = t; vKind = aKind; vUv = uv; vSeed = aSplash.z;
+            vec3 c = (modelMatrix * instanceMatrix * vec4(0.0, 0.0, 0.0, 1.0)).xyz;
+            vDist = length(c - cameraPosition);
+            if (t < 0.0 || t > 1.0 || aSplash.w < 0.5) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); return; }
+            float sz = aSplash.y;
+            vec3 wp;
+            if (aKind < 0.5) {
+              vec3 toCam = cameraPosition - c;
+              toCam.y = 0.0;
+              toCam = normalize(toCam + vec3(1e-4, 0.0, 0.0));
+              vec3 right = vec3(toCam.z, 0.0, -toCam.x);
+              float h = sz * (0.05 + 0.12 * sin(t * 3.14159));
+              float w = sz * (0.06 + 0.12 * t);
+              wp = c + right * position.x * w * 2.0 + vec3(0.0, (position.y + 0.5) * h, 0.0);
+            } else {
+              float r = sz * (0.03 + 0.17 * t);
+              wp = c + vec3(position.x * r * 2.0, 0.004, position.z * r * 2.0);
+            }
+            gl_Position = projectionMatrix * viewMatrix * vec4(wp, 1.0);
+          }
+        `,
+        fragmentShader: /* glsl */ `
+          uniform float uFogDensity;
+          varying vec2 vUv; varying float vT; varying float vKind; varying float vDist; varying float vSeed;
+          void main() {
+            float fade = (1.0 - vT) * exp(-uFogDensity * uFogDensity * vDist * vDist * 3.0) * smoothstep(0.6, 2.0, vDist);
+            float a;
+            if (vKind < 0.5) {
+              // Crown: a fan of thin droplet jets.
+              float jets = pow(abs(sin(vUv.x * 15.0 + vSeed * 40.0)), 8.0);
+              a = jets * smoothstep(0.0, 0.25, vUv.y) * (1.0 - smoothstep(0.6, 1.0, vUv.y)) * (1.0 - abs(vUv.x - 0.5) * 2.0) * 0.55;
+            } else {
+              float r = length(vUv - 0.5) * 2.0;
+              a = smoothstep(0.12, 0.0, abs(r - 0.78)) * 0.32;
+            }
+            gl_FragColor = vec4(vec3(0.62, 0.72, 0.86) * a * fade, 1.0);
+          }
+        `,
+      });
+      this.splashes = new THREE.InstancedMesh(sg, smat, VFX7.SPLASHES);
+      this.splashes.name = 'RainSplashes';
+      this.splashes.frustumCulled = false;
+      this.splashes.renderOrder = 19;
+      for (let i = 0; i < VFX7.SPLASHES; i++) this.splashStart[i] = -1;
+      scene.add(this.splashes);
+    }
+
+    // 7B-7 plasma smoke trails: camera-facing ribbons revealed behind the round (age = t − s / speed), each
+    // point thinning out over 0.38 s while it widens 0.04 → 0.14 m and wavers. aSmA = (start, spawn time),
+    // aSmB = (dir, speed), aSmC = (length, seed, enemy 0|1, live).
+    {
+      const geo = new THREE.PlaneGeometry(1, 1, 1, 24);
+      this.smA = new THREE.InstancedBufferAttribute(new Float32Array(VFX7.SMOKE_TRAILS * 4), 4);
+      this.smB = new THREE.InstancedBufferAttribute(new Float32Array(VFX7.SMOKE_TRAILS * 4), 4);
+      this.smC = new THREE.InstancedBufferAttribute(new Float32Array(VFX7.SMOKE_TRAILS * 4), 4);
+      geo.setAttribute('aSmA', this.smA);
+      geo.setAttribute('aSmB', this.smB);
+      geo.setAttribute('aSmC', this.smC);
+      const W = VFX7.SMOKE_WIDTH;
+      const mat = new THREE.ShaderMaterial({
+        transparent: true,
+        depthWrite: false,
+        side: THREE.DoubleSide,
+        uniforms: { uTime: this.vfxTime, uFogDensity: { value: RENDER.FOG_DENSITY }, uTint: { value: new THREE.Color(COLORS.PLAYER_STRAND) } },
+        vertexShader: /* glsl */ `
+          attribute vec4 aSmA; attribute vec4 aSmB; attribute vec4 aSmC;
+          uniform float uTime;
+          varying vec2 vUv; varying float vAge; varying float vK; varying float vDist; varying float vEnemy;
+          void main() {
+            vUv = uv; vEnemy = aSmC.z;
+            float s = (position.y + 0.5) * aSmC.x;
+            float age = uTime - aSmA.w - s / max(aSmB.w, 1.0);
+            float k = clamp(age / ${VFX7.SMOKE_LIFE_S.toFixed(3)}, 0.0, 1.0);
+            vAge = age; vK = k;
+            if (aSmC.w < 0.5) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); return; }
+            vec3 p = aSmA.xyz + aSmB.xyz * s;
+            vec3 toCam = normalize(cameraPosition - p);
+            vec3 side = normalize(cross(aSmB.xyz, toCam) + vec3(0.0, 1e-4, 0.0));
+            float wob = (sin(s * 1.7 + aSmC.y * 40.0 + uTime * 3.1) + 0.6 * sin(s * 4.3 + uTime * 5.3)) * 0.06 * k;
+            p += side * wob + vec3(0.0, 0.22 * k, 0.0);
+            p += side * position.x * mix(${W[0].toFixed(3)}, ${W[1].toFixed(3)}, k);
+            vDist = length(p - cameraPosition);
+            gl_Position = projectionMatrix * viewMatrix * vec4(p, 1.0);
+          }
+        `,
+        fragmentShader: /* glsl */ `
+          uniform float uFogDensity; uniform vec3 uTint;
+          varying vec2 vUv; varying float vAge; varying float vK; varying float vDist; varying float vEnemy;
+          void main() {
+            if (vAge < 0.0 || vAge > ${VFX7.SMOKE_LIFE_S.toFixed(3)}) discard;
+            float across = 1.0 - abs(vUv.x - 0.5) * 2.0;
+            float a = ${VFX7.SMOKE_ALPHA.toFixed(3)} * pow(1.0 - vK, 1.4) * pow(across, 1.5);
+            // Close to the lens the ribbon would smear across the screen: fade it in from 1.2 m.
+            a *= smoothstep(1.2, 4.0, vDist) * exp(-uFogDensity * uFogDensity * vDist * vDist * 2.0);
+            vec3 tint = mix(uTint, vec3(1.0, 0.25, 0.32), vEnemy);
+            gl_FragColor = vec4(mix(vec3(0.6, 0.66, 0.76), tint, 0.3 * (1.0 - vK)), a);
+          }
+        `,
+      });
+      this.smoke = new THREE.InstancedMesh(geo, mat, VFX7.SMOKE_TRAILS);
+      this.smoke.name = 'SmokeTrails';
+      this.smoke.frustumCulled = false;
+      this.smoke.renderOrder = 21;
+      scene.add(this.smoke);
+    }
 
     // Tracers: unit box stretched along the flight direction, additive HDR colour per instance.
     const tracerMat = new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, blending: THREE.AdditiveBlending, depthWrite: false });
@@ -786,7 +944,75 @@ export class EffectsPool {
     this.pSlowK[i] = 1;
     this.pGrazeMin[i] = Infinity;
     this.pGrazeDone[i] = spec.owner === 'PLAYER' ? 1 : 0;
+    this.pSmoke[i] = spec.smoke ? this.spawnSmoke(muzzle ?? origin, dir, spec.speed, spec.range, spec.owner === 'ENEMY') : -1;
     return i;
+  }
+
+  /** 7B-7: opens a smoke trail behind a round (≤ 3 per shotgun blast). Returns the trail slot or −1. */
+  private spawnSmoke(start: THREE.Vector3, dir: THREE.Vector3, speed: number, range: number, enemy: boolean): number {
+    const now = this.vfxTime.value;
+    if (now === this.smStepAt) {
+      if (this.smStepCount >= VFX7.SMOKE_PER_SHOT) return -1;
+      this.smStepCount++;
+    } else {
+      this.smStepAt = now;
+      this.smStepCount = 1;
+    }
+    const k = this.smNext;
+    this.smNext = (k + 1) % VFX7.SMOKE_TRAILS;
+    // A trail being recycled must no longer be shortened by its old round.
+    for (let j = 0; j < P_CAP; j++) if (this.pSmoke[j] === k) this.pSmoke[j] = -1;
+    this.smA.setXYZW(k, start.x, start.y, start.z, now);
+    this.smB.setXYZW(k, dir.x, dir.y, dir.z, speed);
+    this.smC.setXYZW(k, range, this.rng(), enemy ? 1 : 0, 1);
+    this.smA.needsUpdate = true;
+    this.smB.needsUpdate = true;
+    this.smC.needsUpdate = true;
+    this.smokeSpawned++;
+    return k;
+  }
+
+  /** 7B-7: the round stopped after `travelled` m — its smoke trail ends there. */
+  private endSmoke(i: number): void {
+    const k = this.pSmoke[i];
+    if (k < 0) return;
+    this.pSmoke[i] = -1;
+    this.smC.setX(k, Math.max(0.5, this.pTravel[i]));
+    this.smC.needsUpdate = true;
+  }
+
+  /** 7B-7: ground height query for the rain splashes (y of the first surface at or below (x, y, z)). */
+  setGroundQuery(q: (x: number, y: number, z: number) => number | null): void {
+    this.groundQuery = q;
+  }
+
+  /** 7B-7: respawns finished splashes on the ground level around the camera (≤ 18 m). */
+  private updateSplashes(cameraPos: THREE.Vector3): void {
+    const now = this.vfxTime.value;
+    const R = VFX7.SPLASH_RADIUS_M;
+    let changed = false;
+    let live = 0;
+    for (let i = 0; i < VFX7.SPLASHES; i++) {
+      if (this.splashAttr.getW(i) > 0.5) live++;
+      if (now < this.splashStart[i] + this.splashPeriod[i]) continue;
+      const a = this.rng() * Math.PI * 2;
+      const r = Math.sqrt(this.rng()) * R;
+      const x = cameraPos.x + Math.cos(a) * r;
+      const z = cameraPos.z + Math.sin(a) * r;
+      const gy = this.groundQuery ? this.groundQuery(x, cameraPos.y + 0.5, z) : null;
+      const ok = gy !== null && gy > cameraPos.y - 6;
+      this.splashStart[i] = now + this.rng() * 0.2;
+      this.splashPeriod[i] = VFX7.SPLASH_PERIOD[0] + this.rng() * (VFX7.SPLASH_PERIOD[1] - VFX7.SPLASH_PERIOD[0]);
+      _m4.makeTranslation(x, (gy ?? 0) + 0.02, z);
+      this.splashes.setMatrixAt(i, _m4);
+      this.splashAttr.setXYZW(i, this.splashStart[i], 0.8 + this.rng() * 0.6, this.rng(), ok ? 1 : 0);
+      changed = true;
+    }
+    this.splashLive = live;
+    if (changed) {
+      this.splashes.instanceMatrix.needsUpdate = true;
+      this.splashAttr.needsUpdate = true;
+    }
   }
 
   /** Cancels all rounds of one owner (e.g. boss finisher clears enemy fire). */
@@ -883,6 +1109,8 @@ export class EffectsPool {
           continue;
         }
         this.pActive[i] = 0;
+        this.pTravel[i] = im.travelled;
+        this.endSmoke(i);
         onImpact(im);
         continue;
       }
@@ -1057,6 +1285,8 @@ export class EffectsPool {
    * @param cameraVel current camera world velocity (m/s, simulation space)
    */
   update(simDt: number, realDt: number, cameraPos: THREE.Vector3, cameraVel: THREE.Vector3, realTime = 0, viewportH = 1080): void {
+    this.vfxTime.value += simDt;
+    if (simDt > 0) this.updateSplashes(cameraPos);
     this.syncTracers(realDt);
     this.scorchTime.value += simDt;
     this.updateParticles(simDt);

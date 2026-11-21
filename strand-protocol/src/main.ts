@@ -14,6 +14,7 @@ import {
   GAME_TITLE,
   GAME_SUBTITLE,
   CAMERA,
+  CITY_FX,
   FLOW_POINTS,
   FLOW_RANKS,
   INPUT,
@@ -58,7 +59,7 @@ import { AudioEngine } from './engine/AudioEngine';
 import { Renderer } from './engine/Renderer';
 import { getProceduralTextures } from './engine/ProceduralTextures';
 import { InputManager } from './engine/InputManager';
-import { CityBuilder, type SectorLayout } from './world/CityBuilder';
+import { CityBuilder, type SectorLayout, blimpPose, lightningAt } from './world/CityBuilder';
 import { PhysicsWorld, type HitboxTarget } from './world/PhysicsWorld';
 import { EffectsPool, BURST, type ProjectileImpact, type ProjectileOwner, type ProjectileSpec } from './entities/EffectsPool';
 import { EnemyManager, RICOCHET_TAG, type HitMarkerKind, type KillInfo } from './entities/EnemyManager';
@@ -220,6 +221,9 @@ export class FlowSystem {
 // ---------------------------------------------------------------------------
 /** 7A-4: ADS target read-out cone (deg) and scratch. */
 const AIM_HP_MAX_DEG = 3.5;
+/** 7B-8: seconds without shots, hits or telegraph locks before the HUD settles. */
+const ADAPTIVE_HUD_QUIET_S = 4.0;
+const _groundQ = new THREE.Vector3();
 const _aimFwd = new THREE.Vector3();
 const _aimInfo = { hp: 0, maxHp: 1, name: '', dist: 0 };
 const _a = new THREE.Vector3();
@@ -355,6 +359,8 @@ class App {
   private lastFrame = performance.now();
   private readonly camVel = new THREE.Vector3();
   private readonly prevCamPos = new THREE.Vector3();
+  /** 7B-8: sim time of the last enemy telegraph lock. */
+  private lastLockAt = -1e9;
   private readonly hudFrame: HudFrame;
   /** Death sequence: red/white glitch 250 ms → respawn 250 ms (manual R retry 150 ms). */
   private deathTimer = -1;
@@ -406,6 +412,8 @@ class App {
     if (this.qualityOverride) this.city.setQuality(q as QualityPreset);
     this.renderer.scene.add(this.city.root);
     this.effects = new EffectsPool(this.renderer.scene);
+    // 7B-7: rain splashes land on the first surface under their spot (street, deck, roof, puddle).
+    this.effects.setGroundQuery((x, y, z) => this.physics.probeGround(_groundQ.set(x, y, z), 0.05, 6.5));
 
     this.input = new InputManager(this.renderer.renderer.domElement);
     this.viewModel = new ViewModelRenderer(this.renderer.viewModelScene, this.renderer.viewModelCamera, textures);
@@ -472,7 +480,10 @@ class App {
       onHitMarker: (kind) => this.onHitMarker(kind),
       onKill: (info) => this.onKill(info),
       onGraze: () => this.onGraze(),
-      onLockStart: (_kind, pos, lockS, sniper) => audio.lock(pos, lockS / Math.max(this.clock.bulletTimeScale, 0.05), sniper),
+      onLockStart: (_kind, pos, lockS, sniper) => {
+        this.lastLockAt = this.player.clockS;
+        audio.lock(pos, lockS / Math.max(this.clock.bulletTimeScale, 0.05), sniper);
+      },
       onEnemyFire: (kind, pos, sniper) => audio.enemyFire(kind, pos, sniper),
       onShieldBreak: (pos, weapon) => this.onPartBreak(pos, weapon, 'SHIELD BREAK'),
       onBossPartBreak: (pos, weapon) => this.onPartBreak(pos, weapon, 'WING BREAK'),
@@ -531,6 +542,7 @@ class App {
       bossPhase: 1,
       bossDowned: false,
       zoom: 0,
+      calm: false,
       aimVisible: false,
       aimFrac: 1,
       aimName: '',
@@ -585,6 +597,15 @@ class App {
         layout: () => this.layout,
         input: this.input,
         renderer: this.renderer,
+        // 7B-5 verification helpers (deterministic blimp orbit / lightning schedule).
+        cityFx: {
+          blimpPose: (i: number, t: number) => {
+            const o = { x: 0, y: 0, z: 0, yaw: 0 };
+            blimpPose(CITY_FX.BLIMPS[i], t, o);
+            return o;
+          },
+          lightningAt,
+        },
       };
       console.info(`[STRAND] procedural textures ${(t1 - t0).toFixed(0)} ms, sector build ${(performance.now() - t1).toFixed(0)} ms`);
       this.debugEl.hidden = false;
@@ -1371,6 +1392,13 @@ class App {
     f.regenerating = p.isRegenerating;
     f.sinceShot = e.sinceShot;
     f.zoom = e.zoomBlend;
+    // 7B-8 adaptive HUD: calm once the sector is cleared — or 4 s after the last shot / hit / telegraph lock
+    // with full HP — while slower than 18 m/s and not aiming down sights.
+    {
+      const since = p.clockS - Math.max(p.lastAttackTime, p.lastDamageTime, this.lastLockAt);
+      const quiet = this.enemies.isCleared || (since >= ADAPTIVE_HUD_QUIET_S && p.hp >= p.maxHp);
+      f.calm = p.isAlive && quiet && p.speed < RENDER.SPEEDLINE_MIN_SPEED && e.zoomBlend < 0.05;
+    }
     f.aimVisible = false;
     if (e.zoomBlend > 0.3 && p.isAlive) {
       const cam = this.renderer.camera;

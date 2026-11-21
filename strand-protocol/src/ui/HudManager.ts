@@ -95,6 +95,8 @@ export interface HudFrame {
   bossDowned: boolean;
   /** 0..1 tactical-zoom blend. */
   zoom: number;
+  /** 7B-8 out of combat: peripheral HUD at 55 %. */
+  calm: boolean;
   /** 7A-4 ADS target mini HP bar: shown, HP fraction, enemy name. */
   aimVisible: boolean;
   aimFrac: number;
@@ -699,6 +701,7 @@ export class HudManager {
   }
 
   update(f: HudFrame): void {
+    if (this.changed('calm', f.calm)) this.root.classList.toggle('calm', f.calm);
     this.updateCombat(f);
     // --- Crosshair ---
     if (this.changed('dot', f.centerDot)) this.dot.style.display = f.centerDot ? 'block' : 'none';

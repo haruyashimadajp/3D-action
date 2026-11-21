@@ -62,6 +62,7 @@ import {
 } from '../world/PhysicsWorld';
 import { BURST, type EffectsPool, type GrazeProbe, type ProjectileImpact, type ProjectileSpec } from './EffectsPool';
 import { getProceduralTextures } from '../engine/ProceduralTextures';
+import { mergeVertices } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 
 // =============================================================================================
 // Public types
@@ -184,13 +185,92 @@ function makeFlareGeometry(): THREE.BufferGeometry {
   return g;
 }
 
+/**
+ * 7B-6 chamfered unit box (flat-shaded, 6 inset faces + 12 edge bevels + 8 corner facets, edge cut `c`):
+ * environment reflections and the rim / scan light now run along every armour edge. Indexed like the
+ * other shared BatchedMesh geometries (position / normal / uv).
+ */
+function chamferBox(c: number): THREE.BufferGeometry {
+  const h = 0.5;
+  const i = 0.5 - c;
+  const pos: number[] = [];
+  const tri = (a: number[], b: number[], d: number[]): void => {
+    // Outward winding (centroid test — the solid is convex and centred).
+    const ux = b[0] - a[0], uy = b[1] - a[1], uz = b[2] - a[2];
+    const vx = d[0] - a[0], vy = d[1] - a[1], vz = d[2] - a[2];
+    const nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
+    const cx = a[0] + b[0] + d[0], cy = a[1] + b[1] + d[1], cz = a[2] + b[2] + d[2];
+    if (nx * cx + ny * cy + nz * cz < 0) pos.push(...a, ...d, ...b);
+    else pos.push(...a, ...b, ...d);
+  };
+  const quad = (a: number[], b: number[], d: number[], e: number[]): void => {
+    tri(a, b, d);
+    tri(a, d, e);
+  };
+  const P = (k: number, sk: number, u: number, su: number, v: number, sv: number, m: number, sm: number, vm: number): number[] => {
+    const p = [0, 0, 0];
+    p[k] = sk;
+    p[u] = su;
+    p[v] = sv;
+    if (m >= 0) p[m] = sm * vm;
+    return p;
+  };
+  for (let k = 0; k < 3; k++) {
+    const u = (k + 1) % 3;
+    const v = (k + 2) % 3;
+    for (const s of [-1, 1]) {
+      // Inset face.
+      quad(P(k, s * h, u, -i, v, -i, -1, 0, 0), P(k, s * h, u, i, v, -i, -1, 0, 0), P(k, s * h, u, i, v, i, -1, 0, 0), P(k, s * h, u, -i, v, i, -1, 0, 0));
+      // Edge bevels between face k and face u (running along v).
+      for (const t of [-1, 1]) {
+        quad(P(k, s * h, u, t * i, v, -i, -1, 0, 0), P(k, s * h, u, t * i, v, i, -1, 0, 0), P(k, s * i, u, t * h, v, i, -1, 0, 0), P(k, s * i, u, t * h, v, -i, -1, 0, 0));
+      }
+    }
+  }
+  // Corner facets.
+  for (const sx of [-1, 1]) for (const sy of [-1, 1]) for (const sz of [-1, 1]) {
+    tri([sx * h, sy * i, sz * i], [sx * i, sy * h, sz * i], [sx * i, sy * i, sz * h]);
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.computeVertexNormals();
+  const n = pos.length / 3;
+  const uv = new Float32Array(n * 2);
+  const nrm = g.getAttribute('normal');
+  for (let q = 0; q < n; q++) {
+    // Planar projection along the dominant normal axis.
+    const ax = Math.abs(nrm.getX(q)), ay = Math.abs(nrm.getY(q)), az = Math.abs(nrm.getZ(q));
+    const x = pos[q * 3], y = pos[q * 3 + 1], z = pos[q * 3 + 2];
+    const [a, b] = ax >= ay && ax >= az ? [z, y] : ay >= az ? [x, z] : [x, y];
+    uv[q * 2] = a + 0.5;
+    uv[q * 2 + 1] = b + 0.5;
+  }
+  g.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
+  return mergeVertices(g);
+}
+
+/** 7B-6 hexagonal tapered plate with chamfered top / bottom rims (flat-shaded, indexed). */
+function chamferTaper(): THREE.BufferGeometry {
+  const prof = [
+    new THREE.Vector2(0, -0.5),
+    new THREE.Vector2(0.44, -0.5),
+    new THREE.Vector2(0.5, -0.44),
+    new THREE.Vector2(0.37, 0.44),
+    new THREE.Vector2(0.31, 0.5),
+    new THREE.Vector2(0, 0.5),
+  ];
+  const lathe = new THREE.LatheGeometry(prof, 6).toNonIndexed();
+  lathe.computeVertexNormals();
+  return mergeVertices(lathe);
+}
+
 function buildGeometries(): Record<GeoName, THREE.BufferGeometry> {
   const torus = new THREE.TorusGeometry(0.5, 0.06, 6, 24);
   torus.rotateX(Math.PI / 2);
   return {
-    box: new THREE.BoxGeometry(1, 1, 1),
+    box: chamferBox(0.12),
     // Hexagonal tapered prism: angular tactical plates (wide bottom, narrow top; flip for chests).
-    taper: new THREE.CylinderGeometry(0.36, 0.5, 1, 6, 1),
+    taper: chamferTaper(),
     cyl: new THREE.CylinderGeometry(0.5, 0.5, 1, 8, 1),
     sphere: new THREE.SphereGeometry(0.5, 14, 10),
     torus,
@@ -686,8 +766,9 @@ const CAUSE_BOSS_DIVE = 'VALKYRIE-09 DIVE SHOCKWAVE';
 const CAUSE_BOSS_MISSILE = 'VALKYRIE-09 MICRO-MISSILE';
 const CAUSE_DRONE_BLAST = 'HUNTER DRONE SELF-DESTRUCT';
 
-function enemySpec(def: EnemyDef, damage: number, speed: number, width: number, color: number, intensity: number, tag: number): ProjectileSpec {
-  return { owner: 'ENEMY', speed, range: def.gun.range + 30, damage, headMultiplier: 1, shieldMultiplier: 1, color, intensity, width, tag };
+function enemySpec(def: EnemyDef, damage: number, speed: number, width: number, color: number, intensity: number, tag: number, smoke = false): ProjectileSpec {
+  // 7B-7: sniper rounds and the boss's heavy rail leave plasma smoke trails.
+  return { owner: 'ENEMY', speed, range: def.gun.range + 30, damage, headMultiplier: 1, shieldMultiplier: 1, color, intensity, width, tag, smoke: smoke || damage >= PLAYER.DAMAGE_SNIPER };
 }
 
 function gunPattern(def: EnemyDef): Pattern {
@@ -721,7 +802,7 @@ const PATTERNS = {
     kind: 'BULLET', lines: 1, fanStepDeg: 0, fromPods: false,
     acquireMs: VB.SNIPE.telegraph.acquireMs, lockMs: VB.SNIPE.telegraph.lockMs,
     rounds: 1, roundIntervalS: 0, sequentialLines: false,
-    spec: enemySpec(VALK_DEF, VB.SNIPE.damage, VB.SNIPE.speed, 0.07, VALK_DEF.gun.tracerColor, 4.2, KIND_TAG.VALKYRIE),
+    spec: enemySpec(VALK_DEF, VB.SNIPE.damage, VB.SNIPE.speed, 0.07, VALK_DEF.gun.tracerColor, 4.2, KIND_TAG.VALKYRIE, true),
     trackRadPerS: VALK_DEF.gun.trackDegPerS * DEG2RAD, predictive: false, cooldownS: 0.25,
   },
   BOSS_SWEEP: {
@@ -986,6 +1067,8 @@ const LINE_IGNORE_NONE = undefined;
 const PLAYER_R = 0.38;
 const GRAPPLE_HOOK_DAMAGE = 15;
 const _aim = new THREE.Vector3();
+/** 7B-6 contact shadow: radius 0.68 m, max opacity 0.55, 2.5 cm above the ground, ≤ 16 instances. */
+const CONTACT_SHADOW = { RADIUS_M: 0.68, OPACITY: 0.55, LIFT_M: 0.025, MAX: 16 } as const;
 const PLAYER_STAND_H = 1.86;
 const PLAYER_SLIDE_H = 0.98;
 
@@ -1180,6 +1263,35 @@ export class EnemyManager {
         }
       `,
     });
+    // 7B-6 contact shadows: a soft radial-Gaussian dark disc (r 0.68 m, ≤ 0.55) under every grounded enemy
+    // (and the downed Valkyrie) — one instanced draw, ≤ 16.
+    const shGeo = new THREE.PlaneGeometry(1, 1);
+    shGeo.rotateX(-Math.PI / 2);
+    const shMat = new THREE.ShaderMaterial({
+      transparent: true,
+      depthWrite: false,
+      polygonOffset: true,
+      polygonOffsetFactor: -2,
+      polygonOffsetUnits: -6,
+      vertexShader: /* glsl */ `
+        varying vec2 vUv;
+        void main() { vUv = uv; gl_Position = projectionMatrix * viewMatrix * modelMatrix * instanceMatrix * vec4(position, 1.0); }
+      `,
+      fragmentShader: /* glsl */ `
+        varying vec2 vUv;
+        void main() {
+          float r = length(vUv - 0.5) * 2.0;
+          float a = ${CONTACT_SHADOW.OPACITY.toFixed(2)} * exp(-r * r * 3.2) * (1.0 - smoothstep(0.8, 1.0, r));
+          gl_FragColor = vec4(0.0, 0.0, 0.0, a);
+        }
+      `,
+    });
+    this.contactShadows = new THREE.InstancedMesh(shGeo, shMat, CONTACT_SHADOW.MAX);
+    this.contactShadows.count = 0;
+    this.contactShadows.frustumCulled = false;
+    this.contactShadows.name = 'EnemyContactShadows';
+    this.contactShadows.renderOrder = 1;
+    scene.add(this.contactShadows);
     this.shieldMesh = new THREE.InstancedMesh(shieldGeo, shieldMat, SHIELD_CAP);
     this.shieldMesh.name = 'AegisShields';
     this.shieldMesh.frustumCulled = false;
@@ -1250,6 +1362,7 @@ export class EnemyManager {
   /** Removes every enemy, round-trip state and wave (title screen). */
   clear(): void {
     this.clearAll();
+    this.contactShadows.count = 0;
     this.waveLists = [];
     this.wave = -1;
     this.totalCount = 0;
@@ -1680,6 +1793,8 @@ export class EnemyManager {
   }
 
   private readonly playerChest = new THREE.Vector3();
+  /** 7B-6 contact shadows (one draw). */
+  private readonly contactShadows: THREE.InstancedMesh;
 
   private updatePlayerTarget(): void {
     const p = this.player;
@@ -2757,6 +2872,7 @@ export class EnemyManager {
     this.realTime += realDt;
     const blinkOn = Math.floor(this.realTime * TELEGRAPH.LOCK_BLINK_HZ * 2) % 2 === 0;
     let shields = 0;
+    let shadows = 0;
     for (const e of this.enemies) {
       if (!e.active || !e.rig) continue;
       if (e.alive) {
@@ -2764,6 +2880,13 @@ export class EnemyManager {
         const ryaw = e.prevYaw + wrapAngle(e.yaw - e.prevYaw) * alpha;
         this.poseEnemy(e, _v4, ryaw, realDt, simDt);
         this.writeRig(e, blinkOn);
+        // 7B-6: contact shadow under grounded humanoids (and the downed boss).
+        const onGround = e.kind === 'VALKYRIE' ? e.bossMode === 'DOWNED' : e.kind !== 'DRONE' && e.grounded;
+        if (onGround && shadows < CONTACT_SHADOW.MAX) {
+          const d = CONTACT_SHADOW.RADIUS_M * 2 * e.scale * (e.kind === 'VALKYRIE' ? 1.6 : 1);
+          _m1.compose(_v1.set(_v4.x, _v4.y + CONTACT_SHADOW.LIFT_M, _v4.z), _q1.identity(), _v2.set(d, 1, d));
+          this.contactShadows.setMatrixAt(shadows++, _m1);
+        }
         this.drawTelegraph(e, blinkOn);
         if (e.kind === 'PHANTOM') this.updateGhosts(e, simDt);
         if (e.kind === 'AEGIS' && e.shieldHp > 0 && shields < SHIELD_CAP) {
@@ -2783,6 +2906,8 @@ export class EnemyManager {
       this.updateDebris(e, simDt);
     }
     this.shieldMesh.count = shields;
+    this.contactShadows.count = shadows;
+    this.contactShadows.instanceMatrix.needsUpdate = true;
     this.shieldMesh.instanceMatrix.needsUpdate = true;
     if (this.shieldMesh.instanceColor) this.shieldMesh.instanceColor.needsUpdate = true;
     this.shieldUniforms.uTime.value = this.realTime;

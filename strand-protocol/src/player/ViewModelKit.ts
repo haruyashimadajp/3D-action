@@ -219,6 +219,9 @@ export interface KitUniforms {
   uClaw: { value: number };
   /** 7A-5: shotgun shell held in the left glove (visible ≥ 0.5). */
   uHand: { value: number };
+  /** 7B-7 rain-wet gloss: clock (s) and world up in view space (from the main camera's pitch). */
+  uWetTime: { value: number };
+  uUpView: { value: THREE.Vector3 };
 }
 
 export function createKitUniforms(): KitUniforms {
@@ -230,6 +233,8 @@ export function createKitUniforms(): KitUniforms {
     uShells: { value: 4 },
     uClaw: { value: 0 },
     uHand: { value: 0 },
+    uWetTime: { value: 0 },
+    uUpView: { value: new THREE.Vector3(0, 1, 0) },
   };
 }
 
@@ -279,6 +284,8 @@ export function kitMaterial(tex: PbrTextureSet, u: KitUniforms, key: string, nor
         uniform vec3 uEnergy;
         uniform float uCharge;
         uniform vec3 uBarColor;
+        uniform float uWetTime;
+        uniform vec3 uUpView;
         varying vec3 vSurf;
         varying float vZone;
         varying vec3 vGlow;
@@ -293,7 +300,12 @@ export function kitMaterial(tex: PbrTextureSet, u: KitUniforms, key: string, nor
         vec4 kRM = textureGrad(roughnessMap, kUv, kGx, kGy);
         float roughnessFactor = clamp(kRM.g * vSurf.x, 0.04, 1.0);`)
       .replace('#include <metalnessmap_fragment>', `
-        float metalnessFactor = clamp(kRM.b * vSurf.y, 0.0, 1.0);`)
+        float metalnessFactor = clamp(kRM.b * vSurf.y, 0.0, 1.0);
+        // 7B-7 rain-wet clear coat: up-facing metal / carbon surfaces turn glossier.
+        float kWetUp = smoothstep(0.3, 0.7, dot(normalize(vNormal), uUpView));
+        float kWetMat = max(step(0.35, metalnessFactor), step(1.5, kZ) * step(kZ, 2.5));
+        float kWet = kWetUp * kWetMat;
+        roughnessFactor = mix(roughnessFactor, max(roughnessFactor * 0.55, 0.06), kWet);`)
       .replace('#include <normal_fragment_maps>', `
         {
           vec3 mapN = textureGrad(normalMap, kUv, kGx, kGy).xyz * 2.0 - 1.0;
@@ -301,7 +313,16 @@ export function kitMaterial(tex: PbrTextureSet, u: KitUniforms, key: string, nor
           normal = normalize(tbn * mapN);
         }`)
       .replace('#include <emissivemap_fragment>', `#include <emissivemap_fragment>
-        totalEmissiveRadiance += uEnergy * (vGlow.x + vGlow.y * uCharge) + uBarColor * vGlow.z + vColor.rgb * vSurf.z;`);
+        totalEmissiveRadiance += uEnergy * (vGlow.x + vGlow.y * uCharge) + uBarColor * vGlow.z + vColor.rgb * vSurf.z;
+        // 7B-7: tiny bright droplets beading on the wet top surfaces, slowly creeping and refreshing.
+        {
+          vec2 dc = vKitUv * 46.0 + vec2(0.0, uWetTime * 0.35);
+          vec2 di = floor(dc);
+          float dh = fract(sin(dot(di, vec2(12.9898, 78.233))) * 43758.5453);
+          vec2 df = fract(dc) - vec2(0.3 + 0.4 * fract(dh * 7.1), 0.3 + 0.4 * fract(dh * 3.7));
+          float drop = step(0.93, dh) * smoothstep(0.12, 0.02, length(df)) * (0.5 + 0.5 * sin(uWetTime * 1.3 + dh * 30.0));
+          totalEmissiveRadiance += vec3(0.75, 0.85, 1.0) * drop * kWet * 0.35;
+        }`);
   };
   mat.customProgramCacheKey = () => `strand-vmkit-${key}`;
   return mat;

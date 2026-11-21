@@ -856,6 +856,8 @@ function buildSpecs(energyHex: number, plasma: boolean, pierce: boolean): Record
       width: width * (pierce ? 1.4 : 1),
       tag,
       pierce,
+      // 7B-7: pistol and shotgun rounds leave plasma smoke.
+      smoke: id !== 'SMG',
     };
   };
   return {

@@ -1225,6 +1225,8 @@ function generateRoadAtlas(anisotropy: number): PbrTextureSet {
 // ---------------------------------------------------------------------------
 // 4. Hologram neon sign atlas (1024², 8 vertical strips)
 // ---------------------------------------------------------------------------
+/** 7B-1: glow colour of each vertical blade strip (reflection lights on the wet street). */
+export const NEON_STRIP_GLOW: readonly number[] = [0x00f0ff, 0xff2bd6, 0xffa21f, 0x38f8ff, 0xff2bd6, 0x00f0ff, 0xffa21f, 0xff2b6d];
 const NEON_STRIPS: ReadonlyArray<{ text: string; color: string; glow: string }> = [
   { text: 'ストランド', color: '#7ff8ff', glow: '#00f0ff' },
   { text: 'ネオンバー', color: '#ff8ae8', glow: '#ff2bd6' },

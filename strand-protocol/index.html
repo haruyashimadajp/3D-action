@@ -273,6 +273,10 @@
       /* 5B-5 helmet-visor depth: side panels tilt toward the centre; faint optical scales on both edges. */
       #hp, #spd { transform: perspective(900px) rotateY(5deg); transform-origin: left center; }
       #dock { transform: perspective(900px) rotateY(-5deg); transform-origin: right center; }
+      /* 7B-8 adaptive HUD: out of combat the peripheral read-outs settle to 55 % so the city takes the screen;
+         any shot / hit / lock / speed ≥ 18 m/s / ADS snaps them back to 100 % in 120 ms. */
+      #hp, #spd, #dock, #flow, #buffs, #sector-hud { transition: opacity 0.12s linear; }
+      #hud.calm #hp, #hud.calm #spd, #hud.calm #dock, #hud.calm #flow, #hud.calm #buffs, #hud.calm #sector-hud { opacity: 0.55; transition: opacity 0.9s ease-in-out; }
       .visor { position: absolute; top: 32vh; height: 36vh; width: 8px; opacity: 0.14; pointer-events: none;
         background: repeating-linear-gradient(to bottom, #00f0ff 0 1px, transparent 1px 10px); }
       .visor::after { content: ''; position: absolute; top: 0; bottom: 0; width: 4px;

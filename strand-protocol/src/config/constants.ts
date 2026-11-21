@@ -441,8 +441,27 @@ export const RENDER = {
   ROAD_TEX_SIZE: 512,
   ROOF_TILE_M: 14,
   /** City-light reflections (street lamps / bridge neon / highway strips) evaluated in ground, road & water shaders. */
-  CITY_LIGHTS_MAX: 24,
+  /** 7B-1: nearest 20 of all registered lights (lamps, neon signs, car head / tail lights, vending fronts). */
+  CITY_LIGHTS_MAX: 20,
+  /** 7B-1 anisotropic wet streaks: horizontal surfaces (n.y > 0.75) with roughness < 0.40. */
+  STREAK_MAX_ROUGHNESS: 0.4,
+  STREAK_GAIN: 1.0,
   CITY_LIGHT_RANGE_M: 20,
+  /**
+   * 7B-2 height fog: a blue-violet / teal street haze (#101E38) thickening exponentially toward Y ≤ 26 m, gone
+   * by Y = 50 m; blends in from 25 m to 220 m of view distance, at most 0.38.
+   */
+  HEIGHT_FOG_COLOR: 0x101e38,
+  HEIGHT_FOG_MAX: 0.38,
+  HEIGHT_FOG_FULL_Y: 26,
+  HEIGHT_FOG_CLEAR_Y: 50,
+  HEIGHT_FOG_NEAR_M: 25,
+  HEIGHT_FOG_FAR_M: 220,
+  /** 7B-2 grading + grain (display-referred, before tone mapping). */
+  GRADE_SHADOW_TINT: [-0.008, 0.004, 0.014] as readonly number[],
+  GRADE_HIGHLIGHT_TINT: [0.012, 0.004, -0.006] as readonly number[],
+  GRADE_S_CURVE: 0.12,
+  FILM_GRAIN: 0.016,
   AVIATION_BLINK_HZ: 1.2,
 } as const;
 
@@ -587,6 +606,66 @@ export const ARCHETYPE = {
   BASE_TOP_M: 4.2,
   FLOOR_CANOPY_DEPTH_M: 0.8,
   FLOOR_CANOPIES_MAX: 4,
+} as const;
+
+/** 7B-7 rain micro-splashes and plasma smoke trails. */
+export const VFX7 = {
+  SPLASHES: 180,
+  SPLASH_RADIUS_M: 18,
+  SPLASH_LIFE_S: 0.18,
+  SPLASH_PERIOD: [0.3, 0.8] as readonly number[],
+  SMOKE_TRAILS: 48,
+  SMOKE_LIFE_S: 0.38,
+  SMOKE_WIDTH: [0.04, 0.14] as readonly number[],
+  SMOKE_ALPHA: 0.2,
+  /** Pellets of one shotgun blast sharing a step: at most this many trails. */
+  SMOKE_PER_SHOT: 3,
+} as const;
+
+/** Phase 7B street-life and sky set pieces. */
+export const CITY_FX = {
+  /** 7B-3 lamp light cones: head (6.2 m) → 0.2 m, radius 0.35 → 2.8 m, additive ≤ 0.11. */
+  CONE_TOP_Y: 6.2,
+  CONE_HEIGHT: 6.0,
+  CONE_R_TOP: 0.35,
+  CONE_R_BOTTOM: 2.8,
+  CONE_OPACITY: 0.11,
+  /** 7B-4 traffic lights: ≤ 32 per sector, green 10 s → yellow 2.5 s → red 12.5 s (cross axis inverted). */
+  SIGNALS_MAX: 32,
+  SIGNAL_GREEN_S: 10,
+  SIGNAL_YELLOW_S: 2.5,
+  SIGNAL_RED_S: 12.5,
+  SIGNAL_LENS: 1.45,
+  SIGNAL_POLE_H: 6.0,
+  SIGNAL_ARM: 4.2,
+  /** 7B-4 catenary cable bundles across alleys (4–14 m wide), Y 5.5–18 m, sag 0.6–1.4 m, 2–3 cables, 6 segments. */
+  CABLE_Y: [5.5, 18] as readonly number[],
+  CABLE_SAG: [0.6, 1.4] as readonly number[],
+  CABLE_SEGMENTS: 6,
+  CABLE_RADIUS: 0.03,
+  /** 7B-4 parked-car paints: carbon · gunmetal · navy · weathered pearl · wine · cyber-taxi amber. */
+  CAR_PAINTS: [0x141821, 0x252c38, 0x152238, 0x6b7482, 0x3a1620, 0x5c4318] as readonly number[],
+  CAR_TAXI: 5,
+  /** 7B-4 head / tail light pools on the road: front 4.5 m (white / cyan), rear 2.8 m (red). */
+  POOL_FRONT_LEN: 4.5,
+  POOL_FRONT_W: 2.6,
+  POOL_REAR_LEN: 2.8,
+  POOL_REAR_W: 2.2,
+  POOL_FRONT_GAIN: 0.42,
+  POOL_REAR_GAIN: 0.34,
+  /** 7B-5 storm sky: light pollution under the clouds; distant lightning every 18–26 s (double flash). */
+  SKY_GLOW_MAGENTA: 0x6b1858,
+  SKY_GLOW_CYAN: 0x0f4f6b,
+  SKY_GLOW_AMBER: 0x5a3614,
+  LIGHTNING_PERIOD_S: 22,
+  LIGHTNING_JITTER_S: 2,
+  /** 7B-5 two advertising blimps cruising the far sky. */
+  BLIMPS: [
+    { radius: 262, y: 138, speed: 5.2, phase: 0.4 },
+    { radius: 322, y: 158, speed: -4.4, phase: 3.3 },
+  ] as ReadonlyArray<{ radius: number; y: number; speed: number; phase: number }>,
+  BLIMP_LENGTH: 112,
+  BLIMP_RADIUS: 16,
 } as const;
 
 /** 6A-3 walkable balconies (Type B). */

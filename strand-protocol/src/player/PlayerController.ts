@@ -320,6 +320,11 @@ export class PlayerController {
     return this.state === 'MANTLING';
   }
 
+  /** Player simulation clock (s) — the base of lastAttackTime / lastDamageTime (7B-8 adaptive HUD). */
+  get clockS(): number {
+    return this.simTime;
+  }
+
   /** 0 → 1 progress of the running auto-mantle (−1 when not mantling). */
   get mantleProgress(): number {
     return this.state === 'MANTLING' ? clamp(this.mantleT / PHYSICS.MANTLE_DURATION_S, 0, 1) : -1;
