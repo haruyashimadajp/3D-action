@@ -33,7 +33,9 @@
  *    (pilasters, balconies) · C industrial (fire escape, ducts, loading dock) · D commercial (recessed
  *    shopfronts behind glass, per-floor canopies, packed signage)
  *  - 6A-3 walkable balconies (slab + rail colliders ≤ 36 m) · 6A-4 climbable zig-zag fire escapes (landing
- *    boxes + RampCollider flights) · 6A-5 cyan wall-run cladding removed (flat faces keep invisible surfaces)
+ *    boxes + RampCollider flights) · 6A-5 cyan wall-run cladding removed
+ *  - 6B-2 no wall-run list any more: PhysicsWorld finds runnable faces on every BUILDING / HIGHWAY / BRIDGE /
+ *    SKYBRIDGE collider; shallow decorations (mullions, pilasters, ducts, fins ≤ 0.45 m) have no collider
  */
 import * as THREE from 'three';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
@@ -80,16 +82,6 @@ export interface RampCollider {
   readonly thickness: number;
   /** 6A-4 open steel stair flight (fire escape): slab contacts use a slimmer body so the 0.9 m lanes don't snag. */
   readonly steel?: boolean;
-}
-
-export interface WallRunSurface {
-  /** Axis-aligned rectangle lying on the wall face. */
-  readonly min: THREE.Vector3;
-  readonly max: THREE.Vector3;
-  /** Outward unit normal (±X or ±Z). */
-  readonly normal: THREE.Vector3;
-  /** Building index, or -1 for expressway guard walls. */
-  readonly building: number;
 }
 
 export type AnchorKind = 'HIGHWAY_EDGE' | 'BRIDGE_TRUSS' | 'BUILDING_CORNER' | 'SKYBRIDGE' | 'SIGN';
@@ -151,7 +143,6 @@ export interface SectorLayout {
   readonly buildings: readonly BuildingInfo[];
   readonly colliders: readonly BoxCollider[];
   readonly ramps: readonly RampCollider[];
-  readonly wallRunSurfaces: readonly WallRunSurface[];
   readonly anchors: readonly GrappleAnchor[];
   readonly facadeFeatures: readonly FacadeFeature[];
   /** Canal water rectangles (water surface Y = −2.4 m): grounded here ⇒ shallow-water speed × 0.55. */
@@ -2189,7 +2180,6 @@ export class CityBuilder {
 
     const colliders: BoxCollider[] = [];
     const rampColliders: RampCollider[] = [];
-    const wallRun: WallRunSurface[] = [];
     const anchors: GrappleAnchor[] = [];
     const canalWater: RectXZ[] = [];
     const groundSpawns: SpawnPoint[] = [];
@@ -2678,7 +2668,7 @@ export class CityBuilder {
         if (c1 > c0) colliders.push(colliderAL(h.axis, c0, c1, h.coord - HW, h.coord + HW, UNDER, DECK, 'HIGHWAY'));
       }
 
-      // Guard walls with openings (junctions, ramps); outer faces stay wall-runnable (invisible surfaces).
+      // Guard walls with openings (junctions, ramps); the outer face + deck edge is a wall-runnable stack (6B-2).
       for (const side of [-1, 1]) {
         const openings: Array<[number, number]> = [];
         plan.highways.forEach((o, oi) => {
@@ -2701,7 +2691,6 @@ export class CityBuilder {
             addNeon(q.x, q.y, q.z, h.axis === 'z' ? side : 0, h.axis === 'x' ? side : 0, 7, 1.0, Math.floor(srng() * SIGN_ATLAS.WIDE_ROWS), 1);
           }
           // 6A-5: bare concrete outer face with restrained architectural edge lines (no chevron cladding).
-          const n = pt(h.axis, 0, 0, side, new THREE.Vector3());
           const e0 = Math.min(wallOuter, wallOuter + side * 0.04);
           const e1 = Math.max(wallOuter, wallOuter + side * 0.04);
           G.strips.push(
@@ -2710,12 +2699,7 @@ export class CityBuilder {
           );
           const c0 = Math.max(w0, -H);
           const c1 = Math.min(w1, H);
-          if (c1 > c0 + 1) {
-            colliders.push(colliderAL(h.axis, c0, c1, wallOuter, wallInner, DECK, GUARD_TOP, 'HIGHWAY'));
-            const mn = pt(h.axis, c0, UNDER, wallOuter);
-            const mx = pt(h.axis, c1, GUARD_TOP, wallOuter);
-            wallRun.push({ min: new THREE.Vector3(Math.min(mn.x, mx.x), UNDER, Math.min(mn.z, mx.z)), max: new THREE.Vector3(Math.max(mn.x, mx.x), GUARD_TOP, Math.max(mn.z, mx.z)), normal: n, building: -1 });
-          }
+          if (c1 > c0 + 1) colliders.push(colliderAL(h.axis, c0, c1, wallOuter, wallInner, DECK, GUARD_TOP, 'HIGHWAY'));
           // Gold anchors on wall-top posts every 24 m (highway edges).
           const sp = LEVEL.HIGHWAY_ANCHOR_SPACING_M;
           for (let a = Math.ceil((w0 + 4) / sp) * sp; a < w1 - 2; a += sp) {
@@ -2961,10 +2945,10 @@ export class CityBuilder {
     const lowTopOf = (b: Building): number => (b.setbackY > 0 ? b.setbackY : b.roofY);
 
     // ------------------------------------------------------------------ 7. face roles
-    // Alley faces and ≥ 2 faces per tower stay FLAT and carry the wall-run surfaces (the cyan panels are
-    // gone — 6A-5); the other faces carry the archetype's 3D features: B balconies, C the fire escape
-    // (+ ducts / loading dock), D the recessed shopfronts with per-floor canopies. A keeps every face flat
-    // behind its mullions.
+    // Alley faces and ≥ 2 faces per tower stay FLAT (clean runs for 6B-2's anywhere wall-run, which detects
+    // every vertical collider face); the other faces carry the archetype's 3D features: B balconies, C the
+    // fire escape (+ ducts / loading dock), D the recessed shopfronts with per-floor canopies. A keeps every
+    // face flat behind its decorative mullions.
     const fkey = (b: Building, ax: Axis, sg: number): string => `${b.index}:${ax}:${sg}`;
     const faceLen = (b: Building, ax: Axis): number => (ax === 'x' ? b.lotHalfD : b.lotHalfW) * 2;
     const runFaces = new Set<string>();
@@ -3112,33 +3096,6 @@ export class CityBuilder {
       }
     });
 
-    // ------------------------------------------------------------------ 7c. wall-run surfaces (flat faces)
-    // 6A-5: no visible cladding any more — every flat face (alleys + ≥ 2 per tower, all crown-tier faces)
-    // keeps an invisible wall-run surface until 6B's anywhere wall-run replaces the list.
-    const addRunSurface = (axis: Axis, face: number, sign: number, a0: number, a1: number, y0: number, y1: number, building: number): void => {
-      if (y1 - y0 < 3 || a1 - a0 < 2.5) return;
-      wallRun.push({
-        min: axis === 'x' ? new THREE.Vector3(face, y0, a0) : new THREE.Vector3(a0, y0, face),
-        max: axis === 'x' ? new THREE.Vector3(face, y1, a1) : new THREE.Vector3(a1, y1, face),
-        normal: axis === 'x' ? new THREE.Vector3(sign, 0, 0) : new THREE.Vector3(0, 0, sign),
-        building,
-      });
-    };
-    buildings.forEach((b) => {
-      for (const [ax, sg] of FACES) {
-        if (runFaces.has(fkey(b, ax, sg))) {
-          const c = ax === 'x' ? b.cz : b.cx;
-          const half = (ax === 'x' ? b.lotHalfD : b.lotHalfW) - 0.6;
-          addRunSurface(ax, ax === 'x' ? b.cx + sg * b.lotHalfW : b.cz + sg * b.lotHalfD, sg, c - half, c + half, 1.6, lowTopOf(b) - 0.5, b.index);
-        }
-        if (b.setbackY > 0) {
-          const c = ax === 'x' ? b.cz : b.cx;
-          const half = (ax === 'x' ? b.halfD : b.halfW) - 0.6;
-          addRunSurface(ax, ax === 'x' ? b.cx + sg * b.halfW : b.cz + sg * b.halfD, sg, c - half, c + half, b.setbackY + 0.6, b.roofY - 0.5, b.index);
-        }
-      }
-    });
-
     // ------------------------------------------------------------------ 7d. archetype 3D details
     /** Structural add-on drawn with the tower material in its archetype's plain cladding band (one draw). */
     const plainBody = (g: THREE.BufferGeometry, seed: number, col: number): THREE.BufferGeometry => withAttr1(withAttr1(g, 'aSeed', seed), 'aArch', col + 0.25);
@@ -3183,7 +3140,7 @@ export class CityBuilder {
       for (const [sx, sz] of CORNERS_4) G.steel.push(boxAt(AR.MULLION_D + 0.1, h, AR.MULLION_D + 0.1, cx + sx * (hw + 0.02), cy, cz + sz * (hd + 0.02)));
     };
 
-    /** Type B: thick cast-concrete corner pilasters. */
+    /** Type B: thick cast-concrete corner pilasters (0.4 m relief ≤ 0.45 m: decorative, no collider — 6B-2). */
     const pilasters = (b: Building): void => {
       const P = AR.PILASTER_W;
       const O = AR.PILASTER_OUT;
@@ -3192,7 +3149,6 @@ export class CityBuilder {
         const x = b.cx + sx * (b.lotHalfW + O - P / 2);
         const z = b.cz + sz * (b.lotHalfD + O - P / 2);
         G.bodies.push(plainBody(boxAt(P, top, P, x, top / 2, z), b.seed, ARCH_B));
-        colliders.push({ min: new THREE.Vector3(x - P / 2, 0, z - P / 2), max: new THREE.Vector3(x + P / 2, top, z + P / 2), kind: 'BUILDING', building: b.index });
       }
     };
 
@@ -3358,7 +3314,7 @@ export class CityBuilder {
       escapeCount++;
     };
 
-    /** Type C: thick wall ducts with hoods, cable / drain pipes and a loading dock with bumpers. */
+    /** Type C: wall ducts with hoods (0.4 m relief, no collider), cable / drain pipes, a loading dock with bumpers. */
     const ductsAndDock = (b: Building, ax: Axis, sg: number): void => {
       const f = faceFrame(b, ax, sg);
       const lowTop = lowTopOf(b);
@@ -3369,7 +3325,6 @@ export class CityBuilder {
         const a = f.c + (n === 1 ? (arng() - 0.5) * f.len * 0.4 : (k === 0 ? -1 : 1) * f.len * 0.3);
         G.steel.push(f.box(a - W2, a + W2, 0.4, lowTop + 0.9, 0, O), f.box(a - W2 - 0.15, a + W2 + 0.15, lowTop + 0.9, lowTop + 1.15, -0.1, O + 0.2));
         for (let y = 3; y < lowTop; y += 3) G.steel.push(f.box(a - W2 - 0.05, a + W2 + 0.05, y, y + 0.08, 0, O + 0.04));
-        f.coll(a - W2, a + W2, 0.4, lowTop, 0, O);
         for (const off of [W2 + 0.25, W2 + 0.45]) G.steel.push(f.box(a + off - 0.05, a + off + 0.05, 0, lowTop + 0.3, 0.12, 0.22));
       }
       if (f.len >= 10) {
@@ -3990,7 +3945,6 @@ export class CityBuilder {
       buildings: buildings.map(({ index, cx, cz, halfW, halfD, roofY, arch }) => ({ index, cx, cz, halfW, halfD, roofY, arch })),
       colliders,
       ramps: rampColliders,
-      wallRunSurfaces: wallRun,
       anchors,
       facadeFeatures,
       canalWater,

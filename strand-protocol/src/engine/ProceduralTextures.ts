@@ -12,6 +12,9 @@
  *  - Sign atlas (1024², 5B-3): 6 wide banners + 2 seamless scrolling LED tickers, 8 emblems / holograms
  *  - Tactical tech PBR set (512², 5B-4): carbon weave, panel grooves, screw heads, edge wear, brushed metal
  *  - Rooftop machinery (256²): AC-unit fan grille Albedo / Roughness / Normal
+ *  - 6B-1 view-model sets (512², 4 zones each): glove & wear (leather grain + stitching + knuckle creases,
+ *    ballistic nylon, rubber grip, jacket twill) and gun hard-surface (brushed gunmetal with scratches / edge
+ *    wear / screws, checkering, polymer stipple, anodised heat slits)
  */
 import * as THREE from 'three';
 import {
@@ -49,6 +52,10 @@ export interface ProceduralTextureLibrary {
   signAtlas: THREE.Texture;
   /** 5B-4 shared tactical tech PBR set (512²): carbon weave, panel grooves, edge wear, brushed metal. */
   tech: PbrTextureSet;
+  /** 6B-1 tactical glove & wear set (512², four zones; roughnessMap packs G roughness · B metalness). */
+  glove: PbrTextureSet;
+  /** 6B-1 gun micro hard-surface set (512², four zones; roughnessMap packs G roughness · B metalness). */
+  gun: PbrTextureSet;
 }
 
 /** Rows in the wide-banner half of the sign atlas and emblem cells (4 × 2). */
@@ -1463,6 +1470,311 @@ function generateMachinerySet(anisotropy: number): PbrTextureSet {
 }
 
 // ---------------------------------------------------------------------------
+// 6B-1 view-model PBR sets (512², four 256² zones; R unused · G roughness · B metalness packed)
+//   Glove / wear:  0 synthetic leather (grain, stitch rows, knuckle creases) · 1 ballistic nylon weave ·
+//                  2 rubber grip pads · 3 jacket twill
+//   Gun hard-surface: 0 brushed gunmetal (brush marks, micro scratches, edge wear, screws) · 1 grip
+//                  checkering · 2 polymer composite (stipple) · 3 dark anodised heat-slit panel
+// Parts sample their zone with box-proportional UVs (metres / tile), so small parts never stretch.
+// ---------------------------------------------------------------------------
+interface ZoneCanvases {
+  alb: CanvasRenderingContext2D;
+  rgh: CanvasRenderingContext2D;
+  mtl: CanvasRenderingContext2D;
+  hgt: CanvasRenderingContext2D;
+}
+
+function zonedSet(anisotropy: number, seed: number, paint: (z: ZoneCanvases, zone: number, ox: number, oy: number, n: number, rng: () => number) => void, normalStrength: number): PbrTextureSet {
+  const S = 512;
+  const Z = 256;
+  const [albC, alb] = makeCanvas(S, S);
+  const [, rgh] = makeCanvas(S, S);
+  const [, mtl] = makeCanvas(S, S);
+  const [, hgt] = makeCanvas(S, S);
+  const rng = createRng(seed);
+  const z: ZoneCanvases = { alb, rgh, mtl, hgt };
+  for (let k = 0; k < 4; k++) {
+    const ox = (k % 2) * Z;
+    const oy = Math.floor(k / 2) * Z;
+    for (const c of [alb, rgh, mtl, hgt]) {
+      c.save();
+      c.beginPath();
+      c.rect(ox, oy, Z, Z);
+      c.clip();
+    }
+    paint(z, k, ox, oy, Z, rng);
+    for (const c of [alb, rgh, mtl, hgt]) c.restore();
+  }
+  const rD = rgh.getImageData(0, 0, S, S).data;
+  const tD = mtl.getImageData(0, 0, S, S).data;
+  const [packC, pack] = makeCanvas(S, S);
+  const img = pack.createImageData(S, S);
+  for (let i = 0; i < img.data.length; i += 4) {
+    img.data[i] = 0;
+    img.data[i + 1] = rD[i];
+    img.data[i + 2] = tD[i];
+    img.data[i + 3] = 255;
+  }
+  pack.putImageData(img, 0, 0);
+  return {
+    map: finalizeTexture(albC, THREE.SRGBColorSpace, anisotropy),
+    roughnessMap: finalizeTexture(packC, THREE.NoColorSpace, anisotropy),
+    normalMap: normalTextureFromHeight(hgt, S, S, normalStrength, anisotropy),
+  };
+}
+
+const fillZ = (c: CanvasRenderingContext2D, style: string, ox: number, oy: number, n: number): void => {
+  c.fillStyle = style;
+  c.fillRect(ox, oy, n, n);
+};
+
+function generateGloveSet(anisotropy: number): PbrTextureSet {
+  return zonedSet(anisotropy, 0x6107e, ({ alb, rgh, mtl, hgt }, zone, ox, oy, n, rng) => {
+    fillZ(mtl, '#000', ox, oy, n);
+    if (zone === 0) {
+      // Synthetic leather: fine grain (shibo), knuckle creases, two stitch rows.
+      fillZ(alb, grayCss(0.56), ox, oy, n);
+      fillZ(rgh, grayCss(0.58), ox, oy, n);
+      fillZ(hgt, grayCss(0.55), ox, oy, n);
+      for (let i = 0; i < 2600; i++) {
+        const x = ox + rng() * n;
+        const y = oy + rng() * n;
+        const r = 1 + rng() * 2.2;
+        const up = rng() < 0.5;
+        hgt.fillStyle = up ? 'rgba(255,255,255,0.35)' : 'rgba(0,0,0,0.3)';
+        hgt.beginPath();
+        hgt.arc(x, y, r, 0, Math.PI * 2);
+        hgt.fill();
+        alb.fillStyle = up ? 'rgba(255,255,255,0.04)' : 'rgba(0,0,0,0.06)';
+        alb.fillRect(x - r, y - r, r * 2, r * 2);
+        rgh.fillStyle = up ? 'rgba(0,0,0,0.05)' : 'rgba(255,255,255,0.05)';
+        rgh.fillRect(x - r, y - r, r * 2, r * 2);
+      }
+      for (let k = 0; k < 7; k++) {
+        const y0 = oy + 18 + k * 34 + rng() * 6;
+        hgt.strokeStyle = 'rgba(0,0,0,0.55)';
+        hgt.lineWidth = 1.4;
+        hgt.beginPath();
+        for (let x = 0; x <= n; x += 8) hgt.lineTo(ox + x, y0 + Math.sin(x * 0.09 + k) * 2.2);
+        hgt.stroke();
+        alb.strokeStyle = 'rgba(0,0,0,0.12)';
+        alb.beginPath();
+        for (let x = 0; x <= n; x += 8) alb.lineTo(ox + x, y0 + Math.sin(x * 0.09 + k) * 2.2);
+        alb.stroke();
+      }
+      for (const sy of [oy + 22, oy + 150]) {
+        for (let x = ox; x < ox + n; x += 10) {
+          alb.fillStyle = 'rgba(190,190,176,0.75)';
+          alb.fillRect(x, sy, 6, 2);
+          hgt.fillStyle = grayCss(0.85);
+          hgt.fillRect(x, sy, 6, 2);
+          rgh.fillStyle = grayCss(0.72);
+          rgh.fillRect(x, sy, 6, 2);
+        }
+        hgt.fillStyle = 'rgba(0,0,0,0.35)';
+        hgt.fillRect(ox, sy + 4, n, 1);
+      }
+    } else if (zone === 1) {
+      // Ballistic nylon basket weave.
+      fillZ(alb, grayCss(0.5), ox, oy, n);
+      fillZ(rgh, grayCss(0.78), ox, oy, n);
+      fillZ(hgt, grayCss(0.5), ox, oy, n);
+      const c = 4;
+      for (let y = 0; y < n; y += c) {
+        for (let x = 0; x < n; x += c) {
+          const k = (Math.floor(x / (c * 2)) + Math.floor(y / (c * 2))) % 2 === 0;
+          hgt.fillStyle = grayCss(k ? 0.66 : 0.4);
+          hgt.fillRect(ox + x, oy + y, k ? c : c - 1, k ? c - 1 : c);
+          alb.fillStyle = k ? 'rgba(255,255,255,0.05)' : 'rgba(0,0,0,0.08)';
+          alb.fillRect(ox + x, oy + y, c, c);
+        }
+      }
+      for (const sy of [oy + 64, oy + 192]) {
+        for (let x = ox; x < ox + n; x += 9) {
+          alb.fillStyle = 'rgba(170,170,160,0.6)';
+          alb.fillRect(x, sy, 5, 2);
+          hgt.fillStyle = grayCss(0.8);
+          hgt.fillRect(x, sy, 5, 2);
+        }
+      }
+    } else if (zone === 2) {
+      // Anti-slip rubber pads: raised rounded nubs, glossier than the fabric.
+      fillZ(alb, grayCss(0.38), ox, oy, n);
+      fillZ(rgh, grayCss(0.5), ox, oy, n);
+      fillZ(hgt, grayCss(0.42), ox, oy, n);
+      for (let y = 6, row = 0; y < n; y += 11, row++) {
+        for (let x = (row % 2) * 6 + 6; x < n; x += 12) {
+          hgt.fillStyle = grayCss(0.9);
+          hgt.beginPath();
+          hgt.arc(ox + x, oy + y, 3.6, 0, Math.PI * 2);
+          hgt.fill();
+          rgh.fillStyle = grayCss(0.35);
+          rgh.beginPath();
+          rgh.arc(ox + x, oy + y, 3.6, 0, Math.PI * 2);
+          rgh.fill();
+          alb.fillStyle = 'rgba(0,0,0,0.25)';
+          alb.beginPath();
+          alb.arc(ox + x, oy + y, 3.6, 0, Math.PI * 2);
+          alb.fill();
+        }
+      }
+    } else {
+      // Jacket twill with panel seams.
+      fillZ(alb, grayCss(0.52), ox, oy, n);
+      fillZ(rgh, grayCss(0.74), ox, oy, n);
+      fillZ(hgt, grayCss(0.5), ox, oy, n);
+      hgt.strokeStyle = 'rgba(255,255,255,0.4)';
+      hgt.lineWidth = 1.2;
+      for (let d = -n; d < n; d += 4) {
+        hgt.beginPath();
+        hgt.moveTo(ox + d, oy);
+        hgt.lineTo(ox + d + n, oy + n);
+        hgt.stroke();
+      }
+      for (const sy of [oy + 2, oy + 128]) {
+        hgt.fillStyle = 'rgba(0,0,0,0.6)';
+        hgt.fillRect(ox, sy, n, 2);
+        alb.fillStyle = 'rgba(0,0,0,0.18)';
+        alb.fillRect(ox, sy, n, 2);
+        for (let x = ox; x < ox + n; x += 8) {
+          alb.fillStyle = 'rgba(160,160,150,0.5)';
+          alb.fillRect(x, sy + 5, 4, 1.5);
+        }
+      }
+    }
+  }, 2.2);
+}
+
+function generateGunSet(anisotropy: number): PbrTextureSet {
+  return zonedSet(anisotropy, 0x6a7e7, ({ alb, rgh, mtl, hgt }, zone, ox, oy, n, rng) => {
+    if (zone === 0) {
+      // Brushed gunmetal: brush marks, micro scratches, worn bright edges, two screws.
+      fillZ(alb, grayCss(0.62), ox, oy, n);
+      fillZ(rgh, grayCss(0.36), ox, oy, n);
+      fillZ(mtl, grayCss(0.92), ox, oy, n);
+      fillZ(hgt, grayCss(0.6), ox, oy, n);
+      for (let i = 0; i < 900; i++) {
+        const y = oy + rng() * n;
+        const x = ox + rng() * n;
+        const v = 0.42 + rng() * 0.25;
+        alb.fillStyle = `rgba(${Math.round(255 * v)},${Math.round(255 * v)},${Math.round(255 * v)},0.16)`;
+        alb.fillRect(x, y, 20 + rng() * 90, 1);
+        rgh.fillStyle = `rgba(${rng() < 0.5 ? '0,0,0' : '255,255,255'},0.08)`;
+        rgh.fillRect(x, y, 30 + rng() * 60, 1);
+      }
+      for (let i = 0; i < 90; i++) {
+        const x = ox + rng() * n;
+        const y = oy + rng() * n;
+        const a = rng() * Math.PI;
+        const l = 3 + rng() * 9;
+        alb.strokeStyle = 'rgba(230,236,244,0.28)';
+        alb.lineWidth = 0.7;
+        alb.beginPath();
+        alb.moveTo(x, y);
+        alb.lineTo(x + Math.cos(a) * l, y + Math.sin(a) * l);
+        alb.stroke();
+        rgh.strokeStyle = 'rgba(0,0,0,0.25)';
+        rgh.beginPath();
+        rgh.moveTo(x, y);
+        rgh.lineTo(x + Math.cos(a) * l, y + Math.sin(a) * l);
+        rgh.stroke();
+      }
+      for (const [sx, sy] of [[ox + 40, oy + 52], [ox + 196, oy + 188]]) {
+        hgt.fillStyle = grayCss(0.25);
+        hgt.beginPath();
+        hgt.arc(sx, sy, 6, 0, Math.PI * 2);
+        hgt.fill();
+        hgt.fillStyle = grayCss(0.75);
+        hgt.beginPath();
+        hgt.arc(sx, sy, 4.4, 0, Math.PI * 2);
+        hgt.fill();
+        hgt.fillStyle = grayCss(0.3);
+        hgt.fillRect(sx - 3.5, sy - 0.8, 7, 1.6);
+        alb.fillStyle = 'rgba(20,22,26,0.6)';
+        alb.beginPath();
+        alb.arc(sx, sy, 6, 0, Math.PI * 2);
+        alb.fill();
+      }
+      for (let i = 0; i < 40; i++) {
+        alb.fillStyle = 'rgba(240,244,250,0.2)';
+        const x = ox + rng() * n;
+        const y = oy + rng() * n;
+        alb.fillRect(x, y, 2 + rng() * 10, 1 + rng() * 2);
+        rgh.fillStyle = grayCss(0.2);
+        rgh.fillRect(x, y, 6, 1.5);
+      }
+    } else if (zone === 1) {
+      // Grip checkering: raised diamonds.
+      fillZ(alb, grayCss(0.44), ox, oy, n);
+      fillZ(rgh, grayCss(0.64), ox, oy, n);
+      fillZ(mtl, grayCss(0.08), ox, oy, n);
+      fillZ(hgt, grayCss(0.35), ox, oy, n);
+      const p = 8;
+      for (let y = 0; y < n; y += p) {
+        for (let x = 0; x < n; x += p) {
+          const cx = ox + x + p / 2;
+          const cy = oy + y + p / 2;
+          hgt.fillStyle = grayCss(0.9);
+          hgt.beginPath();
+          hgt.moveTo(cx, cy - p * 0.42);
+          hgt.lineTo(cx + p * 0.42, cy);
+          hgt.lineTo(cx, cy + p * 0.42);
+          hgt.lineTo(cx - p * 0.42, cy);
+          hgt.closePath();
+          hgt.fill();
+          alb.fillStyle = 'rgba(255,255,255,0.05)';
+          alb.fillRect(cx - 1, cy - 1, 2, 2);
+        }
+      }
+    } else if (zone === 2) {
+      // Polymer composite: stipple + moulding seams.
+      fillZ(alb, grayCss(0.46), ox, oy, n);
+      fillZ(rgh, grayCss(0.56), ox, oy, n);
+      fillZ(mtl, grayCss(0.06), ox, oy, n);
+      fillZ(hgt, grayCss(0.5), ox, oy, n);
+      for (let i = 0; i < 3000; i++) {
+        const x = ox + rng() * n;
+        const y = oy + rng() * n;
+        hgt.fillStyle = rng() < 0.5 ? 'rgba(255,255,255,0.22)' : 'rgba(0,0,0,0.22)';
+        hgt.fillRect(x, y, 1.5, 1.5);
+        alb.fillStyle = rng() < 0.5 ? 'rgba(255,255,255,0.03)' : 'rgba(0,0,0,0.04)';
+        alb.fillRect(x, y, 2, 2);
+      }
+      for (const sy of [oy + 90, oy + 210]) {
+        hgt.fillStyle = grayCss(0.2);
+        hgt.fillRect(ox, sy, n, 1.5);
+        alb.fillStyle = 'rgba(0,0,0,0.25)';
+        alb.fillRect(ox, sy, n, 1.5);
+      }
+    } else {
+      // Dark anodised panel with machined heat slits and hex bolt holes.
+      fillZ(alb, grayCss(0.38), ox, oy, n);
+      fillZ(rgh, grayCss(0.34), ox, oy, n);
+      fillZ(mtl, grayCss(0.78), ox, oy, n);
+      fillZ(hgt, grayCss(0.6), ox, oy, n);
+      for (let col = 0; col < 2; col++) {
+        for (let k = 0; k < 9; k++) {
+          const x = ox + 24 + col * 120;
+          const y = oy + 20 + k * 25;
+          hgt.fillStyle = grayCss(0.15);
+          hgt.fillRect(x, y, 90, 8);
+          alb.fillStyle = 'rgba(4,5,7,0.9)';
+          alb.fillRect(x, y, 90, 8);
+          alb.fillStyle = 'rgba(230,236,244,0.22)';
+          alb.fillRect(x, y + 8, 90, 1);
+        }
+      }
+      for (const [sx, sy] of [[ox + 12, oy + 12], [ox + n - 12, oy + 12], [ox + 12, oy + n - 12], [ox + n - 12, oy + n - 12]]) {
+        hgt.fillStyle = grayCss(0.2);
+        hgt.beginPath();
+        hgt.arc(sx, sy, 4, 0, Math.PI * 2);
+        hgt.fill();
+      }
+    }
+  }, 2.6);
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 let cache: ProceduralTextureLibrary | null = null;
@@ -1480,6 +1792,8 @@ export function getProceduralTextures(renderer: THREE.WebGLRenderer): Procedural
     neonAtlasStrips: NEON_STRIPS.length,
     signAtlas: generateSignAtlas(aniso),
     tech: generateTechSet(aniso),
+    glove: generateGloveSet(aniso),
+    gun: generateGunSet(aniso),
   };
   return cache;
 }

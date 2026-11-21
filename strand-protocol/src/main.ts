@@ -404,7 +404,7 @@ class App {
     this.effects = new EffectsPool(this.renderer.scene);
 
     this.input = new InputManager(this.renderer.renderer.domElement);
-    this.viewModel = new ViewModelRenderer(this.renderer.viewModelScene, this.renderer.viewModelCamera, textures.tech);
+    this.viewModel = new ViewModelRenderer(this.renderer.viewModelScene, this.renderer.viewModelCamera, textures);
     this.viewModel.root.visible = false;
     const audio = this.audio;
     this.player = new PlayerController(this.input, this.physics, {
@@ -1438,7 +1438,7 @@ class App {
       `GEO ${info.memory.geometries}  TEX ${info.memory.textures}  |  ${this.renderer.getQuality()}  |  ${this.layout.sector.name}  |  ${this.state}\n` +
       `TOWERS ${st.towers}  CARS ${st.cars}  HIGHWAYS ${st.highways}  RAMPS ${st.ramps}  BRIDGES ${st.bridges}  SKYBRIDGES ${st.skybridges}  ` +
       `LAMPS ${st.lamps}  CITY-LIGHTS ${st.cityLights}\n` +
-      `COLLIDERS ${this.layout.colliders.length}  WALLRUN ${this.layout.wallRunSurfaces.length}  ANCHORS ${this.layout.anchors.length}  RAMPS ${this.layout.ramps.length}\n` +
+      `COLLIDERS ${this.layout.colliders.length}  ANCHORS ${this.layout.anchors.length}  RAMPS ${this.layout.ramps.length}\n` +
       `ARCH A/B/C/D ${this.layout.stats.archetypes.join('/')}  BALCONIES ${this.layout.stats.balconies}  ESCAPES ${this.layout.stats.fireEscapes}  SHOPFRONTS ${this.layout.stats.shopfronts}\n` +
       `PLAYER ${p.state}  POS ${p.position.x.toFixed(1)},${p.position.y.toFixed(2)},${p.position.z.toFixed(1)}  SPD ${p.speed.toFixed(1)}  ` +
       `GEAR ${this.equipment.activeSlot}/${this.equipment.state}  ROPE ${p.ropeAttached ? p.ropeLength.toFixed(1) : '-'}  BT ${p.btGauge.toFixed(0)}  HP ${p.hp.toFixed(0)}\n` +

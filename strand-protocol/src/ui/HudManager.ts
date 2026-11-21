@@ -719,6 +719,8 @@ export class HudManager {
     if (this.changed('rk', kq) || this.changed('rkz', zq) || this.changed('rks', f.slot)) {
       const sc = (1 + 0.55 * kq) * (1 - 0.12 * zq);
       this.reticles[f.slot].setAttribute('transform', `scale(${sc.toFixed(3)})`);
+      // 6B-1: in full ADS the physical holo sight's collimated dot is the aiming reference — the HUD reticle fades.
+      this.reticles[f.slot].style.opacity = (1 - 0.8 * clamp((zq - 0.45) / 0.45, 0, 1)).toFixed(2);
     }
     const sharp = z > 0.2;
     if (this.changed('zs', sharp) || this.changed('zsl', f.slot)) {

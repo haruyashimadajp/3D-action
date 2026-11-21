@@ -230,12 +230,27 @@ export const PHYSICS = {
   SLIDE_JUMP_HORIZONTAL: 2.5,
 
   WALLRUN_DETECT_DISTANCE: 0.95,
-  WALLRUN_MIN_ENTER_SPEED: 7.0,
+  /** 6B-2 anywhere parallel wall-run: entry needs ≥ 6.5 m/s ALONG the wall … */
+  WALLRUN_MIN_ALONG_SPEED: 6.5,
+  /** … a travel direction within ±35° of the wall (|v̂·n| ≤ sin 35°) … */
+  WALLRUN_MAX_ENTRY_DEG: 35,
+  /** … a view within ±52° of the wall, looking the way of travel … */
+  WALLRUN_MAX_VIEW_DEG: 52,
+  /** … and ≥ 0.35 m of free fall under the feet (never from walking along a wall). */
+  WALLRUN_MIN_GROUND_CLEARANCE: 0.35,
+  /** Wall faces: vertical extent ≥ 2.2 m, horizontal width ≥ 2.5 m. */
+  WALLRUN_MIN_FACE_HEIGHT: 2.2,
+  WALLRUN_MIN_FACE_WIDTH: 2.5,
+  /** Seams / window frames / collider joints: a same-normal wall found again within 0.12 s keeps the run. */
+  WALLRUN_GAP_GRACE_S: 0.12,
+  /** The run ends when obstacles drop the along-wall speed below 5.5 m/s. */
+  WALLRUN_END_ALONG_SPEED: 5.5,
   WALLRUN_MIN_SPEED: 13.5,
   WALLRUN_GRAVITY: -2.8,
   WALLRUN_ZERO_G_TIME: 0.25,
   WALLRUN_MAX_TIME: 1.8,
-  WALLRUN_SAME_WALL_COOLDOWN: 0.45,
+  /** Same collider & same normal (dot > 0.95): no re-attach for 0.5 s; any other wall chains immediately. */
+  WALLRUN_SAME_WALL_COOLDOWN: 0.5,
   WALLKICK_VERTICAL: 11.2,
   WALLKICK_NORMAL: 9.5,
   WALLKICK_FORWARD: 4.5,

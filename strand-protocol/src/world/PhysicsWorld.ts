@@ -13,7 +13,7 @@
  */
 import * as THREE from 'three';
 import { LEVEL, PHYSICS } from '../config/constants';
-import type { BoxCollider, ColliderKind, GrappleAnchor, RampCollider, SectorLayout, WallRunSurface } from './CityBuilder';
+import type { BoxCollider, ColliderKind, GrappleAnchor, RampCollider, SectorLayout } from './CityBuilder';
 
 // -------------------------------------------------------------------------------------------------
 // Public result types (callers own and reuse instances)
@@ -59,11 +59,45 @@ export function createMoveResult(): MoveResult {
   };
 }
 
-export interface WallRunContact {
-  surface: WallRunSurface | null;
+/**
+ * 6B-2: a vertical collider face usable for a wall-run, found dynamically around the player (pooled — copy
+ * what you keep with `copyWallFace`).
+ */
+export interface WallFace {
+  /** Collider index of the face beside the player's mid-body (same-wall cooldown identity). */
+  collider: number;
+  /** Outward unit normal (±X or ±Z). */
+  readonly normal: THREE.Vector3;
+  /** Plane coordinate (x for ±X faces, z for ±Z faces). */
+  plane: number;
+  /** Along-wall and vertical extent of the face (coplanar stacked colliders merged). */
+  lat0: number;
+  lat1: number;
+  y0: number;
+  y1: number;
+  building: number;
+  /** Player centre → plane distance. */
+  distance: number;
   /** −1 = wall on the player's left, +1 = right. */
   side: number;
-  distance: number;
+}
+
+export function createWallFace(): WallFace {
+  return { collider: -1, normal: new THREE.Vector3(), plane: 0, lat0: 0, lat1: 0, y0: 0, y1: 0, building: -1, distance: 0, side: 0 };
+}
+
+export function copyWallFace(src: WallFace, dst: WallFace): WallFace {
+  dst.collider = src.collider;
+  dst.normal.copy(src.normal);
+  dst.plane = src.plane;
+  dst.lat0 = src.lat0;
+  dst.lat1 = src.lat1;
+  dst.y0 = src.y0;
+  dst.y1 = src.y1;
+  dst.building = src.building;
+  dst.distance = src.distance;
+  dst.side = src.side;
+  return dst;
 }
 
 export type HitRegion = 'HEAD' | 'BODY';
@@ -126,12 +160,18 @@ const AXES_XZ = ['x', 'z'] as const;
 const CORNERS: ReadonlyArray<readonly [number, number]> = [[-1, -1], [1, -1], [-1, 1], [1, 1]];
 /** 6A-4: body half-width used against open steel stair flights (0.9 m lanes side by side). */
 const STEEL_FLIGHT_BODY_R = 0.22;
+/** 6B-2: collider kinds whose vertical faces can be wall-run (buildings, expressway, bridges, sky-bridges). */
+const WALL_KINDS: ReadonlySet<ColliderKind> = new Set<ColliderKind>(['BUILDING', 'HIGHWAY', 'BRIDGE', 'SKYBRIDGE']);
+const MAX_WALL_FACES = 6;
+const _down = new THREE.Vector3(0, -1, 0);
+const _origin = new THREE.Vector3();
 
 export class PhysicsWorld {
   private layout: SectorLayout | null = null;
   private colliders: readonly BoxCollider[] = [];
   private ramps: readonly RampCollider[] = [];
-  private surfaces: readonly WallRunSurface[] = [];
+  private readonly wallFaces: WallFace[] = Array.from({ length: MAX_WALL_FACES }, createWallFace);
+  private wallFaceCount = 0;
   private anchors: readonly GrappleAnchor[] = [];
   private readonly cells: number[][] = Array.from({ length: GRID_SIZE * GRID_SIZE }, () => []);
   private stamps = new Int32Array(1);
@@ -144,7 +184,6 @@ export class PhysicsWorld {
     this.layout = layout;
     this.colliders = layout.colliders;
     this.ramps = layout.ramps;
-    this.surfaces = layout.wallRunSurfaces;
     this.anchors = layout.anchors;
     this.gateOpen = layout.gate.open;
     for (const c of this.cells) c.length = 0;
@@ -471,46 +510,101 @@ export class PhysicsWorld {
   // Wall-run detection
   // ===============================================================================================
   /**
-   * Finds the nearest wall-run surface within 0.95 m of the player centre, overlapping the body.
-   * `right` is the player's horizontal right vector (to classify left / right walls).
+   * 6B-2 anywhere wall-run: the vertical faces of BUILDING / HIGHWAY / BRIDGE / SKYBRIDGE colliders around the
+   * player (spatial grid, no fixed list). Coplanar stacked colliders are merged (expressway deck edge + guard
+   * wall), so a face qualifies with height ≥ 2.2 m and width ≥ 2.5 m, the player centre within `maxDist` of
+   * the plane, inside its width, and the mid-body inside [y0 + 0.3, y1 − 0.2]. Shallow decorations (mullions,
+   * canopy lips ≤ 0.45 m) carry no collider, so runs never snag on them.
+   * Fills a pooled list sorted by distance and returns its length; `onlyNormal` keeps faces parallel to a wall
+   * (continuation across seams / gaps). `right` classifies left / right walls.
    */
-  findWallRun(pos: THREE.Vector3, h: number, right: THREE.Vector3, out: WallRunContact): WallRunContact {
-    out.surface = null;
-    out.side = 0;
-    out.distance = Infinity;
+  findWallFaces(pos: THREE.Vector3, h: number, right: THREE.Vector3, maxDist: number = PHYSICS.WALLRUN_DETECT_DISTANCE, onlyNormal: THREE.Vector3 | null = null): number {
+    this.wallFaceCount = 0;
+    const R = maxDist + 0.2;
+    this.gather(pos.x - R, pos.z - R, pos.x + R, pos.z + R);
     const midY = pos.y + h * 0.5;
-    for (const s of this.surfaces) {
-      const n = s.normal;
-      const onX = Math.abs(n.x) > 0.5;
-      const plane = onX ? s.min.x : s.min.z;
-      const dist = onX ? (pos.x - plane) * n.x : (pos.z - plane) * n.z;
-      if (dist < -0.05 || dist > PHYSICS.WALLRUN_DETECT_DISTANCE) continue;
-      const lat = onX ? pos.z : pos.x;
-      const l0 = onX ? s.min.z : s.min.x;
-      const l1 = onX ? s.max.z : s.max.x;
-      if (lat < l0 + 0.2 || lat > l1 - 0.2) continue;
-      if (midY < s.min.y - 0.4 || midY > s.max.y + 0.3) continue;
-      if (dist < out.distance) {
-        out.surface = s;
-        out.distance = dist;
+    for (let k = 0; k < this.candCount; k++) {
+      const ci = this.cand[k];
+      const c = this.colliders[ci];
+      if (!WALL_KINDS.has(c.kind) || !this.solid(c)) continue;
+      // Identity: the collider whose own height range holds the mid-body (one face per stack).
+      if (midY < c.min.y - 0.05 || midY > c.max.y + 0.05) continue;
+      for (let f = 0; f < 4; f++) {
+        const onX = f < 2;
+        const sgn = f % 2 === 0 ? 1 : -1;
+        const nx = onX ? sgn : 0;
+        const nz = onX ? 0 : sgn;
+        if (onlyNormal && nx * onlyNormal.x + nz * onlyNormal.z < 0.95) continue;
+        const plane = onX ? (sgn > 0 ? c.max.x : c.min.x) : sgn > 0 ? c.max.z : c.min.z;
+        const dist = onX ? (pos.x - plane) * sgn : (pos.z - plane) * sgn;
+        if (dist < -0.05 || dist > maxDist) continue;
+        const lat = onX ? pos.z : pos.x;
+        const l0 = onX ? c.min.z : c.min.x;
+        const l1 = onX ? c.max.z : c.max.x;
+        if (l1 - l0 < PHYSICS.WALLRUN_MIN_FACE_WIDTH || lat < l0 || lat > l1) continue;
+        let y0 = c.min.y;
+        let y1 = c.max.y;
+        for (let pass = 0; pass < 2; pass++) {
+          for (let j = 0; j < this.candCount; j++) {
+            if (j === k) continue;
+            const o = this.colliders[this.cand[j]];
+            if (!WALL_KINDS.has(o.kind) || !this.solid(o)) continue;
+            const op = onX ? (sgn > 0 ? o.max.x : o.min.x) : sgn > 0 ? o.max.z : o.min.z;
+            if (Math.abs(op - plane) > 0.03) continue;
+            if (lat < (onX ? o.min.z : o.min.x) || lat > (onX ? o.max.z : o.max.x)) continue;
+            if (o.max.y < y0 - 0.05 || o.min.y > y1 + 0.05) continue;
+            y0 = Math.min(y0, o.min.y);
+            y1 = Math.max(y1, o.max.y);
+          }
+        }
+        if (y1 - y0 < PHYSICS.WALLRUN_MIN_FACE_HEIGHT || midY < y0 + 0.3 || midY > y1 - 0.2) continue;
+        // Seams of a stack yield the same face twice: keep one.
+        let dup = false;
+        for (let i = 0; i < this.wallFaceCount; i++) {
+          const w = this.wallFaces[i];
+          if (w.normal.x === nx && w.normal.z === nz && Math.abs(w.plane - plane) < 0.03) dup = true;
+        }
+        if (dup) continue;
+        // Insert sorted by distance into the fixed pool (reference swaps only — allocation-free).
+        let at: number;
+        if (this.wallFaceCount < MAX_WALL_FACES) at = this.wallFaceCount++;
+        else if (dist < this.wallFaces[MAX_WALL_FACES - 1].distance) at = MAX_WALL_FACES - 1;
+        else continue;
+        const w = this.wallFaces[at];
+        w.collider = ci;
+        w.normal.set(nx, 0, nz);
+        w.plane = plane;
+        w.lat0 = l0;
+        w.lat1 = l1;
+        w.y0 = y0;
+        w.y1 = y1;
+        w.building = c.building;
+        w.distance = dist;
         // Wall normal pointing toward the player's right ⇒ the wall is on the left.
-        out.side = n.x * right.x + n.z * right.z > 0 ? -1 : 1;
+        w.side = nx * right.x + nz * right.z > 0 ? -1 : 1;
+        while (at > 0 && this.wallFaces[at - 1].distance > w.distance) {
+          this.wallFaces[at] = this.wallFaces[at - 1];
+          this.wallFaces[at - 1] = w;
+          at--;
+        }
       }
     }
-    return out;
+    return this.wallFaceCount;
   }
 
-  /** Is the given surface still beside the player (for continuing a wall-run)? */
-  stillOnSurface(pos: THREE.Vector3, h: number, s: WallRunSurface): boolean {
-    const n = s.normal;
-    const onX = Math.abs(n.x) > 0.5;
-    const plane = onX ? s.min.x : s.min.z;
-    const dist = onX ? (pos.x - plane) * n.x : (pos.z - plane) * n.z;
-    if (dist < -0.05 || dist > PHYSICS.WALLRUN_DETECT_DISTANCE + 0.25) return false;
-    const lat = onX ? pos.z : pos.x;
-    if (lat < (onX ? s.min.z : s.min.x) || lat > (onX ? s.max.z : s.max.x)) return false;
-    const midY = pos.y + h * 0.5;
-    return midY > s.min.y - 0.6 && midY < s.max.y + 0.4;
+  /** i-th face of the last `findWallFaces` call (pooled). */
+  wallFace(i: number): WallFace {
+    return this.wallFaces[i];
+  }
+
+  /**
+   * 6B-2 condition ①: free fall below the feet — distance to the first solid / ramp straight down, up to
+   * `maxCheck` (Infinity when nothing is that close).
+   */
+  groundClearance(pos: THREE.Vector3, maxCheck: number): number {
+    _origin.set(pos.x, pos.y + 0.05, pos.z);
+    this.raycast(_origin, _down, maxCheck + 0.05, _hit);
+    return _hit.hit ? Math.max(0, _hit.distance - 0.05) : Infinity;
   }
 
   // ===============================================================================================

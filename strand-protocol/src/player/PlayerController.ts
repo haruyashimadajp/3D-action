@@ -28,8 +28,7 @@ import {
   lerpFactor,
 } from '../config/constants';
 import type { InputManager } from '../engine/InputManager';
-import { type MoveResult, type PhysicsWorld, type WallRunContact, createMoveResult } from '../world/PhysicsWorld';
-import type { WallRunSurface } from '../world/CityBuilder';
+import { type MoveResult, type PhysicsWorld, type WallFace, copyWallFace, createMoveResult, createWallFace } from '../world/PhysicsWorld';
 
 export type MoveState =
   | 'SPAWN'
@@ -109,6 +108,9 @@ const _tmp2 = new THREE.Vector3();
 const _euler = new THREE.Euler(0, 0, 0, 'YXZ');
 const UP = new THREE.Vector3(0, 1, 0);
 
+const _along = new THREE.Vector3();
+const SIN_ENTRY = Math.sin((PHYSICS.WALLRUN_MAX_ENTRY_DEG * Math.PI) / 180);
+const SIN_VIEW = Math.sin((PHYSICS.WALLRUN_MAX_VIEW_DEG * Math.PI) / 180);
 const AIR_STATES: ReadonlySet<MoveState> = new Set<MoveState>(['AIRBORNE', 'WALL_RUN_L', 'WALL_RUN_R', 'GRAPPLE_SWING', 'GRAPPLE_PULL']);
 /** Rope attaches at the player's chest/winch height above the feet. */
 const ROPE_ATTACH_Y = 1.2;
@@ -170,18 +172,21 @@ export class PlayerController {
   private wallCoyoteSpeed = 0;
   private slideReadyAt = 0;
   private wallTime = 0;
-  private wallSurface: WallRunSurface | null = null;
+  /** 6B-2: the wall face being run (copied from the dynamic detection; refreshed every step). */
+  private readonly wallFace: WallFace = createWallFace();
+  private wallLostFor = 0;
+  private readonly prevPos = new THREE.Vector3();
   private readonly wallNormal = new THREE.Vector3();
   private readonly wallTangent = new THREE.Vector3();
   private wallSpeed = 0;
-  private lastWallSurface: WallRunSurface | null = null;
+  private lastWallCollider = -1;
+  private readonly lastWallNormal = new THREE.Vector3();
   private lastWallEndedAt = -1e9;
   private grounded = false;
   private inWater = false;
   private colliderHeight: number = PLAYER.HEIGHT;
   private readonly move: MoveResult = createMoveResult();
   private readonly ropeMove: MoveResult = createMoveResult();
-  private readonly wallContact: WallRunContact = { surface: null, side: 0, distance: 0 };
   private fallSpeedBeforeLanding = 0;
 
   // ---- camera ----
@@ -245,8 +250,8 @@ export class PlayerController {
     this.dipV = 0;
     this.trauma = 0;
     this.fov = this.settings.baseFov;
-    this.wallSurface = null;
-    this.lastWallSurface = null;
+    this.lastWallCollider = -1;
+    this.wallLostFor = 0;
     this.hoverUntil = -1;
     this.boostUntil = -1;
   }
@@ -519,13 +524,14 @@ export class PlayerController {
     const wasGrounded = this.grounded;
     this.fallSpeedBeforeLanding = -this.velocity.y;
     _delta.copy(this.velocity).multiplyScalar(dt);
+    this.prevPos.copy(this.position);
     this.physics.movePlayer(this.position, PLAYER.RADIUS, this.colliderHeight, _delta, wasGrounded, this.move);
     this.resolveVelocity(dt);
 
     // Rope constraint after movement.
     if (this.ropeAttached) this.applyRopeConstraint(dt);
 
-    this.postMoveTransitions(wasGrounded);
+    this.postMoveTransitions(wasGrounded, dt);
 
     // Safety: anything that escapes below the canal bed respawns via death handling upstream.
     if (this.position.y < -20) this.die();
@@ -716,35 +722,57 @@ export class PlayerController {
       return;
     }
 
-    // Wall-run entry: wall within 0.95 m, forward input, horizontal speed ≥ 7 m/s.
+    // 6B-2 anywhere parallel wall-run: ② W held (① airborne, checked inside).
+    if (this.input.moveZ > 0 && !this.grounded) this.tryStartWallRun();
+  }
+
+  /**
+   * 6B-2 entry — every condition at once, otherwise nothing happens (no sticking when still, walking along
+   * a wall or hitting it head-on):
+   *  ① airborne with ≥ 0.35 m free fall under the feet · ② W held (caller) · ③ along-wall speed ≥ 6.5 m/s ·
+   *  ④ travel within ±35° of the wall (|v̂·n| ≤ sin 35°) · ⑤ view within ±52° of the wall and looking the way of
+   *  travel · ⑥ not the same collider + normal (dot > 0.95) within 0.5 s of the last run (other walls chain).
+   */
+  private tryStartWallRun(): void {
     _hv.set(this.velocity.x, 0, this.velocity.z);
-    if (this.input.moveZ > 0 && _hv.length() >= PHYSICS.WALLRUN_MIN_ENTER_SPEED) {
-      this.physics.findWallRun(this.position, this.colliderHeight, _right, this.wallContact);
-      const s = this.wallContact.surface;
-      const cooling = s !== null && s === this.lastWallSurface && this.simTime - this.lastWallEndedAt < PHYSICS.WALLRUN_SAME_WALL_COOLDOWN;
-      if (s && !cooling) this.startWallRun(s, this.wallContact.side as -1 | 1);
+    const hs = _hv.length();
+    if (hs < PHYSICS.WALLRUN_MIN_ALONG_SPEED) return;
+    const n = this.physics.findWallFaces(this.position, this.colliderHeight, _right);
+    if (n === 0) return;
+    if (this.physics.groundClearance(this.position, 1.0) < PHYSICS.WALLRUN_MIN_GROUND_CLEARANCE) return;
+    _fwd.set(-Math.sin(this.yaw), 0, -Math.cos(this.yaw));
+    for (let i = 0; i < n; i++) {
+      const f = this.physics.wallFace(i);
+      const vn = _hv.x * f.normal.x + _hv.z * f.normal.z;
+      _along.set(_hv.x - vn * f.normal.x, 0, _hv.z - vn * f.normal.z);
+      const along = _along.length();
+      if (along < PHYSICS.WALLRUN_MIN_ALONG_SPEED) continue;
+      if (Math.abs(vn) / hs > SIN_ENTRY) continue;
+      const fn = _fwd.x * f.normal.x + _fwd.z * f.normal.z;
+      if (Math.abs(fn) > SIN_VIEW || _fwd.x * _along.x + _fwd.z * _along.z <= 0) continue;
+      const sameWall = f.collider === this.lastWallCollider && f.normal.dot(this.lastWallNormal) > 0.95;
+      if (sameWall && this.simTime - this.lastWallEndedAt < PHYSICS.WALLRUN_SAME_WALL_COOLDOWN) continue;
+      this.startWallRun(f, along);
+      return;
     }
   }
 
-  private startWallRun(s: WallRunSurface, side: -1 | 1): void {
-    this.wallSurface = s;
-    this.wallNormal.copy(s.normal);
-    _hv.set(this.velocity.x, 0, this.velocity.z);
-    // Tangent: horizontal velocity projected on the wall plane (fallback: view forward).
-    this.wallTangent.copy(_hv).addScaledVector(this.wallNormal, -_hv.dot(this.wallNormal));
-    if (this.wallTangent.lengthSq() < 0.25) {
-      this.wallTangent.copy(_fwd).addScaledVector(this.wallNormal, -_fwd.dot(this.wallNormal));
-    }
-    const along = Math.abs(_hv.dot(this.wallTangent.normalize()));
+  /** Starts on face `f`; `_along` holds the along-wall velocity. Speed ≥ 13.5 m/s, faster entries keep theirs. */
+  private startWallRun(f: WallFace, along: number): void {
+    copyWallFace(f, this.wallFace);
+    this.wallNormal.copy(f.normal);
+    this.wallTangent.copy(_along).divideScalar(Math.max(along, 1e-4));
     this.wallSpeed = Math.max(along, PHYSICS.WALLRUN_MIN_SPEED);
     this.wallTime = 0;
+    this.wallLostFor = 0;
     this.velocity.y = clamp(this.velocity.y, -1.0, 3.5);
-    this.state = side < 0 ? 'WALL_RUN_L' : 'WALL_RUN_R';
-    this.events.onWallRunStart?.(side);
+    this.state = f.side < 0 ? 'WALL_RUN_L' : 'WALL_RUN_R';
+    this.events.onWallRunStart?.(f.side < 0 ? -1 : 1);
   }
 
   private endWallRun(coyote: boolean): void {
-    this.lastWallSurface = this.wallSurface;
+    this.lastWallCollider = this.wallFace.collider;
+    this.lastWallNormal.copy(this.wallNormal);
     this.lastWallEndedAt = this.simTime;
     if (coyote) {
       this.wallCoyoteUntil = this.simTime + PHYSICS.COYOTE_WALLRUN_MS / 1000;
@@ -752,7 +780,6 @@ export class PlayerController {
       this.wallCoyoteTangent.copy(this.wallTangent);
       this.wallCoyoteSpeed = this.wallSpeed;
     }
-    this.wallSurface = null;
     this.state = 'AIRBORNE';
   }
 
@@ -769,17 +796,12 @@ export class PlayerController {
   }
 
   private stepWallRun(dt: number): void {
-    const s = this.wallSurface;
-    if (!s) {
-      this.state = 'AIRBORNE';
-      return;
-    }
     this.wallTime += dt;
-    // Kick.
+    // ⑤ Space: wall-kick.
     if (this.input.consumeBuffered('JUMP')) {
-      this.lastWallSurface = s;
+      this.lastWallCollider = this.wallFace.collider;
+      this.lastWallNormal.copy(this.wallNormal);
       this.lastWallEndedAt = this.simTime;
-      this.wallSurface = null;
       this.wallKick(this.wallNormal, this.wallTangent, this.wallSpeed);
       return;
     }
@@ -885,16 +907,24 @@ export class PlayerController {
     }
   }
 
-  private postMoveTransitions(wasGrounded: boolean): void {
+  private postMoveTransitions(wasGrounded: boolean, dt: number): void {
     const m = this.move;
     this.inWater = m.grounded && m.groundKind === 'WATER';
     const nowGrounded = m.grounded;
 
     if (this.isWallRunning) {
+      // 6B-2 end rules: ④ landing, ⑥ an obstacle dropping the along-wall speed below 5.5 m/s, ③ the wall gone
+      // for more than 0.12 s (seams, window frames, collider joints and short gaps keep the run alive).
+      const moved = (this.position.x - this.prevPos.x) * this.wallTangent.x + (this.position.z - this.prevPos.z) * this.wallTangent.z;
       if (nowGrounded) {
         this.endWallRun(false);
         this.land(wasGrounded);
-      } else if (this.wallSurface && !this.physics.stillOnSurface(this.position, this.colliderHeight, this.wallSurface)) {
+      } else if (moved < PHYSICS.WALLRUN_END_ALONG_SPEED * dt) {
+        this.endWallRun(true);
+      } else if (this.physics.findWallFaces(this.position, this.colliderHeight, _right, PHYSICS.WALLRUN_DETECT_DISTANCE + 0.25, this.wallNormal) > 0) {
+        copyWallFace(this.physics.wallFace(0), this.wallFace);
+        this.wallLostFor = 0;
+      } else if ((this.wallLostFor += dt) > PHYSICS.WALLRUN_GAP_GRACE_S) {
         this.endWallRun(true);
       }
       this.grounded = nowGrounded;

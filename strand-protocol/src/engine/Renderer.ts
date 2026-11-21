@@ -584,7 +584,7 @@ export class Renderer {
     this.scene.environment = this.envTarget.texture;
     this.scene.environmentIntensity = 1.0;
     this.viewModelScene.environment = this.envTarget.texture;
-    this.viewModelScene.environmentIntensity = 1.1;
+    this.viewModelScene.environmentIntensity = 1.35; // 6B-1: neon / sky glints run along the bevelled edges
     pmrem.dispose();
     for (const d of disposables) d.dispose();
   }
