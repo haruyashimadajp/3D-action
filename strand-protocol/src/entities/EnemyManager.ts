@@ -1325,7 +1325,14 @@ export class EnemyManager {
     let bestD = Infinity;
     for (const e of this.enemies) {
       if (!e.active || !e.alive || e.isBoss) continue;
-      _aim.addVectors(e.pos, e.bodyOff).sub(eye);
+      // Closest point of the body axis (feet → head centre) to the view ray: head, chest or legs all count.
+      _aim.copy(e.pos).sub(eye);
+      const t = _aim.dot(forward);
+      if (t < 0.5) continue;
+      const top = Math.max(e.headOff.y, e.bodyOff.y);
+      // Height on the axis nearest to the ray at that distance.
+      const ay = clamp(eye.y + forward.y * t - e.pos.y, 0, top);
+      _aim.set(e.pos.x + e.bodyOff.x, e.pos.y + ay, e.pos.z + e.bodyOff.z).sub(eye);
       const d = _aim.length();
       if (d < 0.5 || d >= bestD) continue;
       if (_aim.dot(forward) / d < cosMax) continue;

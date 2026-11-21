@@ -128,6 +128,7 @@ const _qRack = new THREE.Quaternion().setFromEuler(new THREE.Euler(1.963, 1.963,
 /** Mantle: palm slapped down on the ledge, forearm back-left. */
 const _qMantle = new THREE.Quaternion().setFromEuler(new THREE.Euler(2.487, 1.963, -0.131, 'YXZ'));
 const MANTLE_HAND_S = 0.3;
+const VM_RIM_INTENSITY = 1.5;
 
 /** 7A-1: holo dot colour gain — every channel stays ≤ 0.82, under the 0.92 bloom threshold. */
 const HOLO_DOT_GAIN = 0.82;
@@ -349,7 +350,7 @@ export class ViewModelRenderer {
     // low fill (street lamps) — plus the 60 ms muzzle light (always present, so programs never recompile).
     const key = new THREE.DirectionalLight(0xdfe9ff, 2.1);
     key.position.set(-0.6, 1.0, 0.8);
-    const rim = new THREE.DirectionalLight(COLORS.PLAYER_STRAND, 1.5);
+    const rim = new THREE.DirectionalLight(COLORS.PLAYER_STRAND, VM_RIM_INTENSITY);
     rim.position.set(0.9, 0.3, -1.0);
     this.rimLight = rim;
     const fill = new THREE.PointLight(0xffb070, 0.6, 2.5, 2);
@@ -1176,6 +1177,8 @@ export class ViewModelRenderer {
       }
       this.reloadPrevT = rt;
     }
+    // The rolled reload poses turn the sight hood into the strand-cyan rim light's mirror angle — fade it.
+    this.rimLight.intensity = VM_RIM_INTENSITY * (1 - 0.8 * clamp(Math.abs(R.roll) / 0.5, 0, 1));
     this.joltV += (-320 * this.jolt - 24 * this.joltV) * realDt;
     this.jolt += this.joltV * realDt;
 
@@ -1259,7 +1262,7 @@ export class ViewModelRenderer {
       _q.copy(p.quaternion).multiply(this.reloadQuat);
     } else if (mantling) {
       const push = Math.sin(Math.min(1, mt) * Math.PI);
-      _p.set(-0.16, -0.24 - 0.1 * push, -0.5 + 0.06 * push);
+      _p.set(-0.15, -0.15 - 0.08 * push, -0.48 + 0.05 * push);
       _q.copy(_qMantle);
     } else if (strandOut) {
       _p.set(-0.2 + this.swayX * 0.7, -0.2 + this.swayY * 0.7 - this.lower, -0.5);
