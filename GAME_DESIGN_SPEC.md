@@ -1,549 +1,436 @@
-# 『STRAND // PROTOCOL』完全ゲームデザイン＆技術仕様書 (v1.4)
+# STRAND // PROTOCOL — Complete Game Design & Technical Specification (v1.5)
 
-**対象実装担当**: Claude (TypeScript / Three.js / WebGL2 / Web Audio API 実装担当)  
-**ジャンル**: 雨夜の多層サイバーパンク都市・ハードコア3D立体機動FPS × セクター進行ローグライト  
-**ドキュメントの目的**: 本書は、実装担当AIが独自の推測・仕様省略・簡略化を一切行わず、そのままハイクオリティな製品レベルへ実装できるよう、ゲームメカニクス・物理数式・ステートマシン・3D描画＆シェーダー仕様・人型リグ＆AI・Web Audio API音響合成・全パラメータ表・ファイル構成・パフォーマンス上限を完全に定義したマスター設計書である。
+**Target Implementer**: Claude (TypeScript / Three.js / WebGL2 / Web Audio API)  
+**Genre**: Rain-Soaked Multi-Layer Cyberpunk City · Hardcore 3D Aerial-Mobility & Tactical Stealth FPS × Sector-Progression Roguelite  
+**Document Purpose**: Master technical specification defining every game mechanic, physics formula, state machine, 3D rendering/shader pipeline, procedural humanoid rig & 4-state AI, Web Audio API DSP synth, parameter table, file architecture, and performance cap so the implementation AI executes at production quality without guesswork or omissions.
 
 > [!NOTE]
-> **v1.1 都市構造アップデート**: 雲海上の孤立屋上ステージから、**地面（濡れた大通り・停車車両）・運河と橋・下が空いていて通れる高架高速道路・高密度に林立する高層ビル群**を備えた「多層サイバーパンク・ネオンシティ」へ全面刷新。落下即死と雲海を廃止し、地上〜高架〜中層〜屋上の4層立体戦場を実現する。  
-> **v1.2 Phase 5 最終ブラッシュアップ反映**: 右クリック長押しへの**精密照準ズーム（Tactical Zoom / ADS）統合**、ワイヤー射程 `130m`／弾速 `340m/s` 調整、バレットタイム中の装備操作 `1.0x` 化、ポーズ／タブ非表示時の雨音＆全ワールド音完全停止を反映（詳細：`PHASE5_BRUSHUP_PLAN.md`）。  
-> **v1.3 Phase 6 リアリティ＆立体機動大刷新反映**: ビルの4種建築アーキタイプ化（リアル夜景・パララックス室内・3Dバルコニー・登れる外付け非常階段・強制シアンパネル撤去）、手5本指＆銃4種ベベル／ホロサイト完全リモデル、**どこでも平行ウォールラン（平行 `±35°`・平行速度 `>= 6.5m/s`・静止張り付き禁止）**、および将来オンライン拡張構想メモを追加（詳細：`PHASE6_BRUSHUP_PLAN.md`）。  
-> **v1.4 Phase 7 映画級ビジュアル＆操作快適性 究極ブラッシュアップ反映**: クリアスコープ化、ADSマウス遅延根治＆感度上限 `10.0`、ビル1F透けるガラス撤去、ADS敵ネオン縁取り、両手連動リアルリロード、オートマントル＆しゃがみ＆ワイヤー安全巻取り、および異方性縦長ネオン路面反射・高さフォグ・街灯ボリュメトリック光錐・信号機・路地電線・車両6色＆路面ライト・巨大飛行船・敵ベベル装甲＆接地影・路面雨しぶき・弾道残煙を追加（詳細：`PHASE7_BRUSHUP_PLAN.md`）。
+> **Version History Summary**
+> - **v1.1 (Multi-Layer City)**: Replaced isolated rooftop islands with a continuous multi-layer cyberpunk neon city: wet streets (`Y = 0.0m`) with parked cybercars, canal (`Y = -2.4m`) & truss bridges, passable elevated highway (`Y = 9.5m`, underpass clearance `>= 7.8m`), and dense high-rises (`16m–95m`).
+> - **v1.2 (Phase 5 — `PHASE5_BRUSHUP_PLAN.md`)**: Unified Tactical Zoom (ADS) on RMB hold, Grapple range `130m` / speed `340 m/s`, real-time (`1.0x`) gear ops during Bullet Time, full audio mute on pause/tab blur.
+> - **v1.3 (Phase 6 — `PHASE6_BRUSHUP_PLAN.md`)**: 4 architectural building archetypes, parallax interiors, 3D balconies, climbable fire escapes, 5-finger articulated hands & beveled holo-sight weapons, parallel-only wall-run on any vertical surface (`±35°`, `>= 6.5 m/s`), and §11 future online memo.
+> - **v1.4 (Phase 7 — `PHASE7_BRUSHUP_PLAN.md`)**: Clear untinted optics, zero-lag ADS & sensitivity max `10.0`, solid opaque 1F storefronts, ADS enemy neon rim highlight, two-hand tactical reloads, auto-mantle, crouch, safe grapple reel-in, anisotropic wet-road streaks, height fog & film grade, volumetric lamp cones, traffic signals, alley wires, 6-color parked cars + ground light pools, giant blimps, beveled enemy armor + contact shadows, ground rain splashes, bullet smoke trails, and adaptive HUD.
+> - **v1.5 (Phase 8 — `PHASE8_BRUSHUP_PLAN.md`)**: Full English translation of master spec; inverted wall-run camera roll fix; lower crouch eye height (`0.78m`); streamlined weapon roster to **Suppressed Pistol + Single-Shot 4x Rail Sniper + Grapple** (`[1]/[2]/[3|Q]`); unified SMG-sized open holo hood for both guns; slightly lower ADS mouse sensitivity; reworked `SK_07` (Shadow Step) & `SK_09` (Shield Piercer); **4-State Stealth / Alert / Detected / Combat Enemy AI** with per-enemy FOV & alert gauges, acoustic/proximity detection, shared last-known position, suppressive fire, and global search de-escalation; unified initial sector deployment (Sectors 1–4); and **Gritty Cyberpunk Urban Overhaul** (alley clutter props, wall graffiti & torn posters, dense exposed building piping, glowing iron manholes with anchored steam plumes, doubled neon density, and wet-road oil-slick grime).
 
 ---
 
-## 0. 実装担当AIへの絶対遵守事項（Non-Negotiable Rules）
+## 0. Non-Negotiable Rules
 
 > [!CAUTION]
-> 以下の8項目は本ゲームの核となる絶対要件であり、1つたりとも省略・簡略化・勝手な緩和を行わないこと。
-> 1. **武器とワイヤーの排他切替仕様（同時射出不可・ぶら下がり中切替は可）**: 銃器（ピストル／SMG／ショットガン）を構えている間は新たなワイヤー射出を禁止する。ワイヤーを撃つには必ず装備をグラップルランチャーへ切り替えること。ただし、**ワイヤーをアンカーへ接続してぶら下がり・スイングしている最中に銃器へ切り替えて射撃することは可能**とし、ぶら下がり状態はそのまま維持される。
-> 2. **銃を扱う全敵の「射撃直前予測線（テレグラフ・ライン）」**: 射撃を行う全エネミー（人型・ドローン・ボス）は、発射前に必ずレーザー予測線を照射し、発射直前の指定時間（`180ms〜320ms`）は照準座標を固定して高速点滅・警告音を発すること。
-> 3. **超ハードコア耐久＆「非交戦リジェネ」**: プレイヤーHPは `100`。通常弾 `55`（2発で死亡）、スナイパー弾 `100`（1発即死）。ただし、**最後に攻撃（発砲）した時刻と最後に被弾した時刻の両方から `3000ms`（3.0秒）経過するまで回復を開始しない**。発砲または被弾の瞬間にタイマーをリセットする。死亡からセクター再スタートは `500ms` 以内で完結させること。
-> 4. **ノーアシスト・完全手動エイム＋空中バレットタイム**: 射撃に対するエイムアシスト・オートロック・弾道補正は一切実装しない（完全実力主義）。代わりに**空中状態のみ右クリック長押しで `0.25x` スローになるバレットタイム**を実装し、ゲージはヘッドショットや空中キルで回復する設計とする。
-> 5. **人型サイバー兵の多関節プロシージャル実装**: 敵は人型4種＋空中ドローン1種＋人型強化外骨格ボス1体の計6種を実装。全人型は頭部（発光バイザー＝HS倍率 `2.5x`）と胴体のヒットボックスを明確に分離し、歩行・照準・盾構え・ブリンク・飛翔モーションをプロシージャルに描画すること。
-> 6. **ブラウザ限界突破の高精細ビジュアル**: 外部アセット（GLB/PNG/MP3等）に一切依存せず、Three.js + WebGL2 上で **プロシージャルPBRテクスチャ（ビル窓発光・法線・濡れ道路＆水たまり・運河水面）＋PMREM環境反射＋ACESFilmic＋UnrealBloom＋カスタムPostFX（RGB色収差・雨滴ビネット・スピードライン）** を構築すること。
-> 7. **100% Web Audio API 多層DSP音響**: 単音ビープを禁止し、WaveShaper歪み・Convolverリバーブ・バレットタイム連動Dynamic Lowpass Filter・5レイヤー動的BGMを実装すること。
-> 8. **誤操作・3D酔い防止機構の完全実装**: コヨーテタイム、先行入力バッファ、スイング中切替時の落下事故防止、スキル選択画面の `450ms` 入力ロック、カメラロール／シェイク強度調整オプションを必ず備えること。
+> The following 8 pillars are the core identity of `STRAND // PROTOCOL`. Do NOT omit, simplify, or silently relax any of them:
+> 1. **Exclusive Gun ⇄ Grapple Switching (No Simultaneous Launch; Switching Allowed While Hanging)**: While holding a firearm (`PISTOL` or `SNIPER`), launching a new grapple hook is prohibited—you must switch to `GRAPPLE` (`[3]` or `[Q]`) first. However, **once the grapple is `ATTACHED`, switching to a gun preserves the rope and lets you swing and shoot simultaneously**.
+> 2. **Mandatory 3-Phase Telegraph Lines on All Firing Enemies**: Every shooting enemy (humanoids, drones, boss) MUST project a laser telegraph line before firing (`ACQUIRING` → `LOCK_TELEGRAPH` with frozen aim for `180–320ms` + high-frequency blink + warning tone → `FIRE`). Enemies fire **only** in `DETECTED` and `COMBAT` AI states.
+> 3. **Hardcore Durability & Out-of-Combat Regeneration**: Player `maxHP = 100`. Standard shots deal `55` (2-shot kill); enemy sniper shots deal `100` (1-shot kill). Health regen begins **only after `3000 ms` have elapsed since BOTH the last player gunshot AND the last damage taken**. Firing or taking damage immediately resets the timer. Death-to-sector-restart completes within `500 ms`.
+> 4. **Zero Aim Assist + Airborne Bullet Time**: Zero shooting aim assist, auto-lock, or bullet magnetism. Instead, holding RMB while airborne triggers `0.25x` Bullet Time (plus weapon ADS zoom), replenished through headshots, aerial/wall-run kills, and telegraph grazes.
+> 5. **Procedural Articulated Humanoid Cyborgs + 4-State Stealth-Combat AI**: 6 enemy types (4 humanoids, 1 aerial drone, 1 exo-suit boss) with separate Head/Visor (`2.5x` HS) and Body hitboxes, procedural animations, and the 4-state perception/escalation/de-escalation AI (`UNAWARE` → `ALERT` → `DETECTED` → `COMBAT`).
+> 6. **Zero External Assets — High-Craft Procedural WebGL2**: 100% procedural Three.js + WebGL2 PBR textures, PMREM reflections, ACESFilmic tone mapping, UnrealBloom, and custom KineticPostFX (`<= 120 draw calls / frame`, zero per-frame allocations).
+> 7. **100% Web Audio API Multi-Layer DSP**: No raw single-oscillator beeps. Full WaveShaper distortion, procedural Convolver urban reverb, Bullet-Time dynamic lowpass sweep, HRTF 3D panning, awareness/stealth cues, and 5-layer adaptive BPM 136 BGM.
+> 8. **Anti-Frustration & Motion-Sickness Safeguards**: Coyote time, input buffering, safe grapple swing-switching, `450 ms` skill-modal click lock, instant reload cancel via weapon/grapple switch, and camera shake/roll/FOV/anchor-dot accessibility options.
 
 ---
 
-## 1. コアコンセプト＆ゲームループ
+## 1. Core Concept & Game Loop
 
-### 1.1 コンセプト定義
-* **タイトル**: `STRAND // PROTOCOL`
-* **サブタイトル**: `CYBERNETIC KINETIC GUNPLAY`
-* **舞台**: 深夜2時、激しいスコール直後の**多層サイバーパンク・ネオンシティ**。停車したサイバーカーが並ぶ濡れた大通り（`Y = 0.0m`）、ネオンを映し込む運河（川）とトラス橋、下をくぐり抜けられる高架高速道路（`Y = 9.5m`）、そして空を覆うように密集した高層ビル群（高さ `16m〜95m`）の間を、シアン・マゼンタ・アンバーのネオンとサーチライトが照らす。
-* **ゲーム性の核**: **「止まれば即死、見切って舞えば制圧できる」**。大通り・高架下・運河の橋・高層ビル壁面をワイヤーの振り子運動・壁走り・スライディング・ショットガン反動ジャンプで縦横無尽に駆け抜け、敵の射撃予測線を見切って回避しながら、空中バレットタイム中に人型兵のバイザーを精密に撃ち抜く。
+### 1.1 Concept Definition
+* **Title**: `STRAND // PROTOCOL`
+* **Subtitle**: `CYBERNETIC KINETIC GUNPLAY`
+* **Setting**: 2:00 AM after a torrential downpour in a dense, gritty **multi-layer cyberpunk neon city**. Wet avenues (`Y = 0.0m`) lined with parked cybercars, steaming iron manholes, and trash-strewn graffiti back-alleys; a dark neon-reflecting canal (`Y = -2.4m`) crossed by truss bridges; a passable elevated expressway (`Y = 9.5m`); and towering pipe-lined skyscrapers (`16m–95m`) choked with layered neon signage and distant flying blimps.
+* **Core Fantasy**: **Tactical precision meets lethal verticality**. Creep low through grimy back-alleys picking off patrols silently with a suppressed rail pistol, perch on high-rise ledges with a 4x single-shot rail sniper to shatter shields and snipe rooftops, or explode into full kinetic wall-runs, grapple swings, and airborne Bullet Time when the district escalates to all-out Combat.
 
-### 1.2 コアループ（セクター進行 × テクニカル・ローグライト）
+### 1.2 Core Loop
 ```mermaid
 flowchart LR
-    A["セクター開始 (街区大通り・高架入口へ展開)"] --> B["立体機動移動 (地上 / 高架 / ビル壁面 / 橋)"]
-    B --> C["敵発見 ＆ 射撃予測線の見切り回避"]
-    C --> D["空中バレットタイム ＆ 精密ヘッドショット"]
-    D --> E{"被弾した？"}
-    E -- "はい (瀕死 HP<=45)" --> F["高架下やビル陰へワイヤー離脱 ＆ 3.0秒間非攻撃・非被弾で回復"]
-    F --> B
-    E -- "いいえ / 撃破" --> G{"セクター内敵全滅？"}
-    G -- "残りあり" --> B
-    G -- "全滅" --> H["次街区へのホログラム封鎖ゲート開放 ＆ 3択スキル獲得 (450ms入力ロック)"]
-    H --> I{"セクター5 ボス撃破？"}
-    I -- "No" --> A
-    I -- "Yes" --> J["クリアリザルト / エンドレスLoop突入"]
+    A["Sector Start (Unified Patrol Deployment)"] --> B["Stealth Recon / Gritty Alleys / Vertical Mobility"]
+    B --> C{"Enemy Awareness State"}
+    C -- "Unaware / Alert" --> D["Silent Pistol Takedown or Reposition Out of LOS"]
+    C -- "Detected / Combat" --> E["Dodge 3-Phase Telegraphs / Aerial Bullet Time / 4x Snipe"]
+    D --> F{"Sector Cleared?"}
+    E --> G{"Player Hit (HP <= 45)?"}
+    G -- "Yes" --> H["Grapple Disengage + Break LOS (3.0s No-Fire/No-Hit Regen)"]
+    H --> B
+    G -- "No / Kill" --> F
+    F -- "Remaining" --> B
+    F -- "Cleared" --> I["Hologram Gate Opens + 3-Choice Skill Draft (450ms Lock)"]
+    I --> J{"Sector 5 Boss Defeated?"}
+    J -- "No" --> A
+    J -- "Yes" --> K["Run Results / Endless Protocol Loop 2+"]
 ```
 
-### 1.3 プレイヤー耐久・非交戦リジェネ・即リトライ仕様
-| パラメータ | 数値 | 仕様・トリガー詳細 |
+### 1.3 Player Durability, Out-of-Combat Regen & Instant Retry
+| Parameter | Value | Specification / Trigger Details |
 | :--- | :--- | :--- |
-| 最大HP (`maxHP`) | `100` | 整数管理。UIではセグメントバー＋数値表示。 |
-| 通常被弾ダメージ | `55` | エンフォーサー／ドローン／ファントム弾。**2発で死亡**。 |
-| 狙撃被弾ダメージ | `100` | ヴェイル・スナイパー／ボス狙撃。**1発即死**。 |
-| 近接・爆発ダメージ | `65` | ファントム斬撃／ボスダイブ衝撃波。 |
-| 瀕死警告しきい値 (`criticalHP`) | `<= 45` | 画面四隅の深紅ノイズ＋ビネット強化＋心音SE（BPM 128）発動。 |
-| 非交戦リジェネ待機時間 (`regenDelayMs`) | `3000 ms` | `now - Math.max(lastDamageTime, lastAttackTime) >= 3000` を満たした瞬間に発動。 |
-| リジェネ中断トリガー | 発砲 / 被弾 | 銃の発射（`FIRE`）またはダメージ受領時に即時停止しタイマーを `0` にリセット。※ワイヤー射出・壁走り・スライディング・武器切替・リロードは「攻撃」に含めない（逃走しながら回復可能）。 |
-| リジェネ回復速度 (`regenRate`) | `+18.0 HP/s` | HP 45 → 100 まで約 `3.05秒` で全快。回復中はHUD端にシアン脈動＋微細な電子修復SE。 |
-| 落下ダメージ＆運河仕様 | **落下即死なし** | 地上（`Y = 0.0m`）が存在するため落下即死は廃止。運河（川：水面 `Y = -2.4m`）へ落ちた場合は即死せず**浅瀬着地（地上移動速度 `0.55x`・水しぶきVFX・ジャンプ／ワイヤーで即脱出可能）**とする。エリア外周は都市封鎖バリアで移動制限。 |
-| 死亡→自動リトライ時間 | `500 ms` | 赤白グリッチ暗転 `250ms` → 同セクター開始地点へ即時再配置 `250ms`。手動即リトライ（`R`キー）は `150ms`。 |
+| Max HP (`maxHP`) | `100` | Integer display + segmented bar. |
+| Standard Enemy Damage | `55` | Enforcer / Drone / Phantom bolts (**2-shot kill**). |
+| Enemy Sniper Damage | `100` | Veil Sniper / Boss snipe (**1-shot instant kill**). |
+| Melee / Shockwave Damage | `65` | Phantom slash / Boss dive shockwave. |
+| Critical HP Threshold | `<= 45` | Crimson edge vignette + subtle scanline noise + BPM 128 heartbeat SE. |
+| Regen Delay (`regenDelayMs`) | `3000 ms` | Starts when `now - Math.max(lastDamageTime, lastAttackTime) >= 3000`. |
+| Regen Interrupt Trigger | Fire / Hit | Any firearm shot (`FIRE`) or incoming damage resets timer to `0`. Grapple launch, wall-run, slide, crouch, switch, and reload do **not** interrupt regen. |
+| Regen Rate (`regenRate`) | `+18.0 HP/s` | Recovers HP `45 -> 100` in ~`3.05 s` with cyan HUD pulse + soft electronic hum. |
+| Fall & Canal Rules | **No instant-death pits** | Ground exists at `Y = 0.0m`. Dropping into the canal (`Y = -2.4m`) causes shallow-water wading (`0.55x` move speed + splash VFX); player can jump or grapple straight out. Outer perimeter bounded by holographic lockdown walls. |
+| Death → Auto-Retry | `500 ms` | `250 ms` red/white glitch fade → `250 ms` instant respawn at current sector start. Manual retry (`R` on death): `150 ms`. |
 
 ---
 
-## 2. 「気持ちよさ（Juice）」＆コンボ連動インフレ設計
+## 2. Game Feel (Juice) & FLOW RANK Escalation
 
-### 2.1 ヒットストップ（Hitstop）厳密定義
-ヒットストップ中は物理・敵・弾丸・アニメの `dt` に `hitstopScale` を乗算する（マウス視点移動のみ `1.0` で維持し操作感を損なわない）。
+### 2.1 Hitstop Table
+During hitstop, world physics, enemies, projectiles, and animations multiply `dt` by `hitstopScale`. Mouse camera look remains at `1.0x` real time.
 
-| トリガーイベント | 持続時間 (`ms`) | タイムスケール | 追随フィードバック |
+| Trigger Event | Duration (`ms`) | Time Scale | Accompanying Feedback |
 | :--- | :--- | :--- | :--- |
-| 通常胴体命中 | `0 ms` | `1.00` | テンポ重視で止めず、ヒットマーカー（白）＋微細火花のみ |
-| ヘッドショット命中（生存） | `22 ms` | `0.08` | バイザー破砕パーティクル（12個）＋金ヒットマーカー |
-| 通常キル（胴体トドメ） | `30 ms` | `0.08` | 敵コア破裂＋軽量衝撃波 |
-| ヘッドショット・キル | `52 ms` | `0.05` | 鋭い金属共鳴音＋頭頂部シアン/クリムゾン放電＋FOV一瞬 `+2.5°` パルス |
-| 空中バレットタイム中HSキル | `65 ms` | `0.04` | RGB色収差スパイク `0.008` → `0`（`140ms`）＋スローゲージ即時 `+22%` |
-| イージス盾破壊 / ボス部位破壊 | `85 ms` | `0.03` | 大規模破片32個＋衝撃リング拡大＋重低音サブドロップ |
-| ボス撃破（フィニッシュ） | `240 ms` | `0.04` | 0.24秒の極スロー＋カメラ微ズーム＋画面閃光＋全敵弾消滅 |
+| Standard Body Hit | `0 ms` | `1.00` | White hitmarker + micro sparks (no tempo break). |
+| Headshot Hit (Non-Lethal) | `22 ms` | `0.08` | 12 visor-shatter sparks + gold hitmarker. |
+| Body Kill | `30 ms` | `0.08` | Core burst + lightweight shock ring. |
+| Headshot Kill | `52 ms` | `0.05` | Metallic resonance chord + cyan/crimson head arc + `+2.5°` FOV pulse. |
+| Airborne Bullet-Time HS Kill | `65 ms` | `0.04` | RGB chromatic aberration spike `0.008 -> 0` (`140 ms`) + `+22%` BT gauge. |
+| Aegis Shield / Boss Wing Break | `85 ms` | `0.03` | 32 shatter shards + expanding shock ring + sub-bass drop. |
+| Boss Finish (`VALKYRIE-09`) | `240 ms` | `0.04` | 0.24 s hyper-slow + micro zoom + screen flash + clear all enemy projectiles. |
 
-### 2.2 カメラシェイク（Trauma減衰方式）
-シェイク強度は `trauma`（`0.0〜1.0`）で管理し、実際の変位は `shake = trauma * trauma`（二乗カーブ）とパーリン風サイン合成（周波数 `28 Hz`）で算出する。自然減衰は `trauma = Math.max(0, trauma - 2.2 * dt)`。
+### 2.2 Camera Shake (Squared Trauma Decay)
+Trauma `trauma ∈ [0.0, 1.0]`, effective shake `shake = trauma * trauma`, multi-sine procedural oscillation (`28 Hz`), decay `trauma = Math.max(0, trauma - 2.2 * dt)`.
 
-| イベント | `trauma` 加算値 | 最大ピッチ/ヨー揺れ | 最大ロール揺れ |
+| Event | Trauma Added | Max Pitch/Yaw | Max Roll |
 | :--- | :--- | :--- | :--- |
-| レールピストル発砲 | `+0.18` | `0.6°` | `0.4°` |
-| パルスSMG発砲（1発あたり） | `+0.06` | `0.25°` | `0.15°` |
-| キネティック・ショットガン発砲 | `+0.42` | `1.8°` | `1.2°` |
-| ワイヤーアンカー着弾 | `+0.15` | `0.5°` | `0.5°` |
-| 高速着地（落下速度 `> 14 m/s`） | `+0.32` | `1.4°` | `0.8°` |
-| 敵弾の見切り回避（GRAZE） | `+0.14` | `0.4°` | `1.0°` |
-| プレイヤー被弾 | `+0.68` | `3.2°` | `4.5°` |
-| 盾破壊 / ボス部位破壊 | `+0.50` | `2.2°` | `1.8°` |
+| MK-IV Rail Pistol Fire | `+0.16` | `0.55°` | `0.35°` |
+| K-90 Rail Sniper Fire | `+0.44` | `1.9°` | `1.2°` |
+| Grapple Anchor Impact | `+0.15` | `0.5°` | `0.5°` |
+| Hard Landing (`fallSpeed > 14 m/s`) | `+0.32` | `1.4°` | `0.8°` |
+| Telegraph Graze (`GRAZE`) | `+0.14` | `0.4°` | `1.0°` |
+| Player Hit | `+0.68` | `3.2°` | `4.5°` |
+| Shield / Boss Wing Break | `+0.50` | `2.2°` | `1.8°` |
 
-### 2.3 ダイナミック・カメラワーク数値表
-| 挙動 | パラメータ仕様 | 補間速度 (`lerp`) |
+### 2.3 Dynamic Camera Table
+| Behavior | Parameter Specification | Lerp Rate |
 | :--- | :--- | :--- |
-| **基本FOV** | `84°`（静止〜通常走 `<= 9.5 m/s`） | `10.0 * dt` |
-| **速度連動FOV** | 速度 `9.5 m/s` → `32.0 m/s` に対し `84°` → `110°` へ線形拡大（上限 `114°`） | `8.0 * dt` |
-| **バレットタイムFOV** | 発動中、現在FOVから `-7.0°` ズームイン（精密照準の集中感） | `14.0 * dt` |
-| **ウォールラン・ロール** | 左壁走行時 `-13.5°`、右壁走行時 `+13.5°` 傾ける（設定で倍率変更可） | `12.0 * dt` |
-| **スライディング視点低下** | 目線高さを `1.72m` → `0.86m` へ低下、横ロール `+4.0°` | `16.0 * dt` |
-| **グラップルスイング傾き** | 横方向遠心加速度に比例して最大 `±9.0°` ロール | `6.0 * dt` |
-| **着地スプリングディップ** | 着地時、落下速度 `vy` に応じて目線を最大 `-0.28m` 沈め、バネ定数 `k=180, damping=18` で復帰 | 物理バネ計算 |
-| **武器ビューモデル慣性（Sway）** | マウス回転速度に応じ X/Y 最大 `±0.035m` 遅延追従、移動ボビング振幅 `0.012m`（空中・壁走り中はボブ停止） | `14.0 * dt` |
+| **Base FOV** | `84°` (configurable `75°–100°`) | `10.0 * dt` |
+| **Speed FOV** | Linear `base -> base + 26°` over speed `9.5 -> 32.0 m/s` (hard cap `114°`) | `8.0 * dt` |
+| **ADS / 4x Zoom FOV** | Pistol: `base - 14.0°` (`70°` at default). Sniper: true **4x magnification** `2 * atan(tan(base/2) / 4)` (`24.2°` at default `84°`). | `18.0 * dt` |
+| **Wall-Run Camera Roll** | **Lean AWAY from wall**: Left wall (`WALL_RUN_L`) tilts clockwise (`+13.5°` spec roll → `camera.rotation.z = -13.5°`); Right wall (`WALL_RUN_R`) tilts counter-clockwise (`-13.5°` spec roll → `camera.rotation.z = +13.5°`). | `12.0 * dt` |
+| **Crouch / Slide Eye Height** | Standing `1.72 m` → **Crouch `0.78 m`** → **Slide `0.68 m`** (slide adds `+4.0°` roll). | `16.0 * dt` |
+| **Grapple Swing Roll** | Proportional to lateral centripetal acceleration, up to `±9.0°`. | `6.0 * dt` |
+| **Landing Spring Dip** | Vertical spring dip up to `-0.28 m` (`k = 180`, `damping = 18`). | Spring solver |
+| **Weapon Sway & Bob** | Hip-fire sway up to `±0.035 m` (`14 * dt`), ground bob `0.012 m` (off airborne/wall-run). **ADS cuts viewmodel sway by 95% (`0.05x`)** with zero input lag. | `14.0 * dt` |
 
-### 2.4 コンボ連動の段階的インフレ：『FLOW RANK』システム
-簡単・無双にするのではなく、**「高度な立体機動と精密射撃を途切れさせないほど、操作レスポンス・演出・BGM・スコア倍率が極限まで研ぎ澄まされる」**設計とする。
+### 2.4 FLOW RANK System (7 Tiers)
+FLOW rewards uninterrupted stylish mobility, stealth precision, and gunplay without inflating raw damage.
+* **Base Points**: Body Kill `+100` / Headshot Kill `+220` / Stealth Kill (enemy `UNAWARE` or `ALERT`) `+120` / Aerial Kill `+80` / Wall-Run Kill `+100` / Swing Kill `+120` / Telegraph Graze `+90` / Shield Break `+150`.
+* **Multi-Kill Bonus**: `+25%` per consecutive kill within `2.5 s` (cap `+100%`).
+* **Decay**: Begins `3.5 s` after last score event. Taking damage immediately deducts `-40%` of current FLOW points (max 1 rank drop).
 
-#### FLOWポイント獲得＆減衰ルール
-* **基礎行動ポイント**：胴体キル `+100` / ヘッドショットキル `+220` / 空中キル加算 `+80` / ウォールランキル加算 `+100` / スイング中キル加算 `+120` / 予測線見切り回避（GRAZE） `+90` / 盾破壊 `+150`
-* **マルチキル補正**：`2.5秒` 以内の連続キルごとに `+25%`（最大 `+100%`）
-* **減衰ルール**：最後のポイント獲得から `3.5秒` 経過後に減衰開始。被弾時は現在FLOWポイントの **`-40%`** を即座に失う（最大1ランク降格）。
-
-#### FLOW RANK 7段階インフレ表
-| Rank | 必要pt | 減衰速度 (`pt/s`) | テクニカル性能ボーナス（※火力増加なし） | ビジュアル演出変化 | BGMレイヤー |
+| Rank | Threshold | Decay (`pt/s`) | Technical Bonuses (No Raw Damage Buff) | Visual Escalation | BGM Layers |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **D** | `0` | `15` | なし（基準値） | 通常雨夜、Bloom強度 `0.65` | Layer 1 (Sub Bass + Pulse) |
-| **C** | `250` | `25` | 武器/ワイヤー切替時間 `-10%` | HUD枠シアン微発光 | Layer 1 + 2 (Kick/Snare) |
-| **B** | `600` | `40` | 切替 `-15%` / リロード `-10%` | 速度 `18m/s` 以上でスピードライン薄出現 | Layer 1〜3 (+Arp Synth) |
-| **A** | `1100` | `60` | 切替 `-20%` / リロード `-15%` / 最高速度上限 `+8%` | ビルのネオン発光強度 `+25%`、ワイヤー光跡強化 | Layer 1〜4 (+Hi-Hat/Perc) |
-| **S** | `1800` | `85` | 切替 `-25%` / リロード `-20%` / BTキル回復 `+20%` | 雨粒がシアン/マゼンタに強く反射、キル時RGB色収差 | 全5レイヤー解放 (+Lead) |
-| **SS** | `2700` | `115` | 切替 `-30%` / リロード `-25%` / 最高速度上限 `+14%` | サーチライトがビート同期脈動、銃マズルがプラズマ青白化 | Layer 5 ドライブ強化＋フィル増加 |
-| **SSS** | `3800` | `150` | 切替 `-35%` / リロード `-30%` / 最高速度上限 `+18%` / 空中ジャンプ消費後の壁蹴り高さ `+10%` | **OVERDRIVE視界**: 画面外周に鋭いシアン電流縁取り、スピードライン常時高密度、キル時フレーム閃光 | **OVERDRIVE MIX**（倍音ブースト＋重低音サイドチェイン強調） |
+| **D** | `0` | `15` | Baseline | Standard rain night, Bloom `0.65` | Layer 1 (Sub Bass + Pulse) |
+| **C** | `250` | `25` | Switch time `-10%` | Subtle cyan HUD border glow | Layer 1–2 (+Kick/Snare) |
+| **B** | `600` | `40` | Switch `-15%` / Reload `-10%` | Speed lines above `18 m/s` | Layer 1–3 (+Arp Synth) |
+| **A** | `1100` | `60` | Switch `-20%` / Reload `-15%` / Soft speed cap `+8%` | Building neon emissive `+25%`, brighter strand trail | Layer 1–4 (+Hi-Hat/Perc) |
+| **S** | `1800` | `85` | Switch `-25%` / Reload `-20%` / BT kill refill `+20%` | Cyan/magenta rain highlights, kill RGB spike | All 5 Layers (+Lead) |
+| **SS** | `2700` | `115` | Switch `-30%` / Reload `-25%` / Soft speed cap `+14%` | Beat-pulsing searchlights, plasma-white muzzle | Layer 5 drive + fills |
+| **SSS** | `3800` | `150` | Switch `-35%` / Reload `-30%` / Soft speed cap `+18%` / Wall-kick height `+10%` | **OVERDRIVE**: electric cyan screen rim, dense speed lines, kill flash | **OVERDRIVE MIX** |
 
 ---
 
-## 3. 操作仕様＆ステートマシン（武器・ワイヤー排他切替＋ストレス対策）
+## 3. Controls, Exclusive Equipment Switching & Movement Physics
 
-### 3.1 キーバインド仕様（Pointer Lock FPS操作）
-| アクション | デフォルト入力 | 備考・代替入力 |
+### 3.1 Keybindings (Pointer Lock FPS)
+| Action | Default Input | Notes / Alternates |
 | :--- | :--- | :--- |
-| 移動 | `W` `A` `S` `D` | 前後左右移動・空中エアストレイフ制御 |
-| 視点操作 | `Mouse Move` | Pointer Lock API。感度設定 `0.2〜10.0`（デフォルト `1.0`、ADSスウェイ95%カット・照準0フレーム追従） |
-| ジャンプ / 壁蹴り / ワイヤーリリース | `Space` | 地上ジャンプ、壁走り中キック、スイング中リリース＆上方ブースト、縁への接近時はオートマントル |
-| スライディング / しゃがみ / ワイヤー純カット | `Left Ctrl` または `C` | 地上高速移動中はスライディング、低速・静止中はしゃがみ（目線 `1.05m`）、スイング中はブーストなし純カット |
-| 発砲 / ワイヤー射出・巻取り（※装備に依存） | `Left Click` | 銃装備時＝発砲。ワイヤー装備時＝未接続ならアンカー射出、接続中長押しで安全巻取り（誤切断なし） |
-| 精密照準ズーム / 空中バレットタイム | `Right Click` (長押し) | **地上**：銃装備時のみ精密ズーム（移動減速なし・BT非消費・敵ネオン縁取り）。**空中・壁走り・スイング中**：BT残量 `>= 12%` 時は `0.25x` バレットタイム＋武器別精密ズーム同時発動（残量不足時はズームのみ） |
-| **ワイヤー装備 ⇄ 直前の銃 トグル切替** | `Q` または `Mouse Side 4` | ワンボタンで「銃 ⇄ ワイヤー」を最速往復可能（最重要操作） |
-| 個別装備ダイレクト選択 | `1` ピストル / `2` SMG / `3` ショットガン / `4` ワイヤー | マウスホイール上下でも `[1→2→3→4]` 循環切替可能 |
-| リロード | `R` | 両手連動タクティカルリロード。死亡画面中は即座にセクターリトライ |
-| ポーズ / 設定メニュー | `Esc` または `Tab` | Pointer Lock解除・感度/酔い軽減/低遅延設定（ポーズ中は雨音・BGM含む全ワールド音を完全ミュート） |
+| Move / Air Strafe | `W` `A` `S` `D` | Ground walk/crouch/sprint and Source-style air strafing. |
+| Look | `Mouse Move` | Pointer Lock API. Sensitivity range `0.2–10.0` (default `1.0`). Zero-lag raw delta look; **ADS applies slightly lower precision multiplier** (`0.55x` Pistol, `0.20x` Sniper 4x). |
+| Jump / Wall-Kick / Grapple Boost Release | `Space` | Ground jump, wall-kick, grapple release + upward boost, auto-mantle near ledges. |
+| Slide / Crouch / Pure Grapple Cut | `Left Ctrl` or `C` | Slide when ground speed `>= 7.5 m/s`; **low crouch (`0.78 m` eye height)** below `7.5 m/s`; pure no-boost cut while swinging. |
+| Fire / Grapple Launch & Safe Reel-In | `Left Click` | Firearm equipped → fire. Grapple equipped → launch hook if detached, or hold to reel in safely if attached (never detaches on click). |
+| Tactical Zoom (ADS) / Airborne Bullet Time | `Right Click` (Hold) | **Grounded**: weapon ADS zoom (no movement penalty, zero BT drain, subtle enemy neon rim highlight). **Airborne/Wall-Run/Swing**: activates `0.25x` Bullet Time (if BT `>= 12%`) simultaneously with weapon ADS zoom. |
+| **Quick Toggle Gun ⇄ Grapple** | `Q` or `Mouse Side 4` | Instant 1-button swap between `GRAPPLE` and last active firearm (`PISTOL` / `SNIPER`). |
+| Direct Slot Selection | `1` Pistol / `2` Sniper / `3` Grapple | Mouse wheel cycles `[1 -> 2 -> 3]`. |
+| Reload / Instant Retry | `R` | Two-hand tactical reload (Sniper auto-reloads after every single shot; `R` also works manually). On death screen: instant `150 ms` retry. |
+| Pause / Settings | `Esc` or `Tab` | Releases Pointer Lock; mutes **all** world audio (rain, BGM, ambients, SE). |
 
-### 3.2 【核心仕様】装備切替 ＆ ワイヤー接続の排他ルール
-本ゲームの最大の駆け引きである「**銃とワイヤーの同時使用不可（ただしぶら下がり中の銃切替は可能）**」を以下の厳密なルールで定義する。
+### 3.2 Exclusive Equipment Switching & Grapple Attachment Rules
+1. **Single Active Right-Hand Slot**: `activeSlot` is strictly one of `PISTOL (1) | SNIPER (2) | GRAPPLE (3)`.
+   * While `activeSlot !== 'GRAPPLE'`, LMB fires the gun; launching a new grapple hook is **impossible** until switching to `GRAPPLE` (`110 ms` holster + `110 ms` draw = `220 ms`).
+2. **Decoupled Rope Attachment (`grappleState`)**:
+   * Launching `GRAPPLE` onto any building wall, highway edge, truss bridge, or gold anchor (range `130.0 m`, projectile speed `340 m/s`) transitions to `ATTACHED`.
+   * The rope locks to the left-forearm magnetic winch: **switching to `PISTOL` or `SNIPER` while `ATTACHED` keeps the rope intact**, allowing pendulum swing shooting!
+   * **Anti-Drop Safety**: Switching back to `GRAPPLE` or holding LMB while `ATTACHED` never cuts the rope (LMB reels in). Only `Space` (boosted release), `Ctrl`/`C` (pure cut), or reaching `<= 3.0 m` from the anchor detaches it.
+3. **Reel-In Restriction**: Winch reel-in acceleration (`+24.0 m/s²`) works **only while `GRAPPLE` is held**. While holding a gun, the rope acts as a fixed-length physical pendulum.
 
-1. **装備スロットの排他性**:
-   * プレイヤーの右手アクティブ装備（`activeSlot`）は常に `PISTOL(1) | SMG(2) | SHOTGUN(3) | GRAPPLE(4)` のいずれか1つのみ。
-   * `activeSlot !== GRAPPLE` の時、左クリックは常に銃の発砲となり、**新たなワイヤー射出は一切できない**。
-   * 新たなワイヤーを撃つには、必ず `Q` または `4` で `GRAPPLE` に切り替える（収納 `110ms` ＋ 展開 `110ms` ＝ 計 `220ms`）必要がある。
-2. **ワイヤー接続状態（`grappleState`）とアクティブ装備の分離**:
-   * `GRAPPLE` 装備中に左クリックでワイヤーを射出し、ビル壁面・エッジ・グラップルノード（最大射程 `130.0m`）にヒットすると、ワイヤーは `ATTACHED`（接続状態）になる。
-   * 接続中は左腕／腰部のマグネット・ウインチ機構にワイヤーが自動ロックされる。そのため、**接続状態（`ATTACHED`）のまま `Q` / `1` / `2` / `3` で銃へ切り替えてもワイヤーは切れず、ぶら下がり・振り子スイングしながら銃を撃てる！**
-   * **落下事故防止ルール**: ぶら下がり中（`ATTACHED`）に再び `GRAPPLE` へ切り替えても、また **`GRAPPLE` 装備中に左クリックを長押ししても（安全巻取りへ移行するのみで）現在のワイヤーは切れない**。切れるのは以下の2トリガー（およびアンカー到達自動解除）のみ：
-     1. `Space` 押下（リリース＆慣性ブースト射出：`+7.5 m/s` 上方、`+6.0 m/s` 視線方向）
-     2. `Ctrl` / `C` 押下（ブーストなし純粋カット）
-3. **巻取り加速（Reel-In）の制限**:
-   * `GRAPPLE` を手に持っている間のみ、左クリック長押しでウインチ巻取り加速（`+24.0 m/s²`）が可能。
-   * 銃に持ち替えてぶら下がっている間は、**純粋な物理振り子スイング（ロープ長固定）のみ**となり、巻取り加速は不可。これにより「一気に距離を詰めるならワイヤー保持、スイングの軌道上から狙い撃つなら銃へ切替」という明確な戦術分離が生まれる。
+### 3.3 Movement FSM (10 States)
+`GROUNDED`, `CROUCHING`, `SLIDING`, `AIRBORNE`, `MANTLING`, `WALL_RUN_L`, `WALL_RUN_R`, `GRAPPLE_SWING`, `GRAPPLE_PULL`, `DEAD`.
+* **Auto-Mantle**: Airborne near a ledge `+0.55 m` to `+2.15 m` above feet while pressing `W` or `Space` smoothly vaults over `0.22 s`, guaranteeing `>= 6.5 m/s` forward exit speed.
+* **Crouch (`CROUCHING`)**: Entering `Ctrl`/`C` at speed `< 7.5 m/s` lowers eye height to **`0.78 m`** and collider height to **`0.94 m`** (ceiling clearance checked before standing back up). Crouch speed = `4.4 m/s` (reduced footstep noise and tighter cover behind cars, dumpsters, and alley barriers).
 
-### 3.3 移動ステートマシン（Movement FSM：全9状態）
+### 3.4 Kinetic Physics Parameter Table (`FIXED_DT = 1 / 120 s`, clamp `0.05 s`)
+| Category | Parameter | Value | Details |
+| :--- | :--- | :--- | :--- |
+| **Base Move** | Gravity `G` | `-26.0 m/s²` | Crisp vertical arcade-tactical feel. |
+| | Run / Crouch Speed | `10.5 m/s` / `4.4 m/s` | Ground accel `75 m/s²`, friction `10.0 / s` (`0.55x` wading in canal `Y = -2.4m`). |
+| | Jump Velocity | `10.8 m/s` | Peak ~`2.24 m`; auto-mantle catches ledges `+0.55–2.15 m`. |
+| | Air Strafe | `18.0 m/s²` | Source-style momentum preservation above `11.5 m/s`. |
+| | Soft Speed Cap | `34.0 m/s` | Excess speed damped at `1.8 / s` (`40.1 m/s` at Rank SSS). |
+| **Sliding** | Entry Boost / Drag | `+4.2 m/s` / `2.6 / s` | Cooldown `0.85 s`; down-ramps accelerate `+9.0 m/s²`. Eye height **`0.68 m`**, collider **`0.94 m`**. |
+| | Slide Jump | `11.4 m/s` up + `+2.5 m/s` fwd | Core parkour momentum launch. |
+| **Wall-Run** | Eligible Surfaces | Any vertical face (`H >= 2.2m, W >= 2.5m`) | Requires airborne (`>= 0.35m` clearance), `W` held, along-wall speed `>= 6.5 m/s`, entry angle within `±35°` of parallel, view within `±52°`. |
+| | Speed / Gravity / Duration | Min `13.5 m/s` / `-2.8 m/s²` / `1.80 s` | First `0.25 s` zero-G; `0.12 s` gap grace; `0.50 s` same-wall cooldown. |
+| | Wall-Kick | `11.2` up + `7.5` normal + `8.8` look + `0.85x` tangent | View-prioritized trajectory. |
+| **Grapple** | Range / Projectile Speed | `130.0 m` / `340 m/s` | Min `0.6x` speed in Bullet Time; `6.0°` gold-anchor snap assist. |
+| | Swing / Reel-In / CD | Fixed `L` (`+5.5 m/s²` air assist) / `+24.0 m/s²` (`22 m/s` shorten) / `0.65 s` | Ground upward hook lifts `vy >= 4.2`. Auto-release at `<= 3.0 m` with `+8.0 m/s` upward boost. |
+| **Bullet Time & ADS** | Gauge / Min / Time Scale | `100.0` / `12.0` / `0.25x` | World/enemies/projectiles/swing run at `0.25x`. **Look, weapon switch, fire recovery, reload run at `1.0x` real time**. |
+| | Drain / Passive Regen | `-34.0 / real s` / `+4.5 / s` | Tactical refills: HS Kill `+22`, Aerial Kill `+14`, Wall-Run Kill `+16`, Graze `+12`. |
+
+### 3.5 Equipment FSM (5 States)
+* `IDLE` → `HOLSTERING` (`110 ms`) → `DRAWING` (`110 ms`, `40 ms` pre-fire input buffer) → `FIRING_RECOVERY` (interruptible by switch) → `RELOADING` (**instantly cancellable by switching to Grapple or other gun**).
+
+### 3.6 Anti-Frustration & Accessibility Safeguards
+1. **Coyote Time**: `140 ms` ledge coyote, `160 ms` post-wall-run wall-kick coyote.
+2. **Input Buffer**: `150 ms` for jump, fire, and grapple launch.
+3. **Movement-Only Anchor Snap**: `6.0°` gold-anchor lock indicator visible even while holding a gun (`[◆]` subtle gold diamond; bright bold diamond when holding Grapple).
+4. **Safe Swing Switching**: Never drops rope on switch or LMB reel-in.
+5. **Skill Draft Input Lock**: `450 ms` complete lock on click & number keys (`1/2/3`) when the 3-choice skill modal opens.
+6. **Instant Reload Cancel**: Pressing `Q`/`1`/`2`/`3` cancels reload immediately.
+7. **Accessibility Menu**: Camera shake `0%/50%/100%`, camera roll `0%/50%/100%`, center anchor dot toggle (default `ON`), base FOV `75°–100°`, mouse sensitivity `0.2–10.0`, quality preset (`HIGH`/`MEDIUM`/`LOW`).
+
+---
+
+## 4. Weapons & Grapple Complete Parameter Table
+
+Streamlined to **2 Precision Firearms + 1 Mobility Grapple** to maximize tactical contrast between **silent close/mid stealth** and **high-caliber long-range 4x sniping**.
+
+| Equipment | Slot | Role | Damage (Body / HS `2.5x`) | Fire Rate / Cycle | Mag | Reload | Speed / Range | Stealth Sound Radius | Special Mechanics |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **MK-IV RAIL PISTOL** (Suppressed) | `[1]` | Silent Stealth & Precision HS | `55` / **`138`** | `200 RPM` (`300 ms`) | `8` | `1.15 s` | `260 m/s` / `140 m` | **`14 m`** (Quiet) | `0.0°` spread. Frame-mounted open holo sight (`0.046 × 0.037 × 0.042`, non-reciprocating). ADS FOV `base - 14°`, ADS sensitivity **`0.55x`**. Integral suppressor keeps distant enemies unaware. |
+| **K-90 RAIL SNIPER** (Single-Shot) | `[2]` | 4x Long-Range Pick & Shield Shatter | `120` / **`300`** | Single-shot (auto breech reload) | **`1`** | `1.35 s` | `460 m/s` / `280 m` | **`58 m`** (Loud) | `0.0°` spread. **1-round breech-loaded magazine**: auto-reloads immediately after firing (two-hand bolt open → shell eject → left-hand single cartridge load → bolt close). Same open holo hood size (`0.046 × 0.037 × 0.042`) with ultra-fine faint crosshair/range marks inside clear lens; **true 4x magnification** (`2 * atan(tan(base/2)/4)`, `~24.2°` at `84°`), ADS sensitivity **`0.20x`** (`0.80 × tan(fovAds/2)/tan(fovBase/2)`). **Aegis Shield rule**: `shieldMultiplier: 1.6` (`192 >= 180` HP) **shatters the Aegis shield in 1 shot WITHOUT piercing through to the enemy behind it** (bullet is consumed by the shield break). |
+| **S-00 GRAPPLE LAUNCHER** | `[3]` / `[Q]` | Aerial Mobility Anchor | `0` (direct enemy hook: `15` dmg + `0.4 s` stun + pull) | `650 ms` CD after release | `∞` | None | `340 m/s` / `130.0 m` | `8 m` (Faint) | Attaches to any structure or enemy; persists across gun switches (`ATTACHED`). |
+
+#### Recoil Specification
+* **MK-IV Rail Pistol**: Vertical `+2.2°`, Horizontal `±0.25°`, Recovery `14°/s` (ADS recoil scale `0.78`).
+* **K-90 Rail Sniper**: Vertical `+4.8°`, Horizontal `±0.4°`, Recovery `10°/s` (ADS recoil scale `0.70`; bolt reload resets cleanly on target).
+
+---
+
+## 5. Enemy Archetypes, 4-State Stealth-Combat AI & Telegraph Lines
+
+### 5.1 4-State Stealth / Alert / Detected / Combat AI System
+Every enemy in Sectors 1–4 operates an individual perception/alert state machine coupled with a **sector-wide shared Last Known Player Position (`sharedLastKnownPos`)**:
+
 ```mermaid
 stateDiagram-v2
-    [*] --> GROUNDED
-    GROUNDED --> SLIDING: Ctrl/C (速度 >= 7.5 m/s)
-    GROUNDED --> AIRBORNE: Space / 足場離脱
-    SLIDING --> GROUNDED: 速度 < 5.5 m/s または キー解除
-    SLIDING --> AIRBORNE: Space (スライドジャンプ)
-    AIRBORNE --> WALL_RUN_L: 左の垂直壁接触 (距離<=0.95m, 空中, W押下, 平行速度>=6.5m/s, 平行±35°以内)
-    AIRBORNE --> WALL_RUN_R: 右の垂直壁接触 (距離<=0.95m, 空中, W押下, 平行速度>=6.5m/s, 平行±35°以内)
-    WALL_RUN_L --> AIRBORNE: Space (壁蹴り) / 壁終了(0.12s猶予) / 1.8秒経過 / W離す
-    WALL_RUN_R --> AIRBORNE: Space (壁蹴り) / 壁終了(0.12s猶予) / 1.8秒経過 / W離す
-    GROUNDED --> GRAPPLE_SWING: ワイヤー命中 (GRAPPLE装備時)
-    SLIDING --> GRAPPLE_SWING: ワイヤー命中 (GRAPPLE装備時)
-    AIRBORNE --> GRAPPLE_SWING: ワイヤー命中 (GRAPPLE装備時)
-    WALL_RUN_L --> GRAPPLE_SWING: ワイヤー命中 (GRAPPLE装備時)
-    WALL_RUN_R --> GRAPPLE_SWING: ワイヤー命中 (GRAPPLE装備時)
-    GRAPPLE_SWING --> GRAPPLE_PULL: GRAPPLE装備中 ＆ LMB長押し
-    GRAPPLE_PULL --> GRAPPLE_SWING: LMB離す または 銃へ切替
-    GRAPPLE_SWING --> AIRBORNE: Space(ブースト解除) / Ctrl(純カット)
-    GRAPPLE_PULL --> AIRBORNE: Space / Ctrl / アンカー到達(距離<=3.0m)
-    AIRBORNE --> GROUNDED: 接地 / オートマントル完了
-    GROUNDED --> DEAD: HP <= 0
-    AIRBORNE --> DEAD: HP <= 0
-    WALL_RUN_L --> DEAD: HP <= 0
-    WALL_RUN_R --> DEAD: HP <= 0
-    GRAPPLE_SWING --> DEAD: HP <= 0
-    GRAPPLE_PULL --> DEAD: HP <= 0
+    [*] --> UNAWARE
+    UNAWARE --> ALERT: Player in FOV / Gunshot heard / Proximity <= 5.5m
+    ALERT --> UNAWARE: Player unseen & gauge decays to 0
+    ALERT --> DETECTED: Alert Gauge reaches 100
+    ALERT --> DETECTED: Nearby ally in DETECTED for >= 1.6s (<= 22m)
+    UNAWARE --> DETECTED: Nearby ally in DETECTED for >= 1.6s (<= 22m)
+    DETECTED --> COMBAT: Stayed DETECTED >= 3.5s OR damaged by player
+    UNAWARE --> COMBAT: Damaged by player OR global COMBAT broadcast (>= 2.2s)
+    ALERT --> COMBAT: Damaged by player OR global COMBAT broadcast (>= 2.2s)
+    DETECTED --> ALERT: Shared position inspected & 0 enemies have LOS for >= 4.5s
+    COMBAT --> ALERT: Shared position inspected & 0 enemies have LOS for >= 4.5s
 ```
 
-### 3.4 立体機動・物理パラメータ厳密表
-すべての物理更新は固定タイムステップ `FIXED_DT = 1 / 120` 秒（最大フレームクランプ `0.05s`）で計算し、フレームレート差による挙動ブレを完全排除する。
+1. **`UNAWARE` (Patrol / Guard)**:
+   * Enemies spawn facing their natural street/alley/rooftop guard orientation or patrol waypoint loop (NEVER facing the player automatically on spawn).
+   * Do **not** fire or project telegraph lines. Visor/rim color: dim cool cyan (`#2A7A99`).
+2. **`ALERT` (Suspicious — Individual Alert Gauge `0..100`)**:
+   * **Vision Cone**: Horizontal half-angle `52°` (`104°` full cone; Veil Sniper `38°` at long range `95 m`; standard units `52 m` range; Drone `360°` downward optical scan cone `40 m`).
+   * **Distance-Scaled Vision Fill Rate**: While player is in FOV with clear LOS:
+     $$\text{fillRate} = \text{clamp}\left(18 + 95 \cdot \left(1 - \frac{d}{R_{\text{vision}}}\right)^{1.6},\; 18,\; 115\right)\text{ pt/s}$$
+     (Crouching multiplies fill rate by `0.72x`; `SK_07` Shadow Step further multiplies by `0.65x / 0.52x / 0.40x`.)
+   * **Close Proximity Detection (Outside FOV)**: Within `5.5 m` (`3.5 m` while crouching), Alert Gauge fills even from behind at `38..85 pt/s` scaled inversely by distance.
+   * **Acoustic Detection (Gunshots)**: Firing adds an instant gauge impulse to all enemies within weapon sound radius (`14 m` Pistol, `58 m` Sniper), scaled linearly by `1 - d / soundRadius` (`+25..+75` pts), turning them toward the gunshot origin and entering `ALERT` (or `DETECTED` if gauge hits `100`).
+   * **Decay**: While player is outside FOV and proximity radius, gauge decays at `-14 pt/s` (after a `1.0 s` brief hold). Reaching `0` returns the enemy to `UNAWARE`.
+   * **Behavior & Visuals**: Enemy stops patrol, turns toward the last stimulus point, and cautiously advances/scans. Visor/rim turns **Amber Yellow (`#FFCC22`)** + diegetic overhead gauge bar + subtle HUD directional awareness arc + low electronic suspicion hum SE. Does **not** fire yet.
+3. **`DETECTED` (Spotted — Local Engagement & Spread)**:
+   * Entered when individual Alert Gauge hits `100`. Immediately sets `sharedLastKnownPos` to player's position.
+   * **Enemy attacks** using 3-phase telegraph lines!
+   * **Local Propagation**: After **`1.6 s`** in `DETECTED`, all allies within **`22 m`** also escalate to `DETECTED` (receiving `sharedLastKnownPos`).
+   * **Escalation to `COMBAT`**: Staying in `DETECTED` for **`3.5 s`** OR taking **any damage from the player** escalates immediately to `COMBAT`.
+   * **Visuals & Audio**: Visor/rim flashes **Bright Orange (`#FF6A1A`)** + sharp spotted sting SE.
+4. **`COMBAT` (Full Sector Alert)**:
+   * Triggered by `DETECTED` timer (`3.5 s`) OR taking damage from the player in any state (hitting an `UNAWARE`/`ALERT` enemy instantly promotes that enemy to `COMBAT` and updates `sharedLastKnownPos` to the shooter's position).
+   * **Global Broadcast**: **`2.2 s`** after any enemy enters `COMBAT`, **ALL enemies in the sector** escalate to `COMBAT` (radio alarm chime SE).
+   * **Visuals**: Visor/rim turns **Deep Crimson (`#FF2244`)**.
+5. **Shared Last Known Position, Direct vs Suppressive Fire & Global De-escalation**:
+   * **Shared Position Update**: Whenever ANY enemy in `DETECTED` or `COMBAT` has clear LOS to the player, `sharedLastKnownPos` updates continuously to the player's current position, and `searchClearTimer` resets to `0`.
+   * **Direct vs Suppressive Attack**:
+     * **Has LOS**: Fires directly at the player with standard 3-phase telegraph lines.
+     * **No LOS**: Advances/flanks toward `sharedLastKnownPos` and fires **rough suppressive bursts** toward `sharedLastKnownPos` (angular scatter `±8°`, visible laser/tracers peppering the cover/corner near `sharedLastKnownPos`).
+   * **Global De-escalation (`DETECTED`/`COMBAT` → `ALERT`)**: When an enemy inspects/reaches `sharedLastKnownPos` (within `<= 8.0 m` and clear LOS to that point) and the player is absent—AND **zero enemies in the sector currently have LOS to the player**—`searchClearTimer` accumulates. At **`4.5 s`**, **ALL enemies revert to `ALERT`** (gauge set to `65 / 100`), fanning out briefly before decaying back to `UNAWARE` if the player remains unseen!
+6. **Sector 5 Boss Exception**: `VALKYRIE-09` (and its Phase 2 escorts) spawn directly in `COMBAT` mode.
 
-| カテゴリ | パラメータ | 数値 | 数式・挙動詳細 |
-| :--- | :--- | :--- | :--- |
-| **基本移動** | 重力加速度 `G` | `-26.0 m/s²` | キレのある落下感のため現実より重めに設定 |
-| | 通常走行 / しゃがみ速度 | `10.5 m/s` / `5.0 m/s` | 地上加速度 `75 m/s²`、地上摩擦減衰 `10.0 / s`（運河の水面 `Y = -2.4m` 接地中のみ速度 `0.55x`）。低速・静止中の `Ctrl/C` でしゃがみ（目線 `1.05m`、当たり判定縮小） |
-| | ジャンプ初速 / オートマントル | `10.8 m/s` / 縁高 `+0.55〜2.15m` | 単発到達高度約 `2.24m`。空中で `W` or `Space` 押下中に縁へ接近すると `0.22s` で自動よじ登り（完了時前方 `>= 6.5 m/s` 保証） |
-| | 空中制御（エアストレイフ） | 加速度 `18.0 m/s²` | 現在の水平速度が `11.5 m/s` 超の場合、進行方向への過剰加速を抑制しつつ旋回（Quake/Source式ストレイフ）のみ許可し**慣性を完全保存** |
-| | 最高速度ソフトキャップ | `34.0 m/s` | `34.0 m/s` を超えた分のみ空気抵抗 `1.8 / s` を適用（Rank SSS時は上限 `40.1 m/s`） |
-| **スライディング** | 初速ブースト | `+4.2 m/s` | 突入時に進行方向へ加算（クールダウン `0.85s`） |
-| | 持続減衰 | `2.6 / s` | 下りスロープ（高架オンランプ等）時は減衰せず加速 `+9.0 m/s²` |
-| | スライドジャンプ | 垂直 `11.4 m/s` + 水平 `+2.5 m/s` | 慣性維持の起点となる高速パルクール技 |
-| **ウォールラン**<br>（どこでも平行限定） | 対象壁面＆発動条件 | 全垂直壁（高 `>=2.2m` 幅 `>=2.5m`） | 空中（地面高 `>=0.35m`）・`W`押下・**壁平行速度 `>= 6.5 m/s`**・**進入角が壁平行から `±35°` 以内**・視線一致 `±52°` 以内（静止・正面衝突での張り付き完全禁止） |
-| | 走行速度維持 | 最低 `13.5 m/s` | 突入速度が `13.5 m/s` 以上ならその速度を維持（慣性保存）。壁の微小ギャップ跨ぎ猶予 `0.12s` |
-| | 壁走り中の見かけ重力 | `-2.8 m/s²` | 緩やかな放物線を描いて水平移動（開始 `0.25s` は `0.0 m/s²`） |
-| | 最大連続持続時間 | `1.80 s` | 終了後は同一壁面への再吸着を `0.50s` クールダウン（別壁面へは即連鎖可） |
-| | 壁蹴り（ウォールキック） | 垂直 `11.2 m/s` + 壁法線 `7.5 m/s` + 視線前方 `8.8 m/s` + 接線 `0.85x` | 視線を向けた屋上・バルコニー・敵の方向へ思い通りに飛び移れる視線優先配分 |
-| **グラップル** | 最大射程 | `130.0 m` | 射出弾速 `340 m/s`（BT中も最低 `0.6x` 相当で飛翔）。ビル外壁・高架縁・オンランプ・橋のトラスなど全構造物に刺さる |
-| | 物理振り子（SWING） | ロープ長 `L` 固定拘束 | プレイヤー位置 $P$ とアンカー $A$ の距離 $|P-A| > L$ の時、外向き速度成分 $v_{out} = \max(0, \vec{v} \cdot \hat{r})$ を除去し、ロープ長へ位置補正。スイング補助推力 `+5.5 m/s²`（WASD方向）。地上から上方へ接続時は微小リフト（`vy >= 4.2`）で即スイング移行 |
-| | ウインチ巻取り（PULL） | 牽引加速 `+24.0 m/s²` | ロープ長 $L$ を `22.0 m/s` で短縮（最小 `3.0m` で自動解除＋上方ブースト `+8.0 m/s`） |
-| | ワイヤー再使用CD | `0.65 s` | 解除後から次のワイヤー射出が可能になるまでの最小間隔 |
-| **バレットタイム＆精密ズーム** | 最大ゲージ | `100.0` | 発動最低残量 `12.0`（連打によるガクつき防止）。地上では精密ズームのみ発動（ゲージ非消費） |
-| | 時間スケール | `0.25` | 敵・弾・物理・落下・ワイヤー振り子は `0.25x`。**マウス回転・装備切替・銃の連射回復・リロードは `1.0x`（実時間）** |
-| | 精密ズーム（ADS） | ピストル `-14.0°` / SMG `-10.0°` / SG `-6.5°` | 右クリック長押し（銃装備時）。感度補正 `0.72x / 0.80x / 0.88x`、移動速度ペナルティなし（`1.0x`）、空中BT同時発動時は重複加算せず武器別ズーム値に統一 |
-| | 消費速度 | `-34.0 / 実秒` | 満タンから最大約 `2.94秒` 連続維持可能 |
-| | 自然回復速度 | `+4.5 / 秒` | 地上・空中問わず非発動時に遅く回復（スキル依存を促す） |
-| | 戦術回復ボーナス | HSキル `+22` / 空中キル `+14` / 壁走りキル `+16` / 見切り回避 `+12` | 複数条件は加算（例：空中HSキル＝`+36`） |
+### 5.2 Mandatory 3-Phase Telegraph Line System (Active in `DETECTED` & `COMBAT`)
+1. **Phase 1 `ACQUIRING`**: Thin translucent line (`0.015 m`, opacity `0.28`, `#FF6B00`) tracking player with angular speed limit (can be outrun via swing/wall-run).
+2. **Phase 2 `LOCK_TELEGRAPH`**: For final `T_lock` (`180–320 ms`), **aim target freezes completely**. Line sharpens (`0.045 m -> 0.012 m`), turns `#FF1E42` (emissive `4.0`), flashes at `25 Hz`, muzzle flares, and plays 3D HRTF high-pitch lock tone.
+3. **Phase 3 `FIRE` & `GRAZE`**: Fires high-speed tracer bolt along locked line. Passing within `0.45 m – 1.35 m` of the player without hitting triggers **`GRAZE`** (`EVADE +90`, BT `+12%`, whoosh + bell SE, micro roll).
 
-### 3.5 装備ステートマシン（Weapon/Gear FSM：全5状態）
-| 状態 | 遷移条件・所要時間 | 操作受付・特記事項 |
-| :--- | :--- | :--- |
-| `IDLE` | 待機状態 | 発砲 / ワイヤー射出 / リロード / 装備切替 すべて受付 |
-| `HOLSTERING` | 装備切替入力 → **`110 ms`** | 現在の装備を画面下部へ回転収納。終了後自動で `DRAWING` へ遷移 |
-| `DRAWING` | `HOLSTERING` 完了 → **`110 ms`** | 新装備（銃またはグラップル）を構え上げ。完了 `40ms` 前からのクリックを**先行入力バッファ**として保持し、完了フレームで即発射 |
-| `FIRING_RECOVERY` | 発砲直後 → 武器別RPM間隔 | リコイル復元・ボルト動作。この間も装備切替は即時割り込み可能（キャンセル可） |
-| `RELOADING` | `R` または残弾0自動 → 武器別時間 | 装備切替でリロードを**即時キャンセル可能**（緊急時にワイヤーで逃げるための必須ストレス対策） |
+### 5.3 Procedural Humanoid Rig & Split Hitboxes
+* `THREE.Group` hierarchy: `Root -> Pelvis -> Torso -> Head(Visor) / ArmL / ArmR(Weapon) / LegL / LegR` with beveled armor plates, matte carbon `#161B26`, Fresnel rim light (enhanced during player ADS), and ground contact shadow decals.
+* **Head / Visor Hitbox**: Sphere radius `0.24 m` (`2.5x` HS multiplier; shatters visor glow on hit).
+* **Body Hitbox**: Capsule/OBB `0.62 m × 1.35 m × 0.42 m`.
 
-### 3.6 誤操作・連打ミス・カメラ酔いストレス対策（全7項目）
-1. **コヨーテタイム**: 屋上や高架の端から踏み外した後 `140 ms`、壁走り終了後 `160 ms` はジャンプ／壁蹴り入力を有効とする。
-2. **先行入力バッファ (`150 ms`)**: 着地前 `150ms` の `Space`、切替完了前 `150ms` の `Left Click`、ワイヤーCD完了前 `150ms` のワイヤー射出を記憶し、成立フレームで即実行する。
-3. **アンカー吸着アシスト（移動のみ）**: 射撃にはエイムアシストを一切入れないが、ワイヤーはビルの外壁・高架・橋のどこにでも刺さるのに加え、画面中央から視角 **`6.0°`** 以内にある「ゴールドアンカー（高架縁・橋トラス頂点・ビル角・中層ブリッジ）」へ自動スナップする。ターゲットが射程・視角内にある時はレティクル外周に**ゴールドの菱形ロック表示**を常時出す（銃装備中でも「今ワイヤーに切り替えればそこに届く」ことが視認できる！）。
-4. **スイング中切替の安全設計**: 3.2項の通り、ぶら下がり中にワイヤー装備へ戻しても自動切断しない。
-5. **スキル選択画面の誤クリック防止 (`450 ms` 入力ロック)**: セクタークリア時の3択スキル選択モーダル展開から **`450 ms`** 間はすべてのクリックおよび数字キー（`1/2/3`）を完全に無効化し、プログレスバーで解除を明示する。
-6. **リロード中の緊急切替キャンセル**: リロード中でも `Q` や `4` を押せば即座にリロードを中断してワイヤーへ切り替えられる。
-7. **3D酔い軽減アクセシビリティ設定（メニュー常備）**:
-   * カメラシェイク倍率：`0% / 50% / 100%`
-   * ウォールラン＆スイング傾き（ロール）倍率：`0% / 50% / 100%`
-   * 画面中央アンカー・ドット（酔い防止の固定点）：デフォルト `ON`（`2px` 高輝度白点＋`1px` 黒縁）
-   * FOV基準値：`75°〜100°` 調整可
-
----
-
-## 4. 武器・ワイヤー全パラメータ表
-
-すべての銃弾は高弾速プロジェクタイル（または可視トレーサー付き瞬着レイキャスト＋物理着弾遅延表現）として実装し、空中バレットタイム中に弾道が美しく尾を引く演出を行う。
-
-| 装備名 | スロット | 役割 | ダメージ (胴体 / HS `2.5x`) | 連射速度 (RPM / 間隔) | 装弾数 | リロード時間 | 弾速 / 射程 | 特殊メカニクス |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **MK-IV レールピストル** | `[1]` | 主力・精密HS | `55` / **`138`** | `200 RPM` (`300ms`) | `8` | `1.15 s` | `260 m/s` / `140m` | 拡散 `0.0°`（完全精密）。HSで敵の装甲・バイザーを一撃粉砕。チャージ発光バレル。 |
-| **VX-9 パルスSMG** | `[2]` | 牽制・対ドローン・盾削り | `22` / `44` (`2.0x`) | `840 RPM` (`71ms`) | `30` | `1.45 s` | `190 m/s` / `75m` | 3点バーストではなくフルオート。腰撃ち拡散 `1.4°`（バレットタイム中は `0.4°` に収束）。イージス盾に対しダメージ倍率 `1.5x`。 |
-| **K-12 キネティック・ショットガン** | `[3]` | 至近火力 ＆ **反動ジャンプ** | `16 × 9発` (`最大144`) / HS `1.75x` | `75 RPM` (`800ms`) | `4` | `1.75 s` | `150 m/s` / `28m` | 拡散コーン `5.2°`。**空中で発砲すると視線の真逆方向へ `+11.5 m/s` の反動インパルス（リコイル・ジャンプ）を付与**（地上では `+2.0 m/s`）。落下寸前の緊急復帰や大ジャンプの要。 |
-| **S-00 グラップルランチャー** | `[4]` / `[Q]` | 立体機動アンカー | `0`（敵に当てた場合は `15`＋`0.4s` 怯み＆敵側へ引き寄せ） | 解除後CD `650ms` | `∞` | なし | `180 m/s` / `52.0m` | ビル壁・エッジ・アンカーノードへ接続。接続後、銃へ切替てもぶら下がり維持。敵の人型兵に直接打ち込んで高速接近することも可能。 |
-
-#### 銃器リコイル（跳ね上がり）仕様
-* **レールピストル**: 垂直 `+2.4°`、水平 `±0.3°`、回復速度 `14°/s`
-* **パルスSMG**: 垂直 `+0.65°`、水平 `±0.45°`（連射時サイン揺らぎ）、回復速度 `18°/s`
-* **ショットガン**: 垂直 `+5.8°`、水平 `±1.2°`、回復速度 `11°/s`
-
----
-
-## 5. 敵アーキタイプ（人型＋メカ＋人型ボス）＆「射撃予測線」仕様
-
-### 5.1 【必須仕様】射撃予測線（テレグラフ・ライン）システム
-銃・エネルギー砲を扱う**すべての敵**は、弾を発射する直前に以下の3フェーズを必ず踏む。これにより、1〜2発で死ぬハードコア難易度でありながら、プレイヤーの「見てから躱す」スキルが100%報われる設計とする。
-
-1. **フェーズ1：`ACQUIRING`（照準追尾）**
-   * 敵の銃口からプレイヤーの胴体中央へ向けて、細い半透明ライン（太さ `0.015m`、透明度 `0.28`、色 `#FF6B00`）を描画。
-   * 敵はプレイヤーの現在位置へ角速度制限付きで追尾する（高速スイング・壁走りで視線を振り切ることが可能）。
-2. **フェーズ2：`LOCK_TELEGRAPH`（発射直前ロック＆点滅警告）**
-   * 発射直前の **`T_lock` ミリ秒**（敵種別ごとに `180ms〜340ms`）になった瞬間、**照準ターゲット座標をその時点の座標で完全固定（追尾停止）**する。
-   * 予測線の見た目が変化：太さ `0.045m` → 発射 `0ms` に向けて `0.012m` へ鋭く収束、色 `#FF1E42`（超高輝度 Emissive `4.0`）、`25Hz` 高速点滅、敵銃口にフレア閃光出現。
-   * 同時に立体音響（PannerNode）で「**キィィン！（高周波ロック音）**」を再生。
-3. **フェーズ3：`FIRE`（発射） ＆ 見切り判定（`GRAZE`）**
-   * 固定された予測線上へ高速弾丸（トレーサー付き）を発射。
-   * プレイヤーが予測線のラインから横へ外れ、かつ弾丸通過時の最短距離が **`0.45m 〜 1.35m`** の範囲内だった場合、**`GRAZE（見切り回避）`** が成立！
-   * 見切り成立時：HUD中央下に `EVADE +90`（シアン）、バレットタイムゲージ `+12%`、短い風切り共鳴音＋カメラ微ロール演出。
-
-### 5.2 人型サイバー兵プロシージャル造形＆ヒットボックス仕様
-全人型エネミーは Three.js の `THREE.Group` 階層構造（`Root → Pelvis → Torso → Head(Visor) / ArmL / ArmR(Weapon) / LegL / LegR`）で構築する。
-* **共通シルエット**: マットカーボンブラック（`#141821`, roughness `0.55`, metalness `0.6`）の角張ったタクティカル装甲＋肩・膝のアクセントライン＋**顔面の横長発光バイザー（Emissive `3.5`）**。
-* **分離ヒットボックス**:
-  * **頭部（Head / Visor）**: 中心から半径 `0.24m` の球体判定（視覚サイズより `15%` だけ公平に確保）。命中時は常にヘッドショット倍率適用＆バイザー発光消滅・火花噴出。
-  * **胴体・四肢（Body）**: 幅 `0.62m` × 高さ `1.35m` × 奥行 `0.42m` のカプセル／OBB判定。
-* **プロシージャル・アニメーション**: 移動速度に応じた逆運動学風の脚部スイング、射撃時の上体反動、被弾時の仰け反り、撃破時のパーツ飛散（頭部・装甲片・火花がラグドール風の物理弾道で飛び散り、濡れた屋上に跳ねて `3.0秒` 後にデジタル分解消失）。
-
-### 5.3 全6種エネミー完全パラメータ表
-
-| 敵名称（種別） | HP | 移動速度 | 攻撃パターン | 予測線フェーズ (`ACQUIRING` / `LOCK`) | 弾ダメージ / 弾速 | 戦術的攻略・視認色 |
+### 5.4 Enemy Roster (All 6 Types)
+| Enemy | HP | Move Speed | Attack Pattern | Telegraph (`ACQ / LOCK`) | Damage / Bolt Speed | Tactical Notes & Base Visor Color |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **1. エンフォーサー**<br>（人型・歩兵） | `110` | `5.2 m/s` | 遮蔽物間を移動し、3点バースト射撃（発射間隔 `110ms`、バースト後CD `1.6s`） | `550ms` / **`220ms`** | `55` / `85 m/s` | 基本標的。レールピストルHS1発（`138`）で即死。バイザー色：`#FF3B5C` |
-| **2. イージス・ブリッチャー**<br>（人型・重装盾兵） | `220`<br>(盾 `180`) | `3.6 m/s` | 正面 `130°` を完全防御する大型エネルギー盾を保持。中距離で拡散プラズマ3発同時射撃（CD `2.2s`） | `650ms` / **`260ms`** | `55` / `68 m/s` | **正面弾無効**。ワイヤーや壁走りで頭上・背後を取ってHS2発、またはSMG集中射撃で盾を破壊し `1.5s` スタンさせる。盾色：`#FF8C00` |
-| **3. ヴェイル・スナイパー**<br>（人型・狙撃兵） | `85` | `3.0 m/s` | 高所の別ビル屋上に陣取り、長距離から精密狙撃（CD `2.8s`）。接近されるとバックステップ | `1150ms` / **`320ms`** | **`100` (即死)** / `240 m/s` | 常時細い赤レーザーが視認できる高脅威。ビル陰や高速スイングでロックを切り、真っ先に処理する最優先目標。バイザー色：`#FF003C` |
-| **4. ファントム**<br>（人型・高機動ブリンク兵） | `150` | `8.5 m/s`<br>(ブリンク `32m/s`) | 紫の残像を残して `10m` 瞬間跳躍（CD `2.0s`）。中距離では2発連射パルスガン、距離 `4.5m` 以内で突進斬撃 | 射撃 `400ms`/`190ms`<br>斬撃 `350ms`発光 | 弾 `55` (`95m/s`)<br>斬撃 `65` | プレイヤーを追いかけるライバル人型。ブリンク着地後の `0.45s` 硬直を空中バレットタイムで狙い撃つ。バイザー色：`#C800FF` |
-| **5. ハンター・ドローン**<br>（空中メカ） | `75` | `9.5 m/s` | 高度 `6m〜22m` を3次元旋回し、プレイヤーのスイング軌道を先読みして2連射（CD `1.8s`） | `500ms` / **`200ms`** | `55` / `80 m/s` | 空中ルートの邪魔者。中央の赤い光学レンズが弱点（HS扱い `2.5x`）。撃破時その場で小爆発し周囲 `4m` に `50` ダメージ。レンズ色：`#FF5500` |
-| **6. セクターボス『VALKYRIE-09』**<br>（人型強化外骨格） | `1600`<br>(翼パーツ各`300`) | `14.0 m/s`<br>(飛翔 `28m/s`) | **背部に発光スラスター翼を持つ人型宿敵**。<br>・**Phase 1 (HP 100〜50%)**: ビル屋上間を高速飛翔しながら①3連スナイプ予測線、②空中機銃掃射（扇状予測線5本）を展開。<br>・**Phase 2 (HP < 50%)**: 翼が真紅に覚醒。③高速ダイブ斬撃（地面に予測円＋衝撃波）、④誘導マイクロミサイル4発（撃ち落とし可）を追加。 | スナイプ `850ms`/`280ms`<br>掃射 `600ms`/`240ms`<br>ダイブ `700ms`/`220ms` | スナイプ **`100`**<br>掃射 `55`<br>ダイブ `65` | 左右のスラスター翼（各HP `300`）を破壊すると `3.5秒` 墜落ダウンし、頭部が完全無防備になる。高層ビル群を互いに飛び回りながら撃ち合う最終決戦。色：`#FFFFFF` + `#FF0055` |
+| **1. Enforcer** (Humanoid Infantry) | `110` | `5.2 m/s` (Patrol `2.6 m/s`) | Cover-to-cover advance, 3-round burst (`110 ms` spacing, `1.6 s` CD). | `550 ms` / **`220 ms`** | `55` / `85 m/s` | 1-shot Pistol HS (`138`) or Sniper body (`120`). |
+| **2. Aegis Breacher** (Heavy Shield) | `220` (Shield `180`) | `3.6 m/s` (Patrol `2.0 m/s`) | Frontal `130°` energy shield blocks frontal bullets. 3-bolt plasma spread (`2.2 s` CD). | `650 ms` / **`260 ms`** | `55` / `68 m/s` | **1 Sniper shot (`120 × 1.6 = 192`) shatters shield cleanly without piercing body**, stunning Aegis for `1.5 s`! Or flank/grapple overhead for HS. Shield `#FF8C00`. |
+| **3. Veil Sniper** (Rooftop Marksman) | `85` | `3.0 m/s` | Rooftop/balcony perch, long-range lethal snipe (`2.8 s` CD), backsteps if rushed. | `1150 ms` / **`320 ms`** | **`100` (1-shot)** / `240 m/s` | Long narrow vision cone (`38°`, `95 m`). Ideal counter-snipe duel with K-90 4x scope. |
+| **4. Phantom** (Blink Assassin) | `150` | `8.5 m/s` (Blink `32 m/s`) | `10 m` violet blink (`2.0 s` CD), 2-bolt pulse burst, or close melee slash (`<= 4.5 m`). | Shot `400/190 ms` · Slash `350 ms` glow | Bolt `55` (`95 m/s`) · Slash `65` | Punish `0.45 s` post-blink recovery in Bullet Time or sniper pick from stealth. |
+| **5. Hunter Drone** (Aerial Mech) | `75` | `9.5 m/s` (Patrol `5.0 m/s`) | Orbits at `6–22 m` altitude, leads swing trajectory with 2-shot burst (`1.8 s` CD). | `500 ms` / **`200 ms`** | `55` / `80 m/s` | Central optical lens = `2.5x` HS weakpoint. Explodes on death (`50` dmg, `4 m` radius). |
+| **6. Sector Boss `VALKYRIE-09`** | `1600` (Wings `300` ea) | `14.0 m/s` (Flight `28 m/s`) | **Starts in `COMBAT`**. Phase 1 (100–50%): aerial 3-snipe + 5-fan strafe. Phase 2 (<50%): crimson wings + dive shockwave + 4 shootable micro-missiles + reinforcements. | Snipe `850/280 ms` · Strafe `600/240 ms` · Dive `700/220 ms` | Snipe **`100`** · Strafe `55` · Dive `65` | Destroying either thruster wing triggers `3.5 s` grounded stagger with exposed head. |
 
 ---
 
-## 6. ビジュアル＆アートディレクション（ブラウザ最高峰グラフィック設計）
+## 6. Visuals, Gritty Cyberpunk Art Direction & Render Pipeline
 
-### 6.1 カラーパレット＆Emissive（発光）厳密定義
-視認性と美しさを両立するため、**背景建築の最大輝度を `0.28` 以下に抑え、インタラクティブ要素（走れる壁・アンカー・敵バイザー・予測線）のみ HDR Bloom しきい値（`1.0`）を超えて強烈に発光させる**。
+### 6.1 Color Palette & Emissive Hierarchy
+Background architecture stays below luminance `0.28`; gameplay-critical cues (anchors, enemy visors/states, telegraphs, neon focal points) exceed the HDR Bloom threshold (`0.92`) for razor-sharp readability in pouring rain.
 
-| カテゴリ | トークン名 | HEXコード | Roughness / Metalness | Emissive強度 | 用途・視認ルール |
+| Category | Token | HEX | Roughness / Metalness | Emissive | Usage |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **夜空・上層大気** | `--sky-zenith` | `#05070E` | — | — | 天頂色（スカイドーム・グラデーション上部） |
-| **都市低層フォグ** | `--fog-abyss` | `#0D1628` | — | — | 遠景ビル群を包む雨霧・指数フォグ `FogExp2(0x0D1628, 0.0036)`（※雲海メッシュは廃止） |
-| **濡れた道路＆屋上アスファルト** | `--roof-wet` | `#12161F` | R: `0.06〜0.42` (水たまりマップ) / M: `0.25` | `0.0` | 大通り車線・横断歩道・歩道・屋上。水たまり部分がネオンと街灯を鏡面反射 |
-| **運河（川）水面** | `--canal-water` | `#06111B` | R: `0.04` / M: `0.85` | `0.0` | ビルネオンを強烈に映し込む暗い水面＋雨粒波紋リップル＋緩やかな流れアニメ |
-| **高架高速道路＆橋コンクリート** | `--highway-concrete` | `#1A202C` | R: `0.48` / M: `0.30` | 下面照明 `1.6` | 高架桁・橋脚・トラス橋。高架下面にシアン/アンバーの工業照明ストリップを配置 |
-| **停車サイバーカー車体** | `--car-body` | `#171D28` | R: `0.22` / M: `0.78` | LED帯 `2.2〜2.8` | 道路・高架上に停まる静止車両。フロント白/シアンLED帯＋リア赤LED帯（一部ハザード点滅） |
-| **高層ビル外壁ガラス** | `--building-glass` | `#0C121D` | R: `0.15` / M: `0.85` | 窓テクスチャ部 `0.45` | プレイヤブル＆遠景の超高層ビル。窓明かりは暖色 `#FFD28A` と寒色 `#5CE1E6` を 3:7 で生成 |
-| **ウォールラン可能壁（看板・パネル）** | `--wallrun-cyan` | `#00F0FF` | R: `0.20` / M: `0.60` | **`2.2`** | ビル側面・高架側面ガード壁に水平シアン発光ストリップ＋斜めシェブロン模様を配置 |
-| **グラップル専用アンカー＆ビル角** | `--grapple-gold` | `#FFB800` | R: `0.25` / M: `0.80` | **`2.8`** | 高架縁・橋のトラス頂点・ビル角・中層ブリッジに発光ビーコン配置（6°吸着アシスト対象） |
-| **プレイヤー弾道＆ワイヤー** | `--player-strand` | `#38F8FF` | — | **`3.2`** | ワイヤーは張力が高いほど白熱（`#38F8FF` → `#FFFFFF`） |
-| **敵アーマーベース** | `--enemy-armor` | `#161B26` | R: `0.50` / M: `0.65` | `0.0` | 暗背景でも埋もれないよう、シェーダーに薄いシアン/赤リムライト（Fresnel）を常時適用 |
-| **敵バイザー＆予測線（ロック）** | `--enemy-danger` | `#FF1E42` | — | **`4.2`** | 最優先視認色。Bloomで鋭く滲み、雨夜でも100m先から即発見可能 |
-| **敵予測線（追尾中）** | `--enemy-aim` | `#FF7A00` | — | **`1.8`** | ロック前の予備線（細い点線／半透明） |
-| **イージス盾＆警告** | `--shield-amber` | `#FF9500` | R: `0.10` / M: `0.10` | **`2.0`** | 六角形ハニカム模様の半透明シェーダー（被弾時白フラッシュ） |
-| **次街区開放ゲート** | `--gate-jade` | `#00FF9D` | — | **`3.0`** | 敵全滅時に大通り先／街区奥で開くホログラム封鎖ゲート＋エメラルド光の柱 |
+| Sky Zenith | `--sky-zenith` | `#05070E` | — | — | Skydome top gradient |
+| Low-Altitude Mist | `--fog-abyss` | `#0D1628` | — | — | `FogExp2` + height-based atmospheric haze |
+| Wet Road & Grime | `--roof-wet` | `#12161F` | R `0.06–0.44` / M `0.25` | `0.0` | Anisotropic vertical neon streak reflections + puddle oil-slick iridescence & gutter grime |
+| Canal Water | `--canal-water` | `#06111B` | R `0.04` / M `0.85` | `0.0` | Flowing ripples + Fresnel neon reflection |
+| Highway & Bridges | `--highway-concrete` | `#1A202C` | R `0.48` / M `0.30` | Underside `1.6` | Passable elevated road + underside industrial strips |
+| Parked Cybercars (6-Color) | `--car-body` | 6 dark metallic palettes | R `0.20` / M `0.80` | LEDs `2.2–2.8` | Head/tail light pools on wet asphalt |
+| Building Facades (4 Archetypes) | `--building-glass` | `#0C121D` | R `0.15–0.55` / M `0.3–0.85` | Windows `0.45` | Solid opaque 1F shutters/concrete + parallax upper interiors + exposed pipe bundles |
+| Grapple Gold Anchors | `--grapple-gold` | `#FFB800` | R `0.25` / M `0.80` | **`2.8`** | `6°` snap targets on ledges/bridges/corners |
+| Player Strand & Tracer | `--player-strand` | `#38F8FF` | — | **`3.2`** | Tension white-hot shift `#38F8FF -> #FFFFFF` |
+| Enemy AI State Visors/Rim | Unaware / Alert / Detected / Combat | `#2A7A99` / `#FFCC22` / `#FF6A1A` / `#FF2244` | — | `1.2 / 2.8 / 3.8 / 4.2` | Instant diegetic state reading at 100 m; ADS adds thin cyan/state rim outline |
+| Next-Sector Gate | `--gate-jade` | `#00FF9D` | — | **`3.0`** | Opens when all enemies in sector are cleared |
 
-### 6.2 ハイエンド描画パイプライン＆ポストプロセス（Three.js / WebGL2）
-1. **レンダラー設定**:
-   * `antialias: false`（`EffectComposer` 側でマルチサンプル `WebGLRenderTarget` `samples: 4` を使用）、`powerPreference: 'high-performance'`。
-   * `toneMapping = THREE.ACESFilmicToneMapping`、`toneMappingExposure = 1.15`。
-   * 環境反射マップ：`PMREMGenerator` により、夜のネオン光点・月明かり・下層の青紫光を含む**プロシージャル環境キューブマップ（解像度 256）**を初期化時に1回生成し、`scene.environment` に設定。これにより全ビルのガラス・濡れた大通り・運河水面・停車車両・銃の金属パーツがリアルにネオンを反射する。
-2. **プロシージャル高精細PBRテクスチャ＆都市ディテール生成（起動時1回キャッシュ）**:
-   * **超高層ビル窓マップ（`1024×1024`）**: 階ごとの窓格子、ランダムなブラインド開閉、オフィス室内光の色温度ゆらぎ、低層階（1〜3階）の店舗ネオン窓枠を Canvas2D で描き、**Albedo / Emissive / Roughness / Normal（Sobelフィルタ生成）** の4枚セットを生成。
-   * **濡れた道路＆屋上アスファルトマップ（`512×512`）**: 道路用（センターライン・白破線・横断歩道・マンホール・水たまり）と屋上用（コンクリートひび割れ・水たまり）の2種を生成。水たまり内部は Roughness `0.06`（鏡面）、乾いた濡れ面は `0.42`。
-   * **運河水面シェーダー**: `Y = -2.4m` に配置。UVスクロールによる緩やかな流れ＋時間経過で広がる同心円の雨粒波紋ノーマル変調＋フレネル反射で、周囲のネオンと橋の光を鮮やかに映し込む。
-   * **多層都市ディテール群（すべて `InstancedMesh` 統合）**:
-     * **停車サイバーカー（25〜45台）**: ウェッジ型クーペ／セダン／バン風の3バリエーション。マットダーク塗装ボディ＋フロント白/シアンLED帯＋リア赤LED帯（一部ハザード点滅）。AABBコライダー（約 `2.0m × 1.35m × 4.4m`）を持ち、地上の遮蔽物・踏み台として機能。
-     * **高架高速道路（路面 `Y = 9.5m` / 桁下クリアランス `>= 7.8m`）**: 片側2車線（幅 `14m`）＋中央分離帯＋ガード壁（外壁ウォールラン可）＋橋脚ピラー（`24〜28m`間隔）＋下面工業照明ストリップ＋地上接続オンランプ。下が完全に空いており、スライディング・スイングで自由に潜り抜け可能。
-     * **運河（幅 `14m〜18m`）＆トラス橋（2〜3本）**: コンクリート護岸壁・転落防止ガードレール・ネオン縁取りのトラス橋（路面 `Y = 0.0m〜+0.5m`）。橋のトラス頂点にゴールドアンカーを配置。
-     * **街区＆屋上プロップ**: ネオン街灯、低層店舗ネオン看板（縦書きカタカナ／英字記号）、自販機／キオスク、ガードレール、エアコン室外機、排気ダクト、赤い航空障害灯（`1.2Hz` 点滅）、ボリュメトリック風サーチライト、**遠景ビルの谷間を流れるホバーカー光跡（赤・白の細い発光帯 `40本`、1 InstancedMesh）**。
-3. **描画レイヤー構成（全5パス）**:
-   * **Pass 1（メイン3Dシーン）**: スカイドーム → 遠景超高層ビル群＆ホバーカー光跡（InstancedMesh） → 地上大通り・運河水面・トラス橋・高架高速道路・プレイヤブル高層ビル群・停車車両＆街区ディテール → 人型エネミー＆封鎖ゲート → 弾道・予測線・ワイヤー・雨粒（InstancedMesh 1800本）。
-   * **Pass 2（1人称ビューモデル専用パス）**: `renderer.clearDepth()` の後に、専用FOV `68°`・専用シーン（右手の銃またはグラップルランチャー、左手のウインチリール＆ワイヤー接続部）を描画。これにより**壁にどれだけ近づいても銃や手が絶対に壁にめり込まない**。
-   * **Pass 3（UnrealBloomPass）**: `threshold: 0.92`, `strength: 0.65`（FLOW SSS時は `0.95`）, `radius: 0.48`。
-   * **Pass 4（カスタムKineticPostFX ShaderPass）**: 1枚のフラグメントシェーダーで以下を一括合成（ドローコール節約）：
-     * **RGB色収差**: 通常 `0.0005`、高速時最大 `0.0025`、被弾/HSキル時スパイク `0.009`。
-     * **バレットタイム色彩シフト**: 発動中、彩度を `0.55` に落としつつ青シアン（`#0A2A40`）へティント、ただし赤発光（敵・予測線）の輝度コントラストを強調。
-     * **スピードライン（ラジアル集中線）**: 速度 `18 m/s` 以上で画面外周（中心半径 `0.62` 以遠）にノイズベースの放射状ラインを合成。
-     * **被弾＆瀕死ビネット**: HP `<= 45` 時、四隅に深紅（`#CC0022`）の脈動ビネット＋微細走査線ノイズ。
-   * **Pass 5（OutputPass）**: ACES Filmic トーンマッピング＆sRGB出力。
+### 6.2 Gritty Cyberpunk Urban Layer (v1.5 / Phase 8B)
+To eliminate the "too clean / sterile" look while keeping draw calls `<= 120`:
+1. **Alley & Sidewalk Micro-Clutter (`InstancedMesh`)**: Dense clustered props tucked into narrow alleys, building recesses, underpass piers, and curbs (keeping core lanes & wall-run strips unobstructed): **stacked cardboard boxes, overflowing trash cans & garbage bags, heavy steel dumpsters, weathered metal benches, wooden pallets/scrap piles, rusted oil drums, concrete jersey barriers, and traffic cones**.
+2. **Wall Graffiti & Weathered Posters (`InstancedMesh` ×1 + 4×2 Procedural Canvas Atlas)**: Neon spray tags, street-art stencils, industrial caution stripes, and peeling rain-stained posters placed flush (`+0.03 m`, `polygonOffset`) on 1F shutters, narrow alley walls, highway pillars, and dumpsters.
+3. **Heavy Building-Side Piping & Conduits (Merged into Building Steel Geometry — 0 Extra Draw Calls)**: Multi-pipe vertical/horizontal pipe bundles with collar clamps and 90° elbows, wall junction boxes, ventilation louvers, and sagged cross-alley power cables.
+4. **Steaming Iron Manholes (`InstancedMesh` ×1 + Anchored Steam Plumes)**: Flush cast-iron grated manholes along roads and alleys with dim subterranean orange/cyan glow beneath the grates and focused vertical rising steam plumes anchored directly to manhole positions.
+5. **High-Density Layered Neon Signage (`CAP.NEON = 960`)**: Over double the neon signage density—heavily weighted toward narrow alleys and 1F–4F storefronts with protruding vertical blade signs, cross-alley hanging neon bars, and grime-stained translucent corrugated shop awnings.
+6. **Wet-Road Oil-Slick & Grime Shader Variation**: Subtle dark gutter grime patches and thin-film rainbow oil-slick specular glints near puddles and manholes.
 
-### 6.3 HUD・UI配置仕様（ミニマル＆超高視認サイバーHUD）
-画面占有率を `8%` 以下に抑え、視線移動を最小化するため**重要ゲージ（バレットタイム・ワイヤー吸着・残弾警告）を照準周辺に集約**する。
+### 6.3 5-Pass Rendering Pipeline
+* **Pass 1 (Main 3D Scene)**: Skydome → Distant skyline + blimps + hovercar light trails → Streets/canal/highways/bridges/4-archetype buildings with pipes + dense neon + alley clutter + graffiti decals + steaming manholes + 6-color parked cars + signals/lamp cones/cables → Articulated enemies + overhead alert gauges + contact shadows → Projectiles, smoke trails, telegraphs, strand, 1800 rain streaks + ground rain splashes.
+* **Pass 2 (First-Person ViewModel, `clearDepth`, FOV `68°`)**: 5-finger articulated hands, left-arm grapple winch, MK-IV Suppressed Rail Pistol (SMG-sized frame-mounted open holo hood), K-90 Single-Shot Rail Sniper (SMG-sized clear holo hood + subtle etched crosshair/stadia marks, long fluted barrel, muzzle brake, left-hand single-cartridge breech reload), and S-00 Grapple Launcher.
+* **Pass 3 (`UnrealBloomPass`)**: `threshold: 0.92`, `strength: 0.65` (`0.95` at SSS), `radius: 0.48`.
+* **Pass 4 (`KineticPostFX` Single-Pass Shader)**: RGB chromatic aberration, Bullet-Time cyan grade with preserved red/amber highlights, height/cinematic color grading + micro film grain, radial speed lines (`>= 18 m/s`), and critical-HP vignette.
+* **Pass 5 (`OutputPass`)**: ACESFilmic tone mapping & sRGB output.
 
-| UI要素 | 配置座標・サイズ | デザイン＆動的フィードバック |
-| :--- | :--- | :--- |
-| **クロスヘア（照準）** | 画面中央 (`50%, 50%`) | ・中央固定ドット `2px` (`#FFFFFF` + `1px`黒縁)<br>・武器別ダイナミックレティクル（ピストル：精密十字、SMG：4角括弧、SG：円弧、グラップル：鎖フック型）<br>・ヒットマーカー：胴体＝白 `×` (`120ms`)、HS＝金/赤大 `×` (`180ms`) |
-| **グラップル可能ロック表示** | 画面中央（ターゲット投影座標） | 視角 `6°`＆射程 `52m` 内にアンカーがある時、**銃装備中でも**薄いゴールド菱形 `[◆]` を表示。ワイヤー装備時は太い高輝度菱形に変化。 |
-| **バレットタイム円弧ゲージ** | 照準の右側半径 `36px` の円弧（幅 `3px`） | 残量 `100%→0%` をシアン `#00F0FF` で表示。`12%` 未満は暗灰色。発動中は白熱発光。 |
-| **装備切替・リロード円弧** | 照準の左側半径 `36px` の円弧（幅 `3px`） | 切替中（`220ms`）またはリロード中のみ出現し進行度を表示。 |
-| **HPバー＆非交戦リジェネ表示** | 左下 (`left: 32px, bottom: 28px`, 幅 `240px`) | 100HPバー。被弾すると「**3.0s 回復待機カウントダウンバー**」がHP直下に白細線で表示され、発砲すると赤く一瞬フラッシュしてリセットされる（仕組みを直感的に学習させる！）。 |
-| **速度計（SPEED）＆高度** | 左下HPの上 (`left: 32px, bottom: 72px`) | `28.4 m/s` のデジタル数値表示（`18 m/s` 超でシアン発光）。 |
-| **装備ドック＆残弾数** | 右下 (`right: 32px, bottom: 28px`) | `[1] PISTOL` `[2] SMG` `[3] SHOTGUN` `| [Q/4] STRAND` を横並びアイコン表示。現在のアクティブ装備を強調拡大し、ワイヤー接続中は `STRAND` アイコンに **`LOCKED`** バッジが点灯。残弾数を `48px` 等幅フォントで表示。 |
-| **FLOW RANK＆コンボタイマー** | 右上 (`right: 32px, top: 28px`) | 巨大な斜体ランク文字（`D`〜`SSS`）＋下に減衰ゲージ＋直近アクションログ（最大3行：`AIR HEADSHOT +300`, `EVADE +90`）。 |
-| **セクター進捗＆残敵数** | 上部中央 (`top: 20px`) | `SECTOR 02 // REMAINING: 07`（全滅時は緑発光で `GATE OPEN — ADVANCE TO NEXT DISTRICT`）。 |
-| **方向性ダメージ／予測線インジケータ** | 照準周辺半径 `85px` の円弧矢印 | 視界外から予測線ロックを受けた際、敵の方向へ赤い警告弧を点滅表示（背後からの理不尽な即死を防止）。 |
+### 6.4 Minimal High-Clarity Cyber HUD (`<= 8%` Screen Occupancy)
+* **Reticle**: Center `2px` white dot (`1px` black outline); dynamic weapon crosshair (Pistol precision cross, Sniper fine stadia ticks, Grapple hook); hitmarkers (white body, gold/red HS).
+* **Stealth Awareness Arcs**: Subtle radial arcs around reticle (`radius 78px`) filling in **Amber** as an enemy fills its Alert Gauge toward you, flashing **Orange** on `DETECTED` and **Crimson** on `COMBAT` / off-screen telegraph lock.
+* **Overhead Enemy State Indicator**: Ultra-minimal floating bar/diamond above enemies in `ALERT` (filling amber bar), `DETECTED` (orange `!`), or `COMBAT` (crimson chevron)—hidden when `UNAWARE`.
+* **Reticle Side Arcs**: Right arc = Bullet Time (`36px` radius); Left arc = Switch / Reload progress.
+* **Bottom-Left**: Speedometer (`m/s`) + Crouch/Stealth posture badge + 100 HP bar with `3.0 s` out-of-combat regen countdown hairline.
+* **Bottom-Right**: Equipment dock `[1] PISTOL` `[2] SNIPER` `| [Q/3] STRAND` (`LOCKED` badge when rope attached) + `48px` monospace ammo (`8` / `1` + breech ready indicator).
+* **Top-Right**: `FLOW RANK` (`D–SSS`) + decay bar + 3-line action feed (`STEALTH HS +340`, `SHIELD BREAK +150`, `EVADE +90`).
+* **Top-Center**: `SECTOR 01 // REMAINING: 09` + compact district alert status tag (`STEALTH` / `ALERT` / `DETECTED` / `COMBAT`).
 
 ---
 
-## 7. サウンド仕様（Web Audio API 100%プロシージャル多層DSP）
+## 7. Procedural Web Audio API Multi-Layer DSP
 
-外部音声ファイルは一切使用せず、`AudioContext` 上に以下のマスターDSPチェーンとシンセ群を構築する。
+### 7.1 Master Routing
+`[SE Voices] -> [Dynamic Lowpass (BT: 22kHz -> 680Hz in 120ms)] + [Procedural 1.8s Urban Convolver Reverb] -> [Master Compressor]`  
+`[BGM 5 Layers] -> [BGM Lowpass (BT-linked)] -> [Master Compressor]`  
+`[UI / HS Resonance / Awareness Cues] -> [Master Compressor]` (stays crisp during Bullet Time).  
+Constant pink-noise rain loop (`0.09` gain). **All audio suspends/mutes completely on Pause or browser tab blur.**
 
-### 7.1 マスターオーディオ・ルーティング
-```text
-[SE Voices] ──┬──> [Dynamic Lowpass Filter (BT連動)] ──> [Master Compressor] ──> [Destination]
-              └──> [Convolver Reverb (都市の空間残響 1.8s)] ──┘
-[BGM 5 Layers] ──> [BGM Lowpass Filter (BT連動)] ──────────> [Master Compressor]
-[UI / HS共鳴音] ──────────────────────────────────────────> [Master Compressor] (※BT中でもクリアに響かせる)
-```
-* **バレットタイム音響変調**: 発動時、`Dynamic Lowpass Filter` のカットオフ周波数を `22000 Hz` → `680 Hz`（`Q = 2.4`）へ `120 ms` で指数スイープ。解除時は `180 ms` で `22000 Hz` へ復帰。
-* **都市リバーブ（ConvolverNode）**: 起動時にステレオの指数減衰ホワイトノイズ（長さ `1.8s`, 減衰率 `3.2`, 高域ロールオフ `4500Hz`）からインパルス応答（IR）をプロシージャル生成し、屋上・ビル谷間の冷たい反響音を再現する。
-* **雨の環境音（常時ループ）**: ピンクノイズ生成バッファ → Bandpass（`1200 Hz`, `Q=0.6`）＋Highshelf（`6000 Hz`, `+4 dB`）で「アスファルトを叩く雨音」を音量 `0.09` で常時再生。
-
-### 7.2 全SE 合成パラメータ厳密表
-| SE名称 | 合成レイヤー構成（波形・周波数・フィルター・ADSR） | 音程・動的変化ルール |
+### 7.2 Sound Effects Synthesis Table
+| Sound | Synthesis Layers | Dynamic Behavior |
 | :--- | :--- | :--- |
-| **レールピストル発砲** | ①トランジェント：Sawtooth `1400Hz→120Hz` (`35ms`) + WaveShaper歪み<br>②ボディ：Triangle `180Hz→42Hz` (`110ms`)<br>③電磁尾音：Bandpassノイズ `3200Hz→900Hz` (`180ms`) | 残弾が最後2発の時は金属クリック音（Sine `2600Hz`, `25ms`）を追加しリロード時期を聴覚通知 |
-| **パルスSMG発砲** | ①アタック：Square `620Hz→140Hz` (`28ms`)<br>②高域スナップ：Highpassノイズ `2800Hz` (`40ms`) | 連射ごとにピッチを `±3%` ランダム揺らぎ |
-| **ショットガン発砲** | ①サブ衝撃波：Sine `135Hz→28Hz` (`260ms`, 強ドライブ)<br>②散弾炸裂：Bandpassノイズ `900Hz` (`220ms`, WaveShaper `k=40`)<br>③ポンプ動作：発砲 `280ms` 後に金属ノイズ2連（`1800Hz` / `2200Hz`, 各 `45ms`） | 空中リコイルジャンプ時はサブ低音を `+3dB` 強調 |
-| **ヘッドショット命中＆キル** | ①ガラス/バイザー破砕：Highpassノイズ `5500Hz` (`90ms`)<br>②金属共鳴和音：Sine 3音（基音＋完全5度＋オクターブ）`A: 2ms, D: 240ms` | **連続HS音程上昇**: 5秒以内の連続HSごとにペンタトニックスケール（`C6→D6→E6→G6→A6→C7→D7→E7`）で音程が上昇！ |
-| **装備切替（銃⇄ワイヤー）** | 2段階メカニカル音：①収納 `Lowpassノイズ 800Hz (45ms)` → `90ms` 後に ②装填クリック `Triangle 1600Hz→2400Hz (30ms)` | ワイヤー装備へ切替時はリール金属音（FM変調 `3100Hz`）を付加 |
-| **ワイヤー射出＆着弾** | ①射出：高圧エア（Bandpassノイズ `2200Hz→600Hz`, `120ms`）＋ワイヤー巻き出し音（Sawtooth `900Hz→1800Hz`）<br>②アンカー着弾：重金属ガキン音（Square `420Hz` + FM金属倍音 `1950Hz`, `140ms`） | スイング速度に比例して風切りノイズ（Bandpass `400Hz→1600Hz`）のゲインが線形上昇 |
-| **敵予測線ロック警告** | Sine + Triangle 重ね、`980Hz → 1960Hz` へロック時間（`180〜320ms`）かけて線形上昇、`25Hz` トレモロ変調 | `PannerNode (HRTF)` で敵の3D方向から鳴らす。スナイパーはさらに鋭い `1400Hz → 2800Hz` |
-| **見切り回避（GRAZE）** | ドップラー風切り音（Bandpassノイズ `2400Hz→450Hz`, `160ms`）＋透明なベル音（Sine `1760Hz`, `120ms`） | 連続見切りでベル音が半音ずつ上昇 |
-| **バレットタイム突入/解除** | 突入：サブドロップ Sine `160Hz → 32Hz` (`280ms`)＋低域リバース風ノイズ<br>解除：ピッチ上昇 Sine `45Hz → 220Hz` (`200ms`) | 同時にマスターローパスを変調 |
-| **被弾＆瀕死心音** | 被弾：強烈なローパンチ `90Hz→25Hz`＋耳鳴りSine `4200Hz`（音量 `0.06`, `1.2s`減衰）<br>瀕死：HP `<= 45` 中、60Hzローパス心音2拍を `BPM 128` でループ | 非交戦リジェネ開始時に澄んだ和音（`F#4 + C#5`, Sine, `350ms`）を1回再生 |
+| **MK-IV Suppressed Pistol** | ① Damped rail snap: Triangle `900->110Hz` (`28ms`) + soft WaveShaper ② Pneumatic suppressor thump: Bandpass noise `1800->500Hz` (`65ms`) ③ High-tech slide click (`2400Hz`, `18ms`). | Metallic empty-warning ping on last 2 rounds. |
+| **K-90 Rail Sniper** | ① Thunderous sub-shock: Sine `150->26Hz` (`310ms`, heavy drive) ② Electromagnetic crack: Sawtooth `2200->140Hz` (`55ms`) + WaveShaper `k=45` ③ Urban canyon tail: Bandpass noise `1400->320Hz` (`380ms`) into reverb. | Followed by 3-beat breech reload SE (`BOLT_OPEN` + shell clink → `LOAD_ROUND` metallic seat → `BOLT_CLOSE` lock). |
+| **Headshot Hit & Kill** | Visor shatter Highpass noise `5500Hz` (`90ms`) + 3-note Sine metallic chord. | Consecutive HS within `5 s` climbs D-minor pentatonic scale (`C6 -> E7`). |
+| **Stealth / AI Awareness Cues** | ① `ALERT` gauge tick: subtle low pulsing sine `210->340Hz` ② `DETECTED`: sharp 2-note electronic sting (`520Hz -> 880Hz`, `160ms`) ③ `COMBAT` global alarm: brief tactical radio chirp + dual-tone burst (`980Hz / 740Hz`). | Cleanly distinct from telegraph lock tones (`980->1960Hz` HRTF 3D). |
+| **Equipment Switch / Grapple / Graze / BT / Heartbeat** | Identical high-craft multi-layer DSP synthesis (2-stage mechanical click, pneumatic grapple launch + metallic clang, Doppler graze whoosh + bell, BT sub-drop/rise, BPM 128 critical heartbeat, regen chord). | Velocity-linked wind rush while swinging. |
 
-### 7.3 アダプティブ5レイヤーBGM（BPM 136 / Key: D Minor）
-16分音符（`110.29 ms`）の精密ルックアヘッド・スケジューラ（`25ms` タイマー＋`100ms` 先読み）でリアルタイム合成する。
-
-| レイヤー | 解放条件 | 音源・パターン構成 |
-| :--- | :--- | :--- |
-| **Layer 1: Deep Pulse** | 常時（Rank D〜） | D2/F2/G2/A#1 の16分オクターブ・シンセベース（Sawtooth + Lowpass `380Hz`, サイドチェイン風ダッキング） |
-| **Layer 2: Cyber Drums** | Rank C〜 | 4つ打ち＋後半シンコペーションのパンチキック（Sine `130→42Hz`）＆ 2・4拍インダストリアルスネア（Noise + `210Hz`ボディ） |
-| **Layer 3: Neon Arp** | Rank B〜 | Dマイナーペンタトニックの16分アルペジオ（Square + Delay `3/16`拍フィードバック `0.35`） |
-| **Layer 4: Breakbeat Perc** | Rank A〜 | 16分高速ハイハット（Highpass `8000Hz`）＋金属リムショットによる疾走ビート |
-| **Layer 5: Overdrive Lead** | Rank S〜SSS | 歪みソーリード（Sawtooth + WaveShaper + Octaver）による高揚メロディ。**Rank SSS時はフィルターカットオフ最大開放＆8小節ごとのフィルイン追加** |
-| **非交戦（敵全滅／回復中）** | セクタークリア後 | Layer 2〜5 を `800ms` でフェードアウトし、Layer 1 の静かなベースパルスのみ残す |
+### 7.3 Adaptive 5-Layer BGM (BPM 136 / Key: D Minor)
+Real-time 16th-note lookahead scheduler (`25 ms` timer, `100 ms` lookahead):
+* **Stealth / Unaware Calm**: While no enemy is in `DETECTED`/`COMBAT`, BGM automatically ducks to **Layer 1 (Deep Pulse)** + soft filtered tension pad, erupting smoothly into Rank-driven Layers 2–5 as soon as combat or high FLOW kicks in!
+* **Layer 1–5**: Deep Pulse (`D`), Cyber Drums (`C`), Neon Arp (`B`), Breakbeat Perc (`A`), Overdrive Lead (`S–SSS`).
 
 ---
 
-## 8. セクター進行・スキル（ローグライト）・リプレイ要素 全パラメータ表
+## 8. Sector Progression, Roguelite Skills & Replayability
 
-### 8.1 全5セクター構造＆レベル生成仕様（多層サイバーパンク街区）
-各セクターは **プレイ可能エリア約 `180m × 180m`** の高密度サイバーパンク街区で構成される。基準高度 `Y = 0.0m` の**濡れた大通り＆路地**を基盤に、**低層〜超高層ビル `14〜22棟`（高さ `16m〜95m`）**、**停車サイバーカー（`25〜45台`）**、**運河（幅 `14〜18m`, 水面 `Y = -2.4m`）＆トラス橋**、そして**下が空いていて通れる高架高速道路（路面 `Y = 9.5m`, 桁下クリアランス `>= 7.8m`, オンランプ付き）**を立体配置する。
+### 8.1 5-Sector Unified District Structure
+To support whole-district stealth, patrolling, and global escalation/de-escalation without artificial mid-fight wave pop-ins, **Sectors 1–4 deploy their full enemy roster simultaneously at sector start** (strictly `<= 14` simultaneous active enemies for 60fps guarantee).
 
-* **4層立体戦場の動線保証**:
-  1. **Layer 0（地上・運河：`Y = -2.4m〜0.0m`）**: 停車車両を遮蔽物にしつつスライディング・高架下通過・橋渡りを行う高速中継エリア。
-  2. **Layer 1（高架高速道路：`Y = 9.5m`）**: 橋脚と下面照明の上を走る片側2車線の高架道路。外壁はウォールラン可、上にも敵と停車車両を配置。
-  3. **Layer 2（中層スカイブリッジ＆ネオン看板：`Y = 18m〜35m`）**: ビル同士を繋ぐ連絡通路・突き出しネオン看板・ゴールドアンカー。
-  4. **Layer 3（高層屋上：`Y = 30m〜95m`）**: スナイパーの狙撃陣地および見晴らしの良い制圧ポイント。
-* **エリア境界**: 外周は「超高層ビル壁＋道路を塞ぐホログラム封鎖バリア」で自然に囲い、遠景リング（半径 `160m〜650m`）に `80〜100棟` の超高層ビル群と空中ホバーカー光跡を配置する。
-
-| セクター | 街区レイアウト特徴（ビル棟数 / 高架 / 運河） | 総敵数（ウェーブ構成） | 出現エネミー内訳 | クリア報酬 |
+| Sector | District Layout (`~180m × 180m`) | Initial Roster (Unified — No Mid-Fight Wave Pop-In) | Enemy Composition | Reward |
 | :--- | :--- | :--- | :--- | :--- |
-| **SECTOR 01**<br>（大通り＆高架入口） | 14棟（`18〜65m`） / 中央大通りを跨ぐ高架高速道路1本＋オンランプ / 停車車両28台 | 9体（Wave 1: 4体 / Wave 2: 5体） | エンフォーサー×7, スナイパー×2 | スキル3択獲得 |
-| **SECTOR 02**<br>（運河＆トラス橋区画） | 16棟（`18〜75m`） / 街区を縦断する運河＋ネオン・トラス橋2本＋高架1本 / 停車車両32台 | 13体（Wave 1: 6体 / Wave 2: 7体） | エンフォーサー×5, イージス×3, スナイパー×2, ドローン×3 | スキル3択獲得 |
-| **SECTOR 03**<br>（高架交差＆高層路地） | 18棟（`22〜85m`） / 十字交差する高架高速道路＋狭いウォールラン路地＋中層ブリッジ / 停車車両36台 | 16体（Wave 1: 8体 / Wave 2: 8体） | エンフォーサー×5, イージス×3, スナイパー×3, ファントム×2, ドローン×3 | スキル3択獲得 |
-| **SECTOR 04**<br>（繁華街カナル＆二重高架） | 22棟（`24〜95m`） / 運河＆トラス橋3本＋高架高速道路＋高密度ネオン看板街 / 停車車両42台 | 20体（Wave 1: 9体 / Wave 2: 11体） | エンフォーサー×5, イージス×4, スナイパー×4, ファントム×3, ドローン×4 | スキル3択獲得 |
-| **SECTOR 05**<br>（中央スクランブル決戦） | 16棟円環超高層（`30〜95m`） / 中央スクランブル広場＋外周運河＋環状高架道路 | ボス1体 ＋ 増援ドローン | **『VALKYRIE-09』**（HP50%移行時にドローン×3＆スナイパー×2召喚） | ラン完走リザルト＆エンドレス解放 |
+| **SECTOR 01** (Main Avenue & Expressway) | 14 buildings (`18–65m`), 1 highway + on-ramp, 28 cars, gritty side alleys | **9** (All deployed at start, `UNAWARE` patrol/guard) | Enforcer ×7, Veil Sniper ×2 | 3-Choice Skill |
+| **SECTOR 02** (Canal & Truss Bridges) | 16 buildings (`18–75m`), through-canal + 2 truss bridges + highway, 32 cars | **13** (All deployed at start, `UNAWARE` patrol/guard) | Enforcer ×5, Aegis ×3, Veil ×2, Drone ×3 | 3-Choice Skill |
+| **SECTOR 03** (Interchange & High-Rise Alleys) | 18 buildings (`22–85m`), crossing highways + narrow graffiti alleys + 6 skybridges, 36 cars | **14** (All deployed at start, `UNAWARE` patrol/guard) | Enforcer ×4, Aegis ×3, Veil ×3, Phantom ×2, Drone ×2 | 3-Choice Skill |
+| **SECTOR 04** (Neon Canal & Twin Expressways) | 22 buildings (`24–95m`), through-canal + 3 bridges + twin highways + ultra-dense neon alleys, 42 cars | **14** (All deployed at start, `UNAWARE` patrol/guard) | Enforcer ×3, Aegis ×3, Veil ×3, Phantom ×3, Drone ×2 | 3-Choice Skill |
+| **SECTOR 05** (Central Scramble Showdown) | 16 ring skyscrapers (`30–95m`), central scramble plaza + ring highway, 34 cars | Boss `VALKYRIE-09` (starts in **`COMBAT`**) + Phase 2 escorts (Drone ×3, Veil ×2 in `COMBAT`) | **`VALKYRIE-09`** | Run Results + Endless Loop 2+ |
 
-* **セクター間シームレス移動**: セクター内全敵撃破で、大通りの先（または街区奥の橋・高架先）にあるエメラルド色のホログラム封鎖ゲートが開放。3択スキル取得後、ゲートを通過して次街区へ遷移する。
-* **エンドレス・プロトコル（Loop 2+）**: Sector 5 クリア後、獲得スキルを引き継いだまま Loop 2 へ突入可能。1ループごとに敵HP `+25%`、予測線ロック時間 `-8%`（下限 `140ms`）、出現数 `+20%`。
+* **Endless Protocol (Loop 2+)**: Carries all acquired skills. Each loop: enemy HP `+25%`, telegraph lock time `-8%` (floor `140 ms`), roster count `+20%` (active simultaneous enemies capped at `14`; overflow enemies enter only when slots free up).
 
-### 8.2 テクニカル・ローグライトスキル 全15種パラメータ表
-無双化（無条件火力UP・無敵化）を排し、**「正確な操作・立体機動・武器切替・ヘッドショット・見切り」を条件に爆発的なリターンを生むスキル**のみで構成する。各スキルは最大 Lv.3 まで重複取得可能。
-
-| ID | スキル名 | カテゴリ | 発動トリガー条件 | 効果数値 (Lv.1 / Lv.2 / Lv.3) |
+### 8.2 Technical Roguelite Skills (All 15, Max Lv.3 Each)
+| ID | Skill Name | Category | Trigger Condition | Effect (Lv.1 / Lv.2 / Lv.3) |
 | :--- | :--- | :--- | :--- | :--- |
-| `SK_01` | **クイック・ドロウ** | 切替連携 | 銃⇄ワイヤー切替時 | 切替所要時間 `-22%` / `-38%` / `-50%` |
-| `SK_02` | **モメンタム・チャンバー** | 切替連携 | ワイヤー解除（または切替）後 `1.8s` 以内 | 最初の2発に貫通属性付与（盾・敵を貫通）＋弾速 `+35%` / 最初の3発 / 最初の4発 |
-| `SK_03` | **スイング・リローダー** | 切替連携 | ワイヤーぶら下がり中に銃へ切替えた瞬間 | 選択した銃のマガジンを即座に `+40%` / `+70%` / `+100%` 自動補充 |
-| `SK_04` | **ウォール・オーバークロック** | 立体機動 | ウォールラン中のヘッドショット命中 | バレットタイムゲージ追加 `+15%` / `+25%` / `+35%` ＆ 即時リロード完了 |
-| `SK_05` | **キネティック・ブーツ** | 立体機動 | 壁蹴り / スライドジャンプ時 | 初速ブースト `+12%` / `+22%` / `+32%`、壁走り最大時間 `+0.4s` / `+0.8s` / `+1.2s` |
-| `SK_06` | **グラップル・コンデンサ** | 立体機動 | ワイヤーで敵に直接フック命中時 | 敵のスタン時間 `0.4s` → `1.1s` / `1.6s` / `2.2s` に延長＆ワイヤーCD即リセット |
-| `SK_07` | **ブラスト・スラスター** | 武器特化 | ショットガンの空中リコイルジャンプ時 | 反動インパルス `+20%` / `+35%` / `+50%` ＆ 発射後に短時間ホバリング減速（`0.35s` 重力半減） |
-| `SK_08` | **サーマル・ヘッドハンター** | 精密射撃 | レールピストルでのヘッドショットキル時 | 撃破位置から半径 `4.5m` / `6.0m` / `7.5m` に電磁ショック波（ダメージ `65`＋予測線強制キャンセル） |
-| `SK_09` | **パルス・シールドブレイカー** | 武器特化 | SMGでイージス盾またはボス翼へ命中時 | 部位・盾ダメージ倍率 `+40%` / `+80%` / `+120%`、破壊時マガジン全回復 |
-| `SK_10` | **クロノ・エクステンダー** | バレットタイム | バレットタイム発動中 | 消費速度 `-18%` / `-32%` / `-44%`（最大維持時間延長） |
-| `SK_11` | **ゼロ・タイム・ボーナス** | バレットタイム | バレットタイム中での連続キル（1回の発動内） | 2体目以降のキルでタイムスケール解除時に速度ブースト `+6 m/s` / `+9 m/s` / `+12 m/s`（`2.0s`持続） |
-| `SK_12` | **ファントム・グレイズ** | 見切り回避 | 敵予測線の見切り回避（GRAZE）成立時 | バレットタイムゲージ追加回復 `+10%` / `+18%` / `+26%` ＆ 周囲の敵弾速度を `0.6s` 間半減 |
-| `SK_13` | **ステルス・プロトコル** | 非交戦回復 | 非交戦リジェネ（撃たず・撃たれず）待機 | リジェネ開始までの待機時間 `3.0s` → `2.5s` / `2.1s` / `1.7s` に短縮 |
-| `SK_14` | **アドレナリン・サージ** | ハイリスク | プレイヤーHP `<= 45`（瀕死状態）の間 | 移動速度 `+15%` / `+22%` / `+30%`、切替・リロード速度 `+30%` / `+45%` / `+60%` |
-| `SK_15` | **ヘッドショット・リコシェ** | 精密射撃 | 空中でのヘッドショットキル時 | 最も近い別敵（`18m` 以内）へ自動で1発 / 2発 / 3発の跳弾（威力 `55`、予測線中断）が飛ぶ |
+| `SK_01` | **Quick Draw** | Switch Synergy | Gun ⇄ Grapple switch | Switch duration `-22%` / `-38%` / `-50%` |
+| `SK_02` | **Momentum Chamber** | Switch Synergy | Within `1.8 s` after grapple release/switch | First `2 / 3 / 4` shots gain enemy penetration + `+35%` velocity |
+| `SK_03` | **Swing Reloader** | Switch Synergy | Switching to a gun while rope `ATTACHED` | Instantly refills active gun ammo `+40%` / `+70%` / `+100%` (Sniper rounds up to `1/1` at all levels) |
+| `SK_04` | **Wall Overclock** | Aerial Mobility | Headshot hit while wall-running | BT gauge `+15%` / `+25%` / `+35%` & instant reload |
+| `SK_05` | **Kinetic Boots** | Aerial Mobility | Wall-kick / Slide-jump | Launch boost `+12%` / `+22%` / `+32%`, max wall-run `+0.4s / +0.8s / +1.2s` |
+| `SK_06` | **Grapple Capacitor** | Aerial Mobility | Direct grapple hook hit on enemy | Stun extended `0.4s -> 1.1s / 1.6s / 2.2s` & instant grapple CD reset |
+| `SK_07` | **Shadow Step** | Stealth / Mobility | Crouching & enemy detection | Crouch move speed `+35%` / `+50%` / `+65%` & enemy Alert Gauge fill rate `-35%` / `-48%` / `-60%` |
+| `SK_08` | **Thermal Headhunter** | Precision | Pistol headshot kill | EMP shockwave radius `4.5m / 6.0m / 7.5m` (`65` dmg + cancels telegraphs) |
+| `SK_09` | **Shield Piercer** | Weapon Mastery | Pistol or Sniper hitting Aegis shield / Boss wings | Shield & boss-wing damage `+60%` / `+90%` / `+120%`, and **breaking a shield or wing instantly refills the active gun's chamber/magazine to full** |
+| `SK_10` | **Chrono Extender** | Bullet Time | Bullet Time active | Drain rate `-18%` / `-32%` / `-44%` |
+| `SK_11` | **Zero-Time Bonus** | Bullet Time | 2+ kills in a single Bullet Time activation | Exit speed boost `+6 / +9 / +12 m/s` for `2.0 s` |
+| `SK_12` | **Phantom Graze** | Evasion | Telegraph `GRAZE` | Extra BT `+10% / +18% / +26%` & halves nearby enemy bolt speed for `0.6 s` |
+| `SK_13` | **Stealth Protocol** | Regen | Out-of-combat regen wait | Delay `3.0s -> 2.5s / 2.1s / 1.7s` |
+| `SK_14` | **Adrenaline Surge** | High Risk | Player HP `<= 45` | Move speed `+15% / +22% / +30%`, switch & reload speed `+30% / +45% / +60%` |
+| `SK_15` | **Headshot Ricochet** | Precision | Airborne headshot kill | Auto-ricochets `1 / 2 / 3` bolts (`55` dmg, cancels telegraph) to nearest enemy within `18 m` |
 
-### 8.3 リプレイ要素・スコア評価・永続保存（`localStorage`）
-* **総合ランク算出基準（セクタークリア＆完走時）**:
-  * `S+`：死亡回数 `0` かつ 総合タイム `<= 5分30秒` かつ ヘッドショット率 `>= 45%`
-  * `S`：死亡回数 `<= 1` かつ 総合タイム `<= 7分00秒` かつ 平均FLOW Rank `A` 以上
-  * `A` / `B` / `C`：クリアタイム・死亡回数・最大FLOWスコアから算出
-* **ハードコア・チャレンジ・モディファイア（クリア後解放）**:
-  1. `ONE-SHOT PROTOCOL`：プレイヤーHP `1`（全被弾即死・スコア `1.5x`）
-  2. `NO BULLET TIME`：バレットタイム封印（スコア `1.6x`）
-  3. `HYPER SPEED`：敵の予測線ロック時間 `-25%` ＆ プレイヤー速度上限 `+20%`（スコア `1.4x`）
-* **永続データ保存**: ベストタイム、最高FLOWスコア、最高到達Loop数、総HS数、解放済み武器エネルギーカラー（シアン / クリムゾン / ゴールド / バイオレット / ピュアホワイト）を `localStorage` キー `strand_protocol_save_v1` へ保存。
+### 8.3 Scoring, Modifiers & Persistence (`localStorage`)
+* **Run Ranks**: `S+` (`0` deaths, `<= 5:30`, HS `>= 45%`), `S` (`<= 1` death, `<= 7:00`, avg FLOW `>= A`), `A`/`B`/`C`.
+* **Unlockable Hardcore Modifiers**: `ONE-SHOT PROTOCOL` (HP `1`, `1.5x` score), `NO BULLET TIME` (`1.6x`), `HYPER SPEED` (lock `-25%`, speed cap `+20%`, `1.4x`).
+* **Save Key**: `strand_protocol_save_v1` (best time, high FLOW score, max loop, total HS, unlocked weapon energy colors).
 
 ---
 
-## 9. 推奨ファイル構成（責務分離）＆パフォーマンス上限
+## 9. Architecture & Performance Caps
 
-### 9.1 推奨技術スタックとディレクトリ構成（Vite + TypeScript + Three.js）
-実装担当AIが各モジュールの責務を混濁させず、1ファイルずつ高品質に構築・検証できるよう、以下の**16ファイル構成**を標準とする。
+### 9.1 Module Layout (`strand-protocol/src/`)
+* `config/`: `constants.ts`, `weapons.ts` (Pistol + Sniper + Grapple), `enemies.ts` (6 archetypes + AI perception/alert constants), `skills.ts` (15 skills + 5 unified sectors).
+* `engine/`: `Renderer.ts`, `ProceduralTextures.ts` (facade PBR, wet road + grime/oil-slick, graffiti/poster 4×2 atlas, manhole grate), `AudioEngine.ts`, `InputManager.ts`.
+* `world/`: `CityBuilder.ts` (multi-layer city, alley clutter, graffiti decals, building pipe bundles, steaming iron manholes, 960 neon signs), `FacadeLighting.ts`, `PhysicsWorld.ts`.
+* `player/`: `PlayerController.ts` (fixed wall-run roll, `0.78 m` crouch, `4x` FOV scaling), `EquipmentManager.ts` (Pistol + single-shot auto-reload Sniper + Grapple, sound emission hooks), `ViewModelKit.ts`, `ViewModelRenderer.ts` (unified SMG-sized holo hood on Pistol frame & Sniper, single-round breech animation).
+* `entities/`: `EnemyManager.ts` (4-state AI, per-enemy FOV/alert gauge, acoustic/proximity sensing, shared last-known position, suppressive fire, global search de-escalation, overhead state indicator), `EffectsPool.ts`.
+* `ui/`: `HudManager.ts` (awareness arcs, stealth status badge, 3-slot dock).
 
-```text
-strand-protocol/
-├── package.json                  # three, @types/three, typescript, vite
-├── tsconfig.json                 # strict: true, target: ES2022
-├── index.html                    # Canvasコンテナ、サイバーHUDマークアップ、タイトル/ポーズ/スキル選択/リザルトUI
-└── src/
-    ├── main.ts                   # エントリポイント、固定ステップ物理(120Hz)＋可変描画ループ、シーン統括
-    ├── config/
-    │   ├── constants.ts          # 物理・カメラ・Juice・耐久・非交戦リジェネ・カラーHEX全定数
-    │   ├── weapons.ts            # 武器3種＋グラップルランチャーの全数値・リコイル定義
-    │   ├── enemies.ts            # 敵6種（予測線ms・HP・速度・ボスフェーズ）定義
-    │   └── skills.ts             # 全15種スキル定義・セクター5構成・永続モディファイア定義
-    ├── engine/
-    │   ├── Renderer.ts           # WebGL2初期化、ACESFilmic、PMREM環境反射、EffectComposer、UnrealBloom、KineticPostFXカスタムGLSL
-    │   ├── ProceduralTextures.ts # Canvas2Dによるビル窓PBR4枚セット、濡れ屋上水たまり、ネオン看板、シアン壁パネル生成
-    │   ├── AudioEngine.ts        # Web Audio API多層DSP（WaveShaper, Convolver, BT連動Lowpass, HRTF Panner, 5レイヤーBPM136 BGM）
-    │   └── InputManager.ts       # PointerLock管理、先行入力バッファ(150ms)、キーバインド、誤クリック450msロック
-    ├── world/
-    │   ├── CityBuilder.ts        # 地上大通り・運河＆トラス橋・下が通れる高架高速道路・停車サイバーカー・高密度ビル群・遠景＆ホバー光跡・コライダー生成
-    │   └── PhysicsWorld.ts       # 高速AABB/OBBスイープ衝突、壁走りレイキャスト、視角6°アンカー吸着、弾道＆頭部/胴体分離ヒット判定
-    ├── player/
-    │   ├── PlayerController.ts   # 9状態移動FSM、慣性保存、振り子＆巻取り物理、空中バレットタイム、非交戦リジェネ
-    │   ├── EquipmentManager.ts   # 5状態装備FSM、武器⇄ワイヤー排他切替(220ms)、ぶら下がり中切替維持ロジック、射撃＆反動ジャンプ
-    │   └── ViewModelRenderer.ts  # 専用クリア深度パスでの1人称銃3種＆グラップルランチャー＆左腕ウインチのプロシージャルモデル＆アニメ
-    ├── entities/
-    │   ├── EnemyManager.ts       # 人型多関節プロシージャルリグ生成、6種AI、3フェーズ射撃予測線、見切り(GRAZE)判定、ボス『VALKYRIE-09』
-    │   └── EffectsPool.ts        # 弾道トレーサー、予測線、火花・破片、衝撃波リング、1800本雨粒InstancedMeshのオブジェクトプール管理
-    └── ui/
-        └── HudManager.ts         # 照準・BT円弧・非交戦リジェネ待機バー・FLOWランク・方向警告・3択スキルモーダル・設定＆セーブ管理
-```
-
-### 9.2 パフォーマンス上限＆60fps安定化ガイドライン
-ブラウザ（WebGL2）上で高精細グラフィックと `60fps` 以上を常時維持するため、以下の厳格な上限と最適化ルールを遵守すること。
-
-| リソース種別 | 上限値（プール数） | 最適化・軽量化方針 |
+### 9.2 Strict Performance Budget (60fps WebGL2 Target)
+| Resource | Hard Limit | Optimization Strategy |
 | :--- | :--- | :--- |
-| **ドローコール総数** | **`<= 120 calls / frame`** | 遠景ビル（最大100棟）、停車サイバーカー（最大45台）、街灯・自販機・ガードレール・橋脚・屋上小物、ホバーカー光跡（40本）、雨粒、パーティクルはすべて `THREE.InstancedMesh` に統合 |
-| **雨粒パーティクル** | `1,800 本`（1 InstancedMesh） | プレイヤー周囲 `45m × 30m × 45m` のボックス内で座標ラップアラウンド更新（メモリ確保ゼロ） |
-| **汎用VFXパーティクル（火花・バイザー破片・水しぶき）** | `600 個`（1 InstancedMesh） | 固定リングバッファプール。毎フレーム `new THREE.Vector3()` 等のアロケーション禁止 |
-| **弾丸プロジェクタイル＆トレーサー** | `120 発`（事前確保プール） | プレイヤー弾・敵弾共通プール。軌跡は伸びる細長ボックスのInstancedMeshで表現 |
-| **射撃予測線ライン** | `32 本`（事前確保プール） | 細長シリンダーまたはカメラビルボード・クワッドの再利用プール（`THREE.Line` は太さ固定のため使用禁止、必ずメッシュで太さとBloomを表現） |
-| **衝撃波リング＆爆発フラッシュ** | `24 個`（プール） | スケール・アルファ補間のみ |
-| **同時アクティブ敵数** | 最大 `14 体` | セクター内のウェーブ分割スポーンによりAI・衝突負荷を一定化 |
-| **リアルタイム光源（Lights）** | DirectionalLight `1`（月光・影なし）＋ HemisphereLight `1` ＋ 動的PointLight最大 `4`（マズル・爆発用プール） | **動的シャドウマップは原則OFF（またはプレイヤー周辺ビルのみ簡易ベイク/AO風グラデーション）** とし、光沢と立体感は **PMREM環境反射＋法線マップ＋Emissive＋Bloom** で圧倒的な見栄えを出す |
-| **解像度スケーリング** | `Math.min(window.devicePixelRatio, 1.5)` | ポストプロセス負荷を抑えつつシャープな輪郭を維持。設定画面に品質プリセット（`HIGH: DPR 1.5 + Bloom` / `MEDIUM: DPR 1.0 + Bloom` / `LOW: DPR 1.0 + 軽量PostFX`）を用意 |
-| **GCスパイク対策** | ループ内 `new` ゼロ | ベクトル・クォータニオン・行列・レイキャスターはすべてモジュールスコープの一時変数（`_tmpVec1`, `_tmpQuat` 等）を使い回す |
+| **Total Draw Calls** | **`<= 120 calls / frame`** | Merge wall pipes into building steel; batch all alley clutter, graffiti decals, manholes, neon signs (`960`), cars, lamps, rain, and particles into `THREE.InstancedMesh`. |
+| **Rain / VFX / Projectiles** | `1800` rain / `600` VFX / `120` bolts / `32` telegraphs / `24` rings | Pre-allocated fixed ring-buffer pools; **zero per-frame `new` allocations** in update/render loops. |
+| **Simultaneous Active Enemies** | **`<= 14`** | Unified initial deployment for Sectors 1–4 fits natively within the 14-enemy budget. |
+| **Real-Time Lights** | `1` Moon Directional (no shadow map) + `1` Hemisphere + max `4` dynamic PointLights | Rely on PMREM reflections, normal/roughness maps, emissives, contact shadows, and Bloom. |
+| **Resolution Scaling** | `Math.min(devicePixelRatio, 1.5)` | `HIGH (1.5 + Bloom)` / `MEDIUM (1.0 + Bloom)` / `LOW (1.0 + light PostFX)`. |
 
 ---
 
-## 10. 実装フェーズ推奨順序（Claude 実装ガイド）
-
-実装担当AI（Claude）は以下の順序で段階的に構築・動作確認を行うこと。
-
-1. **Phase 1（基盤・多層サイバーパンク都市ビジュアル）**: `constants.ts`, `Renderer.ts`, `ProceduralTextures.ts`, `CityBuilder.ts` を実装し、濡れた大通り・停車サイバーカー・運河＆トラス橋・下が空いていて通れる高架高速道路・密集する高層ビル群・ホバーカー光跡・Bloom・雨粒が60fps（ドローコール `<= 120`）で描画されることを確認。
-2. **Phase 2（立体機動＆装備排他切替）**: `PhysicsWorld.ts`, `InputManager.ts`, `PlayerController.ts`, `EquipmentManager.ts`, `ViewModelRenderer.ts` を実装。ウォールラン・スライディング・高架下くぐり抜け・運河浅瀬減速・グラップル物理振り子・**「ワイヤー接続中に銃へ切り替えて撃てる／再射出にはワイヤーへ切替必須」**の手触りを完成。
-3. **Phase 3（人型敵・射撃予測線・ハードコア戦闘）**: `EnemyManager.ts`, `EffectsPool.ts` を実装。全人型リグ・頭部HS分離判定・3フェーズ射撃予測線・見切り（GRAZE）・非交戦3秒リジェネ・0.5秒即リトライを接続。
-4. **Phase 4（音響DSP・Juice・ローグライト完走）**: `AudioEngine.ts`, `HudManager.ts`, `skills.ts` を実装。5レイヤーBPM136動的BGM・BTローパス・FLOWランク7段階・全5セクター＆ボス『VALKYRIE-09』・スキル15種（450ms入力ロック付き）・永続保存を統合して完成。
-5. **Phase 5（製品版最終ブラッシュアップ：5A 機能・ズーム・ポーズ音響・UX根治 → 5B ビジュアル・アート・HUD大改修）**: 詳細は別紙 `PHASE5_BRUSHUP_PLAN.md` を厳密に遵守して段階実装すること。
-6. **Phase 6（リアリティ＆立体機動大刷新：6A 建築4アーキタイプ・リアル夜景・3Dバルコニー＆非常階段・シアンパネル撤去 → 6B 手5本指＆銃4種ベベル/ホロサイト完全リモデル＋どこでも平行ウォールラン）**: 詳細は別紙 `PHASE6_BRUSHUP_PLAN.md` を厳密に遵守して段階実装すること。
-7. **Phase 7（映画級ビジュアル＆操作快適性 究極ブラッシュアップ：7A クリアスコープ・遅延根治・感度10・1F脱ガラス・ADS敵ネオン縁取り・両手リアルリロード・操作性5大強化 → 7B 異方性ネオン路面反射・高さフォグ＆映画グレーディング・街灯光錐・信号機＆電線・車両6色＆路面ライト・巨大飛行船・敵ベベル＆接地影・路面雨しぶき・弾道残煙・アダプティブHUD）**: 詳細は別紙 `PHASE7_BRUSHUP_PLAN.md` を厳密に遵守して段階実装すること。
+## 10. Implementation Roadmap
+1. **Phases 1–4**: Core multi-layer city, kinetic movement & exclusive switch, humanoid enemies & telegraphs, DSP audio & roguelite loop.
+2. **Phase 5 (`PHASE5_BRUSHUP_PLAN.md`)**: Tactical ADS zoom, pause audio mute, ramp/grapple polish, art/HUD upgrades.
+3. **Phase 6 (`PHASE6_BRUSHUP_PLAN.md`)**: 4 building archetypes, parallax interiors, fire escapes, 5-finger hands & beveled guns, parallel wall-run anywhere.
+4. **Phase 7 (`PHASE7_BRUSHUP_PLAN.md`)**: Clear scope, zero-lag ADS, solid 1F, ADS rim highlight, two-hand reloads, auto-mantle, wet neon streaks, height fog, lamp cones, signals, cables, 6-color cars, blimps, beveled enemies, splashes, smoke.
+5. **Phase 8 (`PHASE8_BRUSHUP_PLAN.md`)**:
+   * **8A**: Inverted wall-run roll fix, low crouch (`0.78 m`), lower ADS mouse sensitivity (`0.55x` / `0.20x`), Pistol + Single-Shot 4x Sniper roster (unified SMG-size holo hood, 1-shot non-piercing shield shatter), reworked `SK_07`/`SK_09`, and **4-State Stealth-Alert-Detected-Combat AI** with unified sector deployment.
+   * **8B**: Gritty cyberpunk city overhaul — dense alley clutter (cardboard, trash cans/dumpsters, benches, scrap/barriers), wall graffiti & torn posters, heavy building-side pipe bundles, glowing iron manholes with anchored steam plumes, 2.3× denser neon signs & alley banners, and road oil-slick grime.
 
 ---
 
-## 11. 将来拡張構想メモ（未実装・オンライン対戦大型アップデート＆知財戦略）
+## 11. Future Expansion Memo (Not Implemented — Online PvP & IP Strategy)
 
 > [!NOTE]
-> 本セクションは**現時点では実装しない将来ロードマップ用メモ**である。まずはシングルプレイ版で製品クオリティと市場評価を確立し、その後の大型アップデートとしてオンライン対戦モードを展開する方針とする。
+> Roadmap memo only — **do NOT implement** in the single-player release. Establish single-player quality and market traction first, then ship online PvP as a major update.
 
-* **目標体験**: オンライン対戦（PvP）において、**「相手プレイヤーの画面では自分も弾も通常速度（`1.0x`）で動き続けているのに、自分の画面ではバレットタイム中すべてが本物のスローモーション（`0.25x`）に見える」**非対称バレットタイム同期体験の実現。
-* **技術構想（仮称：APBT — Asymmetric Predictive Bullet-Time）**:
-  * 本ゲームのバレットタイムが「空中物理軌道（放物線／ワイヤー振り子）」限定である特性を活かし、**①軌道コミット → ②クライアント側タイムディレイ再生バッファ → ③時空アンカー射撃＆因果調停 → ④解除時の演出付き高速タイムキャッチアップ返済** の4段階で非対称時間進行を成立させる構想。
-* **知財・ビジネス方針**:
-  * シングル版のヒット後に本システムをオンライン対戦機能と同時に投入し、技術的話題性と独自ポジションを確立する。
-  * **※特許出願上の注意**: 特許の「新規性喪失」を防ぐため、具体的な同期アルゴリズム・データ構造・因果調停プロトコル・検証プロトタイプ（PoC）の詳細仕様は**公開リポジトリへ記載せず、特許出願準備まで非公開ドキュメントにて管理する**こと。
+* **Target Experience**: Online PvP featuring **asymmetric local Bullet Time** — from the opponent's perspective, both players and projectiles continue moving at normal `1.0x` speed, while from the Bullet-Time user's perspective, the entire world genuinely runs in `0.25x` slow motion.
+* **High-Level Architecture Concept (Working Name: APBT — Asymmetric Predictive Bullet-Time)**:
+  * Leverages the fact that Bullet Time is strictly airborne (ballistic arc / grapple pendulum) across four conceptual stages: ① trajectory commitment → ② client-side time-delayed playback buffer → ③ time-anchored hit validation & causal reconciliation → ④ stylized high-speed time catch-up repayment upon exit.
+* **IP / Patent Guardrail**:
+  * To preserve patent novelty, keep all concrete synchronization algorithms, wire-protocol schemas, causal reconciliation math, and PoC prototypes **strictly out of public repositories** until patent filing preparation.
