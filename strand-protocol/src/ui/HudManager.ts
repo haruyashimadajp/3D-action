@@ -3,7 +3,7 @@
  *
  * Minimal, high-visibility cyber HUD (≤ 8 % of the screen); critical gauges sit around the crosshair:
  *  - Centre anchor dot (2 px white + 1 px black border, accessibility toggle) + weapon reticle
- *    (pistol precise cross · SMG four brackets · shotgun arcs · grapple chain-hook)
+ *    (pistol precise cross · sniper fine open cross with mil ticks · grapple chain-hook)
  *  - Gold diamond grapple lock at the snapped anchor's screen position — shown with ANY slot equipped
  *    (thin when a gun is held, thick & bright with the grapple launcher)
  *  - Bullet-time arc (right, r = 36 px, 3 px wide): cyan, grey below 12 %, white-hot while active
@@ -29,7 +29,9 @@
  *    screen edge with distance when off-screen), "ARMORED — DESTROY WINGS", orange wing / grey armour hit
  *    markers, "ELIMINATED // <cause>" during the death glitch, active buff tags (PIERCE ×N / ZERO-TIME /
  *    ADRENALINE)
- *  - Phase 5B: dynamic reticle (recoil / SMG bursts open it, zoom tightens it), helmet-visor perspective on
+ *  - 8A-5: awareness arcs (r = 78 px) toward enemies filling their alert gauge / engaging, and a district status
+ *    badge (STEALTH · ALERT · DETECTED · COMBAT) beside the sector read-out
+ *  - Phase 5B: dynamic reticle (recoil opens it, zoom tightens it), helmet-visor perspective on
  *    the side panels + faint edge scales, title SETTINGS / PROTOCOL as right-side drawers
  * DOM is written only when values change (no per-frame layout churn).
  */
@@ -114,7 +116,18 @@ export interface HudFrame {
   readonly trackDist: Float32Array;
   readonly trackOff: Uint8Array;
   readonly trackBoss: Uint8Array;
+  /** 8A-5 awareness arcs: screen angle (deg, clockwise from up), 0..1 gauge, state rank (1 alert, 2 detected, 3 combat). */
+  awareCount: number;
+  readonly awareAngles: Float32Array;
+  readonly awareGauge: Float32Array;
+  readonly awareRank: Uint8Array;
+  /** 8A-5 district status ('' hides the badge, e.g. boss sector or gate open). */
+  alertTag: string;
 }
+
+export const HUD_MAX_AWARE = 4;
+/** Length of one 28° awareness arc at r = 78 px. */
+const AWARE_LEN = 78 * 28 * (Math.PI / 180);
 
 export const HUD_MAX_WARNINGS = 8;
 export const HUD_MAX_TRACKS = 6;
@@ -232,6 +245,9 @@ export class HudManager {
   private readonly dmgAngle = new Float32Array(DAMAGE_ARCS);
   private dmgNext = 0;
   private readonly sectorEl = el('sector-hud');
+  private readonly sectorText = el('sector-text');
+  private readonly alertTagEl = el('alert-tag');
+  private readonly awareArcs: SVGPathElement[] = [];
   private readonly bossEl = el('boss-hud');
   private readonly bossName = el('boss-name');
   private readonly bossFill = el('boss-fill');
@@ -272,14 +288,12 @@ export class HudManager {
   constructor() {
     this.reticles = {
       PISTOL: el<SVGElement>('ret-pistol'),
-      SMG: el<SVGElement>('ret-smg'),
-      SHOTGUN: el<SVGElement>('ret-shotgun'),
+      SNIPER: el<SVGElement>('ret-sniper'),
       GRAPPLE: el<SVGElement>('ret-grapple'),
     };
     this.dockItems = {
       PISTOL: el('dock-PISTOL'),
-      SMG: el('dock-SMG'),
-      SHOTGUN: el('dock-SHOTGUN'),
+      SNIPER: el('dock-SNIPER'),
       GRAPPLE: el('dock-GRAPPLE'),
     };
     this.btLen = this.btArc.getTotalLength();
@@ -287,6 +301,7 @@ export class HudManager {
     this.btTrack.style.strokeDasharray = `${this.btLen} ${this.btLen}`;
     for (let i = 0; i < HUD_MAX_WARNINGS; i++) this.warns.push(el<SVGPathElement>(`warn-${i}`));
     for (let i = 0; i < DAMAGE_ARCS; i++) this.dmgArcs.push(el<SVGPathElement>(`dmg-${i}`));
+    for (let i = 0; i < HUD_MAX_AWARE; i++) this.awareArcs.push(el<SVGPathElement>(`aware-${i}`));
     this.flowLines = Array.from(el('flow-log').children) as HTMLElement[];
     this.tracks = Array.from(el('trk-layer').children) as HTMLElement[];
     this.trackLabels = this.tracks.map((t) => t.querySelector('span') as HTMLElement);
@@ -731,7 +746,7 @@ export class HudManager {
       this.zoomBrackets.setAttribute('transform', `scale(${(r / 46).toFixed(3)})`);
       this.zoomBrackets.style.opacity = clamp((zq - 0.2) / 0.3, 0, 1).toFixed(2);
     }
-    // 5B-5 dynamic reticle: recoil / SMG bursts open it (up to +55 %), zoom tightens it (−12 %).
+    // 5B-5 dynamic reticle: recoil opens it (up to +55 %), zoom tightens it (−12 %).
     const kq = Math.round(clamp(f.reticleKick, 0, 1) * 50) / 50;
     if (this.changed('rk', kq) || this.changed('rkz', zq) || this.changed('rks', f.slot)) {
       const sc = (1 + 0.55 * kq) * (1 - 0.12 * zq);
@@ -883,7 +898,27 @@ export class HudManager {
     const remChanged = this.changed('rem', f.remaining);
     const nameChanged = this.changed('sname', f.sectorName);
     if (this.changed('gateTxt', f.gateOpen) || remChanged || nameChanged) {
-      this.sectorEl.textContent = f.gateOpen ? 'GATE OPEN — ADVANCE TO NEXT DISTRICT' : `${f.sectorName} // REMAINING: ${String(f.remaining).padStart(2, '0')}`;
+      this.sectorText.textContent = f.gateOpen ? 'GATE OPEN — ADVANCE TO NEXT DISTRICT' : `${f.sectorName} // REMAINING: ${String(f.remaining).padStart(2, '0')}`;
+    }
+    // 8A-5 district status badge.
+    if (this.changed('atag', f.alertTag)) {
+      const st = f.alertTag;
+      this.alertTagEl.className = st ? `st-${st}` : 'off';
+      this.alertTagEl.textContent = st === 'UNAWARE' ? 'STEALTH' : st;
+    }
+    // 8A-5 awareness arcs: amber = gauge filling, orange / crimson flashing = detected / combat with LOS.
+    const flashOn = Math.floor(this.blinkClock * 6) % 2 === 0;
+    for (let i = 0; i < HUD_MAX_AWARE; i++) {
+      const arc = this.awareArcs[i];
+      const vis = i < f.awareCount && (f.awareRank[i] === 1 || flashOn);
+      if (this.changed(`awv${i}`, vis)) arc.style.display = vis ? 'block' : 'none';
+      if (i >= f.awareCount) continue;
+      const a = Math.round(f.awareAngles[i]);
+      if (this.changed(`awa${i}`, a)) arc.setAttribute('transform', `rotate(${a})`);
+      const rank = f.awareRank[i];
+      if (this.changed(`awr${i}`, rank)) arc.setAttribute('class', rank === 3 ? 'aware cbt' : rank === 2 ? 'aware det' : 'aware');
+      const g = rank === 1 ? Math.round(clamp(f.awareGauge[i], 0.06, 1) * 50) / 50 : 1;
+      if (this.changed(`awg${i}`, g)) arc.style.strokeDasharray = `${(AWARE_LEN * g).toFixed(1)} ${AWARE_LEN.toFixed(1)}`;
     }
     // Boss bar.
     if (this.changed('boss', f.bossVisible)) this.bossEl.classList.toggle('on', f.bossVisible);

@@ -1,9 +1,9 @@
 /**
  * STRAND // PROTOCOL — Equipment (§3.2, §3.5, §3.6, §4).
  *
- * Exclusive right-hand slot: PISTOL | SMG | SHOTGUN | GRAPPLE.
+ * Exclusive right-hand slot: PISTOL | SNIPER | GRAPPLE (8A-3: [1] / [2] / [3|Q]).
  *  - With a gun active, LMB ALWAYS fires the gun — a new strand can never be launched.
- *  - A new strand requires switching to GRAPPLE (Q / 4 / wheel): holster 110 ms + draw 110 ms.
+ *  - A new strand requires switching to GRAPPLE (Q / 3 / wheel): holster 110 ms + draw 110 ms.
  *  - While the strand is ATTACHED it is locked to the left-arm winch: switching to a gun keeps the
  *    player hanging / swinging (and able to shoot); switching back to GRAPPLE does NOT cut it.
  *    Only Space (release) or Ctrl/C (cut) cut the strand — 7A-6: LMB with GRAPPLE active while attached reels in
@@ -19,7 +19,7 @@
  */
 import * as THREE from 'three';
 import { COLORS, DEG2RAD, EQUIP, MATERIALS, PHYSICS, clamp } from '../config/constants';
-import { GRAPPLE, GUNS, RELOAD_BEATS, SLOT_ORDER, type GunDef, type GunId, type ReloadCue, type SlotId, isGun, shellCycles } from '../config/weapons';
+import { GRAPPLE, GUNS, RELOAD_BEATS, RELOAD_CUES, SLOT_ORDER, adsSensitivity, magnifiedFov, type GunDef, type GunId, type ReloadCue, type SlotId, isGun } from '../config/weapons';
 import { SKILL_BY_ID, SKILL_CONSTANTS } from '../config/skills';
 import type { InputManager, DiscreteAction } from '../engine/InputManager';
 import type { Renderer } from '../engine/Renderer';
@@ -43,8 +43,6 @@ export interface EquipmentModifiers {
   switchTimeMultiplier: number;
   /** Multiplier on reload time (FLOW B −10 % … SSS −30 %, SK_14). */
   reloadTimeMultiplier: number;
-  /** SK_07: shotgun air recoil impulse bonus (fraction). */
-  shotgunImpulseBonus: number;
   /** SK_03: magazine refill fraction when switching to a gun while hanging. */
   swingReloadFraction: number;
   /** SK_02: number of piercing, +35 % speed shots after a strand release / switch (0 = not owned). */
@@ -55,6 +53,8 @@ export interface EquipmentModifiers {
 
 export interface EquipmentEvents {
   onShot?(gun: GunId, ammoLeft: number, airborne: boolean): void;
+  /** 8A-5: a player shot (or hook launch) is audible to enemies inside `radius` metres of `origin`. */
+  onGunshot?(origin: THREE.Vector3, radius: number): void;
   /** Tactical zoom engaged / released (servo SE). */
   onZoom?(on: boolean): void;
   onDryFire?(gun: GunId): void;
@@ -63,8 +63,8 @@ export interface EquipmentEvents {
   onReloadStart?(gun: GunId): void;
   onReloadDone?(gun: GunId): void;
   /**
-   * 7A-5 three-stage reload SE, fired at the exact animation beats: pistol / SMG MAG_OUT 0.14 → MAG_IN 0.54 →
-   * SLIDE 0.72; shotgun one SHELL per loaded shell (0.16 … 0.72) → PUMP 0.78.
+   * 7A-5 / 8A-3 three-stage reload SE, fired at the exact animation beats: pistol MAG_OUT 0.14 → MAG_IN 0.54 →
+   * SLIDE 0.72; sniper BOLT_OPEN 0.10 → LOAD_ROUND 0.60 → BOLT_CLOSE 0.76.
    */
   onReloadCue?(gun: GunId, cue: ReloadCue): void;
   onHookFired?(): void;
@@ -110,12 +110,12 @@ export class EquipmentManager {
   state: GearState = 'IDLE';
   lastGun: GunId = 'PISTOL';
   pendingSlot: SlotId | null = null;
-  readonly ammo: Record<GunId, number> = { PISTOL: GUNS.PISTOL.magazine, SMG: GUNS.SMG.magazine, SHOTGUN: GUNS.SHOTGUN.magazine };
+  readonly ammo: Record<GunId, number> = { PISTOL: GUNS.PISTOL.magazine, SNIPER: GUNS.SNIPER.magazine };
 
   /** Gear timer (real seconds, see 5A-4) and its duration. */
   private stateTime = 0;
   private stateDuration = 0;
-  /** Overshoot of the last FIRING_RECOVERY (keeps the SMG cadence exact at coarse bullet-time steps). */
+  /** Overshoot of the last FIRING_RECOVERY (keeps the fire cadence exact at coarse bullet-time steps). */
   private recoveryCarry = 0;
   private simTime = 0;
   /** 5A-1 tactical zoom: target state, 0..1 blend and the gun whose zoom parameters apply. */
@@ -125,7 +125,6 @@ export class EquipmentManager {
   /** 0..1 reticle bloom from recent shots (HUD dynamic reticle, decays in real time). */
   reticleKick = 0;
   private lastShotAt = -1e9;
-  private smgBurstIndex = 0;
   private grappleReadyAt = 0;
   private suppressCooldown = false;
 
@@ -148,7 +147,6 @@ export class EquipmentManager {
   readonly modifiers: EquipmentModifiers = {
     switchTimeMultiplier: 1,
     reloadTimeMultiplier: 1,
-    shotgunImpulseBonus: 0,
     swingReloadFraction: 0,
     momentumShots: 0,
     enemyHookResetsCooldown: false,
@@ -238,8 +236,7 @@ export class EquipmentManager {
     this.stateTime = 0;
     this.stateDuration = 0;
     this.ammo.PISTOL = GUNS.PISTOL.magazine;
-    this.ammo.SMG = GUNS.SMG.magazine;
-    this.ammo.SHOTGUN = GUNS.SHOTGUN.magazine;
+    this.ammo.SNIPER = GUNS.SNIPER.magazine;
     this.hookInFlight = false;
     this.hookRetracting = false;
     this.grappleReadyAt = 0;
@@ -252,6 +249,8 @@ export class EquipmentManager {
     this.zoomBlend = 0;
     this.input.lookScale = 1;
     this.player.zoomFovDeg = 0;
+    this.player.zoomAbsFov = 0;
+    this.player.zoomAbsBlend = 0;
     this.player.gunZoom = false;
     this.momentumLeft = 0;
     this.momentumUntil = -1;
@@ -323,12 +322,9 @@ export class EquipmentManager {
           this.requestSlot('PISTOL');
           break;
         case 'SLOT2':
-          this.requestSlot('SMG');
+          this.requestSlot('SNIPER');
           break;
         case 'SLOT3':
-          this.requestSlot('SHOTGUN');
-          break;
-        case 'SLOT4':
           this.requestSlot('GRAPPLE');
           break;
         case 'TOGGLE_GRAPPLE': {
@@ -399,33 +395,31 @@ export class EquipmentManager {
     this.events.onReloadStart?.(gun.id);
   }
 
-  /** 7A-5: emits the reload SE cues whose beat the reload progress has crossed (each exactly once). */
+  /** 7A-5 / 8A-3: emits the reload SE cues whose beat the reload progress has crossed (each exactly once). */
   private fireReloadCues(gun: GunId): void {
     const t = this.stateTime / Math.max(this.stateDuration, 1e-4);
-    const B = RELOAD_BEATS;
-    if (gun === 'SHOTGUN') {
-      const n = shellCycles(this.reloadFrom, GUNS[gun].magazine);
-      const span = (B.SHELL_END - B.SHELL_START) / n;
-      while (this.reloadCue < n && t >= B.SHELL_START + (this.reloadCue + B.SHELL_CLICK) * span) {
-        this.reloadCue++;
-        this.events.onReloadCue?.(gun, 'SHELL');
-      }
-      if (this.reloadCue === n && t >= B.PUMP) {
-        this.reloadCue++;
-        this.events.onReloadCue?.(gun, 'PUMP');
-      }
-      return;
-    }
-    const beats = [B.MAG_OUT, B.MAG_IN, B.SLIDE] as const;
-    const cues: readonly ReloadCue[] = ['MAG_OUT', 'MAG_IN', 'SLIDE'];
-    while (this.reloadCue < 3 && t >= beats[this.reloadCue]) this.events.onReloadCue?.(gun, cues[this.reloadCue++]);
+    const cues = RELOAD_CUES[gun];
+    while (this.reloadCue < cues.length && t >= RELOAD_BEATS[cues[this.reloadCue]]) this.events.onReloadCue?.(gun, cues[this.reloadCue++]);
   }
 
-  /** Instant magazine refill (skill hooks: SK_04 wall overclock, SK_09 shield break). */
+  /**
+   * Instant magazine refill (skill hooks: SK_03 swing reloader, SK_04 wall overclock, SK_09 shield break).
+   * ceil(magazine · fraction) ⇒ the 1-round sniper always refills to 1/1 at any fraction > 0.
+   */
   refill(gun: GunId, fraction = 1): void {
     const def = GUNS[gun];
     this.ammo[gun] = Math.min(def.magazine, this.ammo[gun] + Math.ceil(def.magazine * fraction));
     if (this.state === 'RELOADING' && this.activeSlot === gun && this.ammo[gun] >= def.magazine) this.enter('IDLE', 0);
+  }
+
+  /**
+   * 8A-4 SK_09: instantly refill the active gun to full (sniper chamber 1/1, pistol 8/8), cancelling any reload in
+   * progress. Returns false when no gun is in hand.
+   */
+  refillActive(): boolean {
+    if (!isGun(this.activeSlot)) return false;
+    this.refill(this.activeSlot, 1);
+    return true;
   }
 
   // ===============================================================================================
@@ -495,6 +489,8 @@ export class EquipmentManager {
         if (this.stateTime >= this.stateDuration) {
           this.enter('IDLE', 0);
           this.events.onSwitchDone?.(this.activeSlot);
+          // 8A-3: drawing an empty gun (the sniper after a cancelled breech reload) resumes the reload at once.
+          if (isGun(this.activeSlot) && this.ammo[this.activeSlot] === 0) this.startReload();
         }
         break;
       case 'FIRING_RECOVERY':
@@ -520,12 +516,9 @@ export class EquipmentManager {
 
     if (isGun(this.activeSlot)) {
       const gun = GUNS[this.activeSlot];
-      // Semi-auto: buffered press (≤ 150 ms). Full-auto (SMG): held trigger.
+      // Semi-auto: buffered press (≤ 150 ms).
       const wants = gun.automatic ? this.input.isDown('FIRE') || this.input.consumeBuffered('FIRE') : this.input.consumeBuffered('FIRE');
-      if (!wants) {
-        if (!this.input.isDown('FIRE')) this.smgBurstIndex = 0;
-        return;
-      }
+      if (!wants) return;
       if (this.ammo[gun.id] <= 0) {
         this.events.onDryFire?.(gun.id);
         this.startReload();
@@ -592,25 +585,20 @@ export class EquipmentManager {
       this.effects.spawnProjectile(_eye, _dir, spec, _muzzle);
     }
 
-    // Recoil (deg) — SMG horizontal kick follows a sine sway while held.
+    // Recoil (deg).
     const r = gun.recoil;
-    const horiz = r.sineSway ? Math.sin(this.smgBurstIndex * 0.9) * r.horizontalDeg : (Math.random() * 2 - 1) * r.horizontalDeg;
-    this.smgBurstIndex++;
+    const horiz = (Math.random() * 2 - 1) * r.horizontalDeg;
     this.player.addRecoil(r.verticalDeg * recoilK, horiz * recoilK, r.recoverDegPerS);
     this.reticleKick = Math.min(1, this.reticleKick + RETICLE_KICK[gun.id] * recoilK);
     this.player.addTrauma(gun.shake, recoilK);
     this.player.notifyFired();
     this.viewModel.onFire(gun.id, recoilK);
-    this.renderer.flashLight(_muzzle, this.plasma ? PLASMA_HEX : this.energyHex, gun.id === 'SHOTGUN' ? 18 : 9, 12, gun.id === 'SMG' ? 0.04 : 0.07);
+    // Suppressed pistol: a faint muzzle glow; the rail sniper lights up the street.
+    this.renderer.flashLight(_muzzle, this.plasma ? PLASMA_HEX : this.energyHex, gun.id === 'SNIPER' ? 18 : 5, 12, gun.id === 'SNIPER' ? 0.09 : 0.05);
     this.effects.burst(_muzzle, _aim, BURST.MUZZLE, this.muzzleColor.getHex());
-
-    // Kinetic shotgun recoil jump: opposite to the view (+11.5 m/s airborne, +2.0 m/s grounded).
     const airborne = !this.player.isGrounded;
-    if (gun.id === 'SHOTGUN') {
-      const k = (airborne ? gun.recoilImpulseAir : gun.recoilImpulseGround) * (1 + (airborne ? this.modifiers.shotgunImpulseBonus : 0));
-      this.player.viewDirection(_dir);
-      this.player.addImpulse(_dir.multiplyScalar(-k));
-    }
+    // 8A-5 acoustic sensing: 14 m suppressed pistol, 58 m rail crack.
+    this.events.onGunshot?.(_eye, gun.soundRadius);
     this.events.onShot?.(gun.id, this.ammo[gun.id], airborne);
   }
 
@@ -660,6 +648,8 @@ export class EquipmentManager {
     this.lastShotAt = this.simTime;
     this.enter('FIRING_RECOVERY', 0.12);
     this.viewModel.onFire('GRAPPLE');
+    // v1.5 §4: the launcher's faint 8 m pneumatic hiss.
+    this.events.onGunshot?.(_eye, GRAPPLE.SOUND_RADIUS);
     this.events.onHookFired?.();
   }
 
@@ -771,8 +761,17 @@ export class EquipmentManager {
     this.zoomBlend += ((target ? 1 : 0) - this.zoomBlend) * Math.min(1, z.lerpRate * realDt);
     if (this.zoomBlend < 0.0005) this.zoomBlend = 0;
     this.player.gunZoom = target;
-    this.player.zoomFovDeg = z.fovOffsetDeg * this.zoomBlend;
-    this.input.lookScale = 1 + (z.sensitivity - 1) * this.zoomBlend;
+    const base = this.player.settings.baseFov;
+    if (z.magnification > 0) {
+      // 8A-3 true optical magnification from the user's base FOV (84° → 25.37° at 4x).
+      this.player.zoomFovDeg = 0;
+      this.player.zoomAbsFov = magnifiedFov(base, z.magnification);
+      this.player.zoomAbsBlend = this.zoomBlend;
+    } else {
+      this.player.zoomFovDeg = z.fovOffsetDeg * this.zoomBlend;
+      this.player.zoomAbsBlend = 0;
+    }
+    this.input.lookScale = 1 + (adsSensitivity(z, base) - 1) * this.zoomBlend;
   }
 
   /** True while the zoom is engaged (RMB with a gun ready). */
@@ -829,12 +828,13 @@ export class EquipmentManager {
 /** FLOW SS+ plasma blue-white. */
 const PLASMA_HEX = 0xdcf2ff;
 /** 5B-5 dynamic reticle: bloom added per shot and its real-time decay rate (1/s). */
-const RETICLE_KICK: Readonly<Record<GunId, number>> = { PISTOL: 0.5, SMG: 0.14, SHOTGUN: 1.0 };
+const RETICLE_KICK: Readonly<Record<GunId, number>> = { PISTOL: 0.45, SNIPER: 1.0 };
 const RETICLE_KICK_DECAY = 6.5;
 
 /**
  * Projectile specs per gun, rebuilt only when the energy colour / plasma state changes (no allocation per shot).
- * `pierce` = SK_02 momentum rounds (+35 % speed, pass through shields and bodies).
+ * `pierce` = SK_02 momentum rounds (+35 % speed, pass through bodies; shields too — except the sniper's, which
+ * the 8A-3 Aegis rule always stops at the shield).
  */
 function buildSpecs(energyHex: number, plasma: boolean, pierce: boolean): Record<GunId, ProjectileSpec> {
   const c = new THREE.Color(plasma ? PLASMA_HEX : energyHex);
@@ -856,14 +856,14 @@ function buildSpecs(energyHex: number, plasma: boolean, pierce: boolean): Record
       width: width * (pierce ? 1.4 : 1),
       tag,
       pierce,
-      // 7B-7: pistol and shotgun rounds leave plasma smoke.
-      smoke: id !== 'SMG',
+      shieldStop: id === 'SNIPER',
+      // 7B-7: both rail guns leave plasma smoke.
+      smoke: true,
     };
   };
   return {
     PISTOL: mk('PISTOL', base, MATERIALS.PLAYER_STRAND.emissive, 0.03, 0),
-    SMG: mk('SMG', base, MATERIALS.PLAYER_STRAND.emissive * 0.8, 0.018, 1),
-    SHOTGUN: mk('SHOTGUN', light, MATERIALS.PLAYER_STRAND.emissive * 0.7, 0.016, 2),
+    SNIPER: mk('SNIPER', light, MATERIALS.PLAYER_STRAND.emissive * 1.15, 0.042, 1),
   };
 }
 

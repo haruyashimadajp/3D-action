@@ -28,7 +28,7 @@
 import * as THREE from 'three';
 import { AUDIO, clamp } from '../config/constants';
 import type { EnemyKind } from '../config/skills';
-import type { GunId, SlotId } from '../config/weapons';
+import type { GunId, ReloadCue, SlotId } from '../config/weapons';
 
 type Curve = Float32Array<ArrayBuffer>;
 
@@ -85,6 +85,7 @@ export class AudioEngine {
   private pink!: AudioBuffer;
   private softCurve!: Curve;
   private driveK40!: Curve;
+  private driveK45!: Curve;
   private hardCurve!: Curve;
   private windGain: GainNode | null = null;
   private windFilter: BiquadFilterNode | null = null;
@@ -115,6 +116,9 @@ export class AudioEngine {
   private flowRank = 0;
   private layerCount = 1;
   private calm = true;
+  /** 8A-5: every enemy UNAWARE / ALERT — BGM ducked to a filtered Layer 1 tension pulse. */
+  private stealthy = false;
+  private layer0Level = -1;
   private duckDepth = 0.28;
   private critical = false;
   private regenerating = false;
@@ -270,7 +274,8 @@ export class AudioEngine {
       b6 = x * 0.115926;
     }
     this.softCurve = driveCurve(6);
-    this.driveK40 = driveCurve(AUDIO.SHOTGUN_BLAST.shaperK);
+    this.driveK40 = driveCurve(AUDIO.DRIVE_K);
+    this.driveK45 = driveCurve(AUDIO.SNIPER_CRACK.shaperK);
     this.hardCurve = driveCurve(180);
 
     // BGM layer buses.
@@ -634,7 +639,7 @@ export class AudioEngine {
     const t = c.currentTime;
     this.leadShaper.curve = rankIndex >= 5 ? this.hardCurve : this.driveK40;
     this.leadFilter.frequency.setTargetAtTime(rankIndex >= 6 ? 18000 : rankIndex >= 5 ? 5400 : 3200, t, 0.2);
-    this.bgmShelf.gain.setTargetAtTime(rankIndex >= 6 ? 5 : 0, t, 0.2);
+    this.bgmShelf.gain.setTargetAtTime(this.stealthy ? AUDIO.STEALTH_BGM_SHELF_DB : rankIndex >= 6 ? 5 : 0, t, 0.2);
     this.duckDepth = rankIndex >= 6 ? 0.55 : 0.28;
     this.applyLayers(AUDIO.LAYER_FADE_S);
   }
@@ -651,13 +656,15 @@ export class AudioEngine {
     if (!c) return;
     const now = c.currentTime;
     for (let i = 0; i < 5; i++) {
-      const on = i === 0 || (!this.calm && i < this.layerCount);
-      if (on === this.layerOn[i]) continue;
+      const on = i === 0 || (!this.calm && !this.stealthy && i < this.layerCount);
+      const level = i === 0 && this.stealthy ? LAYER_LEVEL[0] * AUDIO.STEALTH_BGM_LAYER1_K : LAYER_LEVEL[i];
+      if (on === this.layerOn[i] && (i !== 0 || this.layer0Level === level)) continue;
       this.layerOn[i] = on;
+      if (i === 0) this.layer0Level = level;
       const g = this.layerGains[i].gain;
       g.cancelScheduledValues(now);
       g.setValueAtTime(g.value, now);
-      g.linearRampToValueAtTime(on ? LAYER_LEVEL[i] : 0, now + fade);
+      g.linearRampToValueAtTime(on ? level : 0, now + fade);
       this.layerUntil[i] = on ? Infinity : now + fade + 0.25;
     }
   }
@@ -681,33 +688,26 @@ export class AudioEngine {
     const t = c.currentTime;
     const d = this.seBus;
     const K = AUDIO.PISTOL_LOW_AMMO_CLICK;
+    void airborne;
     if (gun === 'PISTOL') {
-      const A = AUDIO.PISTOL_TRANSIENT;
-      const B = AUDIO.PISTOL_BODY;
-      const T = AUDIO.PISTOL_TAIL;
-      this.tone(c, 'sawtooth', A.f0, A.f1, A.ms / 1000, 0.42, d, t, 0.001, this.driveK40);
-      this.tone(c, 'triangle', B.f0, B.f1, B.ms / 1000, 0.55, d, t, 0.002);
-      this.noise(c, 'bandpass', T.f0, T.f1, 1.6, T.ms / 1000, 0.3, d, t, 0.003);
+      // 8A-3 suppressed rail thump: damped triangle drop through a soft shaper, a pneumatic bandpass snap and a
+      // tiny high-tech slide click — quiet enough for alley takedowns.
+      const A = AUDIO.PISTOL_THUMP;
+      const S = AUDIO.PISTOL_SNAP;
+      const C = AUDIO.PISTOL_CLICK;
+      this.tone(c, 'triangle', A.f0, A.f1, A.ms / 1000, 0.42, d, t, 0.001, this.softCurve);
+      this.noise(c, 'bandpass', S.f0, S.f1, 2.2, S.ms / 1000, 0.2, d, t, 0.002);
+      this.tone(c, 'square', C.hz, C.hz * 0.85, C.ms / 1000, 0.05, d, t + 0.03, 0.001);
       if (ammoLeft < K.rounds) this.lowAmmoClick(c, t + 0.03);
-    } else if (gun === 'SMG') {
-      const j = 1 + (Math.random() * 2 - 1) * AUDIO.SMG_PITCH_JITTER;
-      const A = AUDIO.SMG_ATTACK;
-      const S = AUDIO.SMG_SNAP;
-      this.tone(c, 'square', A.f0 * j, A.f1 * j, A.ms / 1000, 0.2, d, t, 0.001);
-      this.noise(c, 'highpass', S.hz * j, S.hz * j, 0.8, S.ms / 1000, 0.22, d, t, 0.001);
-      if (ammoLeft <= AUDIO.SMG_LOW_AMMO_ROUNDS) this.lowAmmoClick(c, t + 0.025);
     } else {
-      const S = AUDIO.SHOTGUN_SUB;
-      const B = AUDIO.SHOTGUN_BLAST;
-      const P = AUDIO.SHOTGUN_PUMP;
-      const sub = 0.6 * (airborne ? Math.pow(10, AUDIO.SHOTGUN_AIR_SUB_DB / 20) : 1);
-      this.tone(c, 'sine', S.f0, S.f1, S.ms / 1000, sub, d, t, 0.002, this.hardCurve);
-      this.noise(c, 'bandpass', B.hz, B.hz * 0.6, 0.9, B.ms / 1000, 0.5, d, t, 0.001, this.driveK40);
-      const tp = t + P.delayMs / 1000;
-      this.noise(c, 'bandpass', P.hzA, P.hzA, 4, P.ms / 1000, 0.2, d, tp, 0.001);
-      this.noise(c, 'bandpass', P.hzB, P.hzB, 4, P.ms / 1000, 0.2, d, tp + 0.075, 0.001);
-      // Last shell fired.
-      if (ammoLeft === 0) this.lowAmmoClick(c, t + 0.04);
+      // 8A-3 K-90: driven sub-bass shock, distorted electromagnetic whip-crack and a long canyon boom.
+      const S = AUDIO.SNIPER_SUB;
+      const W = AUDIO.SNIPER_CRACK;
+      const B = AUDIO.SNIPER_BOOM;
+      this.tone(c, 'sine', S.f0, S.f1, S.ms / 1000, 0.75, d, t, 0.002, this.hardCurve);
+      this.tone(c, 'sawtooth', W.f0, W.f1, W.ms / 1000, 0.36, d, t, 0.001, this.driveK45);
+      this.noise(c, 'bandpass', B.f0, B.f1, 0.9, B.ms / 1000, 0.42, d, t + 0.004, 0.003);
+      this.noise(c, 'bandpass', B.f0 * 0.7, B.f1, 0.7, (B.ms * 1.6) / 1000, 0.22, this.reverbSend, t + 0.02, 0.01);
     }
   }
 
@@ -745,11 +745,11 @@ export class AudioEngine {
   }
 
   /**
-   * 7A-5 three-stage reload SE: MAG_OUT metallic release click (カチャッ) · MAG_IN heavy lock (ガツン!) ·
-   * SLIDE bolt / slide release (シャキン!) · SHELL loading-port click (カチッ) · PUMP heavy two-part pump
-   * (ガシャン・ガシャッ).
+   * Three-stage reload SE at the exact animation beats. Pistol: MAG_OUT metallic release click · MAG_IN heavy lock ·
+   * SLIDE slide release. 8A-3 sniper breech: BOLT_OPEN lever lift + rearward rasp · LOAD_ROUND metallic clack of
+   * the round into the chamber · BOLT_CLOSE crisp forward slam and lock.
    */
-  reloadCue(cue: 'MAG_OUT' | 'MAG_IN' | 'SLIDE' | 'SHELL' | 'PUMP'): void {
+  reloadCue(cue: ReloadCue): void {
     const c = this.can();
     if (!c) return;
     const t = c.currentTime;
@@ -770,19 +770,74 @@ export class AudioEngine {
         this.fm(c, 2300, 3300, 3.0, 0.1, 0.16, B, t + 0.055);
         this.tone(c, 'square', 2900, 1900, 0.012, 0.14, B, t + 0.055, 0.001);
         break;
-      case 'SHELL':
-        this.tone(c, 'triangle', 2400, 1500, 0.016, 0.16, B, t, 0.001);
-        this.noise(c, 'bandpass', 1800, 900, 1.4, 0.05, 0.12, B, t + 0.006);
+      case 'BOLT_OPEN':
+        this.tone(c, 'square', 2600, 1700, 0.012, 0.12, B, t, 0.001);
+        this.noise(c, 'bandpass', 1500, 3600, 2.0, 0.08, 0.16, B, t + 0.02, 0.004);
+        this.tone(c, 'triangle', 820, 520, 0.04, 0.1, B, t + 0.09, 0.002);
         break;
-      case 'PUMP':
-        this.noise(c, 'lowpass', 2400, 500, 1.0, 0.09, 0.3, B, t, 0.002);
-        this.tone(c, 'triangle', 210, 90, 0.08, 0.28, B, t, 0.001);
-        this.noise(c, 'lowpass', 3000, 600, 1.0, 0.08, 0.32, B, t + 0.13, 0.002);
-        this.fm(c, 1300, 1850, 2.4, 0.07, 0.16, B, t + 0.13);
+      case 'LOAD_ROUND':
+        this.tone(c, 'triangle', 1900, 1150, 0.02, 0.18, B, t, 0.001);
+        this.noise(c, 'lowpass', 2600, 420, 1.1, 0.07, 0.24, B, t + 0.004, 0.001);
+        this.fm(c, 1250, 1900, 2.0, 0.05, 0.1, B, t + 0.01);
+        break;
+      case 'BOLT_CLOSE':
+        this.noise(c, 'lowpass', 3000, 400, 1.1, 0.08, 0.34, B, t, 0.001);
+        this.tone(c, 'triangle', 200, 78, 0.1, 0.32, B, t, 0.001);
+        this.fm(c, 1700, 2450, 2.6, 0.08, 0.16, B, t + 0.012);
+        this.tone(c, 'square', 3100, 2100, 0.01, 0.12, B, t + 0.05, 0.001);
         break;
       default:
         break;
     }
+  }
+
+  // =============================================================================================
+  // 8A-5 awareness cues & stealth BGM
+  // =============================================================================================
+  /**
+   * `ALERT`: low electronic suspicion hum · `DETECTED`: sharp spotted sting · `GLOBAL_COMBAT`: tactical radio
+   * alarm chime with crackle · `DEESCALATE`: soft descending all-clear blip.
+   */
+  awareness(kind: 'ALERT' | 'DETECTED' | 'GLOBAL_COMBAT' | 'DEESCALATE'): void {
+    const c = this.can();
+    if (!c) return;
+    const t = c.currentTime;
+    const B = this.clearBus;
+    switch (kind) {
+      case 'ALERT':
+        this.tone(c, 'sine', 220, 236, 0.42, 0.05, B, t, 0.06);
+        this.tone(c, 'sine', 223, 240, 0.42, 0.045, B, t, 0.06);
+        this.noise(c, 'bandpass', 900, 1200, 6, 0.3, 0.025, B, t + 0.05, 0.05);
+        break;
+      case 'DETECTED':
+        this.tone(c, 'square', 1800, 2700, 0.07, 0.11, B, t, 0.001, this.driveK40);
+        this.tone(c, 'sawtooth', 2700, 2400, 0.11, 0.07, B, t + 0.07, 0.002);
+        this.noise(c, 'highpass', 5000, 3000, 0.8, 0.06, 0.08, B, t, 0.001);
+        break;
+      case 'GLOBAL_COMBAT':
+        for (let k = 0; k < 3; k++) {
+          const tk = t + k * 0.16;
+          this.tone(c, 'square', k % 2 ? 1175 : 880, k % 2 ? 1175 : 880, 0.11, 0.07, B, tk, 0.004);
+          this.noise(c, 'bandpass', 2400, 1800, 3, 0.1, 0.04, B, tk, 0.002);
+        }
+        this.noise(c, 'bandpass', 1600, 2600, 1.5, 0.5, 0.035, B, t, 0.02);
+        break;
+      case 'DEESCALATE':
+        this.tone(c, 'sine', 1320, 660, 0.25, 0.05, B, t, 0.01);
+        this.tone(c, 'sine', 990, 495, 0.3, 0.035, B, t + 0.12, 0.01);
+        break;
+      default:
+        break;
+    }
+  }
+
+  /** 8A-5: highest enemy state UNAWARE / ALERT → filtered Layer 1 only; DETECTED / COMBAT → erupt to FLOW layers. */
+  setStealth(stealthy: boolean): void {
+    if (this.stealthy === stealthy) return;
+    this.stealthy = stealthy;
+    const c = this.ctx;
+    if (c) this.bgmShelf.gain.setTargetAtTime(stealthy ? AUDIO.STEALTH_BGM_SHELF_DB : this.flowRank >= 6 ? 5 : 0, c.currentTime, stealthy ? 0.4 : 0.08);
+    this.applyLayers(stealthy ? AUDIO.CALM_FADE_MS / 1000 : AUDIO.STEALTH_ERUPT_S);
   }
 
   /** 7A-6 auto-mantle: glove grip slap on the ledge + a short body scrape. */

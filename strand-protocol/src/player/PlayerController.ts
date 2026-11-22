@@ -61,6 +61,8 @@ export interface PlayerModifiers {
   criticalMoveBonus: number;
   /** Modifier NO BULLET TIME. */
   bulletTimeDisabled: boolean;
+  /** 8A-4 SK_07 Shadow Step: crouch move-speed bonus (fraction, +35 / 50 / 65 %). */
+  crouchSpeedBonus: number;
 }
 
 export interface PlayerEvents {
@@ -164,6 +166,9 @@ export class PlayerController {
   // ---- tactical zoom (written by the equipment each frame) ----
   /** Blended weapon zoom FOV offset (deg, ≤ 0). */
   zoomFovDeg = 0;
+  /** 8A-3 magnified optic: absolute ADS FOV (deg) and its 0..1 blend over the unzoomed FOV. */
+  zoomAbsFov = 0;
+  zoomAbsBlend = 0;
   /** A gun zoom is engaged: the −7° bullet-time FOV offset is not added on top. */
   gunZoom = false;
 
@@ -240,6 +245,7 @@ export class PlayerController {
     regenDelayMs: PLAYER.REGEN_DELAY_MS,
     criticalMoveBonus: 0,
     bulletTimeDisabled: false,
+    crouchSpeedBonus: 0,
   };
   readonly settings: AccessibilitySettings = { shakeScale: 1, rollScale: 1, baseFov: CAMERA.BASE_FOV };
 
@@ -617,7 +623,7 @@ export class PlayerController {
   }
 
   private runSpeed(): number {
-    let s: number = this.state === 'CROUCHING' ? PHYSICS.CROUCH_SPEED : PHYSICS.RUN_SPEED;
+    let s: number = this.state === 'CROUCHING' ? PHYSICS.CROUCH_SPEED * (1 + this.modifiers.crouchSpeedBonus) : PHYSICS.RUN_SPEED;
     if (this.inWater) s *= PHYSICS.CANAL_SPEED_MULT;
     if (this.isCritical) s *= 1 + this.modifiers.criticalMoveBonus;
     return s + this.activeBoost();
@@ -1166,7 +1172,7 @@ export class PlayerController {
     this.recoilYawDeg = this.recoilYawDeg > 0 ? Math.max(0, this.recoilYawDeg - rec) : Math.min(0, this.recoilYawDeg + rec);
 
     // Eye height: 1.72 → 0.86 while sliding (lerp 16·dt).
-    // 7A-6: crouch 1.05 m.
+    // 8A-2: crouch 0.78 m, slide 0.68 m.
     const eyeTarget =
       this.state === 'SLIDING' ? PLAYER.SLIDE_EYE_HEIGHT
       : this.state === 'CROUCHING' ? PLAYER.CROUCH_EYE_HEIGHT
@@ -1183,8 +1189,9 @@ export class PlayerController {
     const rs = this.settings.rollScale;
     let rollTarget = 0;
     let rollRate: number = CAMERA.WALLRUN_ROLL_LERP;
-    if (this.state === 'WALL_RUN_L') rollTarget = -CAMERA.WALLRUN_ROLL_DEG;
-    else if (this.state === 'WALL_RUN_R') rollTarget = CAMERA.WALLRUN_ROLL_DEG;
+    // 8A-1: lean AWAY from the wall — left wall ⇒ camera.rotation.z < 0 (top tilts right), right wall ⇒ > 0.
+    if (this.state === 'WALL_RUN_L') rollTarget = CAMERA.WALLRUN_ROLL_DEG;
+    else if (this.state === 'WALL_RUN_R') rollTarget = -CAMERA.WALLRUN_ROLL_DEG;
     else if (this.state === 'SLIDING') {
       rollTarget = CAMERA.SLIDE_ROLL_DEG;
       rollRate = CAMERA.SLIDE_LERP;
@@ -1246,7 +1253,8 @@ export class PlayerController {
     );
     camera.position.copy(this.eye);
     camera.rotation.copy(this.cameraEuler);
-    const fov = this.fov + this.fovPulse + this.zoomFovDeg;
+    let fov = this.fov + this.fovPulse + this.zoomFovDeg;
+    if (this.zoomAbsBlend > 0) fov += (this.zoomAbsFov - fov) * this.zoomAbsBlend;
     if (Math.abs(camera.fov - fov) > 1e-3) {
       camera.fov = fov;
       camera.updateProjectionMatrix();

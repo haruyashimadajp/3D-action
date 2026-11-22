@@ -23,7 +23,6 @@ export type DiscreteAction =
   | 'SLOT1'
   | 'SLOT2'
   | 'SLOT3'
-  | 'SLOT4'
   | 'TOGGLE_GRAPPLE'
   | 'SLOT_NEXT'
   | 'SLOT_PREV'
@@ -45,7 +44,6 @@ const KEY_DISCRETE: Readonly<Record<string, DiscreteAction>> = {
   Digit1: 'SLOT1',
   Digit2: 'SLOT2',
   Digit3: 'SLOT3',
-  Digit4: 'SLOT4',
   KeyQ: 'TOGGLE_GRAPPLE',
   KeyR: 'RELOAD',
   Escape: 'PAUSE',
@@ -54,7 +52,7 @@ const KEY_DISCRETE: Readonly<Record<string, DiscreteAction>> = {
 };
 
 /** Keys whose default browser behaviour must never fire during play. */
-const PREVENT = new Set(['Space', 'Tab', 'ControlLeft', 'KeyC', 'KeyQ', 'KeyW', 'KeyA', 'KeyS', 'KeyD', 'KeyR', 'KeyF', 'Digit1', 'Digit2', 'Digit3', 'Digit4']);
+const PREVENT = new Set(['Space', 'Tab', 'ControlLeft', 'KeyC', 'KeyQ', 'KeyW', 'KeyA', 'KeyS', 'KeyD', 'KeyR', 'KeyF', 'Digit1', 'Digit2', 'Digit3']);
 
 interface KeyboardLockApi {
   lock(keys?: string[]): Promise<void>;

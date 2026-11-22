@@ -377,6 +377,10 @@
       #pause.mini .mini-msg { display: block; }
       #pause .mini-msg b { color: #00f0ff; }
       @keyframes minifade { from { opacity: 0; } to { opacity: 1; } }
+      /* 8A-5 awareness arcs (r = 78 px): amber fill = alert gauge, orange / crimson = detected / combat with LOS. */
+      #xh .aware { fill: none; stroke: #ffcc22; stroke-width: 2.5; stroke-linecap: round; opacity: 0.8; display: none; filter: drop-shadow(0 0 3px rgba(255, 204, 34, 0.7)); }
+      #xh .aware.det { stroke: #ff6a1a; filter: drop-shadow(0 0 4px rgba(255, 106, 26, 0.85)); }
+      #xh .aware.cbt { stroke: #ff2244; filter: drop-shadow(0 0 4px rgba(255, 34, 68, 0.9)); }
       #xh .warn { fill: none; stroke: #ff1e42; stroke-width: 4; stroke-linecap: round; filter: drop-shadow(0 0 5px rgba(255, 30, 66, 0.95)); display: none; }
       #xh .dmg { fill: none; stroke: rgba(255, 60, 80, 0.85); stroke-width: 6; stroke-linecap: butt; display: none; }
       #evade {
@@ -396,6 +400,14 @@
         font-size: 12px; letter-spacing: 0.28em; color: rgba(232, 246, 255, 0.82); white-space: nowrap;
         text-shadow: 0 0 6px rgba(0, 0, 0, 0.9);
       }
+      /* 8A-5 district awareness badge beside the sector read-out. */
+      #alert-tag { display: inline-block; margin-left: 12px; padding: 1px 7px 1px 8px; border: 1px solid currentColor; font-size: 10px; letter-spacing: 0.22em; vertical-align: 1px; transition: color 0.2s, background 0.2s; }
+      #alert-tag.st-UNAWARE { color: #4fc3e0; background: rgba(42, 122, 153, 0.12); }
+      #alert-tag.st-ALERT { color: #ffcc22; background: rgba(255, 204, 34, 0.12); }
+      #alert-tag.st-DETECTED { color: #ff6a1a; background: rgba(255, 106, 26, 0.16); animation: tagblink 0.5s steps(2) infinite; }
+      #alert-tag.st-COMBAT { color: #ff2244; background: rgba(255, 34, 68, 0.18); }
+      #alert-tag.off { display: none; }
+      @keyframes tagblink { 50% { opacity: 0.45; } }
       #sector-hud.open { color: #00ff9d; text-shadow: 0 0 12px rgba(0, 255, 157, 0.9); animation: gatepulse 1.2s ease-in-out infinite; }
       @keyframes gatepulse { 50% { text-shadow: 0 0 4px rgba(0, 255, 157, 0.4); } }
       /* 7A-4: ADS target read-out under the crosshair (88 × 3 px tactical bar + lowercase name). */
@@ -553,8 +565,8 @@
         <button id="title-settings-btn" class="tbtn" type="button">SETTINGS</button>
       </div>
       <div class="controls">
-        <b>WASD</b> MOVE · <b>SPACE</b> JUMP / KICK · <b>CTRL</b> SLIDE · <b>LMB</b> FIRE / STRAND · <b>RMB</b> ZOOM (+ AIR BULLET-TIME)<br />
-        <b>Q</b> GUN ⇄ STRAND · <b>1-4</b> SELECT · <b>R</b> RELOAD · <b>ESC</b> PAUSE · <b>F</b> FULLSCREEN
+        <b>WASD</b> MOVE · <b>SPACE</b> JUMP / KICK · <b>CTRL / C</b> SLIDE · CROUCH · <b>LMB</b> FIRE / STRAND · <b>RMB</b> ZOOM (+ AIR BULLET-TIME)<br />
+        <b>Q</b> GUN ⇄ STRAND · <b>1-3</b> SELECT · <b>R</b> RELOAD · <b>ESC</b> PAUSE · <b>F</b> FULLSCREEN
       </div>
     </div>
     <div id="pause">
@@ -621,12 +633,9 @@
         <g id="ret-pistol" class="ret">
           <path d="M0 -5 V-12 M0 5 V12 M-5 0 H-12 M5 0 H12" />
         </g>
-        <g id="ret-smg" class="ret" style="display: none">
-          <path d="M-15 -8 V-15 H-8 M8 -15 H15 V-8 M15 8 V15 H8 M-8 15 H-15 V8" />
-        </g>
-        <g id="ret-shotgun" class="ret" style="display: none">
-          <circle r="22" stroke-dasharray="22 12.56" transform="rotate(-50)" />
-          <path d="M0 -4 V-8 M0 4 V8 M-4 0 H-8 M4 0 H8" />
+        <g id="ret-sniper" class="ret" style="display: none">
+          <path d="M0 -7 V-20 M0 7 V20 M-7 0 H-20 M7 0 H20 M-2 12 H2 M-2 16 H2 M12 -2 V2 M-12 -2 V2" />
+          <circle r="0.9" />
         </g>
         <g id="ret-grapple" class="ret" style="display: none">
           <circle r="12" stroke-dasharray="3 3" />
@@ -646,6 +655,10 @@
           <line x1="-15" y1="15" x2="-7" y2="7" />
           <line x1="15" y1="15" x2="7" y2="7" />
         </g>
+        <path class="aware" id="aware-0" d="M -18.87 -75.68 A 78 78 0 0 1 18.87 -75.68" />
+        <path class="aware" id="aware-1" d="M -18.87 -75.68 A 78 78 0 0 1 18.87 -75.68" />
+        <path class="aware" id="aware-2" d="M -18.87 -75.68 A 78 78 0 0 1 18.87 -75.68" />
+        <path class="aware" id="aware-3" d="M -18.87 -75.68 A 78 78 0 0 1 18.87 -75.68" />
         <path class="warn" id="warn-0" d="M -20.56 -82.47 A 85 85 0 0 1 20.56 -82.47" />
         <path class="warn" id="warn-1" d="M -20.56 -82.47 A 85 85 0 0 1 20.56 -82.47" />
         <path class="warn" id="warn-2" d="M -20.56 -82.47 A 85 85 0 0 1 20.56 -82.47" />
@@ -675,7 +688,7 @@
         <div class="trk"><i></i><i></i><span></span></div>
         <div class="trk"><i></i><i></i><span></span></div>
       </div>
-      <div id="sector-hud"></div>
+      <div id="sector-hud"><span id="sector-text"></span><span id="alert-tag" class="st-UNAWARE">STEALTH</span></div>
       <div id="flow">
         <div id="flow-rank">D</div>
         <div id="flow-bar"><div id="flow-fill"></div><div id="flow-delay"></div></div>
@@ -698,10 +711,9 @@
       <div id="dock">
         <div class="slots">
           <span class="slot" id="dock-PISTOL">[1] PISTOL</span>
-          <span class="slot" id="dock-SMG">[2] SMG</span>
-          <span class="slot" id="dock-SHOTGUN">[3] SHOTGUN</span>
+          <span class="slot" id="dock-SNIPER">[2] SNIPER</span>
           <span class="sep">|</span>
-          <span class="slot" id="dock-GRAPPLE">[Q/4] STRAND<span id="dock-locked">LOCKED</span></span>
+          <span class="slot" id="dock-GRAPPLE">[Q/3] STRAND<span id="dock-locked">LOCKED</span></span>
         </div>
         <div class="ammo"><span id="ammo-num">8</span><span id="ammo-max">/ 8</span></div>
         <div id="ammo-name">MK-IV RAIL PISTOL</div>

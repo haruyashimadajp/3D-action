@@ -329,3 +329,83 @@ export function scaledLockMs(baseMs: number, loop: number, extraReduction = 0): 
   const ms = baseMs * (1 - ENDLESS.LOCK_TIME_REDUCTION_PER_LOOP * loop) * (1 - extraReduction);
   return Math.max(Math.min(ENDLESS.LOCK_TIME_FLOOR_MS, baseMs), ms);
 }
+
+// ---------------------------------------------------------------------------
+// 8A-5 4-state Stealth / Alert / Detected / Combat AI (§5.1, PHASE8_BRUSHUP_PLAN.md 8A-5-B)
+// ---------------------------------------------------------------------------
+export type AlertState = 'UNAWARE' | 'ALERT' | 'DETECTED' | 'COMBAT';
+
+export const AI_STEALTH = {
+  // Vision cones
+  FOV_HALF_DEG: 52,            // Standard humanoids (104° cone)
+  FOV_HALF_VEIL_DEG: 38,       // Veil Sniper narrow long-range cone
+  VISION_RANGE: 52,            // Standard units
+  VISION_RANGE_VEIL: 95,       // Veil Sniper
+  VISION_RANGE_DRONE: 40,      // Drone downward 360° scan cone
+  // Distance-scaled vision fill rate (pts/sec, gauge 0..100)
+  FILL_MIN_PER_S: 18,
+  FILL_MAX_PER_S: 115,
+  FILL_DIST_EXP: 1.6,
+  CROUCH_FILL_MULT: 0.72,
+  // Out-of-FOV proximity sensing
+  PROX_RADIUS_STAND: 5.5,      // m
+  PROX_RADIUS_CROUCH: 3.5,     // m
+  PROX_FILL_MIN_PER_S: 38,
+  PROX_FILL_MAX_PER_S: 85,
+  // Acoustic gunshot sensing (instant gauge impulse)
+  GUNSHOT_IMPULSE_MIN: 25,
+  GUNSHOT_IMPULSE_MAX: 75,
+  // Decay while unseen
+  DECAY_HOLD_S: 1.0,
+  DECAY_PER_S: 14,
+  // Escalation timers
+  DETECTED_PROPAGATE_DELAY_S: 1.6,
+  DETECTED_PROPAGATE_RADIUS: 22.0,
+  DETECTED_TO_COMBAT_S: 3.5,
+  COMBAT_GLOBAL_DELAY_S: 2.2,
+  // De-escalation (Shared Last Known Position search)
+  SEARCH_ARRIVE_DIST: 8.0,
+  SEARCH_GIVE_UP_S: 4.5,
+  DEESCALATE_ALERT_GAUGE: 65,
+  // Suppressive fire when no LOS
+  SUPPRESS_SPREAD_DEG: 8.0,
+  SUPPRESS_CD_MULT: 1.35,
+} as const;
+
+/** 8A-5 values the plan states outside the AI_STEALTH block (patrol / scan / fallback), plus tuned extras. */
+export const AI_PATROL = {
+  /** Calm patrol speed per archetype (m/s; spec §5.4: Enforcer 2.6, Aegis 2.0, Drone 5.0; others in 2.0–2.6). */
+  SPEED: { ENFORCER: 2.6, AEGIS: 2.0, VEIL: 2.0, PHANTOM: 2.4, DRONE: 5.0, VALKYRIE: 0 } as Readonly<Record<EnemyKind, number>>,
+  /** Patrol legs: 2–3 connected waypoints, each leg this long (m). */
+  LEG_MIN_M: 7,
+  LEG_MAX_M: 15,
+  /** Pause at each turn, scanning left / right. */
+  PAUSE_MIN_S: 1.5,
+  PAUSE_MAX_S: 3.0,
+  SCAN_DEG: 35,
+  /** Rooftop Veil watch arc over the avenue (±deg) and its sweep period (s). */
+  VEIL_SCAN_DEG: 40,
+  VEIL_SCAN_PERIOD_S: 9,
+  /** Drone oval / figure-8 loops. */
+  DRONE_ALT_MIN: 8,
+  DRONE_ALT_MAX: 18,
+  DRONE_LOOP_R_MIN: 9,
+  DRONE_LOOP_R_MAX: 16,
+  /** ALERT: cautious advance toward the stimulus at this fraction of patrol speed; stop this close (m). */
+  INVESTIGATE_SPEED_K: 0.8,
+  INVESTIGATE_STOP_M: 2.5,
+  /** Body turn rate while patrolling / investigating (deg/s). */
+  TURN_DEG_PER_S: 150,
+  /** Suppressive fire: max distance to the shared last-known position, pitch scatter (±deg). */
+  SUPPRESS_MAX_DIST: 45,
+  SUPPRESS_PITCH_DEG: 4.0,
+  /** Unreachable last-known position (rooftop): a stalled searcher counts as inspecting after this long. */
+  SEARCH_STALL_S: 6.0,
+  /** Revert to ALERT: hold before decay starts (s). */
+  DEESCALATE_HOLD_S: 2.0,
+  /** Visor / rim colour and emissive per state (§6.1). */
+  STATE_COLOR: { UNAWARE: 0x2a7a99, ALERT: 0xffcc22, DETECTED: 0xff6a1a, COMBAT: 0xff2244 } as Readonly<Record<AlertState, number>>,
+  STATE_EMISSIVE: { UNAWARE: 1.2, ALERT: 2.8, DETECTED: 3.8, COMBAT: 4.2 } as Readonly<Record<AlertState, number>>,
+  /** Stealth kill FLOW bonus (killing an UNAWARE / ALERT enemy). */
+  STEALTH_KILL_FLOW: 120,
+} as const;

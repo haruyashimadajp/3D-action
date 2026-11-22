@@ -6,23 +6,24 @@
  * segments), lathes and tubes, baked into one geometry per material and per moving part:
  *  - two tactical-glove hands with five jointed fingers (thumb 2 + fingers 3 phalanges), four independent
  *    carbon knuckle plates, wrist cuffs, jacket sleeves and a cyber exo-brace (frame, light fibres, cables);
- *    the right index finger pulls the trigger on every shot; the left hand supports the SMG / shotgun
- *    fore-end and thrusts the wrist winch (frame, wound drum, guide rollers, status ring, pressure gauge)
- *    forward while the strand is out
- *  - MK-IV rail pistol (angled slide, glowing coil slits, under-barrel laser), VX-9 pulse SMG (faceted
- *    receiver, perforated shroud, angled foregrip, heat-sink fins), K-12 kinetic shotgun (twin barrels,
- *    perforated heat shield, ammo-linked 4-shell side saddle, ribbed pump), S-00 grapple launcher (twin
- *    hydraulics, pressure canister, wound reel + pulleys, three-claw anchor that opens on launch)
- *  - every gun: Picatinny rail + physical holographic sight (bevelled hood, coated lens, collimated reticle
- *    that sits exactly on the aim point in ADS), blowback (slide / bolt / pump / pistons), ejection sparks,
- *    diegetic ammo bar recessed in a bevelled housing
+ *    the right index finger pulls the trigger on every shot; the left hand supports the sniper fore-end and
+ *    thrusts the wrist winch (frame, wound drum, guide rollers, status ring, pressure gauge) forward while the
+ *    strand is out
+ *  - 8A-3 MK-IV suppressed rail pistol (angled slide, glowing coil slits, vented integral suppressor, holo sight
+ *    on a non-reciprocating frame bridge), K-90 single-shot rail sniper (faceted receiver with bevelled side
+ *    armour, cheek-rest stock, fluted barrel with twin rail-coil channels, baffled muzzle brake, folded bipod,
+ *    bolt / breech lever, two-hand breech reload), S-00 grapple launcher (twin hydraulics, pressure canister,
+ *    wound reel + pulleys, three-claw anchor that opens on launch)
+ *  - both guns share the old SMG holo hood (0.046 × 0.037 × 0.042): clear lens with a collimated dot (pistol)
+ *    or an ultra-fine crosshair with mil ticks (sniper) that sits exactly on the aim point in ADS; blowback,
+ *    ejection sparks, diegetic ammo bar recessed in a bevelled housing
  *  - lighting: tuned environment reflections + a 60 ms muzzle point light on every shot
  * Draw calls: ≤ 11 per frame for the whole view-model (one material per static body, one per moving part).
  */
 import * as THREE from 'three';
 import { CAMERA, COLORS, MATERIALS, clamp, lerpFactor } from '../config/constants';
 import type { ProceduralTextureLibrary } from '../engine/ProceduralTextures';
-import { RELOAD_BEATS, SLOT_ORDER, type GunId, type ReloadCue, type SlotId, shellCycles } from '../config/weapons';
+import { RELOAD_BEATS, SLOT_ORDER, type GunId, type ReloadCue, type SlotId } from '../config/weapons';
 import {
   MeshKit,
   type PartOpts,
@@ -51,7 +52,7 @@ export interface ViewModelFrame {
   phaseT: number;
   /** 0..1 reload progress (−1 when not reloading). */
   reloadT: number;
-  /** 7A-5: rounds loaded when the reload started (shotgun shell cycles, side-saddle refill). */
+  /** 7A-5: rounds loaded when the reload started (pistol slide lock). */
   reloadFrom: number;
   ammo: number;
   magazine: number;
@@ -108,7 +109,7 @@ interface ReloadPose {
   /** Ammo-bar override (0 mag out, 1 fresh mag, −1 none) and visible side-saddle shells. */
   bar: number;
   shells: number;
-  /** Shell in the left glove (shotgun). */
+  /** Rail cartridge in the left glove (sniper breech load). */
   handShell: number;
   /** The left hand follows `reloadHand` / `reloadQuat`. */
   hand: boolean;
@@ -184,8 +185,12 @@ interface WeaponRig {
   readonly support?: THREE.Vector3;
   readonly hasBar: boolean;
   readonly shells: boolean;
-  /** Ejection happens at the pump stroke (shotgun) instead of on the shot. */
+  /** Ejection spark delay after the shot (s); −1 = no spark on the shot (bolt action ejects on reload). */
   readonly ejectAt: number;
+  /** 8A-3 bolt action: the bolt only moves by hand (reload), never as blowback. */
+  readonly boltAction?: boolean;
+  /** 8A-3 spent rail casing flung out of the breech on BOLT_OPEN. */
+  readonly casing?: THREE.Object3D;
   readonly kickBack: number;
   readonly kickPitch: number;
 }
@@ -204,6 +209,10 @@ function createLensMaterial(color: THREE.Color): THREE.ShaderMaterial {
       uColor: { value: color },
       uReticle: { value: new THREE.Vector2() },
       uAspect: { value: 1 },
+      // 8A-3: 0 = pin-point dot (pistol), 1 = ultra-fine crosshair + open centre dot + mil ticks (sniper).
+      uMode: { value: 0 },
+      // NDC units per screen pixel (2 / viewport height).
+      uPx: { value: 0.002 },
     },
     vertexShader: /* glsl */ `
       varying vec2 vUv;
@@ -218,16 +227,36 @@ function createLensMaterial(color: THREE.Color): THREE.ShaderMaterial {
       uniform vec3 uColor;
       uniform vec2 uReticle;
       uniform float uAspect;
+      uniform float uMode;
+      uniform float uPx;
       varying vec2 vUv;
       varying vec2 vNdc;
+      float hair(float x, float w) { return 1.0 - smoothstep(w, w + 0.9, abs(x)); }
       void main() {
         vec2 d = (vNdc - uReticle) * vec2(uAspect, 1.0);
-        float dotR = 1.0 - smoothstep(0.0022, 0.0038, length(d));
         vec2 e = abs(vUv - 0.5) * 2.0;
         float edge = smoothstep(0.85, 1.0, max(e.x, e.y));
         vec3 glass = vec3(0.03, 0.06, 0.065);
-        float a = mix(0.02 + 0.10 * edge, 0.92, dotR);
-        gl_FragColor = vec4(mix(glass, uColor, dotR), a);
+        float base = 0.02 + 0.10 * edge;
+        if (uMode < 0.5) {
+          float dotR = 1.0 - smoothstep(0.0022, 0.0038, length(d));
+          gl_FragColor = vec4(mix(glass, uColor, dotR), mix(base, 0.92, dotR));
+          return;
+        }
+        // 8A-3 sniper: 0.7 px hairlines with an open centre (7 px gap), a 1 px centre dot and three tiny
+        // perpendicular mil ticks every 18 px along each arm — 0.65 opacity, targets stay unobstructed.
+        vec2 q = d / uPx;
+        float lw = 0.35;
+        float lines = max(hair(q.y, lw) * step(7.0, abs(q.x)), hair(q.x, lw) * step(7.0, abs(q.y)));
+        float ticks = 0.0;
+        for (int i = 1; i <= 3; i++) {
+          float o = 18.0 * float(i);
+          ticks = max(ticks, hair(abs(q.x) - o, lw) * step(abs(q.y), 3.0));
+          ticks = max(ticks, hair(abs(q.y) - o, lw) * step(abs(q.x), 3.0));
+        }
+        float dotC = 1.0 - smoothstep(0.6, 1.4, length(q));
+        float cross = max(max(lines, ticks), dotC);
+        gl_FragColor = vec4(mix(glass, uColor, cross), mix(base, 0.65, cross));
       }
     `,
   });
@@ -361,8 +390,7 @@ export class ViewModelRenderer {
     // ---------------- Weapons (each with its own posed right hand) ----------------
     this.rigs = {
       PISTOL: this.buildPistol(),
-      SMG: this.buildSmg(),
-      SHOTGUN: this.buildShotgun(),
+      SNIPER: this.buildSniper(),
       GRAPPLE: this.buildGrapple(),
     };
     for (const r of Object.values(this.rigs)) {
@@ -612,8 +640,31 @@ export class ViewModelRenderer {
     slideKit.add(new THREE.BoxGeometry(0.0016, 0.014, 0.036), { tint: 0x08090b, zone: 3 }, at(0.0166, 0.031, -0.04));
     slideKit.add(bevelBox(0.0018, 0.008, 0.03, 0.0008), { tint: T.CHROME, zone: 0 }, at(0.0168, 0.031, -0.04));
     slideKit.add(lathe([[0.0098, 0], [0.0098, 0.002], [0.0062, 0.003], [0.0045, 0.002], [0.0045, -0.004]], 18), { tint: T.DARK, zone: 0 }, at(0, 0.021, -0.197));
-    addRail(slideKit, -0.046, 0.012, 0.047, 0, T.DARK);
-    const lens = this.holoSight(slideKit, slide, 0, 0.05, -0.014, 0.03, 0.025, 0.026);
+    // 8A-3 non-reciprocating bridge mount: two side uprights clamp the frame outside the slide's path and carry a
+    // short rail 6 mm above the slide — the SMG-size holo hood stays rock-steady while the slide cycles beneath.
+    for (const sx of [-1, 1]) {
+      for (const bz of [-0.028, 0.03]) {
+        hard.add(bevelBox(0.0036, 0.068, 0.012, 0.0011), { tint: T.DARK, zone: 0 }, at(sx * 0.0207, 0.018, bz));
+        hard.add(bevelBox(0.006, 0.01, 0.016, 0.0015), { tint: T.GUNMETAL, zone: 0 }, at(sx * 0.0204, -0.011, bz));
+      }
+      hard.add(bevelBox(0.003, 0.006, 0.07, 0.001), { tint: T.GUNMETAL, zone: 0 }, at(sx * 0.0207, 0.049, 0.001));
+    }
+    hard.add(bevelBox(0.045, 0.004, 0.072, 0.0012), { tint: T.DARK, zone: 0 }, at(0, 0.051, 0.001));
+    addRail(hard, -0.032, 0.034, 0.057, 0, T.DARK);
+    const lens = this.holoSight(hard, group, 0, 0.06, 0.0, 0.046, 0.037, 0.042);
+    // 8A-3 integral suppressor: vented can ahead of the muzzle with a stepped front cap.
+    hard.add(lathe([[0.0, 0.199], [0.0098, 0.199], [0.0142, 0.205], [0.0145, 0.212], [0.0145, 0.3], [0.0136, 0.312], [0.0, 0.312]], 22), { tint: T.DARK, zone: 3, rough: 1.1 }, at(0, 0.021, 0));
+    hard.add(lathe([[0.0138, 0.3], [0.0148, 0.302], [0.0148, 0.309], [0.0138, 0.311]], 22), { tint: T.GUNMETAL, zone: 0 }, at(0, 0.021, 0));
+    for (let i = 0; i < 5; i++) {
+      for (let k = 0; k < 6; k++) {
+        const a = (k / 6) * Math.PI * 2 + (i % 2) * 0.52;
+        const f = 0.226 + i * 0.015;
+        hard.add(new THREE.BoxGeometry(0.0046, 0.0024, 0.0072), { tint: 0x050607, zone: 3, rough: 2 }, at(Math.cos(a) * 0.0146, 0.021 + Math.sin(a) * 0.0146, -f, 0, 0, a + Math.PI / 2));
+      }
+    }
+    const tr = torus(0.0147, 0.0011, 6, 24);
+    tr.translate(0, 0.021, -0.292);
+    hard.add(tr, { tint: 0x0a0c10, zone: 0, glow: [0.25, 0.7, 0] });
     // Ammo housing on the left flank of the frame.
     this.ammoHousing(hard, -0.0158, -0.012, 0.035, 0.08);
     const index = this.rightHand(gear, hard, group, grip);
@@ -625,139 +676,97 @@ export class ViewModelRenderer {
     const mag = this.mesh(magKit, this.hardMat, 'PistolMag', group, magRest);
     mag.rotation.x = grip.tilt;
     const muzzle = new THREE.Object3D();
-    muzzle.position.set(0, 0.021, -0.2);
+    muzzle.position.set(0, 0.021, -0.316);
     const eject = new THREE.Object3D();
     eject.position.set(0.02, 0.032, -0.04);
     group.add(muzzle, eject);
-    return { group, muzzle, eject, lens, sight: lens.position.clone(), adsDist: 0.3, slide, slideTravel: 0.028, mag, magRest, magAxis, index, hasBar: true, shells: false, ejectAt: 0, kickBack: 0.05, kickPitch: 0.13 };
+    return { group, muzzle, eject, lens, sight: lens.position.clone(), adsDist: 0.27, slide, slideTravel: 0.028, mag, magRest, magAxis, index, hasBar: true, shells: false, ejectAt: 0, kickBack: 0.045, kickPitch: 0.12 };
   }
 
-  private buildSmg(): WeaponRig {
+  /**
+   * 8A-3 K-90 rail sniper: faceted upper / lower receiver with bevelled side armour plates, cheek-rest stock,
+   * long fluted barrel with two glowing rail-coil channels, baffled rectangular muzzle brake, folded bipod rails,
+   * right-side bolt / breech lever (moving part) and the shared SMG-size holo hood with the fine crosshair.
+   */
+  private buildSniper(): WeaponRig {
     const group = new THREE.Group();
     const hard = new MeshKit();
     const gear = new MeshKit();
     const boltKit = new MeshKit();
-    const magKit = new MeshKit();
-    // Faceted (polyhedral) upper receiver + polymer lower, angled side armour plates.
-    hard.add(profile([[-0.11, 0.008], [-0.11, 0.036], [-0.085, 0.05], [0.125, 0.05], [0.15, 0.036], [0.15, 0.008]], 0.046, 0.0035), { tint: T.GUNMETAL, zone: 0 });
-    hard.add(profile([[-0.11, -0.03], [-0.11, 0.008], [0.15, 0.008], [0.15, -0.012], [0.115, -0.032], [-0.07, -0.032]], 0.043, 0.0035), { tint: T.POLYMER, zone: 2 });
-    hard.add(profile([[-0.005, 0.012], [0.1, 0.012], [0.116, 0.03], [0.0, 0.035], [-0.022, 0.024]], 0.05, 0.002), { tint: T.DARK, zone: 3 });
-    // Top rail + holographic sight (EOTech-like hood).
-    addRail(hard, -0.095, 0.125, 0.054, 0, T.DARK);
-    const lens = this.holoSight(hard, group, 0, 0.057, 0.0, 0.046, 0.037, 0.042);
-    // Perforated heat shroud and the pulse emitter with energy rings.
-    hard.add(lathe([[0.0195, 0.15], [0.0195, 0.258], [0.016, 0.262], [0.016, 0.15]], 22), { tint: T.DARK, zone: 3 }, at(0, 0.012, 0));
-    for (let i = 0; i < 6; i++) {
-      for (let k = 0; k < 4; k++) {
-        const a = 0.35 + (k / 3) * 2.4;
-        const f = 0.162 + i * 0.016;
-        hard.add(new THREE.BoxGeometry(0.0062, 0.0062, 0.003), { tint: 0x050607, zone: 3, rough: 2 }, at(Math.cos(a) * 0.0196, 0.012 + Math.sin(a) * 0.0196, -f, 0, 0, a + Math.PI / 2));
-      }
-    }
-    hard.add(lathe([[0.012, 0.258], [0.0165, 0.262], [0.0165, 0.292], [0.013, 0.3], [0.007, 0.3], [0.007, 0.29]], 22), { tint: T.GUNMETAL, zone: 0 }, at(0, 0.012, 0));
-    for (const f of [0.268, 0.278, 0.288]) {
-      const t = torus(0.0168, 0.0016, 6, 24);
-      t.translate(0, 0.012, -f);
-      hard.add(t, { tint: 0x0a0c10, zone: 0, glow: [0.5, 1.3, 0] });
-    }
-    // Side heat-sink fins, energy strips, angled foregrip, grip, skeletal stock.
+    const casingKit = new MeshKit();
+    // Receiver: faceted upper, polymer lower, bevelled side armour plates with recessed energy seams.
+    hard.add(profile([[-0.12, 0.008], [-0.12, 0.038], [-0.095, 0.054], [0.15, 0.054], [0.172, 0.04], [0.172, 0.008]], 0.05, 0.0035), { tint: T.GUNMETAL, zone: 0 });
+    hard.add(profile([[-0.12, -0.032], [-0.12, 0.008], [0.172, 0.008], [0.172, -0.014], [0.14, -0.034], [-0.08, -0.034]], 0.046, 0.0035), { tint: T.POLYMER, zone: 2 });
     for (const sx of [-1, 1]) {
-      for (let k = 0; k < 7; k++) hard.add(bevelBox(0.004, 0.022, 0.0075, 0.001), { tint: T.GUNMETAL, zone: 0 }, at(sx * 0.0262, 0.025, -0.035 - k * 0.0115));
-      hard.add(new THREE.BoxGeometry(0.0014, 0.0018, 0.11), { tint: 0x0a0c10, zone: 0, glow: [1.05, 0, 0] }, at(sx * 0.0232, 0.003, -0.02));
+      hard.add(profile([[-0.06, 0.012], [0.11, 0.012], [0.13, 0.03], [0.11, 0.046], [-0.04, 0.046], [-0.07, 0.03]], 0.004, 0.0015), { tint: T.DARK, zone: 3 }, at(sx * 0.0262, 0, 0));
+      hard.add(new THREE.BoxGeometry(0.0012, 0.0016, 0.15), { tint: 0x0a0c10, zone: 0, glow: [0.35, 1.0, 0] }, at(sx * 0.0286, 0.029, -0.035));
     }
-    hard.add(bevelBox(0.028, 0.072, 0.034, 0.006), { tint: T.GRIP, zone: 1, tile: 0.05 }, at(0, -0.062, -0.112, 0.35));
-    const grip: GripDef = { top: V(0, -0.03, 0.032), tilt: -0.2, rx: 0.015, rz: 0.021, trigger: V(0, -0.044, -0.012) };
-    hard.add(bevelBox(0.03, 0.095, 0.042, 0.006), { tint: T.GRIP, zone: 1, tile: 0.05 }, gripMatrix(grip, 0, -0.0475, 0));
-    hard.add(profile([[0.0, -0.032], [0.05, -0.032], [0.048, -0.04], [0.036, -0.056], [0.0, -0.056], [-0.006, -0.047]], 0.012, 0.0022, [[[0.007, -0.036], [0.042, -0.036], [0.034, -0.05], [0.007, -0.05]]]), { tint: T.POLYMER, zone: 2 }, at(0, 0, 0.0));
-    hard.add(profile([[0.006, -0.032], [0.011, -0.032], [0.009, -0.042], [0.003, -0.05], [0.0, -0.048], [0.004, -0.04]], 0.006, 0.0012), { tint: T.DARK, zone: 0 });
-    hard.add(bevelBox(0.012, 0.012, 0.13, 0.003), { tint: T.DARK, zone: 0 }, at(0, 0.006, 0.17));
-    hard.add(bevelBox(0.012, 0.012, 0.12, 0.003), { tint: T.DARK, zone: 0 }, at(0, -0.026, 0.165, 0.12));
-    hard.add(bevelBox(0.03, 0.062, 0.014, 0.004), { tint: T.RUBBER, zone: 2 }, at(0, -0.012, 0.236));
-    // Ejection port (right) with the bolt carrier visible inside — the bolt and charging handle are the blowback part.
-    hard.add(new THREE.BoxGeometry(0.0016, 0.016, 0.046), { tint: 0x08090b, zone: 3 }, at(0.0232, 0.026, -0.03));
+    addRail(hard, -0.1, 0.14, 0.058, 0, T.DARK);
+    const lens = this.holoSight(hard, group, 0, 0.061, 0.0, 0.046, 0.037, 0.042);
+    // Octagonal handguard around the barrel root, folded bipod rails beneath it.
+    hard.add(bevelBox(0.046, 0.044, 0.2, 0.008), { tint: T.CARBON, zone: 2, tile: 0.08 }, at(0, 0.014, -0.27));
+    for (let k = 0; k < 5; k++) hard.add(bevelBox(0.048, 0.006, 0.012, 0.0015), { tint: T.BLACK, zone: 3 }, at(0, 0.03, -0.2 - k * 0.032));
+    for (const sx of [-1, 1]) {
+      hard.add(bevelBox(0.006, 0.006, 0.17, 0.0015), { tint: T.DARK, zone: 0 }, at(sx * 0.012, -0.016, -0.27));
+      hard.add(bevelBox(0.009, 0.01, 0.014, 0.002), { tint: T.RUBBER, zone: 2 }, at(sx * 0.012, -0.016, -0.355));
+    }
+    hard.add(bevelBox(0.03, 0.012, 0.02, 0.003), { tint: T.GUNMETAL, zone: 0 }, at(0, -0.01, -0.185));
+    // Long fluted barrel with twin rail-coil channels (energy, pulse with the charge uniform).
+    hard.add(lathe([[0.0, 0.37], [0.0135, 0.37], [0.0135, 0.585], [0.0, 0.585]], 22), { tint: T.DARK, zone: 0 }, at(0, 0.016, 0));
+    for (let k = 0; k < 6; k++) {
+      const a = (k / 6) * Math.PI * 2;
+      hard.add(new THREE.BoxGeometry(0.0034, 0.0026, 0.19), { tint: 0x050607, zone: 3, rough: 1.8 }, at(Math.cos(a) * 0.0134, 0.016 + Math.sin(a) * 0.0134, -0.475, 0, 0, a + Math.PI / 2));
+    }
+    for (const sx of [-1, 1]) {
+      hard.add(bevelBox(0.005, 0.009, 0.2, 0.0012), { tint: T.GUNMETAL, zone: 0 }, at(sx * 0.0158, 0.016, -0.47));
+      hard.add(new THREE.BoxGeometry(0.0016, 0.0042, 0.19), { tint: 0x0a0c10, zone: 0, glow: [0.5, 1.6, 0] }, at(sx * 0.0186, 0.016, -0.47));
+    }
+    for (const f of [0.39, 0.45, 0.51, 0.57]) {
+      const t = torus(0.0145, 0.0014, 6, 24);
+      t.translate(0, 0.016, -f);
+      hard.add(t, { tint: 0x0a0c10, zone: 0, glow: [0.3, 1.2, 0] });
+    }
+    // Heavy baffled rectangular muzzle brake.
+    hard.add(bevelBox(0.036, 0.03, 0.062, 0.005), { tint: T.GUNMETAL, zone: 0 }, at(0, 0.016, -0.616));
+    for (const sx of [-1, 1]) {
+      for (let k = 0; k < 3; k++) hard.add(new THREE.BoxGeometry(0.003, 0.018, 0.009), { tint: 0x050607, zone: 3, rough: 2 }, at(sx * 0.0178, 0.016, -0.598 - k * 0.016));
+    }
+    hard.add(new THREE.BoxGeometry(0.014, 0.012, 0.004), { tint: 0x050607, zone: 3 }, at(0, 0.016, -0.6475));
+    // Grip, trigger guard, cheek-rest stock with riser and butt pad.
+    const grip: GripDef = { top: V(0, -0.032, 0.03), tilt: -0.22, rx: 0.015, rz: 0.022, trigger: V(0, -0.046, -0.014) };
+    hard.add(bevelBox(0.03, 0.1, 0.044, 0.006), { tint: T.GRIP, zone: 1, tile: 0.05 }, gripMatrix(grip, 0, -0.05, 0));
+    hard.add(profile([[0.0, -0.034], [0.052, -0.034], [0.05, -0.042], [0.038, -0.058], [0.0, -0.058], [-0.006, -0.049]], 0.012, 0.0022, [[[0.007, -0.038], [0.044, -0.038], [0.036, -0.052], [0.007, -0.052]]]), { tint: T.POLYMER, zone: 2 });
+    hard.add(profile([[0.004, -0.034], [0.009, -0.034], [0.007, -0.044], [0.001, -0.052], [-0.002, -0.05], [0.002, -0.042]], 0.006, 0.0012), { tint: T.DARK, zone: 0 });
+    hard.add(profile([[-0.12, -0.03], [-0.12, 0.034], [-0.17, 0.03], [-0.31, 0.024], [-0.315, -0.046], [-0.29, -0.06], [-0.2, -0.04], [-0.14, -0.034]], 0.036, 0.005), { tint: T.POLYMER, zone: 2 });
+    hard.add(bevelBox(0.03, 0.016, 0.12, 0.004), { tint: T.RUBBER, zone: 2 }, at(0, 0.04, 0.215));
+    hard.add(bevelBox(0.04, 0.09, 0.016, 0.004), { tint: T.RUBBER, zone: 2 }, at(0, -0.012, 0.318));
+    for (const sx of [-1, 1]) hard.add(bevelBox(0.003, 0.03, 0.09, 0.001), { tint: T.DARK, zone: 3 }, at(sx * 0.019, -0.005, 0.23));
+    // Ejection port (right) — the bolt / breech lever is the moving part, opened only by hand.
+    hard.add(new THREE.BoxGeometry(0.0016, 0.018, 0.06), { tint: 0x08090b, zone: 3 }, at(0.0252, 0.03, -0.02));
+    this.ammoHousing(hard, -0.0262, -0.014, 0.06, 0.05);
     const bolt = new THREE.Group();
     group.add(bolt);
-    boltKit.add(bevelBox(0.003, 0.012, 0.03, 0.001), { tint: T.CHROME, zone: 0 }, at(0.0226, 0.026, -0.032));
-    boltKit.add(bevelBox(0.012, 0.008, 0.018, 0.002), { tint: T.DARK, zone: 0 }, at(0.03, 0.04, 0.0));
-    // Magazine (detachable).
-    magKit.add(bevelBox(0.024, 0.115, 0.034, 0.003), { tint: T.DARK, zone: 0 }, at(0, 0, 0));
-    magKit.add(bevelBox(0.028, 0.008, 0.04, 0.0025), { tint: T.BLACK, zone: 2 }, at(0, -0.06, 0.0));
-    for (let k = 0; k < 4; k++) magKit.add(bevelBox(0.0254, 0.003, 0.03, 0.0008), { tint: T.BLACK, zone: 0 }, at(0, 0.03 - k * 0.02, 0));
-    this.ammoHousing(hard, -0.0218, -0.012, 0.05, 0.1);
+    boltKit.add(cylinder(V(0.012, 0.03, 0.04), V(0.012, 0.03, -0.045), 0.0085, 0.0085, 16), { tint: T.CHROME, zone: 0 });
+    boltKit.add(cylinder(V(0.016, 0.03, 0.03), V(0.046, 0.026, 0.034), 0.0032, 0.0032, 10), { tint: T.DARK, zone: 0 });
+    boltKit.add(lathe([[0.0, -0.007], [0.0075, -0.005], [0.0085, 0.0], [0.0075, 0.005], [0.0, 0.007]], 14), { tint: T.GUNMETAL, zone: 0 }, at(0.049, 0.026, 0.034, 0, 0, Math.PI / 2));
+    // Spent rail casing (hidden until BOLT_OPEN throws it out to the right).
+    casingKit.add(lathe([[0.0, 0.0], [0.0062, 0.0], [0.0062, 0.05], [0.0045, 0.056], [0.0, 0.056]], 12), { tint: T.BRASS, zone: 0 }, at(0, 0, 0, -Math.PI / 2));
+    casingKit.add(lathe([[0.0, 0.05], [0.0046, 0.05], [0.0046, 0.056], [0.0, 0.058]], 10), { tint: 0x101214, zone: 0, glow: [0.12, 0, 0] }, at(0, 0, 0, -Math.PI / 2));
     const index = this.rightHand(gear, hard, group, grip);
-    this.mesh(hard, this.hardMat, 'SmgBody', group);
-    this.mesh(gear, this.gearMat, 'SmgHand', group);
-    this.mesh(boltKit, this.hardMat, 'SmgBolt', bolt);
-    const magRest = V(0, -0.085, -0.065);
-    const mag = this.mesh(magKit, this.hardMat, 'SmgMag', group, magRest);
-    mag.rotation.x = 0.12;
+    this.mesh(hard, this.hardMat, 'SniperBody', group);
+    this.mesh(gear, this.gearMat, 'SniperHand', group);
+    this.mesh(boltKit, this.hardMat, 'SniperBolt', bolt);
+    const casing = this.mesh(casingKit, this.hardMat, 'SniperCasing', group);
+    casing.visible = false;
     const muzzle = new THREE.Object3D();
-    muzzle.position.set(0, 0.012, -0.3);
+    muzzle.position.set(0, 0.016, -0.652);
     const eject = new THREE.Object3D();
-    eject.position.set(0.03, 0.026, -0.03);
+    eject.position.set(0.032, 0.03, -0.02);
     group.add(muzzle, eject);
     return {
-      group, muzzle, eject, lens, sight: lens.position.clone(), adsDist: 0.24, slide: bolt, slideTravel: 0.018,
-      mag, magRest, magAxis: V(0, -Math.cos(0.12), -Math.sin(0.12)), index, support: V(0, -0.034, -0.082), hasBar: true, shells: false, ejectAt: 0, kickBack: 0.016, kickPitch: 0.035,
+      group, muzzle, eject, lens, sight: lens.position.clone(), adsDist: 0.27, slide: bolt, slideTravel: 0.075,
+      index, support: V(0, -0.012, -0.27), hasBar: true, shells: false, ejectAt: -1, boltAction: true, casing, kickBack: 0.075, kickPitch: 0.17,
     };
-  }
-
-  private buildShotgun(): WeaponRig {
-    const group = new THREE.Group();
-    const hard = new MeshKit();
-    const gear = new MeshKit();
-    const pumpKit = new MeshKit();
-    // Receiver, twin barrels, perforated heat shield.
-    hard.add(profile([[-0.09, -0.032], [-0.09, 0.03], [-0.07, 0.046], [0.12, 0.046], [0.136, 0.032], [0.136, -0.012], [0.1, -0.036], [-0.05, -0.036]], 0.062, 0.004), { tint: T.GUNMETAL, zone: 0 });
-    hard.add(profile([[-0.06, -0.02], [0.1, -0.02], [0.11, 0.0], [0.1, 0.03], [-0.06, 0.03]], 0.066, 0.002), { tint: T.DARK, zone: 3 });
-    for (const bx of [-0.0165, 0.0165]) {
-      hard.add(lathe([[0.016, 0.136], [0.016, 0.462], [0.0175, 0.466], [0.0175, 0.476], [0.0115, 0.476], [0.0115, 0.45]], 20), { tint: T.DARK, zone: 0 }, at(bx, 0.02, 0));
-      hard.add(lathe([[0.0115, 0.47], [0.0115, 0.477], [0.0, 0.477]], 16), { tint: 0x050505, zone: 3 }, at(bx, 0.02, 0));
-    }
-    const shield = new THREE.CylinderGeometry(0.039, 0.039, 0.26, 26, 1, true, -1.75, 3.5);
-    shield.rotateX(Math.PI / 2);
-    hard.add(shield, { tint: T.DARK, zone: 3, rough: 1.2 }, at(0, 0.02, -0.29));
-    for (let i = 0; i < 9; i++) {
-      for (let k = 0; k < 5; k++) {
-        const a = -1.2 + k * 0.6;
-        const z = -0.175 - i * 0.026;
-        hard.add(bevelBox(0.008, 0.0042, 0.013, 0.0012), { tint: 0x040506, zone: 3, rough: 2 }, at(Math.sin(a) * 0.0394, 0.02 + Math.cos(a) * 0.0394, z, 0, 0, -a));
-      }
-    }
-    for (const z of [-0.17, -0.41]) hard.add(bevelBox(0.07, 0.008, 0.008, 0.002), { tint: T.GUNMETAL, zone: 0 }, at(0, 0.004, z));
-    addRail(hard, -0.07, 0.12, 0.05, 0, T.DARK);
-    const lens = this.holoSight(hard, group, 0, 0.053, 0.01, 0.046, 0.037, 0.042);
-    // Side-saddle 4-shell carrier (right flank, ammo-linked in the shader).
-    hard.add(bevelBox(0.004, 0.036, 0.1, 0.0012), { tint: T.BLACK, zone: 2 }, at(0.0335, 0.004, 0.0));
-    for (let i = 0; i < 4; i++) {
-      const z = 0.034 - i * 0.022;
-      hard.add(lathe([[0.0, 0.0], [0.0092, 0.0], [0.0092, 0.011], [0.0, 0.011]], 14), { tint: T.BRASS, zone: 0, anim: [0, 0, i, 1] }, at(0.0395, -0.025, z, Math.PI / 2));
-      hard.add(lathe([[0.0086, 0.011], [0.0086, 0.056], [0.006, 0.058], [0.0, 0.058]], 14), { tint: T.SHELL, zone: 2, rough: 0.8, anim: [0, 0, i, 1] }, at(0.0395, -0.025, z, Math.PI / 2));
-    }
-    // Grip, trigger guard, stock stub.
-    const grip: GripDef = { top: V(0, -0.03, 0.058), tilt: -0.25, rx: 0.016, rz: 0.023, trigger: V(0, -0.046, 0.022) };
-    hard.add(bevelBox(0.032, 0.1, 0.046, 0.006), { tint: T.GRIP, zone: 1, tile: 0.05 }, gripMatrix(grip, 0, -0.05, 0));
-    hard.add(profile([[-0.04, -0.036], [0.012, -0.036], [0.008, -0.044], [-0.006, -0.06], [-0.04, -0.06], [-0.046, -0.05]], 0.012, 0.0022, [[[-0.034, -0.04], [0.004, -0.04], [-0.004, -0.054], [-0.034, -0.054]]]), { tint: T.POLYMER, zone: 2 });
-    hard.add(profile([[-0.024, -0.036], [-0.019, -0.036], [-0.021, -0.046], [-0.027, -0.054], [-0.03, -0.052], [-0.026, -0.044]], 0.006, 0.0012), { tint: T.DARK, zone: 0 });
-    hard.add(bevelBox(0.05, 0.06, 0.1, 0.008), { tint: T.POLYMER, zone: 2 }, at(0, -0.005, 0.13, -0.08));
-    this.ammoHousing(hard, -0.0328, 0.0, 0.07, 0.12);
-    // Ribbed pump fore-end (cycles 280 ms after the shot).
-    const pump = new THREE.Group();
-    pump.position.set(0, 0, -0.24);
-    group.add(pump);
-    pumpKit.add(bevelBox(0.064, 0.042, 0.12, 0.007), { tint: T.POLYMER, zone: 1, tile: 0.06 }, at(0, -0.016, 0));
-    for (let k = 0; k < 6; k++) pumpKit.add(bevelBox(0.0685, 0.046, 0.0065, 0.002), { tint: T.BLACK, zone: 2 }, at(0, -0.016, -0.05 + k * 0.02));
-    pumpKit.add(bevelBox(0.03, 0.012, 0.16, 0.003), { tint: T.DARK, zone: 0 }, at(0, -0.002, 0.07));
-    const index = this.rightHand(gear, hard, group, grip);
-    this.mesh(hard, this.hardMat, 'ShotgunBody', group);
-    this.mesh(gear, this.gearMat, 'ShotgunHand', group);
-    this.mesh(pumpKit, this.hardMat, 'ShotgunPump', pump);
-    const muzzle = new THREE.Object3D();
-    muzzle.position.set(0, 0.02, -0.48);
-    const eject = new THREE.Object3D();
-    eject.position.set(0.034, 0.03, -0.02);
-    group.add(muzzle, eject);
-    return { group, muzzle, eject, lens, sight: lens.position.clone(), adsDist: 0.25, slideTravel: 0, pump, index, support: V(0, -0.012, -0.24), hasBar: true, shells: true, ejectAt: 0.3, kickBack: 0.09, kickPitch: 0.28 };
   }
 
   private buildGrapple(): WeaponRig {
@@ -968,9 +977,10 @@ export class ViewModelRenderer {
       fl.translate(s, 0, 0);
       drumKit.add(fl, { tint: T.GUNMETAL, zone: 0 });
     }
-    // 7A-5: shotgun shell held in the fingers while loading (shown only through uHand — no extra draw call).
-    hard.add(lathe([[0.0, 0.0], [0.0092, 0.0], [0.0092, 0.011], [0.0, 0.011]], 14), { tint: T.BRASS, zone: 0, anim: [0, 0, 0, 2] }, at(-0.008, 0.014, 0.03, -Math.PI / 2));
-    hard.add(lathe([[0.0086, 0.011], [0.0086, 0.056], [0.006, 0.058], [0.0, 0.058]], 14), { tint: T.SHELL, zone: 2, rough: 0.8, anim: [0, 0, 0, 2] }, at(-0.008, 0.014, 0.03, -Math.PI / 2));
+    // 8A-3: fresh long cyan-tipped rail cartridge held in the fingers during the sniper breech load (shown only
+    // through uHand — no extra draw call).
+    hard.add(lathe([[0.0, 0.0], [0.0064, 0.0], [0.0064, 0.052], [0.0047, 0.058], [0.0047, 0.064], [0.0, 0.064]], 14), { tint: T.BRASS, zone: 0, anim: [0, 0, 0, 2] }, at(-0.008, 0.014, 0.03, -Math.PI / 2));
+    hard.add(lathe([[0.0, 0.064], [0.0047, 0.064], [0.0035, 0.074], [0.0, 0.079]], 14), { tint: 0x0a0c10, zone: 0, glow: [1.1, 0, 0], anim: [0, 0, 0, 2] }, at(-0.008, 0.014, 0.03, -Math.PI / 2));
     this.mesh(gear, this.gearMat, 'LeftHand', this.leftArm);
     this.mesh(hard, this.hardMat, 'LeftArmor', this.leftArm);
     this.leftArm.add(drumHolder);
@@ -994,9 +1004,10 @@ export class ViewModelRenderer {
       this.clawT = 0;
       return;
     }
-    this.flashLife = slot === 'SHOTGUN' ? 0.07 : 0.045;
+    // Suppressed pistol: a small, brief flash at the can; the rail sniper's brake throws a big star.
+    this.flashLife = slot === 'SNIPER' ? 0.07 : 0.035;
     this.flashMat.uniforms.uSeed.value = Math.random();
-    this.flash.scale.setScalar(slot === 'SHOTGUN' ? 1.6 : slot === 'SMG' ? 0.75 : 1.0);
+    this.flash.scale.setScalar(slot === 'SNIPER' ? 1.5 : 0.5);
     this.flash.rotation.z = Math.random() * Math.PI;
     // 6B-1: 60 ms muzzle light — the barrel and the glove fingers flash with the shot.
     this.lightLife = 0.06;
@@ -1004,15 +1015,22 @@ export class ViewModelRenderer {
     this.ejectPending = true;
   }
 
-  /** 7A-5: each loaded shotgun shell makes the gun twitch as it clicks home. */
+  /** 8A-3 breech beats: the round seats with an upward settle jolt, the bolt slams home with a forward kick. */
   onReloadCue(_gun: GunId, cue: ReloadCue): void {
-    if (cue === 'SHELL') {
-      this.joltV += 0.32;
-      this.kickVP += 0.45;
-    } else if (cue === 'PUMP') {
-      this.kickVZ += 0.6;
+    if (cue === 'LOAD_ROUND') {
+      this.joltV += 0.5;
+      this.kickVP += 0.8;
+    } else if (cue === 'BOLT_CLOSE') {
+      this.kickVZ += 0.7;
+      this.boltPulse = 0.35;
+    } else if (cue === 'BOLT_OPEN') {
+      this.sparkLife = 0.04;
+      this.sparkMat.uniforms.uSeed.value = Math.random();
     }
   }
+
+  /** 8A-3: rail coils pulse bright along the barrel after the bolt locks (s). */
+  private boltPulse = 0;
 
   /** 7A-6: auto-mantle started — left-hand push on the ledge, weapon dips. */
   onMantle(): void {
@@ -1022,12 +1040,10 @@ export class ViewModelRenderer {
   /**
    * 7A-5 reload timeline at progress t (−1 = not reloading). Fills `this.pose` plus the left-hand target
    * (`reloadHand` in gun space, `reloadQuat` gun-relative) when the hand is part of the move.
-   *  Pistol / SMG — 0–0.24 roll +0.48 rad, lift; the left hand grabs the magazine and strips it downward ·
+   *  Pistol — 0–0.24 roll +0.48 rad, lift; the left hand grabs the magazine and strips it downward ·
    *  0.24–0.56 hand out of view at the pouch (0.30–0.40), back with a fresh magazine, slammed home 0.46–0.56 ·
-   *  0.56–0.82 the hand racks the slide (pistol, overhand) / charging handle (SMG) back and lets it snap ·
-   *  0.82–1 back to the ready pose.
-   *  Shotgun — 0–0.16 roll −0.52 / pitch +0.32 showing the loading port · 0.16–0.72 n = 2…4 shells pushed in
-   *  from the belt one by one · 0.72–0.90 one full pump stroke · 0.90–1 ready.
+   *  0.56–0.82 the hand racks the slide (overhand) back and lets it snap · 0.82–1 back to the ready pose.
+   *  Sniper (8A-3) — two-hand single-round breech load, see the bolt-action branch below.
    */
   private reloadPose(rig: WeaponRig, f: ViewModelFrame, t: number): ReloadPose {
     const P = this.pose;
@@ -1043,46 +1059,57 @@ export class ViewModelRenderer {
     P.hand = false;
     if (rig.mag && rig.magRest && rig.magAxis) rig.mag.position.copy(rig.magRest);
     if (rig.mag) rig.mag.visible = true;
+    if (rig.casing) rig.casing.visible = false;
     if (t < 0) return P;
     const B = RELOAD_BEATS;
-    if (rig.shells) {
-      // ----- K-12 shotgun -----
-      const A = sstep(0, 0.16, t) * (1 - sstep(0.72, 0.8, t));
-      const C = sstep(0.72, 0.8, t) * (1 - sstep(0.9, 1, t));
-      P.roll = -0.52 * A - 0.12 * C;
-      P.pitch = 0.32 * A + 0.06 * C;
-      P.lift = 0.08 * A + 0.02 * C;
-      P.shift = -0.06 * A;
-      const n = shellCycles(f.reloadFrom, f.magazine);
-      const span = (B.SHELL_END - B.SHELL_START) / n;
-      const k = Math.floor((t - B.SHELL_START) / span);
-      const loaded = t < B.SHELL_START ? 0 : Math.min(n, Math.floor((t - B.SHELL_START) / span + (1 - B.SHELL_CLICK)));
-      P.shells = Math.min(4, f.reloadFrom + loaded);
-      if (t >= B.SHELL_START && t < B.SHELL_END) {
-        // One shell cycle: up from the belt (0–0.35) · push into the port (0.35–0.72, click) · back down.
-        const u = (t - B.SHELL_START) / span - k;
-        const up = u < 0.35 ? sstep(0, 0.35, u) : u < B.SHELL_CLICK ? 1 : 1 - sstep(B.SHELL_CLICK, 1, u);
-        const push = u < 0.35 ? 0 : u < B.SHELL_CLICK ? sstep(0.35, B.SHELL_CLICK, u) : 1;
-        this.reloadHand.set(-0.004, -0.25 + 0.2 * up + 0.012 * push, 0.03 - 0.045 * push);
+    if (rig.boltAction) {
+      // ----- 8A-3 K-90 two-hand single-round breech reload -----
+      //  0.00–0.22 tilt left, left hand pulls the bolt back (BOLT_OPEN 0.10), spent casing flung right ·
+      //  0.22–0.68 hand dips out of view, returns with a fresh cyan-tipped round and guides it into the open
+      //  breech (LOAD_ROUND 0.60, settle jolt) · 0.68–0.88 bolt slammed forward and locked (BOLT_CLOSE 0.76),
+      //  coils pulse · 0.88–1.00 back to the ready / ADS sight picture.
+      const A = sstep(0, 0.12, t) * (1 - sstep(0.84, 1, t));
+      P.roll = 0.26 * A;
+      P.pitch = 0.08 * A;
+      P.lift = 0.07 * A;
+      P.shift = -0.05 * A;
+      const open = t < 0.04 ? 0 : t < B.BOLT_OPEN + 0.04 ? sstep(0.04, B.BOLT_OPEN + 0.04, t) : t < 0.7 ? 1 : 1 - sstep(0.72, B.BOLT_CLOSE, t);
+      P.slide = open;
+      P.bar = t >= B.LOAD_ROUND ? 1 : 0;
+      _rb.set(0.046, 0.03, 0.034 + rig.slideTravel * open);
+      // Round path: below the gun (out of view) → up beside the breech → pushed forward into the chamber.
+      const up = sstep(0.24, 0.42, t);
+      const push = sstep(0.46, B.LOAD_ROUND, t);
+      _ra.set(-0.006 + 0.018 * up, -0.24 + 0.27 * up, 0.12 - 0.075 * push);
+      if (t < 0.22) {
+        this.reloadHand.copy(_rb);
+        this.reloadHand.x -= 0.035 * sstep(0.16, 0.22, t);
+        this.reloadQuat.copy(_qRack);
+      } else if (t < 0.66) {
+        this.reloadHand.copy(_ra);
         this.reloadQuat.identity();
-        P.handShell = u < B.SHELL_CLICK ? 1 : 0;
-        P.hand = true;
-      } else if (t >= B.SHELL_END && t < 0.9) {
-        // Pump: hand onto the fore-end, one full stroke (back 0.74 → 0.78, forward 0.80 → 0.85).
-        P.pump = sstep(0.74, 0.78, t) * (1 - sstep(0.8, 0.85, t));
-        if (rig.support) this.reloadHand.set(rig.support.x, rig.support.y, -0.24 + P.pump * 0.07);
-        this.reloadQuat.identity();
-        P.hand = t < 0.88 || !rig.support;
-      } else if (t < B.SHELL_START) {
-        this.reloadHand.set(-0.004, -0.25, 0.03);
-        this.reloadQuat.identity();
-        P.handShell = sstep(0.06, 0.12, t) > 0.5 ? 1 : 0;
-        P.hand = t > 0.05;
+        P.handShell = t > 0.28 && t < B.LOAD_ROUND + 0.02 ? 1 : 0;
+      } else {
+        const k = sstep(0.66, 0.7, t);
+        this.reloadHand.copy(_ra).lerp(_rb, k);
+        this.reloadHand.y += 0.05 * sstep(B.BOLT_CLOSE + 0.02, 0.88, t);
+        this.reloadHand.x -= 0.06 * sstep(B.BOLT_CLOSE + 0.02, 0.88, t);
+        this.reloadQuat.identity().slerp(_qRack, k);
+      }
+      P.hand = t > 0.01 && t < 0.88;
+      // Spent casing: out of the port at BOLT_OPEN, tumbling up and to the right.
+      if (rig.casing) {
+        const u = (t - B.BOLT_OPEN) / 0.2;
+        rig.casing.visible = u > 0 && u < 1;
+        if (rig.casing.visible) {
+          rig.casing.position.set(rig.eject.position.x + 0.32 * u, rig.eject.position.y + 0.16 * u - 0.34 * u * u, rig.eject.position.z + 0.06 * u);
+          rig.casing.rotation.set(u * 9, u * 4, 0);
+        }
       }
       return P;
     }
     if (!rig.mag || !rig.magRest || !rig.magAxis) return P;
-    // ----- MK-IV pistol / VX-9 SMG -----
+    // ----- MK-IV pistol -----
     const A = sstep(0, 0.12, t) * (1 - sstep(0.56, 0.64, t));
     const C = sstep(0.56, 0.64, t) * (1 - sstep(0.82, 1, t));
     P.roll = 0.48 * A + 0.16 * C;
@@ -1099,19 +1126,16 @@ export class ViewModelRenderer {
       : 0;
     rig.mag.position.copy(rig.magRest).addScaledVector(rig.magAxis, drop);
     P.bar = t >= B.MAG_OUT && t < B.SEATED ? 0 : t >= B.SEATED ? 1 : -1;
-    // Slide / charging handle: held back 0.60–0.70 (locked open stays back), released at 0.72 — snaps forward.
+    // Slide: held back 0.60–0.70 (locked open stays back), released at 0.72 — snaps forward.
     const locked = f.slot === 'PISTOL' && f.reloadFrom <= 0 ? 1 : 0;
     const back = t < 0.6 ? locked : t < 0.7 ? locked + (1.08 - locked) * sstep(0.6, 0.7, t) : t < B.SLIDE ? 1.08 : 1.08 * (1 - sstep(B.SLIDE, B.SLIDE + 0.025, t));
     P.slide = back;
     // Left hand: on the magazine (grab → strip → pouch → fresh mag → seat) until 0.58, then on the slide.
     const tilt = Math.atan2(-rig.magAxis.z, -rig.magAxis.y);
     _qa.setFromAxisAngle(_X, tilt).multiply(_qMagGrip);
-    const isPistol = f.slot === 'PISTOL';
-    const grip = isPistol ? 0.03 : 0.04;
-    _ra.copy(rig.mag.position).addScaledVector(rig.magAxis, grip);
+    _ra.copy(rig.mag.position).addScaledVector(rig.magAxis, 0.03);
     _ra.x -= 0.006;
-    if (isPistol) _rb.set(0, 0.024, 0.034 + rig.slideTravel * back);
-    else _rb.set(0.024, 0.04, 0.004 + rig.slideTravel * back);
+    _rb.set(0, 0.024, 0.034 + rig.slideTravel * back);
     const toSlide = sstep(0.56, 0.6, t);
     const away = sstep(B.SLIDE, 0.8, t);
     this.reloadHand.copy(_ra).lerp(_rb, toSlide);
@@ -1184,11 +1208,11 @@ export class ViewModelRenderer {
     this.joltV += (-320 * this.jolt - 24 * this.joltV) * realDt;
     this.jolt += this.joltV * realDt;
 
-    // Blowback: the slide / bolt / pistons snap back in 18 ms and return in 62 ms (pistol slide locks open
-    // on an empty magazine); the shotgun pump cycles 280 ms after the shot. Reloads drive them by hand.
+    // Blowback: the pistol slide snaps back in 18 ms and returns in 62 ms (locks open on an empty magazine);
+    // the sniper's bolt only moves by hand. Reloads drive them by hand.
     if (rig.slide) {
       const a = f.sinceShot;
-      let s = a < 0.018 ? a / 0.018 : a < 0.08 ? 1 - (a - 0.018) / 0.062 : 0;
+      let s = rig.boltAction ? 0 : a < 0.018 ? a / 0.018 : a < 0.08 ? 1 - (a - 0.018) / 0.062 : 0;
       if (f.slot === 'PISTOL' && f.ammo <= 0 && rt < 0) s = 1;
       if (rt >= 0 && f.slot !== 'GRAPPLE') s = R.slide;
       rig.slide.position.z = s * rig.slideTravel;
@@ -1198,7 +1222,7 @@ export class ViewModelRenderer {
       const pumpT = t > 0 && t < 0.22 ? Math.sin((t / 0.22) * Math.PI) : 0;
       rig.pump.position.z = -0.24 + (rt >= 0 ? R.pump : pumpT) * 0.07;
     }
-    // Ejection spark at the port (shotgun: on the pump stroke).
+    // Ejection spark at the port (the sniper's comes from BOLT_OPEN instead).
     if (this.ejectPending && rig.ejectAt >= 0 && f.sinceShot >= rig.ejectAt) {
       this.ejectPending = false;
       this.sparkLife = 0.04;
@@ -1210,7 +1234,7 @@ export class ViewModelRenderer {
     const pull = this.triggerT < 0.05 ? this.triggerT / 0.05 : this.triggerT < 0.13 ? 1 - (this.triggerT - 0.05) / 0.08 : 0;
     rig.index.rotation.x = pull * 0.24;
 
-    // Shader-driven parts: ammo bar length / colour, shells, pistol coil charge, SMG emitter flicker.
+    // Shader-driven parts: ammo bar length / colour, pistol coil charge, sniper rail-coil charge / bolt pulse.
     const u = this.hardU;
     const frac = f.magazine > 0 ? clamp(f.ammo / f.magazine, 0, 1) : 1;
     u.uAmmo.value = rig.hasBar ? (rt >= 0 && R.bar >= 0 ? R.bar : frac) : 1;
@@ -1221,7 +1245,11 @@ export class ViewModelRenderer {
     else if (low) u.uBarColor.value.setHex(COLORS.ENEMY_DANGER).multiplyScalar(Math.sin(this.time * 18) > 0 ? 2.6 : 0.9);
     else u.uBarColor.value.setHex(this.plasma ? 0xdcf2ff : this.energyHex).multiplyScalar(2.2);
     const S = MATERIALS.PLAYER_STRAND.emissive;
-    u.uCharge.value = f.slot === 'PISTOL' ? (0.35 + 0.65 * clamp(f.sinceShot / 0.3, 0, 1)) * (S / 3) : f.slot === 'SMG' ? (f.sinceShot < 0.1 ? 1.3 : 0.7) : 1;
+    this.boltPulse = Math.max(0, this.boltPulse - realDt);
+    u.uCharge.value =
+      f.slot === 'PISTOL' ? (0.35 + 0.65 * clamp(f.sinceShot / 0.3, 0, 1)) * (S / 3)
+      : f.slot === 'SNIPER' ? (f.ammo > 0 ? 0.85 : 0.15) + 2.2 * (this.boltPulse / 0.35)
+      : 1;
 
     // Grapple: claws open on launch (90 ms) before the anchor leaves; drums spin while reeling / paying out.
     this.clawT += realDt;
@@ -1251,7 +1279,7 @@ export class ViewModelRenderer {
     p.rotation.set(this.kickP + ease * 0.95 + this.swayY * 2 * calm + R.pitch, this.swayX * 2.5 * calm, (-this.tilt - ease * 0.35 + R.roll) * (1 - 0.6 * z), 'XYZ');
     p.updateMatrix();
 
-    // Left arm: supports the SMG / shotgun fore-end, thrusts the winch forward while the strand is out,
+    // Left arm: supports the sniper fore-end, thrusts the winch forward while the strand is out,
     // otherwise rests low-left. Poses blend smoothly (position lerp + quaternion slerp).
     const strandOut = f.ropeAttached || f.hookInFlight;
     // 7A-6 mantle: the free hand slaps down on the ledge and pushes (0.3 s).
@@ -1326,6 +1354,8 @@ export class ViewModelRenderer {
     const lock = z >= 0.5 ? 1 : z <= 0 ? 0 : (z / 0.5) * (z / 0.5) * (3 - (2 * z) / 0.5);
     (this.lensMat.uniforms.uReticle.value as THREE.Vector2).set(_ndc.x * (1 - lock), _ndc.y * (1 - lock));
     this.lensMat.uniforms.uAspect.value = this.vmCamera.aspect;
+    this.lensMat.uniforms.uMode.value = f.slot === 'SNIPER' ? 1 : 0;
+    this.lensMat.uniforms.uPx.value = 2 / Math.max(1, typeof window !== 'undefined' ? window.innerHeight : 1080);
   }
 
   /** Keeps the view-model's PMREM reflections consistent with the main view orientation. */

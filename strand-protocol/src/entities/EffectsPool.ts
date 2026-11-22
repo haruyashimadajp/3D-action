@@ -69,7 +69,9 @@ export interface ProjectileSpec {
   readonly tag: number;
   /** Passes through shields and bodies (each body is hit once); stops at world geometry (SK_02). */
   readonly pierce?: boolean;
-  /** 7B-7: leaves a plasma smoke trail (pistol, shotgun, sniper and boss heavy rounds). */
+  /** 8A-3 Aegis rule: a piercing round is still consumed by an energy shield (K-90 sniper). */
+  readonly shieldStop?: boolean;
+  /** 7B-7: leaves a plasma smoke trail (pistol, sniper and boss heavy rounds). */
   readonly smoke?: boolean;
 }
 
@@ -938,7 +940,8 @@ export class EffectsPool {
     this.pColor[i * 3 + 2] = _c.b * spec.intensity;
     this.pWidth[i] = spec.width;
     this.pTag[i] = spec.tag;
-    this.pPierce[i] = spec.pierce ? 1 : 0;
+    // 0 = stops at the first target, 1 = pierces bodies + shields, 2 = pierces bodies but stops at shields (8A-3).
+    this.pPierce[i] = spec.pierce ? (spec.shieldStop ? 2 : 1) : 0;
     this.pSkipGroup[i] = -1;
     this.pSlowT[i] = 0;
     this.pSlowK[i] = 1;
@@ -948,7 +951,7 @@ export class EffectsPool {
     return i;
   }
 
-  /** 7B-7: opens a smoke trail behind a round (≤ 3 per shotgun blast). Returns the trail slot or −1. */
+  /** 7B-7: opens a smoke trail behind a round (player rail rounds, enemy snipes). Returns the trail slot or −1. */
   private spawnSmoke(start: THREE.Vector3, dir: THREE.Vector3, speed: number, range: number, enemy: boolean): number {
     const now = this.vfxTime.value;
     if (now === this.smStepAt) {
@@ -1062,8 +1065,8 @@ export class EffectsPool {
       const targets = targetsFor(owner);
       let tHit = false;
       if (targets.length) {
-        const pierce = this.pPierce[i] === 1;
-        physics.raycastTargets(_a, _d, _worldHit.hit ? _worldHit.distance : step, targets, _targetHit, pierce ? this.pSkipGroup[i] : -1, pierce);
+        const pierce = this.pPierce[i] !== 0;
+        physics.raycastTargets(_a, _d, _worldHit.hit ? _worldHit.distance : step, targets, _targetHit, pierce ? this.pSkipGroup[i] : -1, this.pPierce[i] === 1);
         tHit = _targetHit.hit;
       }
       // GRAZE: closest approach of this step's path (up to a world hit) to the player's body axis.
@@ -1075,7 +1078,7 @@ export class EffectsPool {
         const im = this.impact;
         im.owner = owner;
         im.tag = this.pTag[i];
-        im.pierce = tHit && this.pPierce[i] === 1;
+        im.pierce = tHit && (this.pPierce[i] === 1 || (this.pPierce[i] === 2 && !_targetHit.target?.shield));
         im.damage = this.pDamage[i];
         im.headMultiplier = this.pHead[i];
         im.shieldMultiplier = this.pShield[i];

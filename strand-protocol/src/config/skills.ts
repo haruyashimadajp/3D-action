@@ -66,7 +66,8 @@ export const SECTORS: readonly SectorDef[] = [
     highways: 1, highwayCrossing: false, highwayRing: false, onRamps: 1,
     canal: 'NONE', bridges: 0, narrowAlleys: false, skyBridges: 2, denseNeon: false, scramblePlaza: false,
     parkedCars: 28,
-    waves: [{ count: 4 }, { count: 5 }],
+    // 8A-5: unified initial patrol deployment (no mid-fight wave pop-in in Sectors 1–4).
+    waves: [{ count: 9 }],
     roster: { ENFORCER: 7, VEIL: 2 },
     reward: 'SKILL',
   },
@@ -76,7 +77,7 @@ export const SECTORS: readonly SectorDef[] = [
     highways: 1, highwayCrossing: false, highwayRing: false, onRamps: 1,
     canal: 'THROUGH', bridges: 2, narrowAlleys: false, skyBridges: 2, denseNeon: false, scramblePlaza: false,
     parkedCars: 32,
-    waves: [{ count: 6 }, { count: 7 }],
+    waves: [{ count: 13 }],
     roster: { ENFORCER: 5, AEGIS: 3, VEIL: 2, DRONE: 3 },
     reward: 'SKILL',
   },
@@ -86,8 +87,8 @@ export const SECTORS: readonly SectorDef[] = [
     highways: 2, highwayCrossing: true, highwayRing: false, onRamps: 2,
     canal: 'NONE', bridges: 0, narrowAlleys: true, skyBridges: 6, denseNeon: false, scramblePlaza: false,
     parkedCars: 36,
-    waves: [{ count: 8 }, { count: 8 }],
-    roster: { ENFORCER: 5, AEGIS: 3, VEIL: 3, PHANTOM: 2, DRONE: 3 },
+    waves: [{ count: 14 }],
+    roster: { ENFORCER: 4, AEGIS: 3, VEIL: 3, PHANTOM: 2, DRONE: 2 },
     reward: 'SKILL',
   },
   {
@@ -96,8 +97,8 @@ export const SECTORS: readonly SectorDef[] = [
     highways: 2, highwayCrossing: false, highwayRing: false, onRamps: 2,
     canal: 'THROUGH', bridges: 3, narrowAlleys: false, skyBridges: 3, denseNeon: true, scramblePlaza: false,
     parkedCars: 42,
-    waves: [{ count: 9 }, { count: 11 }],
-    roster: { ENFORCER: 5, AEGIS: 4, VEIL: 4, PHANTOM: 3, DRONE: 4 },
+    waves: [{ count: 14 }],
+    roster: { ENFORCER: 3, AEGIS: 3, VEIL: 3, PHANTOM: 3, DRONE: 2 },
     reward: 'SKILL',
   },
   {
@@ -130,7 +131,7 @@ export type SkillId =
   | 'SK_06' | 'SK_07' | 'SK_08' | 'SK_09' | 'SK_10'
   | 'SK_11' | 'SK_12' | 'SK_13' | 'SK_14' | 'SK_15';
 
-export type SkillCategory = '切替連携' | '立体機動' | '武器特化' | '精密射撃' | 'バレットタイム' | '見切り回避' | '非交戦回復' | 'ハイリスク';
+export type SkillCategory = '切替連携' | '立体機動' | '武器特化' | '精密射撃' | 'バレットタイム' | '見切り回避' | '非交戦回復' | 'ハイリスク' | 'ステルス';
 
 export interface SkillDef {
   readonly id: SkillId;
@@ -165,7 +166,7 @@ export const SKILLS: readonly SkillDef[] = [
   {
     id: 'SK_03', name: 'スイング・リローダー', nameEn: 'SWING RELOADER', category: '切替連携',
     trigger: 'ワイヤーぶら下がり中に銃へ切替えた瞬間',
-    levelText: ['マガジン即時 +40% 補充', 'マガジン即時 +70% 補充', 'マガジン即時 +100% 補充'],
+    levelText: ['マガジン即時 +40% 補充（スナイパーは 1/1）', 'マガジン即時 +70% 補充（スナイパーは 1/1）', 'マガジン即時 +100% 補充'],
     values: [0.4, 0.7, 1.0],
   },
   {
@@ -188,11 +189,12 @@ export const SKILLS: readonly SkillDef[] = [
     values: [1.1, 1.6, 2.2],
   },
   {
-    id: 'SK_07', name: 'ブラスト・スラスター', nameEn: 'BLAST THRUSTER', category: '武器特化',
-    trigger: 'ショットガンの空中リコイルジャンプ時',
-    levelText: ['反動 +20% ＆ 0.35s 重力半減', '反動 +35% ＆ 0.35s 重力半減', '反動 +50% ＆ 0.35s 重力半減'],
-    values: [0.2, 0.35, 0.5],
-    values2: [0.35, 0.35, 0.35],
+    // 8A-4: values = crouch move speed bonus, values2 = enemy alert-gauge fill multiplier (−35 / −48 / −60 %).
+    id: 'SK_07', name: 'シャドウ・ステップ', nameEn: 'SHADOW STEP', category: 'ステルス',
+    trigger: 'しゃがみ移動中 ＆ 敵の警戒検知',
+    levelText: ['しゃがみ速度 +35% ＆ 敵警戒ゲージ上昇 -35%', 'しゃがみ速度 +50% ＆ 敵警戒ゲージ上昇 -48%', 'しゃがみ速度 +65% ＆ 敵警戒ゲージ上昇 -60%'],
+    values: [0.35, 0.5, 0.65],
+    values2: [0.65, 0.52, 0.4],
   },
   {
     id: 'SK_08', name: 'サーマル・ヘッドハンター', nameEn: 'THERMAL HEADHUNTER', category: '精密射撃',
@@ -202,10 +204,11 @@ export const SKILLS: readonly SkillDef[] = [
     values2: [65, 65, 65],
   },
   {
-    id: 'SK_09', name: 'パルス・シールドブレイカー', nameEn: 'PULSE SHIELDBREAKER', category: '武器特化',
-    trigger: 'SMGでイージス盾またはボス翼へ命中時',
-    levelText: ['部位・盾ダメージ +40% ＆ 破壊時全弾補充', '部位・盾ダメージ +80% ＆ 破壊時全弾補充', '部位・盾ダメージ +120% ＆ 破壊時全弾補充'],
-    values: [0.4, 0.8, 1.2],
+    // 8A-4: pistol or sniper vs Aegis shields / VALKYRIE wing emitters; a break refills the active gun to full.
+    id: 'SK_09', name: 'シールド・ピアサー', nameEn: 'SHIELD PIERCER', category: '武器特化',
+    trigger: 'ピストル／スナイパーでイージス盾またはボス翼へ命中時',
+    levelText: ['盾・翼ダメージ +60% ＆ 破壊時に即時フル装填', '盾・翼ダメージ +90% ＆ 破壊時に即時フル装填', '盾・翼ダメージ +120% ＆ 破壊時に即時フル装填'],
+    values: [0.6, 0.9, 1.2],
   },
   {
     id: 'SK_10', name: 'クロノ・エクステンダー', nameEn: 'CHRONO EXTENDER', category: 'バレットタイム',
@@ -335,9 +338,10 @@ export interface DerivedModifiers {
   // Equipment
   switchTimeMultiplier: number;
   reloadTimeMultiplier: number;
-  shotgunImpulseBonus: number;
   swingReloadFraction: number;
   // Player
+  /** SK_07: crouch move speed bonus (fraction). */
+  crouchSpeedBonus: number;
   maxSpeedBonus: number;
   wallKickHeightBonus: number;
   kickBoostBonus: number;
@@ -349,7 +353,10 @@ export interface DerivedModifiers {
   // Enemies / combat
   grappleStunS: number;
   btKillRecoveryBonus: number;
-  smgPartBonus: number;
+  /** SK_09: pistol / sniper damage bonus vs shields and boss wings (fraction). */
+  shieldPartBonus: number;
+  /** SK_07: multiplier on every enemy alert-gauge fill (vision + proximity), 1 = none. */
+  alertFillMultiplier: number;
   grazeBtBonus: number;
   lockTimeReduction: number;
 }
@@ -358,8 +365,8 @@ export function createDerivedModifiers(): DerivedModifiers {
   return {
     switchTimeMultiplier: 1,
     reloadTimeMultiplier: 1,
-    shotgunImpulseBonus: 0,
     swingReloadFraction: 0,
+    crouchSpeedBonus: 0,
     maxSpeedBonus: 0,
     wallKickHeightBonus: 0,
     kickBoostBonus: 0,
@@ -370,7 +377,8 @@ export function createDerivedModifiers(): DerivedModifiers {
     bulletTimeDisabled: false,
     grappleStunS: SKILL_CONSTANTS.GRAPPLE_BASE_STUN_S,
     btKillRecoveryBonus: 0,
-    smgPartBonus: 0,
+    shieldPartBonus: 0,
+    alertFillMultiplier: 1,
     grazeBtBonus: 0,
     lockTimeReduction: 0,
   };
@@ -384,7 +392,8 @@ export function deriveModifiers(levels: SkillLevels, flow: FlowRankDef, critical
   const surge = critical ? 1 + skillValue2(levels, 'SK_14') : 1;
   out.switchTimeMultiplier = ((1 - flow.switchReduction) * (1 - skillValue(levels, 'SK_01'))) / surge;
   out.reloadTimeMultiplier = (1 - flow.reloadReduction) / surge;
-  out.shotgunImpulseBonus = skillValue(levels, 'SK_07');
+  out.crouchSpeedBonus = skillValue(levels, 'SK_07');
+  out.alertFillMultiplier = levels.SK_07 > 0 ? skillValue2(levels, 'SK_07') : 1;
   out.swingReloadFraction = skillValue(levels, 'SK_03');
   out.maxSpeedBonus = (1 + flow.maxSpeedBonus) * (1 + (mods.has('HYPER_SPEED') ? HYPER_SPEED_SPEED_BONUS : 0)) - 1;
   out.wallKickHeightBonus = flow.wallKickHeightBonus;
@@ -396,7 +405,7 @@ export function deriveModifiers(levels: SkillLevels, flow: FlowRankDef, critical
   out.bulletTimeDisabled = mods.has('NO_BULLET_TIME');
   out.grappleStunS = levels.SK_06 > 0 ? skillValue(levels, 'SK_06') : SKILL_CONSTANTS.GRAPPLE_BASE_STUN_S;
   out.btKillRecoveryBonus = flow.btKillRecoveryBonus;
-  out.smgPartBonus = skillValue(levels, 'SK_09');
+  out.shieldPartBonus = skillValue(levels, 'SK_09');
   out.grazeBtBonus = skillValue(levels, 'SK_12');
   out.lockTimeReduction = mods.has('HYPER_SPEED') ? HYPER_SPEED_LOCK_REDUCTION : 0;
   return out;

@@ -66,7 +66,7 @@ import { EnemyManager, RICOCHET_TAG, type HitMarkerKind, type KillInfo } from '.
 import { PlayerController } from './player/PlayerController';
 import { EquipmentManager } from './player/EquipmentManager';
 import { ViewModelRenderer } from './player/ViewModelRenderer';
-import { HUD_MAX_TRACKS, HUD_MAX_WARNINGS, HudManager, SaveStore, formatTime, type HudFrame } from './ui/HudManager';
+import { HUD_MAX_AWARE, HUD_MAX_TRACKS, HUD_MAX_WARNINGS, HudManager, SaveStore, formatTime, type HudFrame } from './ui/HudManager';
 
 // ---------------------------------------------------------------------------
 // Game clock: simulation dt = real dt × min(bullet-time scale, hitstop scale).
@@ -156,6 +156,11 @@ export class FlowSystem {
     const P = FLOW_POINTS;
     let pts = info.headshot ? P.HEADSHOT_KILL : P.BODY_KILL;
     let tag = '';
+    // 8A-5: +120 for killing an UNAWARE / ALERT enemy (STEALTH KILL / STEALTH HS).
+    if (info.stealth) {
+      pts += P.STEALTH_KILL_BONUS;
+      tag = 'STEALTH ';
+    }
     if (info.swinging) {
       pts += P.SWING_KILL_BONUS;
       tag = 'SWING ';
@@ -171,7 +176,7 @@ export class FlowSystem {
     this.lastKillAt = this.time;
     const mult = 1 + Math.min(P.MULTIKILL_MAX, P.MULTIKILL_STEP * this.chain);
     out.points = Math.round(pts * mult);
-    out.label = `${tag}${info.headshot ? 'HEADSHOT' : 'KILL'}${mult > 1 ? ` ×${mult.toFixed(2)}` : ''}`;
+    out.label = `${tag}${info.headshot ? (info.stealth ? 'HS' : 'HEADSHOT') : 'KILL'}${mult > 1 ? ` ×${mult.toFixed(2)}` : ''}`;
     this.add(out.points);
   }
 
@@ -289,6 +294,7 @@ const _camFwd = new THREE.Vector3();
 const _toSrc = new THREE.Vector3();
 const _bossStatus = { hp: 0, maxHp: 1, wingL: 1, wingR: 1, phase: 1, downed: false };
 const _proj = new THREE.Vector3();
+const _awarePos = Array.from({ length: HUD_MAX_AWARE }, () => new THREE.Vector3());
 const _feet = new THREE.Vector3();
 const _chest = new THREE.Vector3();
 const _killPos = new THREE.Vector3();
@@ -456,11 +462,9 @@ class App {
       },
     });
     this.equipment = new EquipmentManager(this.input, this.player, this.physics, this.effects, this.renderer, this.viewModel, this.renderer.scene, {
-      onShot: (gun, ammoLeft, airborne) => {
-        audio.gunshot(gun, ammoLeft, airborne);
-        // SK_07 blast thruster: 0.35 s of half gravity after an air recoil jump.
-        if (gun === 'SHOTGUN' && airborne && this.skills.SK_07 > 0) this.player.hover(skillValue2(this.skills, 'SK_07'));
-      },
+      onShot: (gun, ammoLeft, airborne) => audio.gunshot(gun, ammoLeft, airborne),
+      // 8A-5 acoustic sensing: 14 m suppressed pistol, 58 m rail sniper, 8 m grapple hiss.
+      onGunshot: (origin, radius) => this.enemies.onPlayerGunshot(origin, radius),
       onDryFire: () => audio.dryFire(),
       onZoom: (on) => audio.zoom(on),
       onSwitchStart: (to) => audio.switchGear(to),
@@ -498,6 +502,13 @@ class App {
       },
       onSectorClear: () => this.onSectorCleared(),
       onExplosion: (pos) => audio.explosion(pos),
+      onAlertState: (kind) => {
+        // 8A-5 awareness cues: suspicion hum, spotted sting, radio alarm, all-clear.
+        if (this.state !== 'PLAYING') return;
+        if (kind === 'ALERT' || kind === 'DETECTED' || kind === 'GLOBAL_COMBAT' || kind === 'DEESCALATE') audio.awareness(kind);
+        if (kind === 'GLOBAL_COMBAT') this.hud.flowLog('DISTRICT ALERT — COMBAT', 0, 'skill');
+        else if (kind === 'DEESCALATE') this.hud.flowLog('SEARCH ABANDONED — ALERT', 0, 'skill');
+      },
     });
     // The strand can bite straight into humanoids / drones / the boss (15 dmg + stagger, anchor follows).
     this.equipment.combat = {
@@ -556,6 +567,11 @@ class App {
       trackDist: new Float32Array(HUD_MAX_TRACKS),
       trackOff: new Uint8Array(HUD_MAX_TRACKS),
       trackBoss: new Uint8Array(HUD_MAX_TRACKS),
+      awareCount: 0,
+      awareAngles: new Float32Array(HUD_MAX_AWARE),
+      awareGauge: new Float32Array(HUD_MAX_AWARE),
+      awareRank: new Uint8Array(HUD_MAX_AWARE),
+      alertTag: '',
     };
 
     this.startSector = clamp(parseInt(params.get('sector') ?? '1', 10) || 1, 1, SECTORS.length);
@@ -1085,10 +1101,10 @@ class App {
     this.flow.add(FLOW_POINTS.SHIELD_BREAK);
     this.hud.flowLog(label, FLOW_POINTS.SHIELD_BREAK, 'kill');
     this.audio.partBreak(pos);
-    // SK_09 pulse shieldbreaker: an SMG break refills the SMG magazine.
-    if (weapon === 1 && this.skills.SK_09 > 0) {
-      this.equipment.refill('SMG', 1);
-      this.hud.flowLog('SMG REFILLED', 0, 'skill');
+    // 8A-4 SK_09 Shield Piercer: a pistol / sniper break instantly refills the active gun (sniper 1/1, pistol 8/8),
+    // skipping the breech reload so the staggered target can be punished at once.
+    if ((weapon === 0 || weapon === 1) && this.skills.SK_09 > 0 && this.equipment.refillActive()) {
+      this.hud.flowLog('CHAMBER REFILLED', 0, 'skill');
     }
   }
 
@@ -1141,17 +1157,18 @@ class App {
     pm.regenDelayMs = d.regenDelayMs;
     pm.criticalMoveBonus = d.criticalMoveBonus;
     pm.bulletTimeDisabled = d.bulletTimeDisabled;
+    pm.crouchSpeedBonus = d.crouchSpeedBonus;
     const em = this.equipment.modifiers;
     em.switchTimeMultiplier = d.switchTimeMultiplier;
     em.reloadTimeMultiplier = d.reloadTimeMultiplier;
-    em.shotgunImpulseBonus = d.shotgunImpulseBonus;
     em.swingReloadFraction = d.swingReloadFraction;
     em.momentumShots = skillValue(this.skills, 'SK_02');
     em.enemyHookResetsCooldown = this.skills.SK_06 > 0;
     const cm = this.enemies.modifiers;
     cm.grappleStunS = d.grappleStunS;
     cm.btKillRecoveryBonus = d.btKillRecoveryBonus;
-    cm.smgPartBonus = d.smgPartBonus;
+    cm.shieldPartBonus = d.shieldPartBonus;
+    cm.alertFillMultiplier = d.alertFillMultiplier;
     cm.grazeBtBonus = d.grazeBtBonus;
     cm.lockTimeReduction = d.lockTimeReduction;
   }
@@ -1327,7 +1344,12 @@ class App {
     const live = playing && this.player.isAlive;
     this.audio.update(cam.position, _camFwd, _camUp, live && this.player.ropeAttached, this.player.speed, live && this.player.state === 'GRAPPLE_PULL');
     this.audio.setPlayerState(live && this.player.isCritical, live && this.player.isRegenerating);
-    if (this.state === 'PLAYING') this.audio.setCalm(this.enemies.isCleared || this.player.isRegenerating);
+    if (this.state === 'PLAYING') {
+      this.audio.setCalm(this.enemies.isCleared || this.player.isRegenerating);
+      // 8A-5 adaptive BGM: ducked tension pulse while the district is UNAWARE / ALERT.
+      const hi = this.enemies.highestAlert;
+      this.audio.setStealth(!this.enemies.isCleared && (hi === 'UNAWARE' || hi === 'ALERT'));
+    }
 
     // --- World & effects ---
     this.city.update(this.clock.simTime, cam.position);
@@ -1361,6 +1383,10 @@ class App {
       f.warnAngles[f.warnCount++] = this.screenAngle(w.position);
     }
     this.updateTracking(f);
+    // 8A-5 awareness arcs (≤ 4) toward enemies filling their gauge or engaging with LOS, and the district badge.
+    f.awareCount = this.enemies.awareness(_awarePos, f.awareGauge, f.awareRank);
+    for (let i = 0; i < f.awareCount; i++) f.awareAngles[i] = this.screenAngle(_awarePos[i]);
+    f.alertTag = this.enemies.isCleared ? '' : this.enemies.highestAlert;
     f.sectorName = this.sectorLabel;
     f.remaining = this.enemies.remaining;
     f.gateOpen = (this.enemies.isCleared && this.layout.sector.reward === 'SKILL') || this.debugGate;

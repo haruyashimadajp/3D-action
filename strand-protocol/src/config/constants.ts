@@ -32,13 +32,13 @@ export const PLAYER = {
   /** Manual retry with R while dead. */
   MANUAL_RETRY_MS: 150,
   EYE_HEIGHT: 1.72,
-  SLIDE_EYE_HEIGHT: 0.86,
+  SLIDE_EYE_HEIGHT: 0.68,
   /** 7A-6 crouch eye height (collider = SLIDE_HEIGHT). */
-  CROUCH_EYE_HEIGHT: 1.05,
+  CROUCH_EYE_HEIGHT: 0.78,
   /** Player capsule. */
   RADIUS: 0.38,
   HEIGHT: 1.86,
-  SLIDE_HEIGHT: 0.98,
+  SLIDE_HEIGHT: 0.94,
 } as const;
 
 // ---------------------------------------------------------------------------
@@ -80,9 +80,9 @@ export interface ShakeDef {
 export const SHAKE_FREQUENCY_HZ = 28;
 export const SHAKE_DECAY_PER_S = 2.2;
 export const SHAKE = {
-  PISTOL_FIRE: { trauma: 0.18, maxPitchYawDeg: 0.6, maxRollDeg: 0.4 },
-  SMG_FIRE: { trauma: 0.06, maxPitchYawDeg: 0.25, maxRollDeg: 0.15 },
-  SHOTGUN_FIRE: { trauma: 0.42, maxPitchYawDeg: 1.8, maxRollDeg: 1.2 },
+  /** v1.5 §2.2 */
+  PISTOL_FIRE: { trauma: 0.16, maxPitchYawDeg: 0.55, maxRollDeg: 0.35 },
+  SNIPER_FIRE: { trauma: 0.44, maxPitchYawDeg: 1.9, maxRollDeg: 1.2 },
   ANCHOR_IMPACT: { trauma: 0.15, maxPitchYawDeg: 0.5, maxRollDeg: 0.5 },
   HARD_LANDING: { trauma: 0.32, maxPitchYawDeg: 1.4, maxRollDeg: 0.8 },
   GRAZE: { trauma: 0.14, maxPitchYawDeg: 0.4, maxRollDeg: 1.0 },
@@ -140,6 +140,8 @@ export const FLOW_POINTS = {
   SWING_KILL_BONUS: 120,
   GRAZE: 90,
   SHIELD_BREAK: 150,
+  /** 8A-5: killing an UNAWARE / ALERT enemy (STEALTH KILL / STEALTH HS). */
+  STEALTH_KILL_BONUS: 120,
   MULTIKILL_WINDOW_MS: 2500,
   MULTIKILL_STEP: 0.25,
   MULTIKILL_MAX: 1.0,
@@ -275,7 +277,7 @@ export const PHYSICS = {
   MANTLE_EXIT_SPEED: 6.5,
   /** 7A-6 crouch: grounded below 7.5 m/s with Ctrl/C held — 0.98 m body, 1.05 m eyes, 5.0 m/s. */
   CROUCH_MAX_ENTER_SPEED: 7.5,
-  CROUCH_SPEED: 5.0,
+  CROUCH_SPEED: 4.4,
 
   /** User-tuned: 2.5× the spec value of 52 m. */
   GRAPPLE_RANGE: 130.0,
@@ -620,7 +622,7 @@ export const VFX7 = {
   SMOKE_LIFE_S: 0.38,
   SMOKE_WIDTH: [0.04, 0.14] as readonly number[],
   SMOKE_ALPHA: 0.2,
-  /** Pellets of one shotgun blast sharing a step: at most this many trails. */
+  /** Rounds spawned in one step sharing smoke: at most this many trails. */
   SMOKE_PER_SHOT: 3,
 } as const;
 
@@ -835,13 +837,16 @@ export const AUDIO = {
   WORLD_RESUME_MS: 80,
 
   // §7.2 SE parameters
-  PISTOL_TRANSIENT: { f0: 1400, f1: 120, ms: 35 },
-  PISTOL_BODY: { f0: 180, f1: 42, ms: 110 },
-  PISTOL_TAIL: { f0: 3200, f1: 900, ms: 180 },
+  /** 8A-3 suppressed rail thump: triangle 900 → 110 Hz 28 ms (soft shaper) + bandpass pneumatic snap 1800 → 500 Hz 65 ms + slide click 2400 Hz 18 ms. */
+  PISTOL_THUMP: { f0: 900, f1: 110, ms: 28 },
+  PISTOL_SNAP: { f0: 1800, f1: 500, ms: 65 },
+  PISTOL_CLICK: { hz: 2400, ms: 18 },
   /** Last two rounds: metallic click (sine 2600 Hz, 25 ms). */
   PISTOL_LOW_AMMO_CLICK: { hz: 2600, ms: 25, rounds: 2 },
-  /** 5A-6: SMG ≤ 5 rounds left and the shotgun's last shell add the same metallic dry click. */
-  SMG_LOW_AMMO_ROUNDS: 5,
+  /** 8A-3 K-90: sub shock sine 150 → 26 Hz 310 ms (heavy drive) + saw whip-crack 2200 → 140 Hz 55 ms (k = 45) + canyon boom bandpass noise 1400 → 320 Hz 380 ms. */
+  SNIPER_SUB: { f0: 150, f1: 26, ms: 310 },
+  SNIPER_CRACK: { f0: 2200, f1: 140, ms: 55, shaperK: 45 },
+  SNIPER_BOOM: { f0: 1400, f1: 320, ms: 380 },
   /** 5A-6 Aegis shield / boss armour deflect: FM 2400 Hz carrier × 3700 Hz modulator, 85 ms + energy ring. */
   HIT_SHIELD: { carrierHz: 2400, modHz: 3700, ms: 85, ringHz: 620, ringMs: 160 },
   /** 5A-6 wall-run magnetic boot taps every 0.22 s: bandpass 1800 Hz noise 25 ms + triangle 320 → 160 Hz 30 ms. */
@@ -851,14 +856,12 @@ export const AUDIO = {
   /** 5A-1 optical servo: zoom in sine 1400 → 2100 Hz 45 ms (0.05), out 1800 → 1100 Hz 40 ms (0.04), UI bus. */
   ZOOM_IN: { f0: 1400, f1: 2100, ms: 45, gain: 0.05 },
   ZOOM_OUT: { f0: 1800, f1: 1100, ms: 40, gain: 0.04 },
-  SMG_ATTACK: { f0: 620, f1: 140, ms: 28 },
-  SMG_SNAP: { hz: 2800, ms: 40 },
-  SMG_PITCH_JITTER: 0.03,
-  SHOTGUN_SUB: { f0: 135, f1: 28, ms: 260 },
-  SHOTGUN_BLAST: { hz: 900, ms: 220, shaperK: 40 },
-  SHOTGUN_PUMP: { delayMs: 280, hzA: 1800, hzB: 2200, ms: 45 },
-  /** Air recoil jump: sub +3 dB. */
-  SHOTGUN_AIR_SUB_DB: 3,
+  /** Shared WaveShaper drive amount for punchy transients. */
+  DRIVE_K: 40,
+  /** 8A-5 stealth BGM: Layer 1 only, filtered (high shelf −9 dB) at 0.7× level; erupts back in 0.35 s. */
+  STEALTH_BGM_SHELF_DB: -9,
+  STEALTH_BGM_LAYER1_K: 0.7,
+  STEALTH_ERUPT_S: 0.35,
   HEADSHOT_GLASS: { hz: 5500, ms: 90 },
   HEADSHOT_CHORD: { attackMs: 2, decayMs: 240 },
   /** Consecutive head-shots within 5 s climb this pentatonic ladder (C6 D6 E6 G6 A6 C7 D7 E7). */
