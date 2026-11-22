@@ -919,8 +919,10 @@ class Enemy implements StealthAgent {
   readonly investigatePos = new THREE.Vector3();
   hasInvestigate = false;
   locked = false;
-  /** Engaged without LOS and not making progress toward the shared position (unreachable-rooftop fallback). */
+  /** Engaged without LOS and not getting ≥ 1 m closer to the shared position (unreachable-rooftop fallback). */
   stallT = 0;
+  /** Closest horizontal approach to the current shared last-known position (s stall bookkeeping). */
+  searchBestD = Infinity;
   /** Clear sightline from the muzzle to the shared last-known position (suppressive fire allowed). */
   suppressLos = false;
   /** The running attack is a suppressive burst at the last-known position. */
@@ -1178,6 +1180,8 @@ export class EnemyManager {
   readonly stealth: StealthDirector;
   /** Point the engaged think functions move / face toward: the player with LOS, else the last-known position. */
   private readonly focus = new THREE.Vector3();
+  /** Player position at the last LOS ray that actually confirmed a sighting (never a stale flag). */
+  private readonly lastSeenPos = new THREE.Vector3();
   private readonly focusChest = new THREE.Vector3();
   /** 8A-5 overhead state markers (one instanced draw). */
   private readonly markers: THREE.InstancedMesh;
@@ -1834,6 +1838,7 @@ export class EnemyManager {
     this.stealth.initAgent(e, bossSector ? 'COMBAT' : 'UNAWARE', bossSector);
     e.visionRange = kind === 'VEIL' ? AI_STEALTH.VISION_RANGE_VEIL : kind === 'DRONE' ? AI_STEALTH.VISION_RANGE_DRONE : AI_STEALTH.VISION_RANGE;
     e.stallT = 0;
+    e.searchBestD = Infinity;
     e.suppress = false;
     e.suppressLos = false;
     e.shownState = '';
@@ -2024,7 +2029,7 @@ export class EnemyManager {
       e.shieldFlash = Math.max(0, e.shieldFlash - dt);
       this.stepSprings(e, dt);
       this.perceive(e, dt);
-      this.stealth.stepAgent(e, dt, this.player.position);
+      this.stealth.stepAgent(e, dt, this.lastSeenPos);
       if (!isEngaged(e.alertState)) {
         // UNAWARE / ALERT: patrol, scan, investigate — never fire, never telegraph.
         if (e.phase !== 'IDLE') this.cancelAttack(e, 0.5);
@@ -2036,7 +2041,17 @@ export class EnemyManager {
       }
       e.unseenT = e.canSee ? 0 : e.unseenT + dt;
       this.setFocus(e);
-      e.stallT = !e.hasPlayerLos && Math.hypot(e.vel.x, e.vel.z) < 0.4 ? e.stallT + dt : 0;
+      if (e.hasPlayerLos || !this.stealth.hasSharedLastKnown) {
+        e.stallT = 0;
+        e.searchBestD = Infinity;
+      } else {
+        const lk = this.stealth.sharedLastKnownPos;
+        const dh = Math.hypot(e.pos.x - lk.x, e.pos.z - lk.z);
+        if (dh < e.searchBestD - 1) {
+          e.searchBestD = dh;
+          e.stallT = 0;
+        } else e.stallT += dt;
+      }
       switch (e.kind) {
         case 'ENFORCER':
           this.thinkEnforcer(e, dt);
@@ -2062,7 +2077,8 @@ export class EnemyManager {
     }
     this.stealth.playerCrouching = this.player.isLowProfile;
     this.stealth.fillMultiplier = this.modifiers.alertFillMultiplier;
-    this.stealth.stepGlobal(this.enemies, dt, this.player.position);
+    // The shared last-known position only ever receives a ray-confirmed sighting.
+    this.stealth.stepGlobal(this.enemies, dt, this.lastSeenPos);
     this.updateMissiles(dt);
     this.updateHook();
   }
@@ -2123,6 +2139,7 @@ export class EnemyManager {
       const range = e.isBoss ? VALK_DEF.gun.range : Math.max(e.def.gun.range, e.visionRange);
       e.canSee = d <= range && this.physics.lineOfSight(_v1, this.playerChest, 0.9);
       e.hasPlayerLos = e.canSee;
+      if (e.canSee) this.lastSeenPos.copy(this.player.position);
       e.suppressLos = false;
       e.inspecting = false;
       const S = this.stealth;
@@ -2159,6 +2176,7 @@ export class EnemyManager {
     }
     if (!inCone && !near) return;
     if (!this.physics.lineOfSight(_v1, this.playerChest, 0.9)) return;
+    this.lastSeenPos.copy(this.player.position);
     if (inCone) {
       e.seesPlayer = true;
       e.visionDist = d;
