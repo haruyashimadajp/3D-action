@@ -39,7 +39,7 @@
  */
 import * as THREE from 'three';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
-import { ARCHETYPE, BALCONY, CITY_FX, CITY_SHADING, COLORS, FACADE, FIRE_ESCAPE, LEVEL, LIMITS, MATERIALS, NEON_BLOOM, RENDER, SILHOUETTE, createRng, clamp } from '../config/constants';
+import { ARCHETYPE, BALCONY, CITY_FX, CITY_SHADING, COLORS, FACADE, FIRE_ESCAPE, LEVEL, LIMITS, MATERIALS, NEON_BLOOM, PHYSICS, RENDER, SILHOUETTE, createRng, clamp } from '../config/constants';
 import { ARCH_A, ARCH_B, ARCH_C, ARCH_D, GLSL_FACADE, facadeFloorY, facadeRoomState, faceKey, isMachineFloor, roomOffset, roomsPerTile, seedInt } from './FacadeLighting';
 import { SECTORS, type SectorDef } from '../config/skills';
 import { NEON_STRIP_GLOW, ROAD_ATLAS, SIGN_ATLAS, type AtlasRegion, type ProceduralTextureLibrary } from '../engine/ProceduralTextures';
@@ -52,8 +52,11 @@ import {
   applyAo,
   assignMassings,
   assignPrograms,
+  baySocket,
   doorClearZone,
   doorSockets,
+  galleryDoorFit,
+  groundDoorFit,
   ensureAo,
   faceKeyOf,
   floorTopY,
@@ -73,6 +76,21 @@ import {
   type MassingPlan,
   type PropSocket,
 } from './BuildingGrammar';
+import {
+  PROPS,
+  alleyCentreBand,
+  alleyStrips,
+  composeSockets,
+  planClutter,
+  planDecals,
+  toAabb,
+  type Aabb3,
+  type ClutterStrip,
+  type DecalSurface,
+  type KitId,
+  type PropInstance,
+} from './CityProps';
+import { CityPropMeshes } from './CityPropMeshes';
 
 // =============================================================================================
 // Public layout data (consumed by PhysicsWorld / PlayerController / EnemyManager / HUD)
@@ -151,6 +169,10 @@ export interface RectXZ {
   readonly z1: number;
 }
 
+export interface DoorZone extends RectXZ {
+  readonly y: number;
+}
+
 export interface GateInfo {
   /** Centre of the gate opening at street level. */
   readonly position: THREE.Vector3;
@@ -204,7 +226,11 @@ export interface SectorLayout {
   /** 9A-4 deterministic prop sockets (every 1F doorway and gallery apartment door) for Phase 9B micro-props. */
   readonly propSockets: readonly PropSocket[];
   /** 9A-4 1.8 m × 1.8 m clear entry zones in front of every 1F doorway (Phase 9B clutter keeps out). */
-  readonly doorClearZones: readonly RectXZ[];
+  /** 1.8 × 1.8 m clear entry zones; `y` = the floor they stand on (0 street, deck height on galleries). */
+  readonly doorClearZones: readonly DoorZone[];
+  /** 9B: footprints of every socket prop and clutter item (verification) and each alley's clear centre band. */
+  readonly propFootprints: readonly Aabb3[];
+  readonly alleyBands: ReadonlyArray<RectXZ & { readonly width: number }>;
   /** 9A-6 manhole centres (steam anchors / Phase 9B clutter avoidance). */
   readonly manholes: readonly THREE.Vector3[];
   readonly stats: {
@@ -259,6 +285,22 @@ export interface SectorLayout {
     readonly alleyNeon: number;
     readonly minRunFaces: number;
     readonly floatingRoofProps: number;
+    /** Phase 9B micro-props / clutter / decals (committed instance counts per kit). */
+    readonly props: {
+      readonly doors: number;
+      readonly tidyDoors: number;
+      readonly dressedDoors: number;
+      readonly adjacentPairs: number;
+      readonly adjacentClones: number;
+      readonly bayProps: number;
+      readonly socketProps: number;
+      readonly kits: Readonly<Record<KitId, number>>;
+      readonly clutter: number;
+      readonly clutterColliders: number;
+      readonly clutterByStrip: Readonly<Record<string, number>>;
+      readonly dumpstersByStrip: Readonly<Record<string, number>>;
+      readonly decals: number;
+    };
   };
 }
 
@@ -931,6 +973,8 @@ export class CityBuilder {
   /** 5B-3: low steam from manholes / ducts and canal mist (one instanced draw, animated on the GPU). */
   private readonly steam: THREE.InstancedMesh;
   private readonly gatePillar: THREE.Mesh;
+  /** Phase 9B socket kits, clutter batches and graffiti decals (10 persistent instanced draws). */
+  private readonly propMeshes: CityPropMeshes;
 
   private layout: SectorLayout | null = null;
   /** Tower records of the current sector (facade probe). */
@@ -1013,10 +1057,12 @@ export class CityBuilder {
     this.steam = this.createSteam();
     this.manholes = this.createManholes();
     this.gatePillar = this.createGatePillar();
+    this.propMeshes = new CityPropMeshes(tex.plaqueAtlas, tex.graffitiAtlas, (shader) => this.injectCityLights(shader));
     this.persistent.add(
       ...this.cars, this.lamps, this.vending, this.guardrails, this.acUnits, this.ducts, this.fences, this.antennas,
       this.machineRooms, this.aviation, this.neonSigns, this.searchlights, this.beacons, this.halos, this.lampHalos, this.steam, this.gatePillar,
       this.lampCones, this.signals, this.carPools, this.blimpHull, this.blimpBanner, this.manholes,
+      ...this.propMeshes.meshes,
     );
   }
 
@@ -2973,8 +3019,11 @@ export class CityBuilder {
       placeInstance(this.guardrails, counts.rail++, x, 0, z, alongX ? 0 : Math.PI / 2);
     };
     const NEON_TINTS = [0xff2bd6, 0x00f0ff, 0xffa21f, 0x39ff88, 0xb44bff];
+    /** 9B: lamp poles carry no collider; clutter keeps clear of them. */
+    const lampPoles: Array<readonly [number, number]> = [];
     const addLamp = (x: number, z: number, yaw: number): void => {
       if (counts.lamp >= CAP.LAMP) return;
+      lampPoles.push([x, z]);
       placeInstance(this.lamps, counts.lamp, x, 0, z, yaw);
       _col.setHex(NEON_TINTS[Math.floor(rng() * NEON_TINTS.length)]);
       lampTint.setXYZ(counts.lamp, _col.r, _col.g, _col.b);
@@ -3290,6 +3339,8 @@ export class CityBuilder {
     // ------------------------------------------------------------------ 5. expressways, piers, on-ramps
     const decks: Array<{ hi: number; axis: Axis; coord: number; a0: number; a1: number }> = [];
     const pierRects: RectXZ[] = [];
+    /** 9B: highway pier centres + the highway's along axis (underpass clutter, pier graffiti). */
+    const pierLines: Array<{ x: number; z: number; axis: Axis }> = [];
     const highwayRects: RectXZ[] = [];
     const rampRects: RectXZ[] = [];
     const HW = LEVEL.HIGHWAY_WIDTH_M / 2;
@@ -3442,6 +3493,7 @@ export class CityBuilder {
         G.hw.push(boxAt(crossAxisIsX ? 3.2 : 1.9, 0.7, crossAxisIsX ? 1.9 : 3.2, qp.x, UNDER - 0.35, qp.z));
         const pr = rectFrom(qp.x - 0.7, qp.z - 0.7, qp.x + 0.7, qp.z + 0.7);
         pierRects.push(pr);
+        pierLines.push({ x: qp.x, z: qp.z, axis: h.axis });
         if (inArea(qp.x, qp.z)) colliders.push({ min: new THREE.Vector3(pr.x0, 0, pr.z0), max: new THREE.Vector3(pr.x1, UNDER, pr.z1), kind: 'HIGHWAY', building: -1 });
         a += LEVEL.HIGHWAY_PIER_SPACING_MIN_M + rng() * (LEVEL.HIGHWAY_PIER_SPACING_MAX_M - LEVEL.HIGHWAY_PIER_SPACING_MIN_M);
       }
@@ -3573,6 +3625,11 @@ export class CityBuilder {
     const arng = createRng(0xa7c4 + sector.index * 131 + loop * 1009);
     const alleyFaces = new Set<string>();
     for (const al of alleyRecs) alleyFaces.add(`${al.a}:${al.axis}:1`).add(`${al.b}:${al.axis}:-1`);
+    /** 9B: narrowest alley a face fronts (socket props stop short of the alley's clear centre path). */
+    const alleyWidth = new Map<string, number>();
+    for (const al of alleyRecs) {
+      for (const k of [`${al.a}:${al.axis}:1`, `${al.b}:${al.axis}:-1`]) alleyWidth.set(k, Math.min(alleyWidth.get(k) ?? Infinity, al.gap1 - al.gap0));
+    }
     const FACES: ReadonlyArray<readonly [Axis, number]> = [['x', 1], ['x', -1], ['z', 1], ['z', -1]];
     const FE = FIRE_ESCAPE;
     const AR = ARCHETYPE;
@@ -3732,6 +3789,39 @@ export class CityBuilder {
         if (lowTopOf(b) >= 12) for (const [ax, sg] of feature) shutterFaces.add(fkey(b, ax, sg));
       }
     });
+    // 9B: every alley gets one service side (bins, dumpsters, pallets against its wall) while the opposite wall stays
+    // a clean run strip. A tower may only give up an alley run face if it keeps ≥ 2 clean run faces: either it has a
+    // spare one, or a plain feature face (no balcony / duct / shutter / escape / gallery / spine) is promoted to a
+    // clean run face in exchange.
+    const serviceFaces = new Set<string>();
+    const alleyService: Array<0 | 1 | null> = [];
+    {
+      const srv = createRng(0x9b5e + sector.index * 53 + loop * 211);
+      const cleanRuns = (bi: number): number => FACES.filter(([ax, sg]) => runFaces.has(`${bi}:${ax}:${sg}`) && !serviceFaces.has(`${bi}:${ax}:${sg}`)).length;
+      const plainFace = (bi: number): string | null => {
+        for (const [ax, sg] of FACES) {
+          const k = `${bi}:${ax}:${sg}`;
+          if (runFaces.has(k) || escapeFaces.has(k) || partialFaces.has(k) || galleryFaces.has(k) || spineFaces.has(k) || balconyFaces.has(k) || ductFaces.has(k) || shutterFaces.has(k)) continue;
+          if (faceLen(buildings[bi], ax) >= PHYSICS.WALLRUN_MIN_FACE_WIDTH + 1) return k;
+        }
+        return null;
+      };
+      for (const al of alleyRecs) {
+        const sides = [
+          { side: 0 as const, bi: al.a, key: `${al.a}:${al.axis}:1` },
+          { side: 1 as const, bi: al.b, key: `${al.b}:${al.axis}:-1` },
+        ]
+          .filter((c) => runFaces.has(c.key) && !serviceFaces.has(c.key) && (cleanRuns(c.bi) > 2 || plainFace(c.bi) !== null))
+          .map((c) => ({ ...c, roll: srv() }))
+          .sort((p, q) => cleanRuns(q.bi) - cleanRuns(p.bi) || p.roll - q.roll);
+        const pick = sides[0];
+        if (pick) {
+          if (cleanRuns(pick.bi) <= 2) runFaces.add(plainFace(pick.bi) as string);
+          serviceFaces.add(pick.key);
+        }
+        alleyService.push(pick ? pick.side : null);
+      }
+    }
     const runFaceCount = buildings.map((b) => FACES.filter(([ax, sg]) => runFaces.has(fkey(b, ax, sg))).length);
 
     // ------------------------------------------------------------------ 7b. tower bodies, roofs, crowns
@@ -4133,8 +4223,13 @@ export class CityBuilder {
     // =========================================================================================
     const GR = GRAMMAR;
     const grng = createRng(0x9a0d + sector.index * 97 + loop * 389);
+    /** 9B stream (bay sockets, decal surfaces, clutter): separate so the 9A layout stays identical. */
+    const p9Rng = createRng(0x9b0b + sector.index * 61 + loop * 433);
     const propSockets: PropSocket[] = [];
-    const doorClearZones: RectXZ[] = [];
+    const doorClearZones: DoorZone[] = [];
+    /** 9B: ground obstacles without colliders (lamp poles, riser pipes) + decal surfaces gathered by the 9A passes. */
+    const propObstacles: Aabb3[] = [];
+    const decalSurfaces: DecalSurface[] = [];
     const eateryVents: THREE.Vector3[] = [];
     const programCounts: Record<GroundProgram, number> = { CYBER_EATERY: 0, TECH_APPAREL: 0, CAPSULE_HOTEL: 0, CYBER_APARTMENT: 0, ALLEY_INFRA: 0 };
     const doorSizes: Array<[number, number]> = [];
@@ -4271,7 +4366,8 @@ export class CityBuilder {
             G.steel.push(...f.bx(wa - 0.6, wa + 0.6, y + 1.05, y + 1.1, 0, 0.08), ...f.bx(wa - 0.6, wa + 0.6, y + 2.2, y + 2.25, 0, 0.08));
             for (let k = -4; k <= 4; k++) G.steel.push(...f.bx(wa + k * 0.12 - 0.012, wa + k * 0.12 + 0.012, y + 1.1, y + 2.2, 0.04, 0.07));
           }
-          propSockets.push(...doorSockets(f.ref, { a, w: 1.02, h: 2.15 }, y, 'GALLERY', ['FLOOR_L', 'FLOOR_R', 'WALL_SIDE', 'WALL_HIGH'], b.index, doorId++, grng));
+          doorClearZones.push({ ...doorClearZone(f.ref, a), y });
+          propSockets.push(...doorSockets(f.ref, { a, w: 1.02, h: 2.15 }, y, 'GALLERY', ['FLOOR_L', 'FLOOR_R', 'WALL_SIDE', 'WALL_HIGH'], b.index, doorId++, grng, galleryDoorFit(a, lv.a0, lv.a1)));
           galleryDoors++;
         }
         galleryLevels++;
@@ -4381,6 +4477,9 @@ export class CityBuilder {
       const feature = !run && !g.alley;
       // Shared grammar: weathered stone piers every ~4 m with dark steel kick plates.
       for (const a of plan.piers) {
+        if ((g.alley || program === 'ALLEY_INFRA') && gTop > 3.4) {
+          decalSurfaces.push({ kind: 'PIER', nAx: span.ax, sg: span.sg, plane: span.plane + span.sg * (run ? GR.PIER_D_RUN_M : GR.PIER_D_M), a0: a - 0.2, a1: a + 0.2, y0: 0.7, y1: Math.min(3.3, gTop - 0.5), seed: p9Rng() });
+        }
         G.concrete.push(...f.bx(a - GR.PIER_W_M / 2, a + GR.PIER_W_M / 2, 0, gTop, 0, PD, { ground: true, tile: T }));
         G.steel.push(...f.bx(a - GR.PIER_W_M / 2 - 0.02, a + GR.PIER_W_M / 2 + 0.02, 0, GR.KICK_H_M, 0, PD + 0.03, { ground: true }));
         pierCount++;
@@ -4390,9 +4489,21 @@ export class CityBuilder {
       if (gTop > sTop + 1) G.concrete.push(...f.bx(span.a0 + 0.2, span.a1 - 0.2, gTop - 0.35, gTop - 0.1, 0, 0.12, { bottom: GR.AO_BAND_UNDERSIDE, tile: T }));
       const oT = sTop - 0.42;
       const tint = (k: number): number => NEON_SHOP[(Math.floor(b.seed * 31) + k) % 2];
+      // 9B socket space: sidewalk faces keep a ≥ 2 m walk; alley faces stop short of the 2.6 m clear centre path;
+      // gallery faces stay inside the corridor's outer columns; wall-run faces only take low props.
+      const sockGroup = PROGRAM_SOCKETS[program].group;
+      const service = serviceFaces.has(g.key);
+      const lowProps = (run || g.alley) && !service;
+      const alleyHalf = g.alley ? ((alleyWidth.get(g.key) ?? 4) - PROPS.ALLEY_CLEAR_M) / 2 - 0.05 : Infinity;
+      const floorReach = Math.min(alleyHalf, galleryFaces.has(g.key) ? 1.1 : run ? 0.75 : 1.55);
       for (const bay of plan.bays) {
         const { a0, a1 } = bay;
         const m = (a0 + a1) / 2;
+        if (!service && (bay.use === 'PANEL' || bay.use === 'VITRINE' || bay.use === 'SHUTTER' || bay.use === 'GRILLE')) {
+          const bs = baySocket(f.ref, a0 + 0.45, a1 - 0.45, 0.36, floorReach - 0.36, 0, sockGroup, b.index, lowProps, p9Rng);
+          if (bs) propSockets.push(bs);
+        }
+        if (bay.use === 'SHUTTER') decalSurfaces.push({ kind: 'SHUTTER', nAx: span.ax, sg: span.sg, plane: span.plane + span.sg * 0.075, a0: a0 + 0.1, a1: a1 - 0.1, y0: 0.35, y1: oT - 0.4, seed: p9Rng() });
         switch (bay.use) {
           case 'PANEL':
             if (program === 'CAPSULE_HOTEL') {
@@ -4481,8 +4592,10 @@ export class CityBuilder {
           G.steel.push(...f.bx(a - 0.16, a + 0.16, h + 0.28, h + 0.3, 0, 0.22), ...f.bx(a - 0.16, a + 0.16, h + 0.52, h + 0.54, 0, 0.22));
         }
         doorSizes.push([w, h]);
-        doorClearZones.push(doorClearZone(f.ref, a));
-        propSockets.push(...doorSockets(f.ref, { a, w, h }, 0, sockets.group, sockets.slots, b.index, doorId++, grng));
+        doorClearZones.push({ ...doorClearZone(f.ref, a), y: 0 });
+        const dBay = plan.bays.find((bb) => a > bb.a0 && a < bb.a1);
+        const fit = groundDoorFit(program, door, dBay, floorReach, lowProps, run);
+        propSockets.push(...doorSockets(f.ref, { a, w, h }, 0, sockets.group, sockets.slots, b.index, doorId++, grng, fit));
         // Program portals in front of the door.
         if (program === 'CAPSULE_HOTEL') {
           const dp = run ? GR.PIER_D_RUN_M : 0.8;
@@ -4515,6 +4628,9 @@ export class CityBuilder {
             const sa = door0.a + door0.w / 2 + 1.4;
             if (sa + 0.9 < span.a1 - 0.3) {
               G.steel.push(...f.bx(sa - 0.9, sa + 0.9, 1.03, 1.08, 0, 0.35), ...f.bx(sa - 0.85, sa - 0.8, 0.7, 1.03, 0, 0.3), ...f.bx(sa + 0.8, sa + 0.85, 0.7, 1.03, 0, 0.3));
+              const c0 = f.P3(sa - 0.92, 0, 0);
+              const c1 = f.P3(sa + 0.92, 0, 0.37);
+              propObstacles.push({ minX: Math.min(c0.x, c1.x), minY: 0.72, minZ: Math.min(c0.z, c1.z), maxX: Math.max(c0.x, c1.x), maxY: 1.08, maxZ: Math.max(c0.z, c1.z) });
             }
           }
           // Stainless exhaust hood + grease duct climbing the wall; its mouth breathes steam.
@@ -4574,8 +4690,10 @@ export class CityBuilder {
       return { piers: plan.piers };
     };
     const pipeSpots: Array<{ g: GroundFace; piers: number[]; program: GroundProgram }> = [];
+    const faceProgram = new Map<GroundFace, GroundProgram>();
     groundFaces.forEach((g, i) => {
       const r = groundFace(g, programs[i]);
+      faceProgram.set(g, programs[i]);
       pipeSpots.push({ g, piers: r.piers, program: programs[i] });
       // 9A-6 dense layered street signage: staggered protruding vertical blades on the piers, 1F–5F (4.6–20 m).
       const { span, b } = g;
@@ -4667,6 +4785,12 @@ export class CityBuilder {
         G.steel.push(...f.bx(a - r * 1.15, a + r * 1.15, top - r * 2.1, top + 0.02, d - r * 1.15, d + r * 1.15));
       }
       for (let y = 1.6; y < top - 0.5; y += 3.5) G.steel.push(...f.bx(base - r - 0.05, base + gap * (n - 1) + r + 0.05, y, y + 0.06, 0, d + r + 0.04));
+      {
+        // 9B: the bundle has no collider; props and clutter keep clear of it.
+        const p0 = f.P3(base - r - 0.08, 0, 0);
+        const p1 = f.P3(base + gap * (n - 1) + r + 0.08, 0, d + r + 0.08);
+        propObstacles.push({ minX: Math.min(p0.x, p1.x), minY: 0, minZ: Math.min(p0.z, p1.z), maxX: Math.max(p0.x, p1.x), maxY: top, maxZ: Math.max(p0.z, p1.z) });
+      }
       // Horizontal conduit just above the 1F fascias + junction boxes with status LEDs.
       if (program === 'ALLEY_INFRA' || program === 'CYBER_EATERY') {
         const cy = 3.85 + grng() * 0.5;
@@ -5279,6 +5403,141 @@ export class CityBuilder {
       cp(g * 84, 30), cp(g * 80, 82), cp(g * 50, 112), cp(0, 114), cp(-g * 50, 112), cp(-g * 80, 82), cp(-g * 86, 30),
     ];
 
+    // ------------------------------------------------------------------ 9B. micro-props, clutter, decals
+    // World blocker for every prop: non-ground colliders at the prop's height, ramp / stair flights, lamp poles and
+    // riser pipes (no colliders), water and the lockdown boundary.
+    const propBlockers: Aabb3[] = [];
+    for (const c of colliders) {
+      if (c.kind === 'GROUND' || c.kind === 'BARRIER') continue;
+      propBlockers.push({ minX: c.min.x, minY: c.min.y, minZ: c.min.z, maxX: c.max.x, maxY: c.max.y, maxZ: c.max.z });
+    }
+    for (const rp of rampColliders) {
+      const [l0, l1] = [rp.lateralMin, rp.lateralMax];
+      const [a0, a1] = [Math.min(rp.alongStart, rp.alongEnd), Math.max(rp.alongStart, rp.alongEnd)];
+      const y0 = Math.min(rp.yStart, rp.yEnd) - rp.thickness;
+      const y1 = Math.max(rp.yStart, rp.yEnd) + 1.2;
+      propBlockers.push(rp.axis === 'x' ? { minX: a0, minY: y0, minZ: l0, maxX: a1, maxY: y1, maxZ: l1 } : { minX: l0, minY: y0, minZ: a0, maxX: l1, maxY: y1, maxZ: a1 });
+    }
+    for (const [x, z] of lampPoles) propBlockers.push({ minX: x - 0.18, minY: 0, minZ: z - 0.18, maxX: x + 0.18, maxY: 7, maxZ: z + 0.18 });
+    propBlockers.push(...propObstacles);
+    const blockGrid = new Map<number, Aabb3[]>();
+    const bkey = (i: number, j: number): number => (i + 512) * 1024 + (j + 512);
+    for (const bb of propBlockers) {
+      if (bb.maxX - bb.minX > 60 || bb.maxZ - bb.minZ > 60) continue;
+      for (let i = Math.floor(bb.minX / 4); i <= Math.floor(bb.maxX / 4); i++) {
+        for (let j = Math.floor(bb.minZ / 4); j <= Math.floor(bb.maxZ / 4); j++) {
+          const l = blockGrid.get(bkey(i, j));
+          if (l) l.push(bb);
+          else blockGrid.set(bkey(i, j), [bb]);
+        }
+      }
+    }
+    const bigBlockers = propBlockers.filter((bb) => bb.maxX - bb.minX > 60 || bb.maxZ - bb.minZ > 60);
+    const propBlocked = (x0: number, z0: number, x1: number, z1: number, y0: number, y1: number): boolean => {
+      if (!inArea(x0, z0, 1) || !inArea(x1, z1, 1)) return true;
+      if (y0 < 0.5 && canalWater.some((r) => x1 > r.x0 - 0.3 && x0 < r.x1 + 0.3 && z1 > r.z0 - 0.3 && z0 < r.z1 + 0.3)) return true;
+      const hit = (bb: Aabb3): boolean => x1 > bb.minX + 0.015 && x0 < bb.maxX - 0.015 && z1 > bb.minZ + 0.015 && z0 < bb.maxZ - 0.015 && y1 > bb.minY + 0.01 && y0 < bb.maxY - 0.01;
+      if (bigBlockers.some(hit)) return true;
+      for (let i = Math.floor(x0 / 4); i <= Math.floor(x1 / 4); i++) {
+        for (let j = Math.floor(z0 / 4); j <= Math.floor(z1 / 4); j++) {
+          const l = blockGrid.get(bkey(i, j));
+          if (l && l.some(hit)) return true;
+        }
+      }
+      return false;
+    };
+    // 9B-1 per-door / per-bay socket props.
+    const composed = composeSockets(propSockets, propBlocked);
+    const socketProps: PropInstance[] = [...composed.bays];
+    for (const d of composed.doors) socketProps.push(...d.props);
+    let adjacentPairs = 0;
+    let adjacentClones = 0;
+    composed.doors.forEach((d, i) => {
+      const prev = composed.doors[i - 1];
+      if (!prev || prev.door !== d.door - 1 || prev.building !== d.building || Math.abs(prev.y - d.y) > 0.5) return;
+      adjacentPairs++;
+      if (prev.signature === d.signature) adjacentClones++;
+    });
+    // 9B-2 clutter strips: alleys (clear centre path), sidewalk walls, kerbs, L courtyards, underpasses, plazas,
+    // canal promenades.
+    const strips: ClutterStrip[] = [];
+    alleyRecs.forEach((al, i) => strips.push(...alleyStrips(al, p9Rng(), 0.26, alleyService[i])));
+    for (const g of groundFaces) {
+      if (g.alley) continue;
+      const { span } = g;
+      const along: Axis = span.ax === 'x' ? 'z' : 'x';
+      const court = span.court;
+      // Infra / back-of-house street frontage (not a wall-run face) takes dumpsters and pallets.
+      const service = !court && !g.run && faceProgram.get(g) === 'ALLEY_INFRA';
+      strips.push({
+        kind: court ? 'COURT' : service ? 'SERVICE' : 'WALL',
+        ax: along,
+        a0: span.a0 + 0.6,
+        a1: span.a1 - 0.6,
+        line: span.plane,
+        sg: span.sg,
+        d0: 0.42,
+        d1: court ? 2.4 : service ? 1.62 : galleryFaces.has(g.key) ? 1.15 : 1.35,
+        run: g.run,
+        y: 0,
+        seed: p9Rng(),
+        spacing: court ? 3.4 : service ? 4.5 : 7.5,
+      });
+    }
+    streets.forEach((st, si) => {
+      const lh = laneHalf(st.kind);
+      for (const [a0, a1] of segmentsByStreet[si]) {
+        for (const side of [-1, 1] as const) {
+          strips.push({ kind: 'CURB', ax: st.axis, a0: a0 + 3, a1: a1 - 3, line: st.coord + side * lh, sg: side, d0: 0.3, d1: 1.05, run: false, y: 0, seed: p9Rng(), spacing: 11 });
+        }
+      }
+    });
+    for (const pl of pierLines) {
+      const lat = pl.axis === 'x' ? pl.z : pl.x;
+      const al = pl.axis === 'x' ? pl.x : pl.z;
+      for (const side of [-1, 1] as const) {
+        strips.push({ kind: 'UNDERPASS', ax: pl.axis, a0: al - 4.5, a1: al + 4.5, line: lat + side * 0.7, sg: side, d0: 0.15, d1: 1.7, run: false, y: 0, seed: p9Rng(), spacing: 3.5 });
+      }
+    }
+    for (const r of [...plazas, ...(plan.plaza ? [plan.plaza] : [])]) {
+      if (r.x1 - r.x0 < 8 || r.z1 - r.z0 < 8) continue;
+      strips.push({ kind: 'OPEN', ax: 'x', a0: r.x0 + 1, a1: r.x1 - 1, line: r.z0, sg: 1, d0: 0.6, d1: 1.6, run: false, y: 0, seed: p9Rng(), spacing: 6 });
+      strips.push({ kind: 'OPEN', ax: 'x', a0: r.x0 + 1, a1: r.x1 - 1, line: r.z1, sg: -1, d0: 0.6, d1: 1.6, run: false, y: 0, seed: p9Rng(), spacing: 6 });
+    }
+    for (const c of canals) {
+      for (const side of [-1, 1] as const) {
+        strips.push({ kind: 'CURB', ax: c.axis, a0: Math.max(c.from, -H) + 4, a1: Math.min(c.to, H) - 4, line: c.coord + side * (c.width / 2), sg: side, d0: 0.55, d1: 1.4, run: false, y: 0, seed: p9Rng(), spacing: 9 });
+      }
+    }
+    const clutterSpawns = [...groundSpawns.map((sp) => ({ x: sp.position.x, z: sp.position.z })), { x: playerSpawn.x, z: playerSpawn.z }, { x: gatePos.x, z: gatePos.z }];
+    const clutter = planClutter({
+      strips,
+      forbid: [...doorClearZones.filter((r) => r.y < 1), ...crosswalkZones, ...intersectionSquares, ...rampRects],
+      spawns: clutterSpawns,
+      occupied: socketProps.filter((p) => p.y0 < 1).map(toAabb),
+      blocked: propBlocked,
+    });
+    for (const c of clutter.colliders) colliders.push({ min: new THREE.Vector3(c.minX, c.minY, c.minZ), max: new THREE.Vector3(c.maxX, c.maxY, c.maxZ), kind: 'PROP', building: -1 });
+    // 9B-3 decals: shutters, alley / infra piers (gathered above), highway piers, dumpster fronts.
+    for (const pl of pierLines) {
+      if (!inArea(pl.x, pl.z, 2)) continue;
+      for (const [nAx, sg] of [['x', 1], ['x', -1], ['z', 1], ['z', -1]] as const) {
+        const c = nAx === 'x' ? pl.z : pl.x;
+        decalSurfaces.push({ kind: 'HWPIER', nAx, sg, plane: (nAx === 'x' ? pl.x : pl.z) + sg * 0.7, a0: c - 0.6, a1: c + 0.6, y0: 0.6, y1: 3.8, seed: p9Rng() });
+      }
+    }
+    for (const it of clutter.items) {
+      if (it.kit !== 'DUMPSTER') continue;
+      const nx = Math.round(Math.sin(it.yaw));
+      const nz = Math.round(Math.cos(it.yaw));
+      const nAx: Axis = Math.abs(nx) > 0 ? 'x' : 'z';
+      const sg = (nAx === 'x' ? nx : nz) > 0 ? 1 : -1;
+      const c = nAx === 'x' ? it.z : it.x;
+      decalSurfaces.push({ kind: 'DUMPSTER', nAx, sg, plane: (nAx === 'x' ? it.x : it.z) + sg * 0.575, a0: c - 0.78, a1: c + 0.78, y0: 0.18, y1: 0.92, seed: p9Rng() });
+    }
+    const decals = planDecals([...decalSurfaces].sort((p, q) => p.seed - q.seed));
+    const alleyBands = alleyRecs.map((al) => ({ ...alleyCentreBand(al), width: al.gap1 - al.gap0 }));
+
     // ------------------------------------------------------------------ 16. commit merged geometry & instances
     const mk = (geos: THREE.BufferGeometry[], mat: THREE.Material, name: string, renderOrder = 0): THREE.Mesh => {
       const geo = mergeOrEmpty(geos);
@@ -5304,6 +5563,7 @@ export class CityBuilder {
     mk(G.archPaint, this.archPaintMat, 'ArchFacadesTrim');
     mk(G.barrier, this.barrierMat, 'LockdownBarrier', 8).frustumCulled = false;
 
+    const kitStats = this.propMeshes.commit([...socketProps, ...clutter.items], decals);
     const commit = (m: THREE.InstancedMesh, n: number): void => {
       m.count = n;
       m.instanceMatrix.needsUpdate = true;
@@ -5326,7 +5586,7 @@ export class CityBuilder {
     const addManhole = (x: number, z: number): void => {
       if (manholePos.length >= CAP.MANHOLE || !inArea(x, z, 2)) return;
       if (manholePos.some((m) => Math.hypot(m.x - x, m.z - z) < 7)) return;
-      if (doorClearZones.some((r) => insideRect(x, z, r, 0.6))) return;
+      if (doorClearZones.some((r) => r.y < 1 && insideRect(x, z, r, 0.6))) return;
       const i = manholePos.length;
       _m4.makeTranslation(x, 0.016, z);
       this.manholes.setMatrixAt(i, _m4);
@@ -5450,6 +5710,8 @@ export class CityBuilder {
       cinematicPath,
       propSockets,
       doorClearZones,
+      propFootprints: [...socketProps, ...clutter.items].map(toAabb),
+      alleyBands,
       manholes: manholePos,
       stats: {
         towers: buildings.length,
@@ -5495,8 +5757,23 @@ export class CityBuilder {
         steamColumns,
         neon: counts.neon,
         alleyNeon,
-        minRunFaces: Math.min(...runFaceCount),
+        minRunFaces: Math.min(...runFaceCount.map((n, bi) => n - FACES.filter(([ax, sg]) => serviceFaces.has(`${bi}:${ax}:${sg}`)).length)),
         floatingRoofProps: roofPropRects.filter(({ b, r }) => !onSolidRoof(b.plan, r)).length,
+        props: {
+          doors: composed.doors.length,
+          tidyDoors: composed.doors.filter((d) => d.tidy).length,
+          dressedDoors: composed.doors.filter((d) => !d.tidy && d.signature.length > 0).length,
+          adjacentPairs,
+          adjacentClones,
+          bayProps: composed.bays.length,
+          socketProps: socketProps.length,
+          kits: kitStats.counts,
+          clutter: clutter.items.length,
+          clutterColliders: clutter.colliders.length,
+          clutterByStrip: clutter.byKind,
+          dumpstersByStrip: clutter.dumpstersByKind,
+          decals: kitStats.decals,
+        },
       },
     };
     this.towers = buildings;

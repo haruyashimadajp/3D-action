@@ -28,6 +28,7 @@ import {
   srgbToLinear,
   clamp,
 } from '../config/constants';
+import { PLAQUE_LABELS } from '../world/CityProps';
 
 export interface PbrTextureSet {
   map: THREE.Texture;
@@ -57,6 +58,10 @@ export interface ProceduralTextureLibrary {
   archDetail: PbrTextureSet;
   /** 9A-6 cast-iron manhole (256²): map / roughness / normal + emissive grate-glow mask. */
   manhole: Required<PbrTextureSet>;
+  /** 9B-1 illuminated room-number plaque atlas (512 × 256, 4 × 4 cells of PLAQUE_LABELS; black = unlit). */
+  plaqueAtlas: THREE.Texture;
+  /** 9B-3 graffiti / torn-poster decal atlas (1024 × 512, 4 × 2 alpha-masked cells: 0–3 spray, 4–7 posters). */
+  graffitiAtlas: THREE.Texture;
   /** 6B-1 tactical glove & wear set (512², four zones; roughnessMap packs G roughness · B metalness). */
   glove: PbrTextureSet;
   /** 6B-1 gun micro hard-surface set (512², four zones; roughnessMap packs G roughness · B metalness). */
@@ -2132,6 +2137,325 @@ function generateGunSet(anisotropy: number): PbrTextureSet {
 }
 
 // ---------------------------------------------------------------------------
+// 9B-1 Room-number plaque atlas (512 × 256, 4 × 4 cells of 128 × 64): crisp backlit digits on black (the plaque
+// shader uses the texture as an emissive mask; the anodised housing colour comes from the kit).
+// ---------------------------------------------------------------------------
+function generatePlaqueAtlas(anisotropy: number): THREE.Texture {
+  const W = 512;
+  const H = 256;
+  const cw = W / 4;
+  const ch = H / 4;
+  const [c, ctx] = makeCanvas(W, H);
+  ctx.fillStyle = '#000000';
+  ctx.fillRect(0, 0, W, H);
+  const accents = ['#ffb347', '#4fd8ff', '#ff4f8a', '#9dff6a'];
+  PLAQUE_LABELS.forEach((label, i) => {
+    const x0 = (i % 4) * cw;
+    const y0 = Math.floor(i / 4) * ch;
+    // Faint backlight bleed behind the digits.
+    const g = ctx.createLinearGradient(x0, y0, x0, y0 + ch);
+    g.addColorStop(0, 'rgba(40,60,80,0.10)');
+    g.addColorStop(1, 'rgba(20,30,40,0.04)');
+    ctx.fillStyle = g;
+    ctx.fillRect(x0 + 6, y0 + 6, cw - 12, ch - 12);
+    // Thin accent rule + crisp condensed digits.
+    ctx.fillStyle = accents[i % accents.length];
+    ctx.fillRect(x0 + 12, y0 + ch - 14, 22, 3);
+    ctx.save();
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.font = "700 30px 'DejaVu Sans Mono','Consolas','Menlo',monospace";
+    ctx.shadowColor = 'rgba(160,220,255,0.85)';
+    ctx.shadowBlur = 6;
+    ctx.fillStyle = '#eaf6ff';
+    ctx.fillText(label, x0 + cw / 2, y0 + ch / 2 - 3, cw - 20);
+    ctx.restore();
+  });
+  const tex = finalizeTexture(c, THREE.SRGBColorSpace, anisotropy, false);
+  return tex;
+}
+
+// ---------------------------------------------------------------------------
+// 9B-3 Graffiti / torn-poster atlas (1024 × 512, 4 × 2 alpha-masked cells of 256²).
+//   0 STRAND wild tag · 1 NO SIGNAL glitch stencil · 2 ZERO / 09 bubble letters · 3 glitch skull stencil
+//   4 rain-stained flyer collage · 5 torn katakana promo · 6 RESTRICTED caution stencil · 7 HIGH VOLTAGE / SECTOR 04
+// ---------------------------------------------------------------------------
+function generateGraffitiAtlas(anisotropy: number): THREE.Texture {
+  const W = 1024;
+  const H = 512;
+  const S = 256;
+  const [c, ctx] = makeCanvas(W, H);
+  ctx.clearRect(0, 0, W, H);
+  const rng = createRng(0x9b3);
+  const font = "'Arial Black','Impact','Helvetica Neue',sans-serif";
+  const jp = "'Hiragino Kaku Gothic ProN','Yu Gothic','Noto Sans CJK JP','Noto Sans JP',sans-serif";
+  const cell = (i: number, draw: (ox: number, oy: number) => void): void => {
+    const ox = (i % 4) * S;
+    const oy = Math.floor(i / 4) * S;
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(ox + 8, oy + 8, S - 16, S - 16);
+    ctx.clip();
+    draw(ox, oy);
+    ctx.restore();
+  };
+  /** Soft overspray halo + core stroke + paint drips under the glyphs. */
+  const spray = (text: string, x: number, y: number, size: number, fill: string, edge: string, rot: number, family = font): void => {
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.rotate(rot);
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.font = `900 ${size}px ${family}`;
+    ctx.shadowColor = edge;
+    ctx.shadowBlur = size * 0.35;
+    ctx.lineJoin = 'round';
+    ctx.lineWidth = size * 0.16;
+    ctx.strokeStyle = edge;
+    ctx.strokeText(text, 0, 0);
+    ctx.shadowBlur = size * 0.08;
+    ctx.fillStyle = fill;
+    ctx.fillText(text, 0, 0);
+    ctx.restore();
+    // Drips.
+    const tw = Math.min(size * text.length * 0.62, S - 40);
+    for (let k = 0; k < 4 + Math.floor(rng() * 4); k++) {
+      const dx = x - tw / 2 + rng() * tw;
+      const len = 10 + rng() * 46;
+      ctx.strokeStyle = rng() < 0.5 ? fill : edge;
+      ctx.globalAlpha = 0.75;
+      ctx.lineWidth = 2 + rng() * 3;
+      ctx.lineCap = 'round';
+      ctx.beginPath();
+      ctx.moveTo(dx, y + size * 0.3);
+      ctx.lineTo(dx + (rng() - 0.5) * 2, y + size * 0.3 + len);
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
+  };
+  const speckle = (ox: number, oy: number, col: string, n: number): void => {
+    ctx.fillStyle = col;
+    for (let k = 0; k < n; k++) {
+      ctx.globalAlpha = 0.25 + rng() * 0.5;
+      ctx.beginPath();
+      ctx.arc(ox + 12 + rng() * (S - 24), oy + 12 + rng() * (S - 24), 0.6 + rng() * 1.8, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  };
+  /** Torn paper sheet: jagged polygon with a ripped corner. */
+  const sheet = (x: number, y: number, w: number, h: number, col: string, rot: number, tearCorner: number): void => {
+    ctx.save();
+    ctx.translate(x + w / 2, y + h / 2);
+    ctx.rotate(rot);
+    ctx.beginPath();
+    const pts: Array<[number, number]> = [];
+    const edge = (ax: number, ay: number, bx: number, by: number, rough: number): void => {
+      const n = 10;
+      for (let k = 0; k < n; k++) {
+        const t = k / n;
+        pts.push([ax + (bx - ax) * t + (rng() - 0.5) * rough, ay + (by - ay) * t + (rng() - 0.5) * rough]);
+      }
+    };
+    const hw = w / 2;
+    const hh = h / 2;
+    edge(-hw, -hh, hw, -hh, 2);
+    edge(hw, -hh, hw, hh, 2);
+    if (tearCorner) {
+      // Diagonal rip across the bottom-right corner.
+      pts.push([hw, hh * 0.25], [hw * 0.2, hh]);
+    }
+    edge(hw * (tearCorner ? 0.2 : 1), hh, -hw, hh, 5);
+    edge(-hw, hh, -hw, -hh, 2);
+    pts.forEach(([px, py], k) => (k ? ctx.lineTo(px, py) : ctx.moveTo(px, py)));
+    ctx.closePath();
+    ctx.fillStyle = col;
+    ctx.fill();
+    ctx.clip();
+    // Rain stains: vertical streaks and a grimy bottom.
+    for (let k = 0; k < 14; k++) {
+      ctx.fillStyle = `rgba(60,48,30,${0.05 + rng() * 0.12})`;
+      ctx.fillRect(-hw + rng() * w, -hh + rng() * h * 0.4, 2 + rng() * 5, h);
+    }
+    const g = ctx.createLinearGradient(0, hh * 0.2, 0, hh);
+    g.addColorStop(0, 'rgba(50,40,24,0)');
+    g.addColorStop(1, 'rgba(50,40,24,0.45)');
+    ctx.fillStyle = g;
+    ctx.fillRect(-hw, -hh, w, h);
+    ctx.restore();
+  };
+  const caution = (ox: number, oy: number, y: number, h: number): void => {
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(ox + 20, oy + y, S - 40, h);
+    ctx.clip();
+    for (let k = -6; k < 16; k++) {
+      ctx.fillStyle = k % 2 ? 'rgba(20,20,18,0.9)' : 'rgba(226,190,40,0.9)';
+      ctx.beginPath();
+      ctx.moveTo(ox + k * 24, oy + y + h);
+      ctx.lineTo(ox + k * 24 + 12, oy + y + h);
+      ctx.lineTo(ox + k * 24 + 12 + h, oy + y);
+      ctx.lineTo(ox + k * 24 + h, oy + y);
+      ctx.fill();
+    }
+    ctx.restore();
+  };
+  const stencil = (text: string, x: number, y: number, size: number, col: string): void => {
+    ctx.save();
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.font = `900 ${size}px ${font}`;
+    ctx.fillStyle = col;
+    ctx.fillText(text, x, y, S - 36);
+    // Stencil bridges: thin gaps through the letters.
+    ctx.globalCompositeOperation = 'destination-out';
+    for (let k = 0; k < 7; k++) ctx.fillRect(x - S / 2 + 30 + k * 30, y - size / 2, 3, size);
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.restore();
+  };
+  const fade = (ox: number, oy: number, amount: number): void => {
+    // Weathering: punch random holes / scuffs through the paint.
+    ctx.save();
+    ctx.globalCompositeOperation = 'destination-out';
+    for (let k = 0; k < 160; k++) {
+      ctx.globalAlpha = rng() * amount;
+      ctx.beginPath();
+      ctx.arc(ox + rng() * S, oy + rng() * S, 1 + rng() * 6, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.restore();
+  };
+
+  // 0 STRAND wild tag (neon cyan over hot magenta) + 09 badge.
+  cell(0, (ox, oy) => {
+    speckle(ox, oy, '#22f0ff', 120);
+    spray('STRAND', ox + S / 2, oy + S * 0.45, 58, '#28f4ff', '#ff2bd6', -0.12);
+    spray('09', ox + S * 0.78, oy + S * 0.76, 40, '#d6ff3a', '#1a1a1a', 0.18);
+    fade(ox, oy, 0.5);
+  });
+  // 1 NO SIGNAL glitch stencil (magenta) with displaced scan bars.
+  cell(1, (ox, oy) => {
+    stencil('NO', ox + S / 2, oy + S * 0.34, 64, 'rgba(255,43,190,0.95)');
+    stencil('SIGNAL', ox + S / 2, oy + S * 0.6, 50, 'rgba(255,43,190,0.95)');
+    for (let k = 0; k < 9; k++) {
+      ctx.fillStyle = k % 3 ? 'rgba(40,240,255,0.55)' : 'rgba(255,255,255,0.6)';
+      ctx.fillRect(ox + 20 + rng() * 120, oy + 40 + rng() * 170, 30 + rng() * 90, 3 + rng() * 5);
+    }
+    fade(ox, oy, 0.45);
+  });
+  // 2 ZERO bubble letters (acid lime fill, coral edge).
+  cell(2, (ox, oy) => {
+    speckle(ox, oy, '#ff7a4a', 90);
+    spray('ZERO', ox + S / 2, oy + S * 0.5, 72, '#b6ff2a', '#ff6a3a', 0.08);
+    fade(ox, oy, 0.4);
+  });
+  // 3 Glitch skull stencil (coral + white).
+  cell(3, (ox, oy) => {
+    const cx = ox + S / 2;
+    const cy = oy + S * 0.46;
+    ctx.fillStyle = 'rgba(255,110,70,0.95)';
+    ctx.beginPath();
+    ctx.arc(cx, cy - 10, 62, Math.PI, 0);
+    ctx.lineTo(cx + 62, cy + 20);
+    ctx.lineTo(cx + 34, cy + 42);
+    ctx.lineTo(cx + 34, cy + 70);
+    ctx.lineTo(cx - 34, cy + 70);
+    ctx.lineTo(cx - 34, cy + 42);
+    ctx.lineTo(cx - 62, cy + 20);
+    ctx.closePath();
+    ctx.fill();
+    ctx.globalCompositeOperation = 'destination-out';
+    for (const sx of [-1, 1]) {
+      ctx.beginPath();
+      ctx.arc(cx + sx * 26, cy + 2, 17, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.beginPath();
+    ctx.moveTo(cx, cy + 22);
+    ctx.lineTo(cx - 9, cy + 38);
+    ctx.lineTo(cx + 9, cy + 38);
+    ctx.fill();
+    for (let k = -2; k <= 2; k++) ctx.fillRect(cx + k * 13 - 2, cy + 50, 4, 20);
+    ctx.globalCompositeOperation = 'source-over';
+    for (let k = 0; k < 6; k++) {
+      ctx.fillStyle = 'rgba(255,255,255,0.7)';
+      ctx.fillRect(ox + 30 + rng() * 150, cy - 60 + rng() * 120, 40 + rng() * 50, 3);
+    }
+    fade(ox, oy, 0.5);
+  });
+  // 4 Rain-stained flyer collage.
+  cell(4, (ox, oy) => {
+    const tones = ['#d8d0bc', '#c9c2ae', '#e2d9c0'];
+    for (let k = 0; k < 3; k++) {
+      const x = ox + 22 + k * 52 + rng() * 10;
+      const y = oy + 18 + rng() * 40;
+      sheet(x, y, 108, 150, tones[k], (rng() - 0.5) * 0.12, k === 2 ? 1 : 0);
+      ctx.save();
+      ctx.translate(x + 54, y + 40);
+      ctx.fillStyle = ['#b8202e', '#1a3a6a', '#202020'][k];
+      ctx.font = `900 22px ${font}`;
+      ctx.textAlign = 'center';
+      ctx.fillText(['RIOT', 'JOBS', 'LOST'][k], 0, 0);
+      ctx.fillStyle = 'rgba(30,30,30,0.6)';
+      for (let l = 0; l < 6; l++) ctx.fillRect(-40, 18 + l * 12, 60 + rng() * 20, 4);
+      ctx.restore();
+    }
+  });
+  // 5 Torn katakana promo poster.
+  cell(5, (ox, oy) => {
+    sheet(ox + 40, oy + 18, 176, 214, '#1a1424', -0.03, 1);
+    ctx.save();
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#ff2bd6';
+    ctx.font = `900 46px ${jp}`;
+    ctx.fillText('ネオ', ox + 128, oy + 90);
+    ctx.fillStyle = '#28f4ff';
+    ctx.font = `900 64px ${font}`;
+    ctx.fillText('77', ox + 128, oy + 160);
+    ctx.fillStyle = 'rgba(255,255,255,0.7)';
+    ctx.font = `700 14px ${font}`;
+    ctx.fillText('LIVE // SECTOR CLUB', ox + 128, oy + 196);
+    ctx.restore();
+    fade(ox, oy, 0.35);
+  });
+  // 6 RESTRICTED caution stencil.
+  cell(6, (ox, oy) => {
+    caution(ox, oy, 46, 30);
+    stencil('RESTRICTED', ox + S / 2, oy + S * 0.52, 34, 'rgba(232,196,40,0.95)');
+    caution(ox, oy, 172, 30);
+    fade(ox, oy, 0.55);
+  });
+  // 7 HIGH VOLTAGE / SECTOR 04 + bolt + rust drips.
+  cell(7, (ox, oy) => {
+    ctx.fillStyle = 'rgba(232,196,40,0.95)';
+    ctx.beginPath();
+    ctx.moveTo(ox + 128, oy + 26);
+    ctx.lineTo(ox + 190, oy + 132);
+    ctx.lineTo(ox + 66, oy + 132);
+    ctx.closePath();
+    ctx.fill();
+    ctx.fillStyle = 'rgba(20,20,18,0.95)';
+    ctx.beginPath();
+    ctx.moveTo(ox + 134, oy + 52);
+    ctx.lineTo(ox + 114, oy + 92);
+    ctx.lineTo(ox + 130, oy + 92);
+    ctx.lineTo(ox + 118, oy + 124);
+    ctx.lineTo(ox + 146, oy + 80);
+    ctx.lineTo(ox + 130, oy + 80);
+    ctx.closePath();
+    ctx.fill();
+    stencil('HIGH VOLTAGE', ox + S / 2, oy + 166, 24, 'rgba(232,196,40,0.95)');
+    stencil('SECTOR 04', ox + S / 2, oy + 200, 28, 'rgba(240,240,236,0.9)');
+    for (let k = 0; k < 6; k++) {
+      ctx.fillStyle = 'rgba(120,52,24,0.55)';
+      ctx.fillRect(ox + 40 + rng() * 170, oy + 212, 3 + rng() * 3, 18 + rng() * 26);
+    }
+    fade(ox, oy, 0.45);
+  });
+  return finalizeTexture(c, THREE.SRGBColorSpace, anisotropy, false);
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 let cache: ProceduralTextureLibrary | null = null;
@@ -2151,6 +2475,8 @@ export function getProceduralTextures(renderer: THREE.WebGLRenderer): Procedural
     tech: generateTechSet(aniso),
     archDetail: generateArchDetailSet(aniso),
     manhole: generateManholeSet(aniso),
+    plaqueAtlas: generatePlaqueAtlas(aniso),
+    graffitiAtlas: generateGraffitiAtlas(aniso),
     glove: generateGloveSet(aniso),
     gun: generateGunSet(aniso),
   };

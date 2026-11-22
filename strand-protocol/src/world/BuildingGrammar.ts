@@ -539,7 +539,8 @@ export function parapetSegments(plan: MassingPlan, gaps: ReadonlyArray<{ ax: Axi
 // =============================================================================================
 // 9A-4 Ground-floor programs, doors, clear zones, sockets
 // =============================================================================================
-export type SocketSlot = 'FLOOR_L' | 'FLOOR_R' | 'WALL_SIDE' | 'WALL_HIGH';
+/** Door sockets (FLOOR_L / FLOOR_R / WALL_SIDE / WALL_HIGH) and the per-bay storefront floor socket (BAY). */
+export type SocketSlot = 'FLOOR_L' | 'FLOOR_R' | 'WALL_SIDE' | 'WALL_HIGH' | 'BAY';
 export type SocketGroup = 'EATERY' | 'TECH' | 'HOTEL' | 'APARTMENT' | 'INFRA' | 'GALLERY';
 
 export interface PropSocket {
@@ -552,10 +553,36 @@ export interface PropSocket {
   slot: SocketSlot;
   group: SocketGroup;
   building: number;
-  /** Sector-unique doorway id (sockets of one door share it). */
+  /** Sector-unique doorway id (sockets of one door share it); BAY sockets carry −1. */
   door: number;
   /** Deterministic per-socket variation seed 0..1. */
   seed: number;
+  /**
+   * 9B free space. Floor slots: the socket sits at the centre of the free along range on the back line (wall /
+   * plinth face); a prop must fit `w` along the wall and `depth` outward. Wall slots: the mounting point (fixture
+   * back on the wall plane, centred at `y`); `w` = free width, `depth` = max fixture depth.
+   */
+  w: number;
+  depth: number;
+  /** Wall-run face: only low (≤ 0.75 m) floor props, so nothing stands in the run strip. */
+  low: boolean;
+}
+
+/**
+ * 9B per-door free space (face coordinates). Omitted fields fall back to the 9A defaults: floor props within 0.7 m
+ * beyond the clear zone / door frame, WALL_SIDE beside the frame, WALL_HIGH centred above the lintel.
+ */
+export interface SocketFit {
+  floorL?: readonly [number, number] | null;
+  floorR?: readonly [number, number] | null;
+  /** Back line of floor props (d) and the depth they may take beyond it. */
+  floorD0?: number;
+  floorDepth?: number;
+  low?: boolean;
+  /** WALL_SIDE mounting point (along, mounting plane d, free width); null drops the slot. */
+  side?: { a: number; d: number; w: number } | null;
+  /** WALL_HIGH mounting point (along, height above the floor, free width); null drops the slot. */
+  high?: { a: number; y: number; w: number } | null;
 }
 
 export const PROGRAM_SOCKETS: Readonly<Record<GroundProgram, { group: SocketGroup; slots: readonly SocketSlot[] }>> = {
@@ -717,35 +744,112 @@ export function doorClearZone(f: FaceRef, a: number): Rect {
   return { x0: Math.min(xA, xB), x1: Math.max(xA, xB), z0: Math.min(zA, zB), z1: Math.max(zA, zB) };
 }
 
+/** Door clearance half-width along the wall: the 1.8 m clear zone or the frame (+ portal pillars) if wider. */
+export function doorClearHalf(w: number): number {
+  return Math.max(GRAMMAR.DOOR_CLEAR_M / 2, w / 2 + 0.45);
+}
+
 /**
- * Deterministic sockets around a doorway: FLOOR_L / FLOOR_R on the floor just outside the clear zone, WALL_SIDE at
+ * Deterministic sockets around a doorway: FLOOR_L / FLOOR_R on the floor beside the clear zone, WALL_SIDE at
  * hand height beside the frame, WALL_HIGH above the lintel. `floorY` = the walkable surface (0 at street level).
+ * `fit` (9B) narrows each socket to the free space the caller knows about (bay piers, portal pillars, windows).
  */
-export function doorSockets(f: FaceRef, door: { a: number; w: number; h: number }, floorY: number, group: SocketGroup, slots: readonly SocketSlot[], building: number, doorId: number, rng: () => number): PropSocket[] {
+export function doorSockets(f: FaceRef, door: { a: number; w: number; h: number }, floorY: number, group: SocketGroup, slots: readonly SocketSlot[], building: number, doorId: number, rng: () => number, fit: SocketFit = {}): PropSocket[] {
   const out: PropSocket[] = [];
   const nx = f.ax === 'x' ? f.sg : 0;
   const nz = f.ax === 'z' ? f.sg : 0;
-  const side = Math.max(GRAMMAR.DOOR_CLEAR_M / 2 + 0.15, door.w / 2 + 0.45);
+  const clear = doorClearHalf(door.w);
+  const floorL = fit.floorL === undefined ? ([door.a - clear - 0.7, door.a - clear] as const) : fit.floorL;
+  const floorR = fit.floorR === undefined ? ([door.a + clear, door.a + clear + 0.7] as const) : fit.floorR;
+  const d0 = fit.floorD0 ?? 0.04;
+  const depth = fit.floorDepth ?? 0.6;
+  const low = fit.low ?? false;
+  const side = fit.side === undefined ? { a: door.a + door.w / 2 + 0.62, d: 0.02, w: 0.44 } : fit.side;
+  const high = fit.high === undefined ? { a: door.a, y: door.h + 0.42, w: 0.4 } : fit.high;
   for (const slot of slots) {
-    let a = door.a;
-    let d = 0.02;
+    // One draw per requested slot (even when the slot is dropped) keeps the caller's RNG stream stable.
+    const seed = rng();
+    let a: number;
+    let d: number;
     let y = floorY;
-    if (slot === 'FLOOR_L') {
-      a = door.a - side - 0.2;
-      d = 0.4;
-    } else if (slot === 'FLOOR_R') {
-      a = door.a + side + 0.2;
-      d = 0.4;
+    let w: number;
+    let dep = depth;
+    if (slot === 'FLOOR_L' || slot === 'FLOOR_R') {
+      const r = slot === 'FLOOR_L' ? floorL : floorR;
+      if (!r || r[1] - r[0] < 0.25) continue;
+      a = (r[0] + r[1]) / 2;
+      w = r[1] - r[0];
+      d = d0;
     } else if (slot === 'WALL_SIDE') {
-      a = door.a + door.w / 2 + 0.55;
+      if (!side) continue;
+      a = side.a;
+      d = side.d;
+      w = side.w;
       y = floorY + 1.45;
-    } else {
-      y = floorY + door.h + 0.42;
-    }
+      dep = 0.2;
+    } else if (slot === 'WALL_HIGH') {
+      if (!high) continue;
+      a = high.a;
+      d = 0.02;
+      w = high.w;
+      y = floorY + high.y;
+      dep = 0.08;
+    } else continue;
     const [x, z] = faceToWorld(f, a, d);
-    out.push({ x, y, z, nx, nz, slot, group, building, door: doorId, seed: rng() });
+    out.push({ x, y, z, nx, nz, slot, group, building, door: doorId, seed, w, depth: dep, low: slot.startsWith('FLOOR') && low });
   }
   return out;
+}
+
+/**
+ * 9B ground-floor door free space: floor props inside the door bay beyond the frame (+ hotel portal pillars),
+ * WALL_SIDE beside the frame (on the pillar front for hotels), WALL_HIGH above the lintel (beside the door lamp on
+ * infra doors). `reach` = free depth in front of the wall; `low` = wall-run face; `run` = run-face pier depth.
+ */
+export function groundDoorFit(program: GroundProgram, door: { a: number; w: number; h: number }, bay: { a0: number; a1: number } | undefined, reach: number, low: boolean, run: boolean): SocketFit {
+  const { a, w, h } = door;
+  const clear = doorClearHalf(w) + (program === 'CAPSULE_HOTEL' ? 0.08 : 0);
+  const sideLo = Math.max(a + GRAMMAR.DOOR_CLEAR_M / 2 + 0.02, a + w / 2 + (program === 'CYBER_APARTMENT' ? 0.45 : 0.42));
+  const sideHi = (bay ? bay.a1 : a + w / 2 + 1) - 0.05;
+  return {
+    floorL: bay ? [bay.a0 + 0.06, a - clear] : null,
+    floorR: bay ? [a + clear, bay.a1 - 0.06] : null,
+    floorD0: 0.04,
+    floorDepth: reach,
+    low,
+    side:
+      program === 'CAPSULE_HOTEL'
+        ? { a: a + w / 2 + 0.36, d: (run ? GRAMMAR.PIER_D_RUN_M : 0.8) + 0.02, w: 0.2 }
+        : sideHi - sideLo >= 0.16
+          ? { a: (sideLo + sideHi) / 2, d: 0.02, w: sideHi - sideLo }
+          : null,
+    high: program === 'ALLEY_INFRA' ? { a: a - w / 2 - 0.5, y: h + 0.3, w: 0.32 } : { a, y: h + 0.42, w: 0.4 },
+  };
+}
+
+/**
+ * 9B gallery door free space: floor props between the clear zone and the half-way line to the neighbouring doors
+ * (in front of the barred window bars), WALL_SIDE on the hinge side away from the window, plaque above the lintel.
+ */
+export function galleryDoorFit(a: number, deckA0: number, deckA1: number): SocketFit {
+  const G = GRAMMAR;
+  return {
+    floorL: [Math.max(deckA0 + 0.12, a - G.GALLERY_DOOR_SPACING_M / 2 + 0.02), a - G.DOOR_CLEAR_M / 2],
+    floorR: [a + G.DOOR_CLEAR_M / 2, Math.min(deckA1 - 0.12, a + G.GALLERY_DOOR_SPACING_M / 2 - 0.02)],
+    floorD0: 0.1,
+    floorDepth: 0.56,
+    low: false,
+    // Hinge side, fully outside the 1.8 m clear zone and clear of the previous door's window.
+    side: { a: a - G.DOOR_CLEAR_M / 2 - 0.24, d: 0.02, w: 0.44 },
+    high: { a, y: 2.15 + 0.42, w: 0.4 },
+  };
+}
+
+/** 9B storefront bay floor socket: centre of [a0, a1] on the back line d0, `depth` free outward. */
+export function baySocket(f: FaceRef, a0: number, a1: number, d0: number, depth: number, floorY: number, group: SocketGroup, building: number, low: boolean, rng: () => number): PropSocket | null {
+  if (a1 - a0 < 0.5 || depth < 0.3) return null;
+  const [x, z] = faceToWorld(f, (a0 + a1) / 2, d0);
+  return { x, y: floorY, z, nx: f.ax === 'x' ? f.sg : 0, nz: f.ax === 'z' ? f.sg : 0, slot: 'BAY', group, building, door: -1, seed: rng(), w: a1 - a0, depth, low };
 }
 
 // =============================================================================================
