@@ -414,7 +414,7 @@ export const BACKGROUND_MAX_LUMINANCE = 0.28;
 export const ROOF_PUDDLE_ROUGHNESS = 0.06;
 export const ROOF_WET_ROUGHNESS = 0.42;
 /** 7B-1: rain-soaked asphalt (below the 0.40 streak threshold, puddles far lower). */
-export const ROAD_WET_ROUGHNESS = 0.32;
+export const ROAD_WET_ROUGHNESS = 0.22;
 
 // ---------------------------------------------------------------------------
 // §6.2 Rendering pipeline

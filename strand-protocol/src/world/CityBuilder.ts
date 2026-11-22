@@ -3877,7 +3877,8 @@ export class CityBuilder {
     });
 
     // 7B-4: sagging catenary cable bundles (2–3 thin cables, 6 segments each, sag 0.6–1.4 m) strung diagonally
-    // across the alleys at 5.5–18 m — visual only (no collider); one in four bundles carries a faint optic fibre.
+    // across the alleys at 5.5–18 m — visual only (no collider), merged into the existing strip batch (+0 draws);
+    // one in four bundles carries a faint optic fibre.
     {
       const C = CITY_FX;
       const cat = (t: number, k = 1.25): number => (Math.cosh(k * (2 * t - 1)) - Math.cosh(k)) / (1 - Math.cosh(k));
@@ -3910,8 +3911,9 @@ export class CityBuilder {
               pts.push(a.clone().lerp(b, t).setY(a.y + (b.y - a.y) * t - sag * cat(t)));
             }
             const tube = new THREE.TubeGeometry(new THREE.CatmullRomCurve3(pts), C.CABLE_SEGMENTS, c === 0 && fibre ? C.CABLE_RADIUS * 0.8 : C.CABLE_RADIUS, 3, false);
+            // Rain-wet cables catch the street light: a dim cool sheen keeps them readable against the night sky.
             if (c === 0 && fibre) G.strips.push(withColor(tube, NEON_TINTS[Math.floor(srng() * NEON_TINTS.length)], 0.55));
-            else G.steel.push(tube);
+            else G.strips.push(withColor(tube, 0x8a97ad, 0.16));
           }
           cableBundles++;
           this.cableDebug.push({ x: (a0x(al, o1, o2)), y: (y1 + y2) / 2, z: a0z(al, o1, o2), axis: al.axis });
