@@ -53,6 +53,10 @@ export interface ProceduralTextureLibrary {
   signAtlas: THREE.Texture;
   /** 5B-4 shared tactical tech PBR set (512²): carbon weave, panel grooves, edge wear, brushed metal. */
   tech: PbrTextureSet;
+  /** 9A-5 weathered paint / stained architectural detail (512²): neutral grey map × vertex tint. */
+  archDetail: PbrTextureSet;
+  /** 9A-6 cast-iron manhole (256²): map / roughness / normal + emissive grate-glow mask. */
+  manhole: Required<PbrTextureSet>;
   /** 6B-1 tactical glove & wear set (512², four zones; roughnessMap packs G roughness · B metalness). */
   glove: PbrTextureSet;
   /** 6B-1 gun micro hard-surface set (512², four zones; roughnessMap packs G roughness · B metalness). */
@@ -1574,6 +1578,188 @@ function generateTechSet(anisotropy: number): PbrTextureSet {
 }
 
 // ---------------------------------------------------------------------------
+// 9A-5 Weathered paint / stained concrete detail (512²): vertical rain streaks, paint scuffs, stain mottling and
+// edge wear. Map is neutral grey 0.78–1.05 (×2 headroom via the material colour), roughness 0.28–0.78.
+// ---------------------------------------------------------------------------
+function generateArchDetailSet(anisotropy: number): PbrTextureSet {
+  const S = 512;
+  const [albC, alb] = makeCanvas(S, S);
+  const [rghC, rgh] = makeCanvas(S, S);
+  const [, hgt] = makeCanvas(S, S);
+  const rng = createRng(0xa9c4d);
+  const noises = [8, 16, 32, 64].map((p) => new TileableValueNoise(p, rng));
+  const img = alb.createImageData(S, S);
+  const rimg = rgh.createImageData(S, S);
+  const himg = hgt.createImageData(S, S);
+  for (let y = 0; y < S; y++) {
+    for (let x = 0; x < S; x++) {
+      const u = x / S;
+      const v = y / S;
+      const m = fbm(noises, 1, u, v);
+      const fine = fbm(noises.slice(2), 1, u * 2, v * 2);
+      // Albedo stays in a narrow neutral band (0.78–1.05 relative) so vertex tints carry the colour.
+      const a = 0.8 + 0.12 * m + 0.05 * fine;
+      const i = (y * S + x) * 4;
+      const g8 = Math.round(Math.min(1, a / 1.06) * 235);
+      img.data[i] = g8;
+      img.data[i + 1] = g8;
+      img.data[i + 2] = g8;
+      img.data[i + 3] = 255;
+      const r8 = Math.round((0.42 + 0.3 * m) * 255);
+      rimg.data[i] = r8;
+      rimg.data[i + 1] = r8;
+      rimg.data[i + 2] = r8;
+      rimg.data[i + 3] = 255;
+      const h8 = Math.round((0.5 + 0.12 * fine) * 255);
+      himg.data[i] = h8;
+      himg.data[i + 1] = h8;
+      himg.data[i + 2] = h8;
+      himg.data[i + 3] = 255;
+    }
+  }
+  alb.putImageData(img, 0, 0);
+  rgh.putImageData(rimg, 0, 0);
+  hgt.putImageData(himg, 0, 0);
+  // Vertical rain streaks (darker, slightly glossier where water runs).
+  for (let k = 0; k < 220; k++) {
+    const x = rng() * S;
+    const y = rng() * S * 0.6;
+    const len = 40 + rng() * 220;
+    const w = 1 + rng() * 3;
+    const grad = alb.createLinearGradient(0, y, 0, y + len);
+    grad.addColorStop(0, 'rgba(30,32,36,0.22)');
+    grad.addColorStop(1, 'rgba(30,32,36,0)');
+    alb.fillStyle = grad;
+    alb.fillRect(x, y, w, len);
+    rgh.fillStyle = 'rgba(70,70,70,0.25)';
+    rgh.fillRect(x, y, w, len * 0.7);
+  }
+  // Paint scuff scratches (bright, rough) and chipped edge wear.
+  for (let k = 0; k < 360; k++) {
+    const x = rng() * S;
+    const y = rng() * S;
+    const ang = (rng() - 0.5) * 0.9;
+    const len = 6 + rng() * 34;
+    alb.strokeStyle = `rgba(250,250,250,${0.08 + rng() * 0.14})`;
+    alb.lineWidth = 0.6 + rng() * 1.2;
+    alb.beginPath();
+    alb.moveTo(x, y);
+    alb.lineTo(x + Math.cos(ang) * len, y + Math.sin(ang) * len);
+    alb.stroke();
+    rgh.strokeStyle = 'rgba(200,200,200,0.35)';
+    rgh.lineWidth = 1;
+    rgh.beginPath();
+    rgh.moveTo(x, y);
+    rgh.lineTo(x + Math.cos(ang) * len, y + Math.sin(ang) * len);
+    rgh.stroke();
+    hgt.strokeStyle = 'rgba(40,40,40,0.5)';
+    hgt.beginPath();
+    hgt.moveTo(x, y);
+    hgt.lineTo(x + Math.cos(ang) * len, y + Math.sin(ang) * len);
+    hgt.stroke();
+  }
+  // Stain blotches (rust / grime mottling).
+  for (let k = 0; k < 70; k++) {
+    const x = rng() * S;
+    const y = rng() * S;
+    const r = 8 + rng() * 40;
+    const grad = alb.createRadialGradient(x, y, 0, x, y, r);
+    grad.addColorStop(0, `rgba(${40 + Math.round(rng() * 30)},${34 + Math.round(rng() * 16)},30,0.22)`);
+    grad.addColorStop(1, 'rgba(40,36,30,0)');
+    alb.fillStyle = grad;
+    alb.fillRect(x - r, y - r, r * 2, r * 2);
+  }
+  // Fine pitting in the height field.
+  for (let k = 0; k < 2600; k++) {
+    hgt.fillStyle = `rgba(30,30,30,${0.2 + rng() * 0.3})`;
+    hgt.fillRect(rng() * S, rng() * S, 1 + rng(), 1 + rng());
+  }
+  return {
+    map: finalizeTexture(albC, THREE.SRGBColorSpace, anisotropy),
+    roughnessMap: finalizeTexture(rghC, THREE.NoColorSpace, anisotropy),
+    normalMap: normalTextureFromHeight(hgt, S, S, 1.6, anisotropy),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// 9A-6 Cast-iron manhole (256²): bevelled frame ring, raised diamond tread, recessed vent slots; the emissive mask
+// is white only inside the slots (tinted amber / cyan per instance in the shader).
+// ---------------------------------------------------------------------------
+function generateManholeSet(anisotropy: number): Required<PbrTextureSet> {
+  const S = 256;
+  const [albC, alb] = makeCanvas(S, S);
+  const [rghC, rgh] = makeCanvas(S, S);
+  const [emC, em] = makeCanvas(S, S);
+  const [, hgt] = makeCanvas(S, S);
+  const c = S / 2;
+  const rng = createRng(0x3a401e);
+  alb.fillStyle = '#101113';
+  alb.fillRect(0, 0, S, S);
+  rgh.fillStyle = grayCss(0.5);
+  rgh.fillRect(0, 0, S, S);
+  hgt.fillStyle = grayCss(0.5);
+  hgt.fillRect(0, 0, S, S);
+  em.fillStyle = '#000';
+  em.fillRect(0, 0, S, S);
+  const disc = (ctx: CanvasRenderingContext2D, r: number, style: string): void => {
+    ctx.fillStyle = style;
+    ctx.beginPath();
+    ctx.arc(c, c, r, 0, Math.PI * 2);
+    ctx.fill();
+  };
+  // Frame ring (worn, glossy) and the lid.
+  disc(alb, 126, '#3a3b3e');
+  disc(alb, 112, '#24262a');
+  disc(hgt, 126, grayCss(0.7));
+  disc(hgt, 114, grayCss(0.42));
+  disc(hgt, 110, grayCss(0.6));
+  disc(rgh, 126, grayCss(0.26));
+  disc(rgh, 112, grayCss(0.44));
+  // Diamond tread.
+  for (let y = 24; y < S - 24; y += 12) {
+    for (let x = 24 + ((y / 12) % 2) * 6; x < S - 24; x += 12) {
+      if (Math.hypot(x - c, y - c) > 100) continue;
+      hgt.fillStyle = grayCss(0.72);
+      hgt.beginPath();
+      hgt.moveTo(x, y - 3.5);
+      hgt.lineTo(x + 3.5, y);
+      hgt.lineTo(x, y + 3.5);
+      hgt.lineTo(x - 3.5, y);
+      hgt.fill();
+      alb.fillStyle = 'rgba(80,82,86,0.6)';
+      alb.fillRect(x - 1, y - 1, 2, 2);
+    }
+  }
+  // Two rows of recessed vent slots (the subterranean glow leaks through).
+  for (const off of [-34, 34]) {
+    for (let k = -3; k <= 3; k++) {
+      const x = c + k * 13 - 3;
+      const y = c + off - 12;
+      alb.fillStyle = '#050505';
+      alb.fillRect(x, y, 6, 24);
+      hgt.fillStyle = grayCss(0.12);
+      hgt.fillRect(x, y, 6, 24);
+      em.fillStyle = `rgba(255,255,255,${0.75 + rng() * 0.25})`;
+      em.fillRect(x + 1, y + 1, 4, 22);
+    }
+  }
+  // Central maker disc + rust freckles.
+  disc(alb, 18, '#2c2d30');
+  for (let k = 0; k < 220; k++) {
+    const a = rng() * Math.PI * 2;
+    const r = rng() * 112;
+    alb.fillStyle = `rgba(${70 + Math.round(rng() * 40)},${40 + Math.round(rng() * 20)},24,${0.15 + rng() * 0.25})`;
+    alb.fillRect(c + Math.cos(a) * r, c + Math.sin(a) * r, 1 + rng() * 2, 1 + rng() * 2);
+  }
+  return {
+    map: finalizeTexture(albC, THREE.SRGBColorSpace, anisotropy, false),
+    roughnessMap: finalizeTexture(rghC, THREE.NoColorSpace, anisotropy, false),
+    normalMap: normalTextureFromHeight(hgt, S, S, 3.0, anisotropy),
+    emissiveMap: finalizeTexture(emC, THREE.SRGBColorSpace, anisotropy, false),
+  };
+}
+
+// ---------------------------------------------------------------------------
 // 5. Rooftop machinery: AC-unit fan grille (256²)
 // ---------------------------------------------------------------------------
 function generateMachinerySet(anisotropy: number): PbrTextureSet {
@@ -1963,6 +2149,8 @@ export function getProceduralTextures(renderer: THREE.WebGLRenderer): Procedural
     neonAtlasStrips: NEON_STRIPS.length,
     signAtlas: generateSignAtlas(aniso),
     tech: generateTechSet(aniso),
+    archDetail: generateArchDetailSet(aniso),
+    manhole: generateManholeSet(aniso),
     glove: generateGloveSet(aniso),
     gun: generateGunSet(aniso),
   };

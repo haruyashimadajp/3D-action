@@ -43,6 +43,36 @@ import { ARCHETYPE, BALCONY, CITY_FX, CITY_SHADING, COLORS, FACADE, FIRE_ESCAPE,
 import { ARCH_A, ARCH_B, ARCH_C, ARCH_D, GLSL_FACADE, facadeFloorY, facadeRoomState, faceKey, isMachineFloor, roomOffset, roomsPerTile, seedInt } from './FacadeLighting';
 import { SECTORS, type SectorDef } from '../config/skills';
 import { NEON_STRIP_GLOW, ROAD_ATLAS, SIGN_ATLAS, type AtlasRegion, type ProceduralTextureLibrary } from '../engine/ProceduralTextures';
+import {
+  GRAMMAR,
+  PAINT,
+  PROGRAM_SOCKETS,
+  aoBox,
+  aoPipe,
+  applyAo,
+  assignMassings,
+  assignPrograms,
+  doorClearZone,
+  doorSockets,
+  ensureAo,
+  faceKeyOf,
+  floorTopY,
+  heightBand,
+  isOnFloorGrid,
+  onSolidRoof,
+  parapetSegments,
+  planGallery,
+  planGroundFace,
+  planMassing,
+  quantizeToFloors,
+  withTint,
+  type FaceSpan,
+  type GroundProgram,
+  type MassingCandidate,
+  type MassingKind,
+  type MassingPlan,
+  type PropSocket,
+} from './BuildingGrammar';
 
 // =============================================================================================
 // Public layout data (consumed by PhysicsWorld / PlayerController / EnemyManager / HUD)
@@ -92,6 +122,10 @@ export interface GrappleAnchor {
 }
 
 export interface BuildingInfo {
+  /** 9A-2 massing (optional for older consumers). */
+  massing?: string;
+  /** 9A-1 first terrace height (0 = none). */
+  setbackY?: number;
   readonly index: number;
   readonly cx: number;
   readonly cz: number;
@@ -129,7 +163,7 @@ export interface GateInfo {
 
 /** 6A: a 3D facade feature (centre of the face it occupies, outward normal) — tests / spawn logic. */
 export interface FacadeFeature {
-  readonly kind: 'BALCONY' | 'FIRE_ESCAPE' | 'SHUTTER_FRONT';
+  readonly kind: 'BALCONY' | 'FIRE_ESCAPE' | 'SHUTTER_FRONT' | 'GALLERY' | 'SPINE';
   readonly building: number;
   readonly center: THREE.Vector3;
   readonly normal: THREE.Vector3;
@@ -167,6 +201,12 @@ export interface SectorLayout {
   readonly center: THREE.Vector3;
   /** Closed collision-free camera loop used by the title-screen attract mode. */
   readonly cinematicPath: readonly THREE.Vector3[];
+  /** 9A-4 deterministic prop sockets (every 1F doorway and gallery apartment door) for Phase 9B micro-props. */
+  readonly propSockets: readonly PropSocket[];
+  /** 9A-4 1.8 m × 1.8 m clear entry zones in front of every 1F doorway (Phase 9B clutter keeps out). */
+  readonly doorClearZones: readonly RectXZ[];
+  /** 9A-6 manhole centres (steam anchors / Phase 9B clutter avoidance). */
+  readonly manholes: readonly THREE.Vector3[];
   readonly stats: {
     readonly towers: number;
     readonly cars: number;
@@ -190,6 +230,35 @@ export interface SectorLayout {
     readonly carPools: number;
     /** 6A-1 rooms per night-light state on the rendered facades: dark · warm · cool · accent. */
     readonly facadeRooms: readonly number[];
+    /** Phase 9A architecture. */
+    readonly massings: Readonly<Record<string, number>>;
+    readonly programs: Readonly<Record<string, number>>;
+    readonly roofsOnGrid: number;
+    readonly setbacksOnGrid: number;
+    readonly parapetLengthM: number;
+    readonly parapetGaps: number;
+    readonly bulkheads: number;
+    readonly galleryDoors: number;
+    readonly galleryLevels: number;
+    readonly galleryRamps: number;
+    /** Galleries whose zig-zag stair links street → 2F → 3F → 4F. */
+    readonly galleriesLinked: number;
+    /** GALLERY_DANCHI buildings left without a corridor face (no free in-play face ≥ GALLERY_MIN_FACE_M). */
+    readonly galleriesWithoutCorridor: number;
+    readonly spines: number;
+    readonly slabBands: number;
+    readonly piers: number;
+    readonly doors: number;
+    readonly doorWidth: readonly number[];
+    readonly doorHeight: readonly number[];
+    readonly sockets: number;
+    readonly pipeBundles: number;
+    readonly manholes: number;
+    readonly steamColumns: number;
+    readonly neon: number;
+    readonly alleyNeon: number;
+    readonly minRunFaces: number;
+    readonly floatingRoofProps: number;
   };
 }
 
@@ -720,6 +789,17 @@ const GLSL_PUDDLE_RIPPLES = /* glsl */ `
 // =============================================================================================
 // Capacities (pre-allocated once; counts set per sector)
 // =============================================================================================
+/** 9A-5 baked vertex AO: `aAo` (1 = open) → albedo and indirect specular × mix(0.32, 1, aAo); emissive untouched. */
+function injectVertexAo(shader: THREE.WebGLProgramParametersWithUniforms): void {
+  shader.vertexShader = shader.vertexShader
+    .replace('#include <common>', '#include <common>\nattribute float aAo;\nvarying float vAo;')
+    .replace('#include <begin_vertex>', '#include <begin_vertex>\nvAo = aAo;');
+  shader.fragmentShader = shader.fragmentShader
+    .replace('#include <common>', '#include <common>\nvarying float vAo;')
+    .replace('#include <map_fragment>', '#include <map_fragment>\ndiffuseColor.rgb *= mix(0.32, 1.0, vAo);')
+    .replace('#include <lights_fragment_end>', '#include <lights_fragment_end>\nreflectedLight.indirectSpecular *= mix(0.32, 1.0, vAo);');
+}
+
 const CAP = {
   /** Roof units + 6A-3 balcony outdoor units. */
   AC: 300,
@@ -727,7 +807,8 @@ const CAP = {
   FENCE: 240,
   ANTENNA: 44,
   AVIATION: 280,
-  NEON: 420,
+  /** 9A-6: layered alley / street signage (was 420). */
+  NEON: 960,
   SEARCH: 20,
   MACHINE_ROOM: 26,
   BEACON: 220,
@@ -736,7 +817,10 @@ const CAP = {
   GUARDRAIL: 220,
   /** 7B-1: lamps, crowns, balconies, neon signs, car head / tail lights, vending fronts. */
   CITY_LIGHTS: 1100,
-  STEAM: SILHOUETTE.STEAM_MAX,
+  /** 9A-6: steam columns anchored on manholes and eatery vents (2 puffs each) + canal mist. */
+  STEAM: 200,
+  /** 9A-6 cast-iron manholes. */
+  MANHOLE: 55,
 } as const;
 
 /**
@@ -748,8 +832,14 @@ interface Building extends BuildingInfo {
   readonly seed: number;
   readonly lotHalfW: number;
   readonly lotHalfD: number;
-  /** Setback terrace height (0 = single block). */
+  /** Lot centre (street faces); `cx` / `cz` are the ROOF centre (offset tower, larger L wing). */
+  readonly lcx: number;
+  readonly lcz: number;
+  /** Setback terrace / podium height (0 = single block). */
   readonly setbackY: number;
+  /** 9A-2 massing and its geometry plan (boxes, roof plates, exposed face spans). */
+  readonly massing: MassingKind;
+  readonly plan: MassingPlan;
 }
 
 interface CarSlot {
@@ -797,6 +887,10 @@ export class CityBuilder {
   /** 6A: transparent tempered glass (balcony rail panels) — one draw. */
   private readonly shopGlassMat: THREE.MeshStandardMaterial;
   private readonly steelMat: THREE.MeshStandardMaterial;
+  /** 9A-5 weathered painted trim (doors, frames, awnings, shutters, mailboxes): vertex tint × archDetail + aAo. */
+  private readonly archPaintMat: THREE.MeshStandardMaterial;
+  /** 9A-6 cast-iron manholes (one instanced draw). */
+  private readonly manholes: THREE.InstancedMesh;
   private readonly glassMat: THREE.MeshStandardMaterial;
   private readonly beaconMat: THREE.MeshStandardMaterial;
   private readonly barrierMat: THREE.ShaderMaterial;
@@ -862,13 +956,16 @@ export class CityBuilder {
       envMapIntensity: 1.5,
     });
     this.steelMat = new THREE.MeshStandardMaterial({ color: 0x2a303b, roughness: 0.42, metalness: 0.85 });
+    this.steelMat.onBeforeCompile = (shader) => injectVertexAo(shader);
+    this.steelMat.customProgramCacheKey = () => 'strand-steel-ao-v1';
+    this.archPaintMat = this.createArchPaintMaterial();
     this.glassMat = new THREE.MeshStandardMaterial({ color: 0x0a1018, roughness: 0.06, metalness: 0.9 });
     this.beaconMat = this.createBeaconMaterial();
     this.barrierMat = this.createBarrierMaterial();
 
     // ---------------- Persistent backdrop ----------------
     this.sky = this.createSky();
-    this.farTowers = new THREE.InstancedMesh(new THREE.BoxGeometry(1, 1, 1), this.buildingMat, LIMITS.FAR_BUILDINGS);
+    this.farTowers = new THREE.InstancedMesh(ensureAo(new THREE.BoxGeometry(1, 1, 1)), this.buildingMat, LIMITS.FAR_BUILDINGS);
     this.farTowers.geometry.setAttribute('aSeed', new THREE.InstancedBufferAttribute(new Float32Array(LIMITS.FAR_BUILDINGS), 1));
     this.farTowers.geometry.setAttribute('aArch', new THREE.InstancedBufferAttribute(new Float32Array(LIMITS.FAR_BUILDINGS), 1));
     this.farTowers.name = 'FarTowers';
@@ -897,11 +994,11 @@ export class CityBuilder {
     const vendGeo = this.createVendingGeometry();
     vendGeo.setAttribute('aTint', new THREE.InstancedBufferAttribute(new Float32Array(CAP.VENDING * 3), 3));
     this.vending = this.makeInstanced(vendGeo, this.createVendingMaterial(), CAP.VENDING, 'VendingKiosks');
-    this.guardrails = this.makeInstanced(this.createGuardrailGeometry(), this.steelMat, CAP.GUARDRAIL, 'Guardrails');
+    this.guardrails = this.makeInstanced(ensureAo(this.createGuardrailGeometry()), this.steelMat, CAP.GUARDRAIL, 'Guardrails');
     this.acUnits = this.makeInstanced(this.createAcGeometry(), machinery, CAP.AC, 'ACUnits');
     this.ducts = this.makeInstanced(this.createDuctGeometry(), new THREE.MeshStandardMaterial({ color: 0x4a525e, roughness: 0.3, metalness: 0.9 }), CAP.DUCT, 'Ducts');
     this.fences = this.makeInstanced(this.createFenceGeometry(), new THREE.MeshStandardMaterial({ color: 0x3a414d, roughness: 0.38, metalness: 0.88 }), CAP.FENCE, 'RoofFences');
-    this.antennas = this.makeInstanced(this.createAntennaGeometry(), this.steelMat, CAP.ANTENNA, 'Antennas');
+    this.antennas = this.makeInstanced(ensureAo(this.createAntennaGeometry()), this.steelMat, CAP.ANTENNA, 'Antennas');
     this.machineRooms = this.makeInstanced(this.createMachineRoomGeometry(), new THREE.MeshStandardMaterial({ color: 0x232934, roughness: 0.5, metalness: 0.55 }), CAP.MACHINE_ROOM, 'MachineRooms');
     this.aviation = this.createAviationLights();
     this.neonSigns = this.createNeonSigns();
@@ -914,11 +1011,12 @@ export class CityBuilder {
     this.carPools = this.createCarPools();
     [this.blimpHull, this.blimpBanner] = this.createBlimps();
     this.steam = this.createSteam();
+    this.manholes = this.createManholes();
     this.gatePillar = this.createGatePillar();
     this.persistent.add(
       ...this.cars, this.lamps, this.vending, this.guardrails, this.acUnits, this.ducts, this.fences, this.antennas,
       this.machineRooms, this.aviation, this.neonSigns, this.searchlights, this.beacons, this.halos, this.lampHalos, this.steam, this.gatePillar,
-      this.lampCones, this.signals, this.carPools, this.blimpHull, this.blimpBanner,
+      this.lampCones, this.signals, this.carPools, this.blimpHull, this.blimpBanner, this.manholes,
     );
   }
 
@@ -1064,6 +1162,7 @@ export class CityBuilder {
       #include <opaque_fragment>
     `;
     const fragCommon = /* glsl */ `
+      varying float vAo;
       uniform float uWallLights;
       uniform float uTime;
       varying vec2 vStrandUv;
@@ -1137,6 +1236,8 @@ export class CityBuilder {
         .replace('#include <common>', `#include <common>
           attribute float aSeed;
           attribute float aArch;
+          attribute float aAo;
+          varying float vAo;
           varying vec2 vStrandUv;
           varying float vStrandY;
           varying float vTop;
@@ -1163,6 +1264,7 @@ export class CityBuilder {
               vStrandUv = vec2(along / ${TW} + mod(floor(aSeed * 65536.0), rooms) / rooms, strandWp.y / ${TEX_H});
             }
             vStrandY = strandWp.y;
+            vAo = aAo;
             vSeed = aSeed;
             vArch = aArch;
             vNormalMapUv = vStrandUv;
@@ -1216,7 +1318,7 @@ export class CityBuilder {
           diffuseColor.rgb = mix(diffuseColor.rgb, vec3(${roofCol.r.toFixed(4)}, ${roofCol.g.toFixed(4)}, ${roofCol.b.toFixed(4)}), vTop);
           // Ground contact AO (0 → 2.6 m): the towers sit heavily on the wet street.
           float strandAO = mix(${CS.AO_MIN.toFixed(2)}, 1.0, mix(smoothstep(0.0, ${CS.AO_HEIGHT_M.toFixed(2)}, vStrandY), 1.0, vTop));
-          diffuseColor.rgb *= strandAO;`)
+          diffuseColor.rgb *= strandAO * mix(0.32, 1.0, vAo);`)
         .replace('#include <roughnessmap_fragment>', `
           vec4 sRM = textureGrad(roughnessMap, sWUv, sWGX, sWGY);
           float sMask = sRM.r * (1.0 - vTop);
@@ -1255,7 +1357,7 @@ export class CityBuilder {
             totalEmissiveRadiance = sOut * (1.0 - vTop) * mix(0.72, 1.0, strandAO);
           }`);
     };
-    mat.customProgramCacheKey = () => 'strand-building-v16';
+    mat.customProgramCacheKey = () => 'strand-building-v17';
     return mat;
   }
 
@@ -1277,9 +1379,70 @@ export class CityBuilder {
       shader.fragmentShader = shader.fragmentShader
         .replace('#include <common>', `#include <common>\nuniform float uTime;\n${GLSL_HASH}\n${GLSL_RIPPLES}`)
         .replace('#include <normal_fragment_maps>', `#include <normal_fragment_maps>\n${GLSL_PUDDLE_RIPPLES}`);
+      injectVertexAo(shader);
     };
-    mat.customProgramCacheKey = () => 'strand-concrete-v11';
+    mat.customProgramCacheKey = () => 'strand-concrete-v12';
     return mat;
+  }
+
+  /** 9A-5 weathered painted trim: per-vertex RGB tint × the scuffed-paint / stain detail maps, city lights, aAo. */
+  private createArchPaintMaterial(): THREE.MeshStandardMaterial {
+    const t = this.tex.archDetail;
+    const mat = new THREE.MeshStandardMaterial({
+      color: new THREE.Color(1.12, 1.12, 1.12),
+      vertexColors: true,
+      map: t.map,
+      roughness: 1.0,
+      roughnessMap: t.roughnessMap,
+      normalMap: t.normalMap,
+      normalScale: new THREE.Vector2(0.55, 0.55),
+      metalness: 0.32,
+      envMapIntensity: 0.9,
+    });
+    mat.onBeforeCompile = (shader) => {
+      this.injectCityLights(shader);
+      injectVertexAo(shader);
+    };
+    mat.customProgramCacheKey = () => 'strand-archpaint-v1';
+    return mat;
+  }
+
+  /** 9A-6 flush cast-iron manholes: iron PBR + per-instance subterranean glow through the vent slots. */
+  private createManholes(): THREE.InstancedMesh {
+    const t = this.tex.manhole;
+    const geo = new THREE.CircleGeometry(0.46, 28);
+    geo.rotateX(-Math.PI / 2);
+    geo.setAttribute('aGlow', new THREE.InstancedBufferAttribute(new Float32Array(CAP.MANHOLE * 3), 3));
+    const mat = new THREE.MeshStandardMaterial({
+      color: 0xffffff,
+      map: t.map,
+      roughness: 1.0,
+      roughnessMap: t.roughnessMap,
+      normalMap: t.normalMap,
+      metalness: 0.7,
+      emissive: 0xffffff,
+      emissiveMap: t.emissiveMap,
+      emissiveIntensity: 1.0,
+      polygonOffset: true,
+      polygonOffsetFactor: -3,
+      polygonOffsetUnits: -6,
+    });
+    mat.onBeforeCompile = (shader) => {
+      shader.uniforms.uTime = this.uTime;
+      this.injectCityLights(shader);
+      shader.vertexShader = shader.vertexShader
+        .replace('#include <common>', '#include <common>\nattribute vec3 aGlow;\nvarying vec3 vGlow;')
+        .replace('#include <begin_vertex>', '#include <begin_vertex>\nvGlow = aGlow;');
+      shader.fragmentShader = shader.fragmentShader
+        .replace('#include <common>', '#include <common>\nuniform float uTime;\nvarying vec3 vGlow;')
+        .replace('#include <emissivemap_fragment>', '#include <emissivemap_fragment>\ntotalEmissiveRadiance *= vGlow * (0.85 + 0.15 * sin(uTime * 1.7 + vCityWorld.x * 0.7));');
+    };
+    mat.customProgramCacheKey = () => 'strand-manhole-v1';
+    const m = new THREE.InstancedMesh(geo, mat, CAP.MANHOLE);
+    m.count = 0;
+    m.frustumCulled = false;
+    m.name = 'Manholes';
+    return m;
   }
 
   /** Wet road atlas: per-vertex atlas rect + continuous tile UV, sampled with textureGrad(fract()). */
@@ -1312,16 +1475,31 @@ export class CityBuilder {
           vec2 sRGY = dFdy(vTileUv) * sRSize;
           diffuseColor *= textureGrad(map, sRUv, sRGX, sRGY);`)
         .replace('#include <roughnessmap_fragment>', `
-          float roughnessFactor = roughness * textureGrad(roughnessMap, sRUv, sRGX, sRGY).g;`)
+          float roughnessFactor = roughness * textureGrad(roughnessMap, sRUv, sRGX, sRGY).g;
+          // 9A-6: low-frequency gutter / alley grime patches (albedo 0.72–1.0).
+          float sGrime = smoothstep(0.42, 0.78, sNoise(vCityWorld.xz * 0.045) * 0.65 + sNoise(vCityWorld.xz * 0.19 + 3.1) * 0.35);
+          diffuseColor.rgb *= mix(1.0, 0.72, sGrime);
+          roughnessFactor = mix(roughnessFactor, min(1.0, roughnessFactor + 0.1), sGrime * 0.6);`)
         .replace('#include <normal_fragment_maps>', `
           {
             vec3 mapN = textureGrad(normalMap, sRUv, sRGX, sRGY).xyz * 2.0 - 1.0;
             mapN.xy *= normalScale;
             normal = normalize(tbn * mapN);
           }
-          ${GLSL_PUDDLE_RIPPLES}`);
+          ${GLSL_PUDDLE_RIPPLES}`)
+        // … and a thin-film oil-slick tint on the glossiest puddle regions (subtle: 0.08–0.13).
+        .replace('#include <lights_fragment_end>', `#include <lights_fragment_end>
+          {
+            float sSlick = (1.0 - smoothstep(0.08, 0.16, roughnessFactor)) * smoothstep(0.35, 0.75, sNoise(vCityWorld.xz * 0.11 + 7.7));
+            vec3 sV = normalize(cameraPosition - vCityWorld);
+            float sPh = dot(sV, vec3(0.0, 1.0, 0.0)) * 6.0 + sNoise(vCityWorld.xz * 0.6) * 4.0;
+            vec3 sFilm = 0.5 + 0.5 * cos(6.2832 * (vec3(0.0, 0.33, 0.67) + sPh));
+            float sK = mix(0.08, 0.13, sNoise(vCityWorld.xz * 0.3)) * sSlick;
+            reflectedLight.indirectSpecular *= mix(vec3(1.0), sFilm * 1.7, sK);
+            reflectedLight.directSpecular *= mix(vec3(1.0), sFilm * 1.7, sK);
+          }`);
     };
-    mat.customProgramCacheKey = () => 'strand-road-v11';
+    mat.customProgramCacheKey = () => 'strand-road-v12';
     return mat;
   }
 
@@ -1959,10 +2137,13 @@ export class CityBuilder {
         varying float vStrip;
         varying float vFormat;
         varying float vDist;
+        varying float vSid;
         void main() {
           vUv = uv;
           vStrip = aStrip;
           vFormat = aFormat;
+          vec4 c0 = instanceMatrix * vec4(0.0, 0.0, 0.0, 1.0);
+          vSid = fract(sin(dot(c0.xz, vec2(12.9898, 78.233)) + c0.y * 3.17) * 43758.5453);
           vec4 wp = modelMatrix * instanceMatrix * vec4(position, 1.0);
           vDist = length(wp.xyz - cameraPosition);
           gl_Position = projectionMatrix * viewMatrix * wp;
@@ -1970,7 +2151,7 @@ export class CityBuilder {
       `,
       fragmentShader: /* glsl */ `
         uniform float uTime; uniform sampler2D uAtlas; uniform sampler2D uSigns; uniform float uStrips; uniform float uBoost; uniform float uFogDensity;
-        varying vec2 vUv; varying float vStrip; varying float vFormat; varying float vDist;
+        varying vec2 vUv; varying float vStrip; varying float vFormat; varying float vDist; varying float vSid;
         ${GLSL_FOG_FADE}
         float h11(float p) { p = fract(p * 0.1031); p *= p + 33.33; p *= p + p; return fract(p); }
         void main() {
@@ -2002,6 +2183,13 @@ export class CityBuilder {
           }
           float fl = h11(floor(uTime * 9.0) + strip * 17.0);
           float flicker = fl < 0.04 ? 0.25 : 1.0;
+          // 9A-6: ~12 % of the tubes are failing — buzzing stutter and a dead segment band.
+          if (vSid < 0.12) {
+            float bz = h11(floor(uTime * 23.0) + vSid * 911.0);
+            flicker *= bz < 0.3 ? 0.08 : bz < 0.45 ? 0.55 : 1.0;
+            float seg = floor(vUv.y * 5.0);
+            if (abs(seg - floor(vSid * 41.0)) < 0.5 || abs(seg - mod(floor(vSid * 41.0) + 3.0, 5.0)) < 0.5 && vSid < 0.05) flicker *= 0.12;
+          }
           float scan = 0.82 + 0.18 * sin(vUv.y * 420.0 - uTime * 6.0);
           // 5B-1: base 1.38 so the tubes bleed into bloom — FLOW A+ boosts a further +25 %.
           vec3 c = t.rgb * ${NEON_BLOOM.SIGN.toFixed(2)} * scan * flicker * uBoost;
@@ -2535,12 +2723,14 @@ export class CityBuilder {
   private createSteam(): THREE.InstancedMesh {
     const geo = new THREE.PlaneGeometry(1, 1);
     geo.setAttribute('aSteam', new THREE.InstancedBufferAttribute(new Float32Array(CAP.STEAM * 4), 4));
+    geo.setAttribute('aSteamH', new THREE.InstancedBufferAttribute(new Float32Array(CAP.STEAM), 1));
     const mat = new THREE.ShaderMaterial({
       transparent: true,
       depthWrite: false,
       uniforms: { uTime: this.uTime, uFogDensity: this.uFogDensity },
       vertexShader: /* glsl */ `
         attribute vec4 aSteam;
+        attribute float aSteamH;
         uniform float uTime;
         varying vec2 vUv; varying float vAlpha; varying float vDist; varying float vSeed;
         void main() {
@@ -2549,7 +2739,10 @@ export class CityBuilder {
           float cyc = uTime * aSteam.z + aSteam.x;
           float t = fract(cyc);
           float size = aSteam.y * (0.7 + t * 1.3);
-          vec3 c = base + vec3(sin(uTime * 0.6 + aSteam.w * 6.28) * 0.6 * t, t * 3.4 + size * 0.35, cos(uTime * 0.45 + aSteam.w * 4.0) * 0.5 * t);
+          // 9A-6: rise height per anchor (2.5–6 m columns over manholes / vents; ~3.4 m canal mist).
+          float rise = aSteamH > 0.0 ? aSteamH : 3.4;
+          float drift = aSteamH > 0.0 ? 0.25 : 0.6;
+          vec3 c = base + vec3(sin(uTime * 0.6 + aSteam.w * 6.28) * drift * t, t * rise + size * 0.35, cos(uTime * 0.45 + aSteam.w * 4.0) * drift * 0.8 * t);
           vec3 right = vec3(viewMatrix[0][0], viewMatrix[1][0], viewMatrix[2][0]);
           vec3 up = vec3(viewMatrix[0][1], viewMatrix[1][1], viewMatrix[2][1]);
           vec3 wp = c + (right * position.x + up * position.y) * size;
@@ -2671,6 +2864,8 @@ export class CityBuilder {
       glass: [] as THREE.BufferGeometry[],
       bodies: [] as THREE.BufferGeometry[],
       barrier: [] as THREE.BufferGeometry[],
+      /** 9A-5 weathered painted trim: doors, frames, awnings, shutters, mailboxes, panels (one draw). */
+      archPaint: [] as THREE.BufferGeometry[],
     };
 
     // Instance counters & attributes
@@ -3399,52 +3594,43 @@ export class CityBuilder {
       .map((o) => ({ i: o.i, pref: hasEscapeFace(o.i) ? 1 : 0, roll: arng() }))
       .sort((p, o) => o.pref - p.pref || p.roll - o.roll)
       .forEach((o, k) => (archOf[o.i] = k < archCount[2] ? ARCH_C : ARCH_D));
+    // 9A-1: every roof sits on the archetype floor grid (FLOOR_BASE_M[arch] + n · 4 m) inside the archetype ∩ sector
+    // band — zero sliced windows; sky-bridge towers round up so Layer 2 keeps its clearance. (Type C bases at 0 m,
+    // so its fire escapes still land flush on whole 4 m storeys.)
     heights.forEach((h, i) => {
       const a = archOf[i];
-      const lo = Math.max(AR.MIN_H[a], sector.heightMin);
-      const hi = Math.min(AR.MAX_H[a], sector.heightMax);
-      let v = q2(clamp(h, lo, hi));
-      // Low-rise Type C: whole 4 m storeys, so its fire escape lands flush on the roof.
-      if (a === ARCH_C && v <= FE.ROOF_ACCESS_MAX_Y) v = clamp(Math.round(v / FE.LEVEL_H_M) * FE.LEVEL_H_M, Math.ceil(lo / FE.LEVEL_H_M) * FE.LEVEL_H_M, hi);
-      heights[i] = v;
+      const [lo, hi] = heightBand(a, sector.heightMin, sector.heightMax);
+      heights[i] = quantizeToFloors(a, clamp(h, lo, hi), lo, hi, bridged.has(i) ? 'ceil' : 'round');
     });
 
-    // 5B-3 / 6A-2: ~60 % of the Type A towers (≥ 45 m) become two-tier — a slimmer crown tier (65–78 %
-    // footprint) rises from a terrace at 65–80 % of the height (above every sky-bridge / Layer-2 sign).
+    // 9A-2: five massings (own rng stream, so streets / cars / lamps stay where they were).
     const SB = SILHOUETTE;
+    const mrng = createRng(0x9a55 + sector.index * 211 + loop * 1013);
+    const candidates: MassingCandidate[] = chosen.map((r, i) => {
+      const alley = new Set<string>();
+      for (const [ax, sg] of FACES) if (alleyFaces.has(`${i}:${ax}:${sg}`)) alley.add(faceKeyOf(ax, sg));
+      return { arch: archOf[i], lot: r, roofY: heights[i], alley };
+    });
+    const massings = assignMassings(candidates, mrng);
     const buildings: Building[] = chosen.map((r, i) => {
-      const lotHalfW = (r.x1 - r.x0) / 2;
-      const lotHalfD = (r.z1 - r.z0) / 2;
-      const roof = heights[i];
-      let setbackY = 0;
-      let kw = 1;
-      let kd = 1;
-      if (archOf[i] === ARCH_A && roof >= SB.SETBACK_MIN_ROOF_M && srng() < SB.SETBACK_CHANCE) {
-        const lo = Math.max(roof * SB.SETBACK_AT_MIN, SB.SETBACK_MIN_Y);
-        const hi = Math.min(roof * SB.SETBACK_AT_MAX, roof - SB.SETBACK_MIN_UPPER_M);
-        const kwr = SB.SETBACK_SCALE_MIN + srng() * (SB.SETBACK_SCALE_MAX - SB.SETBACK_SCALE_MIN);
-        const kdr = SB.SETBACK_SCALE_MIN + srng() * (SB.SETBACK_SCALE_MAX - SB.SETBACK_SCALE_MIN);
-        const t = srng();
-        // The crown tier keeps room for roof props (machine room, anchors): ≥ 4 m half extents.
-        if (hi >= lo && lotHalfW * kwr >= 4 && lotHalfD * kdr >= 4) {
-          setbackY = q2(lo + t * (hi - lo));
-          kw = kwr;
-          kd = kdr;
-        }
-      }
+      const plan = planMassing(massings[i], candidates[i], mrng);
       return {
         index: i,
-        cx: (r.x0 + r.x1) / 2,
-        cz: (r.z0 + r.z1) / 2,
-        halfW: lotHalfW * kw,
-        halfD: lotHalfD * kd,
-        roofY: roof,
+        cx: plan.roof.cx,
+        cz: plan.roof.cz,
+        halfW: plan.roof.halfW,
+        halfD: plan.roof.halfD,
+        roofY: heights[i],
         arch: archOf[i],
         rect: r,
         seed: rng(),
-        lotHalfW,
-        lotHalfD,
-        setbackY,
+        lotHalfW: (r.x1 - r.x0) / 2,
+        lotHalfD: (r.z1 - r.z0) / 2,
+        lcx: (r.x0 + r.x1) / 2,
+        lcz: (r.z0 + r.z1) / 2,
+        setbackY: plan.setbackY,
+        massing: massings[i],
+        plan,
       };
     });
     const lowTopOf = (b: Building): number => (b.setbackY > 0 ? b.setbackY : b.roofY);
@@ -3456,11 +3642,31 @@ export class CityBuilder {
     // per-floor canopies. A keeps every face flat behind its decorative mullions.
     const fkey = (b: Building, ax: Axis, sg: number): string => `${b.index}:${ax}:${sg}`;
     const faceLen = (b: Building, ax: Axis): number => (ax === 'x' ? b.lotHalfD : b.lotHalfW) * 2;
+    /** The band `reach` m out from a lot face (and the face's along span) lies inside the lockdown barrier. */
+    const faceInPlay = (b: Building, ax: Axis, sg: number, reach: number): boolean => {
+      const lim = H - 0.5;
+      const plane = ax === 'x' ? b.lcx + sg * b.lotHalfW : b.lcz + sg * b.lotHalfD;
+      const [c, half] = ax === 'x' ? [b.lcz, b.lotHalfD] : [b.lcx, b.lotHalfW];
+      return Math.abs(plane + sg * reach) <= lim && Math.abs(c) + half <= lim;
+    };
     const runFaces = new Set<string>();
     const balconyFaces = new Set<string>();
     const escapeFaces = new Set<string>();
     const shutterFaces = new Set<string>();
     const ductFaces = new Set<string>();
+    /** 9A-2: GALLERY_DANCHI corridor faces, PENCIL_TOWER spine faces, L_SHAPE partial (courtyard-cut) lot faces. */
+    const galleryFaces = new Set<string>();
+    const spineFaces = new Set<string>();
+    const partialFaces = new Set<string>();
+    buildings.forEach((b) => {
+      const cut = b.plan.cut;
+      if (cut) {
+        if (Math.abs(cut.x1 - b.rect.x1) < 1e-6) partialFaces.add(fkey(b, 'x', 1));
+        if (Math.abs(cut.x0 - b.rect.x0) < 1e-6) partialFaces.add(fkey(b, 'x', -1));
+        if (Math.abs(cut.z1 - b.rect.z1) < 1e-6) partialFaces.add(fkey(b, 'z', 1));
+        if (Math.abs(cut.z0 - b.rect.z0) < 1e-6) partialFaces.add(fkey(b, 'z', -1));
+      }
+    });
     buildings.forEach((b) => {
       let count = 0;
       for (const [ax, sg] of FACES) {
@@ -3468,25 +3674,51 @@ export class CityBuilder {
         runFaces.add(fkey(b, ax, sg));
         count++;
       }
+      const free = (ax: Axis, sg: number): boolean => !runFaces.has(fkey(b, ax, sg)) && !partialFaces.has(fkey(b, ax, sg));
+      // Reserve the massing's signature face before the extra run faces are drawn.
+      if (b.massing === 'GALLERY_DANCHI') {
+        // The corridor's external stair (out to ~2.5 m) and its street approach must be on playable ground.
+        const cands = FACES.filter(([ax, sg]) => free(ax, sg) && faceLen(b, ax) >= GRAMMAR.GALLERY_MIN_FACE_M && faceInPlay(b, ax, sg, GRAMMAR.GALLERY_DEPTH_M + 2.6))
+          .map((f) => ({ f, roll: arng() }))
+          .sort((p, o) => faceLen(b, o.f[0]) - faceLen(b, p.f[0]) || p.roll - o.roll);
+        // Keep ≥ 2 faces for wall-running: a second corridor face only when 4 faces are free.
+        const freeCount = FACES.filter(([ax, sg]) => free(ax, sg)).length + count;
+        const n = Math.min(cands.length, freeCount >= 4 && count === 0 && cands.length >= 3 && arng() < 0.4 ? 2 : 1);
+        for (let i = 0; i < n; i++) galleryFaces.add(fkey(b, cands[i].f[0], cands[i].f[1]));
+      } else if (b.massing === 'PENCIL_TOWER') {
+        const cands = FACES.filter(([ax, sg]) => free(ax, sg) && faceLen(b, ax) >= GRAMMAR.SPINE_W_M + 3 && FACES.filter(([a2, s2]) => !partialFaces.has(fkey(b, a2, s2))).length >= 3);
+        if (cands.length) {
+          const [ax, sg] = cands[Math.floor(arng() * cands.length)];
+          spineFaces.add(fkey(b, ax, sg));
+        }
+      }
       let escape = '';
-      if (b.arch === ARCH_C) {
-        const cands = FACES.filter(([ax, sg]) => !runFaces.has(fkey(b, ax, sg)) && faceLen(b, ax) >= escapeNeed);
+      // Faces still available for the ≥ 2 clean run faces once the signature faces are reserved.
+      const runnable = FACES.filter(([ax, sg]) => !partialFaces.has(fkey(b, ax, sg)) && !galleryFaces.has(fkey(b, ax, sg)) && !spineFaces.has(fkey(b, ax, sg))).length;
+      if (b.arch === ARCH_C && runnable >= 3) {
+        const cands = FACES.filter(([ax, sg]) => free(ax, sg) && !galleryFaces.has(fkey(b, ax, sg)) && !spineFaces.has(fkey(b, ax, sg)) && faceLen(b, ax) >= escapeNeed);
         if (cands.length) {
           const [ax, sg] = cands[Math.floor(arng() * cands.length)];
           escape = fkey(b, ax, sg);
           escapeFaces.add(escape);
         }
       }
-      let k = Math.floor(rng() * 4);
-      let guard = 0;
-      while (count < 2 && guard++ < 8) {
-        const [ax, sg] = FACES[k++ % 4];
+      // ≥ 2 clean full-height run faces: podium towers prefer their flush (full-height) faces; L shapes only use
+      // their two uncut faces; signature faces (gallery / spine / escape) are never taken.
+      const order = [...FACES].map((f, k) => ({ f, k: (k + Math.floor(rng() * 4)) % 4 }));
+      const flush = new Set(b.plan.flush);
+      order.sort((p, o) => (flush.has(faceKeyOf(o.f[0], o.f[1])) ? 1 : 0) - (flush.has(faceKeyOf(p.f[0], p.f[1])) ? 1 : 0) || p.k - o.k);
+      for (const { f: [ax, sg] } of order) {
+        if (count >= 2) break;
         const key = fkey(b, ax, sg);
-        if (runFaces.has(key) || key === escape) continue;
+        if (runFaces.has(key) || key === escape || galleryFaces.has(key) || spineFaces.has(key) || partialFaces.has(key)) continue;
         runFaces.add(key);
         count++;
       }
-      const feature = FACES.filter(([ax, sg]) => !runFaces.has(fkey(b, ax, sg)) && fkey(b, ax, sg) !== escape);
+      const feature = FACES.filter(([ax, sg]) => {
+        const key = fkey(b, ax, sg);
+        return !runFaces.has(key) && key !== escape && !partialFaces.has(key) && !galleryFaces.has(key) && !spineFaces.has(key);
+      });
       if (b.arch === ARCH_B) {
         const cands = feature
           .filter(([ax]) => faceLen(b, ax) >= BALCONY.WIDTH_MIN_M + 2)
@@ -3500,6 +3732,7 @@ export class CityBuilder {
         if (lowTopOf(b) >= 12) for (const [ax, sg] of feature) shutterFaces.add(fkey(b, ax, sg));
       }
     });
+    const runFaceCount = buildings.map((b) => FACES.filter(([ax, sg]) => runFaces.has(fkey(b, ax, sg))).length);
 
     // ------------------------------------------------------------------ 7b. tower bodies, roofs, crowns
     const roofRects: RectXZ[][] = buildings.map(() => []);
@@ -3508,41 +3741,32 @@ export class CityBuilder {
       withAttr1(withAttr1(boxAt(w, h, d, x, y, z), 'aSeed', seed), 'aArch', arch);
     const TERRACE_NEON = [COLORS.WALLRUN_CYAN, COLORS.NEON_MAGENTA, COLORS.NEON_AMBER];
     buildings.forEach((b) => {
-      const lowTop = lowTopOf(b);
-      const top = lowTop - 0.45;
-      G.bodies.push(bodyBox(b.lotHalfW * 2, top, b.lotHalfD * 2, b.cx, top / 2, b.cz, b.seed, b.arch));
-      if (b.setbackY > 0) {
-        // Terrace: wet concrete cap + steel lip + a thin neon edge line, then the slimmer crown tier.
-        G.concrete.push(worldUvBox(b.lotHalfW * 2 + 0.3, 0.5, b.lotHalfD * 2 + 0.3, b.cx, b.setbackY - 0.25, b.cz, RENDER.ROOF_TILE_M));
-        G.steel.push(
-          boxAt(b.lotHalfW * 2 + 0.42, 0.08, 0.22, b.cx, b.setbackY + 0.02, b.cz + b.lotHalfD + 0.1),
-          boxAt(b.lotHalfW * 2 + 0.42, 0.08, 0.22, b.cx, b.setbackY + 0.02, b.cz - b.lotHalfD - 0.1),
-          boxAt(0.22, 0.08, b.lotHalfD * 2 + 0.2, b.cx + b.lotHalfW + 0.1, b.setbackY + 0.02, b.cz),
-          boxAt(0.22, 0.08, b.lotHalfD * 2 + 0.2, b.cx - b.lotHalfW - 0.1, b.setbackY + 0.02, b.cz),
-        );
-        const tn = TERRACE_NEON[Math.floor(srng() * TERRACE_NEON.length)];
-        for (const sz of [-1, 1]) G.strips.push(withColor(boxAt(b.lotHalfW * 2 + 0.3, 0.06, 0.06, b.cx, b.setbackY - 0.6, b.cz + sz * (b.lotHalfD + 0.18)), tn, 1.3));
-        for (const sx of [-1, 1]) G.strips.push(withColor(boxAt(0.06, 0.06, b.lotHalfD * 2 + 0.3, b.cx + sx * (b.lotHalfW + 0.18), b.setbackY - 0.6, b.cz), tn, 1.3));
-        const uh = b.roofY - 0.45 - b.setbackY;
-        G.bodies.push(bodyBox(b.halfW * 2, uh, b.halfD * 2, b.cx, b.setbackY + uh / 2, b.cz, b.seed, b.arch));
+      // 9A-2: one tower-material body + one BUILDING collider per massing box (L wings, podium + offset tower,
+      // stepped tiers); every box top is a floor-grid roof / terrace with a wet concrete cap.
+      for (const bx of b.plan.boxes) {
+        const top = bx.y1 - 0.45;
+        const y0 = bx.y0 > 0 ? bx.y0 - 0.05 : 0;
+        G.bodies.push(bodyBox(bx.x1 - bx.x0, top - y0, bx.z1 - bx.z0, (bx.x0 + bx.x1) / 2, (y0 + top) / 2, (bx.z0 + bx.z1) / 2, b.seed, b.arch));
+        colliders.push({ min: new THREE.Vector3(bx.x0, bx.y0, bx.z0), max: new THREE.Vector3(bx.x1, bx.y1, bx.z1), kind: 'BUILDING', building: b.index });
       }
-      G.concrete.push(worldUvBox(b.halfW * 2 + 0.3, 0.5, b.halfD * 2 + 0.3, b.cx, b.roofY - 0.25, b.cz, RENDER.ROOF_TILE_M));
-      G.steel.push(
-        boxAt(b.halfW * 2 + 0.42, 0.08, 0.22, b.cx, b.roofY + 0.02, b.cz + b.halfD + 0.1),
-        boxAt(b.halfW * 2 + 0.42, 0.08, 0.22, b.cx, b.roofY + 0.02, b.cz - b.halfD - 0.1),
-        boxAt(0.22, 0.08, b.halfD * 2 + 0.2, b.cx + b.halfW + 0.1, b.roofY + 0.02, b.cz),
-        boxAt(0.22, 0.08, b.halfD * 2 + 0.2, b.cx - b.halfW - 0.1, b.roofY + 0.02, b.cz),
-      );
-      // Two box colliders on setback towers: lower block (lot) + crown tier (5B-3).
-      colliders.push({ min: new THREE.Vector3(b.rect.x0, 0, b.rect.z0), max: new THREE.Vector3(b.rect.x1, lowTop, b.rect.z1), kind: 'BUILDING', building: b.index });
-      if (b.setbackY > 0) {
-        colliders.push({ min: new THREE.Vector3(b.cx - b.halfW, b.setbackY, b.cz - b.halfD), max: new THREE.Vector3(b.cx + b.halfW, b.roofY, b.cz + b.halfD), kind: 'BUILDING', building: b.index });
+      for (const pl of b.plan.plates) {
+        G.concrete.push(worldUvBox(pl.x1 - pl.x0 + 0.3, 0.5, pl.z1 - pl.z0 + 0.3, (pl.x0 + pl.x1) / 2, pl.y - 0.25, (pl.z0 + pl.z1) / 2, RENDER.ROOF_TILE_M));
+      }
+      // Terraces (stepped tiers, podium): a thin neon edge line under the parapet where the edge is open.
+      if (b.plan.plates.some((pl) => !pl.main)) {
+        const tn = TERRACE_NEON[Math.floor(srng() * TERRACE_NEON.length)];
+        const sub = { ...b.plan, plates: b.plan.plates.filter((pl) => !pl.main) };
+        for (const seg of parapetSegments(sub)) {
+          const out = seg.plane + seg.sg * 0.18;
+          G.strips.push(withColor(seg.ax === 'x' ? boxAt(0.06, 0.06, seg.a1 - seg.a0, out, seg.y - 0.6, (seg.a0 + seg.a1) / 2) : boxAt(seg.a1 - seg.a0, 0.06, 0.06, (seg.a0 + seg.a1) / 2, seg.y - 0.6, out), tn, 1.3));
+        }
       }
       // Type A roof crown: steel corner posts + two horizontal neon rings — a sharp, lit skyline.
       if (b.arch === ARCH_A) {
         const cn = TERRACE_NEON[Math.floor(srng() * TERRACE_NEON.length)];
-        const ix = b.halfW - 0.35;
-        const iz = b.halfD - 0.35;
+        // Inset clear of the 0.32 m parapet.
+        const ix = b.halfW - 0.55;
+        const iz = b.halfD - 0.55;
         const yb = b.roofY;
         for (const [sx, sz] of CORNERS_4) {
           G.steel.push(boxAt(0.26, 4.8, 0.26, b.cx + sx * ix, yb + 2.4, b.cz + sz * iz));
@@ -3564,12 +3788,14 @@ export class CityBuilder {
         );
         addLight(b.cx, yb + 4.0, b.cz, cn, 3.0);
       }
-      // Two diagonal roof corners carry gold anchors on steel stubs (grapple-able building corners).
+      // Two diagonal roof corners carry gold anchors on steel stubs (grapple-able building corners), now standing on
+      // the parapet corner (9A-1).
       const diag = rng() < 0.5 ? 1 : -1;
+      const pTop = b.roofY + GRAMMAR.PARAPET_H + GRAMMAR.COPING_H;
       for (const [sx, sz] of [[1, diag], [-1, -diag]]) {
         const ex = b.cx + sx * (b.halfW + 0.6);
         const ez = b.cz + sz * (b.halfD + 0.6);
-        const base = new THREE.Vector3(b.cx + sx * (b.halfW - 0.6), b.roofY, b.cz + sz * (b.halfD - 0.6));
+        const base = new THREE.Vector3(b.cx + sx * (b.halfW - 0.16), pTop, b.cz + sz * (b.halfD - 0.16));
         G.steel.push(beam(base, new THREE.Vector3(ex, b.roofY + 2.4, ez), 0.22), beam(base, base.clone().setY(b.roofY + 2.6), 0.26));
         addBeacon(new THREE.Vector3(ex, b.roofY + 2.9, ez), 'BUILDING_CORNER');
         roofRects[b.index].push(rectFrom(base.x - 1, base.z - 1, base.x + 1, base.z + 1));
@@ -3581,7 +3807,7 @@ export class CityBuilder {
     const plainBody = (g: THREE.BufferGeometry, seed: number, col: number): THREE.BufferGeometry => withAttr1(withAttr1(g, 'aSeed', seed), 'aArch', col + 0.25);
     /** Point in a face frame: `al` along the face, `y` up, `d` metres out from the wall (negative = inside). */
     const faceFrame = (b: Building, ax: Axis, sg: number) => {
-      const face = ax === 'x' ? b.cx + sg * b.lotHalfW : b.cz + sg * b.lotHalfD;
+      const face = ax === 'x' ? b.lcx + sg * b.lotHalfW : b.lcz + sg * b.lotHalfD;
       const P3 = (al: number, y: number, d: number): THREE.Vector3 => (ax === 'x' ? new THREE.Vector3(face + sg * d, y, al) : new THREE.Vector3(al, y, face + sg * d));
       const box = (a0: number, a1: number, y0: number, y1: number, d0: number, d1: number): THREE.BufferGeometry => {
         const lo = P3(a0, y0, d0);
@@ -3598,21 +3824,42 @@ export class CityBuilder {
           building: b.index,
         });
       };
-      const c = ax === 'x' ? b.cz : b.cx;
+      const c = ax === 'x' ? b.lcz : b.lcx;
       const len = faceLen(b, ax);
       return { face, P3, box, coll, c, len, a0: c - len / 2, a1: c + len / 2, nx: ax === 'x' ? sg : 0, nz: ax === 'z' ? sg : 0 };
     };
 
-    /** Type A: vertical aluminium mullions on every 3 m room line + corner columns (decorative, no collider). */
-    const mullions = (cx: number, cz: number, hw: number, hd: number, y0: number, y1: number): void => {
+    /**
+     * 9A-3 room-grid lines of a face: world coordinates (z on x-faces, x on z-faces) of the facade room boundaries
+     * (same mapping and per-tower room offset as the tower shader / facadeProbe), every `step` rooms.
+     */
+    const roomLines = (b: Building, ax: Axis, sg: number, w0: number, w1: number, step: number, margin = 0.4): number[] => {
+      const roomW = FACADE.TILE_W_M / roomsPerTile(b.arch);
+      const off = roomOffset(seedInt(b.seed), b.arch) * roomW;
+      const out: number[] = [];
+      // along = −z·sg on x faces, x·sg on z faces; boundaries where along + off = k · roomW.
+      const toW = (k: number): number => (ax === 'x' ? -(k * roomW - off) * sg : (k * roomW - off) * sg);
+      const kA = Math.floor(((ax === 'x' ? -w1 * sg : w0 * sg) + off) / roomW) - 2;
+      const kB = Math.ceil(((ax === 'x' ? -w0 * sg : w1 * sg) + off) / roomW) + 2;
+      for (let k = Math.min(kA, kB); k <= Math.max(kA, kB); k++) {
+        if (((k % step) + step) % step !== 0) continue;
+        const w = toW(k);
+        if (w > Math.min(w0, w1) + margin && w < Math.max(w0, w1) - margin) out.push(w);
+      }
+      return out;
+    };
+    /** Type A: vertical aluminium mullions on the 3 m room lines of every massing box + corner columns (no collider). */
+    const mullions = (b: Building, bx: { x0: number; x1: number; z0: number; z1: number }, y0: number, y1: number): void => {
       if (y1 - y0 < 2) return;
-      const S = AR.MULLION_SPACING_M;
       const h = y1 - y0;
       const cy = (y0 + y1) / 2;
+      const cx = (bx.x0 + bx.x1) / 2;
+      const cz = (bx.z0 + bx.z1) / 2;
+      const hw = (bx.x1 - bx.x0) / 2;
+      const hd = (bx.z1 - bx.z0) / 2;
       for (const [ax, sg] of FACES) {
-        const c = ax === 'x' ? cz : cx;
-        const half = ax === 'x' ? hd : hw;
-        for (let a = Math.ceil((c - half + 0.6) / S) * S; a <= c + half - 0.6; a += S) {
+        const lines = ax === 'x' ? roomLines(b, ax, sg, bx.z0, bx.z1, 1, 0.6) : roomLines(b, ax, sg, bx.x0, bx.x1, 1, 0.6);
+        for (const a of lines) {
           if (ax === 'x') G.steel.push(boxAt(AR.MULLION_D, h, AR.MULLION_W, cx + sg * (hw + AR.MULLION_D / 2), cy, a));
           else G.steel.push(boxAt(AR.MULLION_W, h, AR.MULLION_D, a, cy, cz + sg * (hd + AR.MULLION_D / 2)));
         }
@@ -3620,16 +3867,23 @@ export class CityBuilder {
       for (const [sx, sz] of CORNERS_4) G.steel.push(boxAt(AR.MULLION_D + 0.1, h, AR.MULLION_D + 0.1, cx + sx * (hw + 0.02), cy, cz + sz * (hd + 0.02)));
     };
 
-    /** Type B: thick cast-concrete corner pilasters (0.4 m relief ≤ 0.45 m: decorative, no collider — 6B-2). */
+    /** True when the corner point lies on / inside another massing box at that height (concave or shared corner). */
+    const coveredCorner = (b: Building, self: number, x: number, z: number, y: number): boolean =>
+      b.plan.boxes.some((o, j) => j !== self && o.y0 <= y && o.y1 > y && x >= o.x0 - 1e-6 && x <= o.x1 + 1e-6 && z >= o.z0 - 1e-6 && z <= o.z1 + 1e-6);
+    /** Type B: thick cast-concrete pilasters on every convex massing corner (0.4 m relief ≤ 0.45 m: no collider). */
     const pilasters = (b: Building): void => {
       const P = AR.PILASTER_W;
       const O = AR.PILASTER_OUT;
-      const top = lowTopOf(b) + 0.4;
-      for (const [sx, sz] of CORNERS_4) {
-        const x = b.cx + sx * (b.lotHalfW + O - P / 2);
-        const z = b.cz + sz * (b.lotHalfD + O - P / 2);
-        G.bodies.push(plainBody(boxAt(P, top, P, x, top / 2, z), b.seed, ARCH_B));
-      }
+      b.plan.boxes.forEach((bx, i) => {
+        const y0 = bx.y0;
+        const top = bx.y1 + 0.4 - y0;
+        for (const [sx, sz] of CORNERS_4) {
+          const cxr = sx > 0 ? bx.x1 : bx.x0;
+          const czr = sz > 0 ? bx.z1 : bx.z0;
+          if (coveredCorner(b, i, cxr, czr, y0 + 1)) continue;
+          G.bodies.push(plainBody(boxAt(P, top, P, cxr + sx * (O - P / 2), y0 + top / 2, czr + sz * (O - P / 2)), b.seed, ARCH_B));
+        }
+      });
     };
 
     const facadeFeatures: FacadeFeature[] = [];
@@ -3715,6 +3969,14 @@ export class CityBuilder {
       }
     };
 
+    /** 9A: fire-escape landing gaps in the roof parapet, and along ranges kept free of 1F doors per face. */
+    const escapeGaps: Array<{ building: number; ax: Axis; sg: number; plane: number; a0: number; a1: number }> = [];
+    const blockedRanges = new Map<string, Array<[number, number]>>();
+    const blockRange = (key: string, a0: number, a1: number): void => {
+      const l = blockedRanges.get(key) ?? [];
+      l.push([Math.min(a0, a1), Math.max(a0, a1)]);
+      blockedRanges.set(key, l);
+    };
     /** 6A-4 zig-zag steel fire escape: landings every 4 m (RampCollider flights between them). */
     let escapeCount = 0;
     let flightCount = 0;
@@ -3733,7 +3995,13 @@ export class CityBuilder {
       const toRoof = lowTop <= FE.ROOF_ACCESS_MAX_Y;
       const top = toRoof ? lowTop : LH * (3 + Math.floor(arng() * 4));
       const K = Math.round(top / LH);
-      if (toRoof) roofEscapes.add(fkey(b, ax, sg));
+      if (toRoof) {
+        roofEscapes.add(fkey(b, ax, sg));
+        // 9A-1: 2.4 m parapet gap centred on the top landing.
+        const lc = (K % 2 === 1 ? nearA : farA) + LW / 2;
+        escapeGaps.push({ building: b.index, ax, sg, plane: f.face, a0: lc - GRAMMAR.ESCAPE_GAP_M / 2, a1: lc + GRAMMAR.ESCAPE_GAP_M / 2 });
+      }
+      blockRange(fkey(b, ax, sg), nearA - 0.3, farA + LW + 0.3);
       facadeFeatures.push({ kind: 'FIRE_ESCAPE', building: b.index, center: f.P3(farA, 0, LD * 0.75), normal: new THREE.Vector3(f.nx, 0, f.nz), top: K * LH });
       const alongAxis: Axis = ax === 'x' ? 'z' : 'x';
       for (let k = 1; k <= K; k++) {
@@ -3805,12 +4073,14 @@ export class CityBuilder {
       const O = AR.DUCT_OUT;
       for (let k = 0; k < n; k++) {
         const a = f.c + (n === 1 ? (arng() - 0.5) * f.len * 0.4 : (k === 0 ? -1 : 1) * f.len * 0.3);
+        blockRange(fkey(b, ax, sg), a - W2 - 0.5, a + W2 + 0.5);
         G.steel.push(f.box(a - W2, a + W2, 0.4, lowTop + 0.9, 0, O), f.box(a - W2 - 0.15, a + W2 + 0.15, lowTop + 0.9, lowTop + 1.15, -0.1, O + 0.2));
         for (let y = 3; y < lowTop; y += 3) G.steel.push(f.box(a - W2 - 0.05, a + W2 + 0.05, y, y + 0.08, 0, O + 0.04));
         for (const off of [W2 + 0.25, W2 + 0.45]) G.steel.push(f.box(a + off - 0.05, a + off + 0.05, 0, lowTop + 0.3, 0.12, 0.22));
       }
       if (f.len >= 10) {
         const a = f.c + (arng() - 0.5) * (f.len - 8);
+        blockRange(fkey(b, ax, sg), a - 3.3, a + 3.3);
         G.bodies.push(plainBody(f.box(a - 3, a + 3, 0, 1.1, 0, 1.6), b.seed, ARCH_B));
         f.coll(a - 3, a + 3, 0, 1.1, 0, 1.6);
         for (const s of [-2, 2]) G.steel.push(f.box(a + s - 0.18, a + s + 0.18, 0.35, 0.95, 1.6, 1.75));
@@ -3826,25 +4096,8 @@ export class CityBuilder {
     const shutterFront = (b: Building, ax: Axis, sg: number): void => {
       const f = faceFrame(b, ax, sg);
       const RT = AR.BASE_TOP_M;
-      const PW = AR.SHUTTER_PILLAR_M;
-      const PO = AR.SHUTTER_PILLAR_OUT_M;
       facadeFeatures.push({ kind: 'SHUTTER_FRONT', building: b.index, center: f.P3(f.c, 0, 0), normal: new THREE.Vector3(f.nx, 0, f.nz), top: RT });
-      const bays = Math.max(1, Math.round((f.len - PW) / AR.SHUTTER_PILLAR_SPACING_M));
-      const bw = (f.len - PW) / bays;
-      for (let k = 0; k <= bays; k++) {
-        const a = f.a0 + PW / 2 + k * bw;
-        G.bodies.push(plainBody(f.box(a - PW / 2, a + PW / 2, 0, RT, 0, PO), b.seed, ARCH_D));
-        G.steel.push(f.box(a - PW / 2 - 0.03, a + PW / 2 + 0.03, 0, 0.32, 0, PO + 0.04));
-      }
-      // Sign fascia over the shutters (dark steel box, neon edge) + the warm downlight strip on its soffit.
-      const [fy0, fy1] = AR.SHUTTER_FASCIA_Y;
-      const FO = AR.SHUTTER_FASCIA_OUT_M;
-      G.steel.push(f.box(f.a0 + PW, f.a1 - PW, fy0, fy1, 0, FO));
-      const tintF = NEON_TINTS[Math.floor(srng() * NEON_TINTS.length)];
-      G.strips.push(withColor(f.box(f.a0 + PW + 0.1, f.a1 - PW - 0.1, fy1 - 0.05, fy1 - 0.02, FO, FO + 0.02), tintF, 1.1));
-      G.strips.push(withColor(f.box(f.a0 + PW + 0.25, f.a1 - PW - 0.25, fy0 - 0.03, fy0, 0.04, FO - 0.04), COLORS.STREET_LAMP, 1.05));
-      const sp = f.P3(f.c, 2.6, 0.9);
-      addLight(sp.x, sp.y, sp.z, FACADE.WARM_A, 1.3);
+      // 9A-4: the 1F street base (piers, doors, fascia) now comes from the face's ground program.
       // Horizontal canopy on every floor above the shopfront (dense wide banners).
       const tint = NEON_TINTS[Math.floor(srng() * NEON_TINTS.length)];
       const floors = Math.min(AR.FLOOR_CANOPIES_MAX, Math.floor((lowTopOf(b) - RT - 3) / 4) + 1);
@@ -3863,10 +4116,9 @@ export class CityBuilder {
 
     buildings.forEach((b) => {
       const lowTop = lowTopOf(b);
-      if (b.arch === ARCH_A) {
-        mullions(b.cx, b.cz, b.lotHalfW, b.lotHalfD, 4.0, lowTop - 0.45);
-        if (b.setbackY > 0) mullions(b.cx, b.cz, b.halfW, b.halfD, b.setbackY + 0.05, b.roofY - 0.45);
-      } else if (b.arch === ARCH_B) pilasters(b);
+      void lowTop;
+      if (b.arch === ARCH_A) for (const bx of b.plan.boxes) mullions(b, bx, Math.max(4.0, bx.y0 + 0.05), bx.y1 - 0.45);
+      else if (b.arch === ARCH_B) pilasters(b);
       for (const [ax, sg] of FACES) {
         const key = fkey(b, ax, sg);
         if (balconyFaces.has(key)) balconies(b, ax, sg);
@@ -3875,6 +4127,559 @@ export class CityBuilder {
         if (shutterFaces.has(key)) shutterFront(b, ax, sg);
       }
     });
+
+    // =========================================================================================
+    // 9A architectural pass: galleries, pencil spines, ground programs, slab bands, piers, parapets, pipes
+    // =========================================================================================
+    const GR = GRAMMAR;
+    const grng = createRng(0x9a0d + sector.index * 97 + loop * 389);
+    const propSockets: PropSocket[] = [];
+    const doorClearZones: RectXZ[] = [];
+    const eateryVents: THREE.Vector3[] = [];
+    const programCounts: Record<GroundProgram, number> = { CYBER_EATERY: 0, TECH_APPAREL: 0, CAPSULE_HOTEL: 0, CYBER_APARTMENT: 0, ALLEY_INFRA: 0 };
+    const doorSizes: Array<[number, number]> = [];
+    let doorId = 0;
+    let galleryDoors = 0;
+    let galleryLevels = 0;
+    let galleryRamps = 0;
+    let galleriesLinked = 0;
+    let spineCount = 0;
+    let bandCount = 0;
+    let pierCount = 0;
+    let parapetLen = 0;
+    let parapetGapCount = 0;
+    let pipeBundles = 0;
+    /** Span-local frame: `a` along the wall, `y` up, `d` metres out from the wall plane. */
+    const sf = (ax: Axis, sg: number, plane: number) => {
+      const P3 = (al: number, y: number, d: number): THREE.Vector3 => (ax === 'x' ? new THREE.Vector3(plane + sg * d, y, al) : new THREE.Vector3(al, y, plane + sg * d));
+      const ext = (a0: number, a1: number, y0: number, y1: number, d0: number, d1: number) => {
+        const lo = P3(a0, y0, d0);
+        const hi = P3(a1, y1, d1);
+        return { w: Math.abs(hi.x - lo.x), h: y1 - y0, d: Math.abs(hi.z - lo.z), x: (lo.x + hi.x) / 2, y: (y0 + y1) / 2, z: (lo.z + hi.z) / 2, lo, hi };
+      };
+      const bx = (a0: number, a1: number, y0: number, y1: number, d0: number, d1: number, ao: Parameters<typeof aoBox>[6] = {}): THREE.BufferGeometry[] => {
+        const e = ext(a0, a1, y0, y1, d0, d1);
+        return aoBox(Math.max(e.w, 0.005), Math.max(e.h, 0.005), Math.max(e.d, 0.005), e.x, e.y, e.z, ao);
+      };
+      const paint = (hex: number, a0: number, a1: number, y0: number, y1: number, d0: number, d1: number, ao: Parameters<typeof aoBox>[6] = {}): THREE.BufferGeometry[] =>
+        bx(a0, a1, y0, y1, d0, d1, { tile: 1.6, ...ao }).map((g) => withTint(g, hex));
+      const glow = (hex: number, k: number, a0: number, a1: number, y0: number, y1: number, d0: number, d1: number): THREE.BufferGeometry => {
+        const e = ext(a0, a1, y0, y1, d0, d1);
+        return withColor(boxAt(Math.max(e.w, 0.005), Math.max(e.h, 0.005), Math.max(e.d, 0.005), e.x, e.y, e.z), hex, k);
+      };
+      const coll = (a0: number, a1: number, y0: number, y1: number, d0: number, d1: number, building: number, kind: ColliderKind = 'PROP'): void => {
+        const e = ext(a0, a1, y0, y1, d0, d1);
+        colliders.push({ min: new THREE.Vector3(Math.min(e.lo.x, e.hi.x), y0, Math.min(e.lo.z, e.hi.z)), max: new THREE.Vector3(Math.max(e.lo.x, e.hi.x), y1, Math.max(e.lo.z, e.hi.z)), kind, building });
+      };
+      /** Slanted slab from the wall (yIn at d0) out to yOut at d1 across [a0, a1] (awnings). */
+      const slant = (a0: number, a1: number, yIn: number, yOut: number, d0: number, d1: number, th: number): THREE.BufferGeometry => {
+        const run = d1 - d0;
+        const len = Math.hypot(run, yIn - yOut);
+        const ang = Math.atan2(yIn - yOut, run);
+        const g = ax === 'x' ? new THREE.BoxGeometry(len, th, a1 - a0) : new THREE.BoxGeometry(a1 - a0, th, len);
+        if (ax === 'x') g.rotateZ(-ang * sg);
+        else g.rotateX(ang * sg);
+        const c = P3((a0 + a1) / 2, (yIn + yOut) / 2, (d0 + d1) / 2);
+        g.translate(c.x, c.y, c.z);
+        return applyAo(g, { bottom: GR.AO_UNDERSIDE });
+      };
+      return { P3, bx, paint, glow, coll, slant, ref: { ax, sg, plane }, nx: ax === 'x' ? sg : 0, nz: ax === 'z' ? sg : 0 };
+    };
+    type SF = ReturnType<typeof sf>;
+
+    // ---------------------------------------------------------------- GALLERY_DANCHI corridors
+    const galleryDoorPaint = (b: Building): number => PAINT.DOORS[Math.floor(b.seed * 97) % PAINT.DOORS.length];
+    const ramp = (f: SF, ax: Axis, aLow: number, aHigh: number, yLow: number, yHigh: number, d0: number, d1: number): void => {
+      const alongAxis: Axis = ax === 'x' ? 'z' : 'x';
+      const l0 = f.ref.plane + f.ref.sg * d0;
+      const l1 = f.ref.plane + f.ref.sg * d1;
+      rampColliders.push({ axis: alongAxis, lateralMin: Math.min(l0, l1), lateralMax: Math.max(l0, l1), alongStart: aHigh, alongEnd: aLow, yStart: yHigh, yEnd: yLow, thickness: 0.25, steel: true });
+      for (const d of [d0 + 0.03, d1 - 0.03]) G.steel.push(beam(f.P3(aLow, yLow - 0.12, d), f.P3(aHigh, yHigh - 0.12, d), 0.05, 0.22));
+      const steps = Math.max(4, Math.round((yHigh - yLow) / 0.2));
+      const half = Math.abs(aHigh - aLow) / steps / 2 + 0.03;
+      for (let i = 0; i < steps; i++) {
+        const a = aLow + ((aHigh - aLow) * (i + 0.5)) / steps;
+        const ty = yLow + ((i + 1) * (yHigh - yLow)) / steps - 0.02;
+        G.steel.push(...f.bx(a - half, a + half, ty - 0.05, ty, d0 + 0.05, d1 - 0.05));
+      }
+      G.steel.push(beam(f.P3(aLow, yLow + 1.0, d1 - 0.03), f.P3(aHigh, yHigh + 1.0, d1 - 0.03), 0.05));
+      galleryRamps++;
+    };
+    const gallery = (b: Building, ax: Axis, sg: number): void => {
+      const f0 = faceFrame(b, ax, sg);
+      const f = sf(ax, sg, f0.face);
+      const gp = planGallery(b.arch, f0.a0, f0.a1);
+      const D = GR.GALLERY_DEPTH_M;
+      const S = GR.GALLERY_SLAB_M;
+      const RH = GR.GALLERY_RAIL_M;
+      const doorHex = galleryDoorPaint(b);
+      const e0 = f0.a0 + GR.GALLERY_END_PIER_M;
+      const e1 = f0.a1 - GR.GALLERY_END_PIER_M;
+      const sub = (a0: number, a1: number, cuts: ReadonlyArray<readonly [number, number]>): Array<[number, number]> => subtractIntervals(a0, a1, cuts.map(([c0, c1]) => [c0, c1] as [number, number]));
+      gp.levels.forEach((lv, li) => {
+        const ceilY = (li + 1 < gp.levels.length ? gp.levels[li + 1].y : gp.capY) - S;
+        G.concrete.push(...f.bx(lv.a0, lv.a1, lv.y - S, lv.y, 0, D, { bottom: GR.AO_SOFFIT_GALLERY, tile: RENDER.ROOF_TILE_M }));
+        f.coll(lv.a0, lv.a1, lv.y - S, lv.y, 0, D, b.index);
+        // Floor drain channel along the outer edge.
+        G.steel.push(...f.bx(lv.a0, lv.a1, lv.y - 0.005, lv.y + 0.01, D - 0.2, D - 0.12, { all: 0.7 }));
+        // Outer balustrade (top / bottom rails, pickets every 0.42 m) open where a stair landing meets the deck.
+        for (const [r0, r1] of sub(lv.a0, lv.a1, lv.railGaps)) {
+          if (r1 - r0 < 0.2) continue;
+          G.steel.push(...f.bx(r0, r1, lv.y + RH - 0.05, lv.y + RH, D - 0.07, D), ...f.bx(r0, r1, lv.y + 0.1, lv.y + 0.14, D - 0.06, D - 0.02));
+          for (let a = r0 + 0.05; a <= r1 - 0.04; a += GR.GALLERY_PICKET_M) G.steel.push(...f.bx(a - 0.015, a + 0.015, lv.y, lv.y + RH, D - 0.05, D - 0.02));
+          f.coll(r0, r1, lv.y, lv.y + RH, D - 0.1, D, b.index);
+        }
+        // End railings.
+        for (const a of [lv.a0, lv.a1]) {
+          G.steel.push(...f.bx(a - 0.03, a + 0.03, lv.y + RH - 0.05, lv.y + RH, 0, D));
+          f.coll(a - 0.05, a + 0.05, lv.y, lv.y + RH, 0, D, b.index);
+        }
+        // Overhead infrastructure: galvanised cable-tray ladder on the outer soffit, two conduits, caged tubes.
+        if (ceilY - lv.y > 2.4) {
+          const tY = ceilY - 0.14;
+          G.steel.push(...f.bx(lv.a0, lv.a1, tY, tY + 0.05, D - 0.62, D - 0.58), ...f.bx(lv.a0, lv.a1, tY, tY + 0.05, D - 0.2, D - 0.16));
+          for (let a = lv.a0 + 0.3; a < lv.a1; a += 0.6) G.steel.push(...f.bx(a - 0.015, a + 0.015, tY, tY + 0.025, D - 0.6, D - 0.18));
+          for (const d of [0.32, 0.46]) G.steel.push(aoPipe(f.P3(lv.a0, ceilY - 0.07, d), f.P3(lv.a1, ceilY - 0.07, d), 0.03, null));
+          for (let a = lv.a0 + 2; a < lv.a1 - 0.6; a += GR.GALLERY_COLUMN_M) {
+            const warm = Math.floor(a * 7.3 + li) % 3 === 0;
+            G.strips.push(f.glow(warm ? 0xffd9a0 : 0xdcecff, 0.85, a - 0.6, a + 0.6, ceilY - 0.1, ceilY - 0.06, 0.7, 0.76));
+            G.steel.push(...f.bx(a - 0.65, a + 0.65, ceilY - 0.13, ceilY - 0.12, 0.66, 0.8), ...f.bx(a - 0.65, a - 0.62, ceilY - 0.13, ceilY, 0.66, 0.8), ...f.bx(a + 0.62, a + 0.65, ceilY - 0.13, ceilY, 0.66, 0.8));
+            if (Math.floor((a - lv.a0) / GR.GALLERY_COLUMN_M) % 2 === 0) {
+              const lp = f.P3(a, ceilY - 0.4, 0.9);
+              if (!lightNear(lp.x, lp.y, lp.z, 3)) addLight(lp.x, lp.y, lp.z, warm ? 0xffd9a0 : 0xdcecff, 0.9);
+            }
+          }
+        }
+        // Apartment doors every 4 m: frame surround, recessed painted steel door, barred corridor window.
+        for (const a of lv.doors) {
+          const y = lv.y;
+          G.concrete.push(
+            ...f.bx(a - 0.65, a - 0.51, y, y + 2.3, 0, 0.18, { all: 0.8, tile: RENDER.ROOF_TILE_M }),
+            ...f.bx(a + 0.51, a + 0.65, y, y + 2.3, 0, 0.18, { all: 0.8, tile: RENDER.ROOF_TILE_M }),
+            ...f.bx(a - 0.65, a + 0.65, y + 2.15, y + 2.3, 0, 0.18, { bottom: GR.AO_UNDERSIDE, tile: RENDER.ROOF_TILE_M }),
+          );
+          G.archPaint.push(
+            ...f.paint(doorHex, a - 0.51, a + 0.51, y, y + 2.15, 0.01, 0.06, { all: 0.5 }),
+            ...f.paint(PAINT.FRAME_DARK, a - 0.5, a + 0.5, y + 1.07, y + 1.09, 0.06, 0.065),
+            ...f.paint(PAINT.STEEL_BRUSHED, a - 0.44, a + 0.44, y + 0.02, y + 0.26, 0.06, 0.07),
+            ...f.paint(PAINT.STEEL_BRUSHED, a + 0.2, a + 0.42, y + 1.0, y + 1.06, 0.06, 0.1),
+            ...f.paint(PAINT.STEEL_BRUSHED, a - 0.03, a + 0.03, y + 1.55, y + 1.6, 0.06, 0.08),
+          );
+          const wa = a + 1.55;
+          if (wa + 0.6 < lv.a1 && !lv.doors.some((o) => Math.abs(o - wa) < 1.3)) {
+            G.archPaint.push(...f.paint(0x0c0f13, wa - 0.55, wa + 0.55, y + 1.1, y + 2.2, 0.01, 0.03, { all: 0.6 }));
+            G.steel.push(...f.bx(wa - 0.6, wa + 0.6, y + 1.05, y + 1.1, 0, 0.08), ...f.bx(wa - 0.6, wa + 0.6, y + 2.2, y + 2.25, 0, 0.08));
+            for (let k = -4; k <= 4; k++) G.steel.push(...f.bx(wa + k * 0.12 - 0.012, wa + k * 0.12 + 0.012, y + 1.1, y + 2.2, 0.04, 0.07));
+          }
+          propSockets.push(...doorSockets(f.ref, { a, w: 1.02, h: 2.15 }, y, 'GALLERY', ['FLOOR_L', 'FLOOR_R', 'WALL_SIDE', 'WALL_HIGH'], b.index, doorId++, grng));
+          galleryDoors++;
+        }
+        galleryLevels++;
+      });
+      // Corridor cap over the top level, outer columns every 4 m (ground → cap), zig-zag external stair.
+      G.concrete.push(...f.bx(e0, e1, gp.capY - S, gp.capY, 0, D, { bottom: GR.AO_SOFFIT_GALLERY, tile: RENDER.ROOF_TILE_M }));
+      f.coll(e0, e1, gp.capY - S, gp.capY, 0, D, b.index);
+      // Outer columns stay clear of the landing gaps so the deck → stair step is unobstructed.
+      for (let a = e0 + 0.12; a <= e1 - 0.1; a += GR.GALLERY_COLUMN_M) {
+        if (gp.landings.some((l) => a + 0.12 > l.a0 - 0.05 && a - 0.12 < l.a1 + 0.05)) continue;
+        G.concrete.push(...f.bx(a - 0.12, a + 0.12, 0, gp.capY - S, D - 0.26, D - 0.02, { ground: true, tile: RENDER.ROOF_TILE_M }));
+        f.coll(a - 0.12, a + 0.12, 0, gp.capY - S, D - 0.26, D - 0.02, b.index);
+      }
+      // Zig-zag external stair: flights + landings (steel grating, outer and end guard rails).
+      for (const r of gp.ramps) ramp(f, ax, r.aLow, r.aHigh, r.yLow, r.yHigh, r.d0, r.d1);
+      for (const ld of gp.landings) {
+        G.steel.push(...f.bx(ld.a0, ld.a1, ld.y - 0.12, ld.y, ld.d0, ld.d1, { bottom: GR.AO_UNDERSIDE }));
+        f.coll(ld.a0, ld.a1, ld.y - 0.25, ld.y, ld.d0, ld.d1, b.index);
+        const ea = ld.endRail > 0 ? ld.a1 : ld.a0;
+        const e0r = ld.endRail > 0 ? ea - 0.05 : ea;
+        G.steel.push(...f.bx(ld.a0, ld.a1, ld.y + RH - 0.05, ld.y + RH, ld.d1 - 0.06, ld.d1), ...f.bx(e0r, e0r + 0.05, ld.y + RH - 0.05, ld.y + RH, ld.d0, ld.d1));
+        for (let a = ld.a0 + 0.05; a <= ld.a1 - 0.04; a += GR.GALLERY_PICKET_M) G.steel.push(...f.bx(a - 0.015, a + 0.015, ld.y, ld.y + RH, ld.d1 - 0.05, ld.d1 - 0.02));
+        for (let d = ld.d0 + 0.3; d < ld.d1 - 0.1; d += GR.GALLERY_PICKET_M) G.steel.push(...f.bx(e0r + 0.01, e0r + 0.04, ld.y, ld.y + RH, d - 0.015, d + 0.015));
+        f.coll(ld.a0, ld.a1, ld.y, ld.y + RH, ld.d1 - 0.1, ld.d1, b.index);
+        f.coll(ld.endRail > 0 ? ea - 0.1 : ea, ld.endRail > 0 ? ea : ea + 0.1, ld.y, ld.y + RH, ld.d0, ld.d1, b.index);
+        if (ld.post) {
+          const pa = ld.endRail > 0 ? ld.a1 - 0.14 : ld.a0;
+          G.steel.push(...f.bx(pa, pa + 0.14, 0, ld.y - 0.12, ld.d1 - 0.14, ld.d1, { ground: true }));
+          f.coll(pa, pa + 0.14, 0, ld.y - 0.12, ld.d1 - 0.14, ld.d1, b.index);
+        } else {
+          // Upper landings hang on two knee brackets back to the deck edge.
+          for (const a of [ld.a0 + 0.2, ld.a1 - 0.2]) G.steel.push(beam(f.P3(a, ld.y - 0.95, ld.d0 + 0.02), f.P3(a, ld.y - 0.14, ld.d1 - 0.08), 0.045));
+        }
+      }
+      if (gp.ramps.length === GR.GALLERY_LEVELS) galleriesLinked++;
+      const stair = gp.ramps.find((r) => r.yLow === 0);
+      const stairLanding = stair ? gp.landings.find((l) => l.post) : undefined;
+      if (stair) blockRange(fkey(b, ax, sg), Math.min(stair.aLow, stair.aHigh) - 0.3, Math.max(stair.aLow, stair.aHigh, stairLanding ? stairLanding.a1 : -Infinity) + 0.3);
+      facadeFeatures.push({ kind: 'GALLERY', building: b.index, center: f.P3(f0.c, gp.levels[0].y, D / 2), normal: new THREE.Vector3(f.nx, 0, f.nz), top: gp.levels[gp.levels.length - 1].y });
+    };
+
+    // ---------------------------------------------------------------- PENCIL_TOWER service spine
+    const spine = (b: Building, ax: Axis, sg: number): void => {
+      const f0 = faceFrame(b, ax, sg);
+      const f = sf(ax, sg, f0.face);
+      const W2 = GR.SPINE_W_M / 2;
+      const SD = GR.SPINE_D_M;
+      const a = f0.c + (grng() - 0.5) * Math.max(0, f0.len - GR.SPINE_W_M - 3) * 0.6;
+      const top = b.roofY + 2.0;
+      G.concrete.push(...f.bx(a - W2, a + W2, 0, top, 0, SD, { ground: true, tile: RENDER.ROOF_TILE_M }));
+      f.coll(a - W2, a + W2, 0, top, 0, SD, b.index, 'BUILDING');
+      G.concrete.push(...f.bx(a - W2 - 0.1, a + W2 + 0.1, top, top + 0.25, -0.1, SD + 0.1, { tile: RENDER.ROOF_TILE_M }));
+      // Recessed vertical cable chase with two risers, floor-marker vents with a tiny cyan level light.
+      G.steel.push(...f.bx(a - 0.32, a + 0.32, 0.4, top - 0.4, SD, SD + 0.015, { all: 0.4 }));
+      for (const o of [-0.14, 0.14]) G.steel.push(aoPipe(f.P3(a + o, 0.4, SD + 0.06), f.P3(a + o, top - 0.4, SD + 0.06), 0.045, new THREE.Vector3(f.nx, 0, f.nz)));
+      for (let n = 1; floorTopY(b.arch, n) < top - 1; n++) {
+        const y = floorTopY(b.arch, n);
+        G.steel.push(...f.bx(a - 1.05, a - 0.45, y - 0.7, y - 0.25, SD, SD + 0.05), ...f.bx(a + 0.45, a + 1.05, y - 0.7, y - 0.25, SD, SD + 0.05));
+        if (n % 2 === 0) G.strips.push(f.glow(COLORS.WALLRUN_CYAN, 0.7, a + 1.1, a + 1.25, y - 0.55, y - 0.4, SD, SD + 0.02));
+      }
+      // Dense stacked vertical neon blades on the spine flanks.
+      for (let y = 6 + grng() * 2, k = 0; y < Math.min(top - 4, 44); y += 5.5 + grng() * 2.5, k++) {
+        const side = k % 2 === 0 ? -1 : 1;
+        const w = 1.2 + grng() * 0.8;
+        const hgt = 3.2 + grng() * 1.6;
+        const p = f.P3(a + side * (W2 + w / 2 + 0.05), y, SD * 0.5);
+        addNeon(p.x, p.y, p.z, ax === 'x' ? 0 : 1, ax === 'x' ? 1 : 0, w, hgt, Math.floor(grng() * 8));
+      }
+      blockRange(fkey(b, ax, sg), a - W2 - 0.3, a + W2 + 0.3);
+      facadeFeatures.push({ kind: 'SPINE', building: b.index, center: f.P3(a, 0, SD), normal: new THREE.Vector3(f.nx, 0, f.nz), top });
+      spineCount++;
+    };
+
+    buildings.forEach((b) => {
+      for (const [ax, sg] of FACES) {
+        if (galleryFaces.has(fkey(b, ax, sg))) gallery(b, ax, sg);
+        if (spineFaces.has(fkey(b, ax, sg))) spine(b, ax, sg);
+      }
+    });
+
+    // ---------------------------------------------------------------- 9A-4 ground-floor programs
+    type GroundFace = { b: Building; span: FaceSpan; key: string; alley: boolean; run: boolean };
+    const groundFaces: GroundFace[] = [];
+    buildings.forEach((b) => {
+      for (const span of b.plan.faces) {
+        if (span.y0 > 0.01 || span.a1 - span.a0 < 3) continue;
+        const key = fkey(b, span.ax, span.sg);
+        const alley = span.lot && alleyFaces.has(key);
+        const run = span.lot && runFaces.has(key);
+        groundFaces.push({ b, span, key, alley, run });
+      }
+    });
+    const programs = assignPrograms(
+      groundFaces.map((g, i) => ({ id: i, arch: g.b.arch, alley: g.alley, massing: g.b.massing, len: g.span.a1 - g.span.a0 })),
+      grng,
+    );
+    const NEON_SHOP = [0x38d8f0, 0xe048b8];
+    const groundFace = (g: GroundFace, program: GroundProgram): { piers: number[] } => {
+      const { b, span, run } = g;
+      const f = sf(span.ax, span.sg, span.plane);
+      const plan = planGroundFace(program, span.a0, span.a1, grng, span.lot ? blockedRanges.get(g.key) ?? [] : []);
+      programCounts[program]++;
+      const gTop = Math.min(span.y1, floorTopY(b.arch, 1));
+      const sTop = Math.min(gTop, GR.GROUND_TOP_M);
+      const PD = run ? GR.PIER_D_RUN_M : GR.PIER_D_M;
+      const T = RENDER.ROOF_TILE_M;
+      const feature = !run && !g.alley;
+      // Shared grammar: weathered stone piers every ~4 m with dark steel kick plates.
+      for (const a of plan.piers) {
+        G.concrete.push(...f.bx(a - GR.PIER_W_M / 2, a + GR.PIER_W_M / 2, 0, gTop, 0, PD, { ground: true, tile: T }));
+        G.steel.push(...f.bx(a - GR.PIER_W_M / 2 - 0.02, a + GR.PIER_W_M / 2 + 0.02, 0, GR.KICK_H_M, 0, PD + 0.03, { ground: true }));
+        pierCount++;
+      }
+      // Lintel band over the storefronts (Type B adds a 2 m mezzanine fascia above it).
+      G.concrete.push(...f.bx(span.a0 + 0.2, span.a1 - 0.2, sTop - 0.4, sTop, 0, Math.min(PD, 0.22), { bottom: GR.AO_UNDERSIDE, tile: T }));
+      if (gTop > sTop + 1) G.concrete.push(...f.bx(span.a0 + 0.2, span.a1 - 0.2, gTop - 0.35, gTop - 0.1, 0, 0.12, { bottom: GR.AO_BAND_UNDERSIDE, tile: T }));
+      const oT = sTop - 0.42;
+      const tint = (k: number): number => NEON_SHOP[(Math.floor(b.seed * 31) + k) % 2];
+      for (const bay of plan.bays) {
+        const { a0, a1 } = bay;
+        const m = (a0 + a1) / 2;
+        switch (bay.use) {
+          case 'PANEL':
+            if (program === 'CAPSULE_HOTEL') {
+              G.concrete.push(...f.bx(a0, a1, 0, oT, 0.02, 0.1, { ground: true, all: 0.85, tile: T }));
+              for (let a = a0 + 0.25; a < a1 - 0.1; a += 0.3) G.concrete.push(...f.bx(a - 0.04, a + 0.04, 0.3, oT - 0.1, 0.1, 0.14, { ground: true, tile: T }));
+              G.strips.push(f.glow(0xffb45a, 0.55, m - 0.04, m + 0.04, 0.6, oT - 0.3, 0.14, 0.16));
+            } else {
+              // Eatery: timber / slate panelling (0.38 m reveal) + warm frosted ribbed glass, never hollow.
+              G.archPaint.push(...f.paint(PAINT.TIMBER, a0, a1, 0, 0.92, 0.02, 0.1, { ground: true }), ...f.paint(PAINT.SLATE, a0, a1, oT - 0.4, oT, 0.02, 0.1));
+              G.strips.push(f.glow(0xff9b42, 0.48, a0 + 0.12, a1 - 0.12, 0.98, oT - 0.46, 0.03, 0.05));
+              for (let y = 1.1; y < oT - 0.5; y += 0.2) G.archPaint.push(...f.paint(0x1a1512, a0 + 0.1, a1 - 0.1, y, y + 0.025, 0.06, 0.09));
+            }
+            break;
+          case 'VITRINE': {
+            // Matte black frame, opaque backlit display niches with silhouette dividers, half-lowered ribbed shutter.
+            G.archPaint.push(...f.paint(PAINT.BLACK_ALU, a0, a1, 0, 0.42, 0.02, 0.14, { ground: true }), ...f.paint(PAINT.BLACK_ALU, a0, a0 + 0.1, 0.42, oT, 0.02, 0.14), ...f.paint(PAINT.BLACK_ALU, a1 - 0.1, a1, 0.42, oT, 0.02, 0.14));
+            const shutterY = 0.42 + (oT - 0.42) * 0.62;
+            G.strips.push(f.glow(tint(Math.floor(m)), 0.5, a0 + 0.12, a1 - 0.12, 0.45, shutterY, 0.02, 0.04));
+            for (let k = 1; k < 4; k++) {
+              const a = a0 + ((a1 - a0) * k) / 4;
+              G.archPaint.push(...f.paint(0x07080a, a - 0.05, a + 0.05, 0.45, shutterY, 0.04, 0.09));
+            }
+            G.archPaint.push(...f.paint(PAINT.SHUTTER[0], a0 + 0.1, a1 - 0.1, shutterY, oT, 0.04, 0.08, { all: 0.85 }));
+            for (let y = shutterY + 0.06; y < oT; y += 0.11) G.archPaint.push(...f.paint(0x1d2025, a0 + 0.1, a1 - 0.1, y, y + 0.02, 0.08, 0.095));
+            break;
+          }
+          case 'SHUTTER': {
+            const sh = PAINT.SHUTTER[Math.floor(b.seed * 13 + m) % PAINT.SHUTTER.length];
+            G.archPaint.push(...f.paint(sh, a0 + 0.05, a1 - 0.05, 0.12, oT - 0.3, 0.02, 0.06, { ground: true, all: 0.9 }));
+            for (let y = 0.2; y < oT - 0.3; y += 0.1) G.archPaint.push(...f.paint(0x15171a, a0 + 0.05, a1 - 0.05, y, y + 0.018, 0.06, 0.075));
+            G.steel.push(...f.bx(a0, a1, oT - 0.3, oT, 0.02, 0.2, { bottom: GR.AO_UNDERSIDE }));
+            G.concrete.push(...f.bx(a0, a1, 0, 0.16, 0, run ? 0.2 : 0.32, { ground: true, tile: T }));
+            if (feature) {
+              for (const a of [a0 + 0.25, a1 - 0.25]) {
+                G.archPaint.push(...f.paint(PAINT.HAZARD_Y, a - 0.09, a + 0.09, 0, 0.95, 0.42, 0.6, { ground: true }));
+                for (const y of [0.3, 0.62]) G.archPaint.push(...f.paint(PAINT.HAZARD_K, a - 0.095, a + 0.095, y, y + 0.12, 0.415, 0.605));
+              }
+            }
+            break;
+          }
+          case 'GRILLE':
+            G.archPaint.push(...f.paint(PAINT.FRAME_DARK, a0 + 0.1, a1 - 0.1, 0.5, oT - 0.2, 0.02, 0.06, { all: 0.8 }));
+            for (let y = 0.58; y < oT - 0.25; y += 0.14) G.steel.push(...f.bx(a0 + 0.12, a1 - 0.12, y, y + 0.03, 0.06, 0.12));
+            G.archPaint.push(...f.paint(PAINT.SLATE, a0, a1, 0, 0.5, 0.02, 0.1, { ground: true }));
+            break;
+          case 'MAILBOX': {
+            // Brushed-steel mailbox bank, glowing intercom, utility meter cabinet.
+            const mx = m - 0.3;
+            G.archPaint.push(...f.paint(PAINT.MAILBOX, mx - 0.6, mx + 0.6, 1.0, 1.85, 0.02, 0.16));
+            for (let k = 1; k < 4; k++) G.archPaint.push(...f.paint(0x23262b, mx - 0.6 + k * 0.3 - 0.01, mx - 0.6 + k * 0.3 + 0.01, 1.0, 1.85, 0.16, 0.17));
+            for (const y of [1.28, 1.57]) G.archPaint.push(...f.paint(0x23262b, mx - 0.6, mx + 0.6, y - 0.01, y + 0.01, 0.16, 0.17));
+            G.strips.push(f.glow(0x6fb4ff, 0.8, m + 0.55, m + 0.72, 1.25, 1.5, 0.02, 0.05));
+            G.archPaint.push(...f.paint(0x4b5158, m + 0.45, m + 1.05, 0.4, 1.0, 0.02, 0.22, { ground: true }));
+            G.archPaint.push(...f.paint(PAINT.SLATE, a0, a1, 0, 0.3, 0.02, 0.08, { ground: true }));
+            break;
+          }
+          case 'BLOCKED':
+            G.archPaint.push(...f.paint(PAINT.SLATE, a0, a1, 0, oT, 0.01, 0.04, { ground: true, all: 0.9 }));
+            break;
+          default:
+            break;
+        }
+      }
+      // Doors: human-scale, recessed inside bevelled surrounds; clear entry zone + sockets.
+      const sockets = PROGRAM_SOCKETS[program];
+      for (const door of plan.doors) {
+        const { a, w, h } = door;
+        const r = run ? Math.min(door.recess, GR.PIER_D_RUN_M) : door.recess;
+        const hx = PAINT.DOORS[(Math.floor(b.seed * 53) + doorId) % PAINT.DOORS.length];
+        const leaf = program === 'CYBER_APARTMENT' || program === 'ALLEY_INFRA' ? hx : program === 'CYBER_EATERY' ? 0x5a6068 : PAINT.STEEL_BRUSHED;
+        // Surround (jambs + lintel), threshold step.
+        G.concrete.push(
+          ...f.bx(a - w / 2 - 0.2, a - w / 2, 0, h + 0.2, 0, r, { ground: true, all: 0.75, tile: T }),
+          ...f.bx(a + w / 2, a + w / 2 + 0.2, 0, h + 0.2, 0, r, { ground: true, all: 0.75, tile: T }),
+          ...f.bx(a - w / 2 - 0.2, a + w / 2 + 0.2, h, h + 0.2, 0, r, { bottom: GR.AO_UNDERSIDE, tile: T }),
+          ...f.bx(a - w / 2, a + w / 2, 0, 0.08, 0, r, { all: 0.8, tile: T }),
+        );
+        // Leaf (recess back: dark AO), seams, kick plate, handle.
+        G.archPaint.push(...f.paint(leaf, a - w / 2, a + w / 2, 0.08, h, 0.01, 0.06, { all: GR.AO_RECESS + 0.08 }));
+        if (door.double) G.archPaint.push(...f.paint(0x0b0c0e, a - 0.012, a + 0.012, 0.08, h, 0.06, 0.065));
+        G.archPaint.push(...f.paint(PAINT.FRAME_DARK, a - w / 2, a + w / 2, h * 0.52, h * 0.52 + 0.02, 0.06, 0.065), ...f.paint(PAINT.STEEL_BRUSHED, a - w / 2 + 0.05, a + w / 2 - 0.05, 0.1, 0.32, 0.06, 0.07));
+        G.archPaint.push(...f.paint(PAINT.STEEL_BRUSHED, a + w / 2 - 0.3, a + w / 2 - 0.08, 0.98, 1.04, 0.06, 0.11));
+        if (program === 'TECH_APPAREL') G.strips.push(f.glow(0x58f0ff, 0.9, a + w / 2 + 0.25, a + w / 2 + 0.38, 1.2, 1.42, 0.01, 0.04));
+        if (program === 'ALLEY_INFRA') {
+          G.strips.push(f.glow(0xffb34a, 0.95, a - 0.12, a + 0.12, h + 0.32, h + 0.5, 0.05, 0.17));
+          G.steel.push(...f.bx(a - 0.16, a + 0.16, h + 0.28, h + 0.3, 0, 0.22), ...f.bx(a - 0.16, a + 0.16, h + 0.52, h + 0.54, 0, 0.22));
+        }
+        doorSizes.push([w, h]);
+        doorClearZones.push(doorClearZone(f.ref, a));
+        propSockets.push(...doorSockets(f.ref, { a, w, h }, 0, sockets.group, sockets.slots, b.index, doorId++, grng));
+        // Program portals in front of the door.
+        if (program === 'CAPSULE_HOTEL') {
+          const dp = run ? GR.PIER_D_RUN_M : 0.8;
+          for (const s of [-1, 1]) {
+            const ai = a + s * (w / 2 + 0.36);
+            G.concrete.push(...f.bx(ai - 0.11, ai + 0.11, 0, sTop - 0.4, 0, dp, { ground: true, tile: T }));
+            G.strips.push(f.glow(0xffb45a, 0.7, ai - 0.02, ai + 0.02, 0.4, sTop - 0.7, dp, dp + 0.015));
+          }
+        } else if (program === 'CYBER_APARTMENT') {
+          const dp = run ? GR.PIER_D_RUN_M : 0.68;
+          for (const s of [-1, 1]) G.concrete.push(...f.bx(a + s * (w / 2 + 0.3) - 0.1, a + s * (w / 2 + 0.3) + 0.1, 0, 2.85, 0, dp, { ground: true, tile: T }));
+        }
+      }
+      // Canopies / awnings / exhaust (feature faces only — run faces stay ≤ 0.28 m relief).
+      const ca0 = span.a0 + 0.4;
+      const ca1 = span.a1 - 0.4;
+      const door0 = plan.doors[0];
+      if (feature && ca1 - ca0 > 2) {
+        if (program === 'CYBER_EATERY') {
+          const aw = PAINT.AWNINGS[Math.floor(b.seed * 7 + span.a0) % PAINT.AWNINGS.length];
+          G.archPaint.push(withTint(f.slant(ca0, ca1, 3.55, 3.15, 0, 1.35, 0.06), aw));
+          for (let a = ca0 + 0.1; a < ca1; a += 0.32) G.archPaint.push(withTint(f.slant(a - 0.03, a + 0.03, 3.6, 3.2, 0, 1.33, 0.05), 0x1a1a1d));
+          G.strips.push(f.glow(0xffc884, 0.95, ca0 + 0.2, ca1 - 0.2, 3.12, 3.15, 1.05, 1.15));
+          G.strips.push(f.glow(0xffa848, 0.75, ca0 + 0.3, ca1 - 0.3, 3.66, 3.95, 0.02, 0.1));
+          f.coll(ca0, ca1, 3.12, 3.22, 0, 1.35, b.index);
+          const lp = f.P3((ca0 + ca1) / 2, 2.8, 1.0);
+          addLight(lp.x, lp.y, lp.z, 0xffa860, 1.3);
+          if (door0) {
+            // Counter shelf beside the door.
+            const sa = door0.a + door0.w / 2 + 1.4;
+            if (sa + 0.9 < span.a1 - 0.3) {
+              G.steel.push(...f.bx(sa - 0.9, sa + 0.9, 1.03, 1.08, 0, 0.35), ...f.bx(sa - 0.85, sa - 0.8, 0.7, 1.03, 0, 0.3), ...f.bx(sa + 0.8, sa + 0.85, 0.7, 1.03, 0, 0.3));
+            }
+          }
+          // Stainless exhaust hood + grease duct climbing the wall; its mouth breathes steam.
+          const top = Math.min(span.y1 - 1.0, 12 + grng() * 8);
+          const da = plan.piers[plan.piers.length > 2 ? 1 : 0] + 0.6;
+          if (top > 6 && da + 0.4 < span.a1) {
+            G.steel.push(...f.bx(da - 0.28, da + 0.28, 3.7, top, 0, 0.45, { all: 0.92 }));
+            for (let y = 4.5; y < top - 0.3; y += 3) G.steel.push(...f.bx(da - 0.33, da + 0.33, y, y + 0.08, 0, 0.5));
+            G.steel.push(...f.bx(da - 0.4, da + 0.4, top, top + 0.22, -0.05, 0.6, { bottom: GR.AO_UNDERSIDE }));
+            G.steel.push(...f.bx(da - 0.55, da + 0.55, 3.62, 3.95, 0, 0.62, { bottom: GR.AO_UNDERSIDE }));
+            eateryVents.push(f.P3(da, top + 0.35, 0.3));
+          }
+        } else if (program === 'TECH_APPAREL') {
+          G.steel.push(...f.bx(ca0, ca1, 3.29, 3.41, 0, 1.45, { bottom: GR.AO_UNDERSIDE }));
+          G.strips.push(f.glow(tint(0), 1.35, ca0, ca1, 3.29, 3.33, 1.43, 1.47), f.glow(0xe8f4ff, 0.85, ca0 + 0.3, ca1 - 0.3, 3.26, 3.29, 0.3, 0.36));
+          f.coll(ca0, ca1, 3.29, 3.41, 0, 1.45, b.index);
+          const ba = ca1 - 0.6;
+          const sp = f.P3(ba, 5.6 + grng(), 0.75);
+          addNeon(sp.x, sp.y, sp.z, span.ax === 'x' ? 0 : 1, span.ax === 'x' ? 1 : 0, 1.2, 3.4, Math.floor(grng() * 8));
+        } else if (program === 'CAPSULE_HOTEL' && door0) {
+          const half = Math.min((ca1 - ca0) / 2, 3 + grng());
+          const ma = Math.min(ca1 - half, Math.max(ca0 + half, door0.a));
+          G.steel.push(...f.bx(ma - half, ma + half, 3.47, 3.63, 0, 1.9, { bottom: GR.AO_UNDERSIDE }));
+          G.strips.push(f.glow(0xffb040, 1.3, ma - half, ma + half, 3.47, 3.52, 1.88, 1.92), f.glow(0xff2a50, 1.2, ma - half, ma + half, 3.58, 3.63, 1.88, 1.92));
+          for (let a = ma - half + 0.6; a < ma + half - 0.4; a += 1.2) G.strips.push(f.glow(0xfff0d8, 0.6, a - 0.35, a + 0.35, 3.44, 3.47, 0.6, 1.5));
+          f.coll(ma - half, ma + half, 3.47, 3.63, 0, 1.9, b.index);
+          const tp = f.P3(ma, 4.25, 0.12);
+          addNeon(tp.x, tp.y, tp.z, f.nx, f.nz, Math.min(2 * half - 0.4, 6), 0.7, 6 + Math.floor(grng() * 2), 1);
+          const mh = 8 + grng() * 8;
+          const vp = f.P3(ma + half - 0.3, 4.4 + mh / 2, 0.85);
+          addNeon(vp.x, Math.min(vp.y, span.y1 - mh / 2 - 0.5), vp.z, span.ax === 'x' ? 0 : 1, span.ax === 'x' ? 1 : 0, 1.4, mh, Math.floor(grng() * 8));
+          const lp = f.P3(ma, 2.8, 1.2);
+          addLight(lp.x, lp.y, lp.z, 0xffc070, 1.0);
+        } else if (program === 'CYBER_APARTMENT' && door0) {
+          const ea0 = door0.a - door0.w / 2 - 0.7;
+          const ea1 = door0.a + door0.w / 2 + 0.7;
+          G.concrete.push(...f.bx(ea0, ea1, 2.85, 3.05, 0, 1.15, { bottom: GR.AO_UNDERSIDE, tile: T }));
+          G.strips.push(f.glow(0xdcecff, 0.85, door0.a - 0.55, door0.a + 0.55, 2.79, 2.83, 0.55, 0.6));
+          G.steel.push(...f.bx(door0.a - 0.6, door0.a + 0.6, 2.77, 2.78, 0.5, 0.66));
+          f.coll(ea0, ea1, 2.85, 3.05, 0, 1.15, b.index);
+          const lp = f.P3(door0.a, 2.4, 0.8);
+          addLight(lp.x, lp.y, lp.z, 0xdcecff, 1.0);
+        } else if (program === 'ALLEY_INFRA') {
+          // Wall-mounted high-voltage transformer box with heat-sink fins and status LEDs.
+          const sb = plan.bays.find((bb) => bb.use === 'SHUTTER');
+          if (sb) {
+            const m = (sb.a0 + sb.a1) / 2;
+            G.steel.push(...f.bx(m - 0.5, m + 0.5, 1.2, 2.6, 0.06, 0.5));
+            for (let k = 0; k < 6; k++) G.steel.push(...f.bx(m - 0.45 + k * 0.18 - 0.02, m - 0.45 + k * 0.18 + 0.02, 1.3, 2.5, 0.5, 0.58));
+            G.strips.push(f.glow(0xff3030, 1.3, m + 0.3, m + 0.36, 2.42, 2.48, 0.5, 0.52), f.glow(0xffb020, 1.2, m + 0.18, m + 0.24, 2.42, 2.48, 0.5, 0.52));
+          }
+        }
+      } else if (program === 'CYBER_EATERY' || program === 'TECH_APPAREL') {
+        // Flat run-face variant: a lit fascia box only (≤ 0.12 m relief).
+        G.strips.push(f.glow(program === 'CYBER_EATERY' ? 0xffa848 : tint(1), 0.7, ca0 + 0.3, ca1 - 0.3, 3.66, 3.92, 0.02, 0.1));
+      }
+      return { piers: plan.piers };
+    };
+    const pipeSpots: Array<{ g: GroundFace; piers: number[]; program: GroundProgram }> = [];
+    groundFaces.forEach((g, i) => {
+      const r = groundFace(g, programs[i]);
+      pipeSpots.push({ g, piers: r.piers, program: programs[i] });
+      // 9A-6 dense layered street signage: staggered protruding vertical blades on the piers, 1F–5F (4.6–20 m).
+      const { span, b } = g;
+      if (g.alley || galleryFaces.has(g.key) || spineFaces.has(g.key) || span.y1 < 9) return;
+      const dense = sector.denseNeon || b.arch === ARCH_D ? 1 : 0;
+      for (let k = 1; k < r.piers.length - 1; k += dense ? 1 : 2) {
+        if (grng() < 0.35) continue;
+        const a = r.piers[k];
+        const reach = 1.2 + grng() * 1.6;
+        const hgt = 2.6 + grng() * 3.4;
+        const y = Math.min(span.y1 - hgt / 2 - 1, 4.6 + hgt / 2 + grng() * 13);
+        if (y - hgt / 2 < 4.4) continue;
+        const f = sf(span.ax, span.sg, span.plane);
+        const p = f.P3(a, y, reach / 2 + 0.1);
+        addNeon(p.x, p.y, p.z, span.ax === 'x' ? 0 : 1, span.ax === 'x' ? 1 : 0, reach, hgt, Math.floor(grng() * 8));
+        for (const yy of [y + hgt / 2 - 0.15, y - hgt / 2 + 0.15]) G.steel.push(...f.bx(a - 0.03, a + 0.03, yy - 0.03, yy + 0.03, 0, reach + 0.1));
+      }
+    });
+
+    // ---------------------------------------------------------------- 9A-3 slab drip bands + aligned piers
+    buildings.forEach((b) => {
+      for (const span of b.plan.faces) {
+        const key = fkey(b, span.ax, span.sg);
+        const run = span.lot && runFaces.has(key);
+        const isGallery = span.lot && galleryFaces.has(key);
+        const f = sf(span.ax, span.sg, span.plane);
+        const out = run ? GR.BAND_OUT_RUN_M : GR.BAND_OUT_FEATURE_M;
+        const yMax = Math.min(span.y1 - 1.5, GR.BAND_MAX_Y_M);
+        for (let n = 1; floorTopY(b.arch, n) <= yMax; n++) {
+          const y = floorTopY(b.arch, n);
+          if (y < span.y0 + 3.9) continue;
+          if (isGallery && y <= floorTopY(b.arch, GR.GALLERY_LEVELS + 1) + 0.1) continue;
+          G.concrete.push(...f.bx(span.a0, span.a1, y - GR.BAND_H_M, y, 0, out, { bottom: GR.AO_BAND_UNDERSIDE, tile: RENDER.ROOF_TILE_M }));
+          bandCount++;
+        }
+        // Vertical structure on the room grid (A has its mullions): B piers every room, D every 2 rooms, C H-beam ribs.
+        if (b.arch === ARCH_A || isGallery) continue;
+        const y0 = Math.max(span.y0 + 0.05, floorTopY(b.arch, 1));
+        const y1 = span.y1 - 0.45;
+        if (y1 - y0 < 3) continue;
+        const lines = roomLines(b, span.ax, span.sg, span.a0, span.a1, b.arch === ARCH_D ? 2 : 1, 0.7);
+        const rel = run ? 0.14 : 0.22;
+        for (const a of lines) {
+          if (b.arch === ARCH_C) {
+            G.steel.push(...f.bx(a - 0.06, a + 0.06, y0, y1, 0, rel - 0.05), ...f.bx(a - 0.18, a + 0.18, y0, y1, rel - 0.05, rel));
+          } else {
+            const w = b.arch === ARCH_D ? 0.42 : 0.32;
+            const p0 = f.P3(a - w / 2, y0, 0);
+            const p1 = f.P3(a + w / 2, y1, rel);
+            G.bodies.push(plainBody(boxAt(Math.abs(p1.x - p0.x), y1 - y0, Math.abs(p1.z - p0.z), (p0.x + p1.x) / 2, (y0 + y1) / 2, (p0.z + p1.z) / 2), b.seed, b.arch));
+          }
+          pierCount++;
+        }
+      }
+    });
+
+    // ---------------------------------------------------------------- 9A-1 parapets (1.05 m) + coping
+    buildings.forEach((b) => {
+      const gaps = escapeGaps.filter((gp) => gp.building === b.index);
+      parapetGapCount += gaps.length;
+      for (const seg of parapetSegments(b.plan, gaps)) {
+        const f = sf(seg.ax, seg.sg, seg.plane);
+        const H2 = GR.PARAPET_H;
+        G.concrete.push(...f.bx(seg.a0, seg.a1, seg.y, seg.y + H2, 0.12 - GR.PARAPET_T, 0.12, { ground: true, contact: seg.y, tile: RENDER.ROOF_TILE_M }));
+        G.steel.push(...f.bx(seg.a0, seg.a1, seg.y + H2, seg.y + H2 + GR.COPING_H, 0.15 - GR.COPING_W, 0.15, { bottom: 0.7 }));
+        f.coll(seg.a0, seg.a1, seg.y, seg.y + H2, 0.12 - GR.PARAPET_T, 0.12, b.index);
+        parapetLen += seg.a1 - seg.a0;
+      }
+    });
+
+    // ---------------------------------------------------------------- 9A-6 building-side riser bundles + conduits
+    for (const { g, piers, program } of pipeSpots) {
+      const { b, span, run } = g;
+      if (!(g.alley || program === 'ALLEY_INFRA' || program === 'CYBER_EATERY')) continue;
+      if (span.y1 < 8 || piers.length < 2) continue;
+      const f = sf(span.ax, span.sg, span.plane);
+      const wallN = new THREE.Vector3(f.nx, 0, f.nz);
+      const n = grng() < 0.5 ? 2 : 3;
+      const r = run || g.alley ? 0.075 : 0.1 + grng() * 0.04;
+      const gap = r * 2.4;
+      const base = (grng() < 0.5 ? piers[0] + 0.55 : piers[piers.length - 1] - 0.55 - gap * (n - 1));
+      const top = Math.min(span.y1 - 1.0, 12 + grng() * 16);
+      const d = r + 0.04;
+      for (let k = 0; k < n; k++) {
+        const a = base + k * gap;
+        G.steel.push(aoPipe(f.P3(a, 0.3, d), f.P3(a, top, d), r, wallN, true));
+        // 90° elbow into the facade.
+        G.steel.push(aoPipe(f.P3(a, top - r, d), f.P3(a, top - r, -0.05), r, null));
+        G.steel.push(...f.bx(a - r * 1.15, a + r * 1.15, top - r * 2.1, top + 0.02, d - r * 1.15, d + r * 1.15));
+      }
+      for (let y = 1.6; y < top - 0.5; y += 3.5) G.steel.push(...f.bx(base - r - 0.05, base + gap * (n - 1) + r + 0.05, y, y + 0.06, 0, d + r + 0.04));
+      // Horizontal conduit just above the 1F fascias + junction boxes with status LEDs.
+      if (program === 'ALLEY_INFRA' || program === 'CYBER_EATERY') {
+        const cy = 3.85 + grng() * 0.5;
+        G.steel.push(aoPipe(f.P3(span.a0 + 0.6, cy, 0.09), f.P3(span.a1 - 0.6, cy, 0.09), 0.045, wallN));
+        const jn = span.a1 - span.a0 > 12 ? 2 : 1;
+        for (let k = 0; k < jn; k++) {
+          const ja = span.a0 + (span.a1 - span.a0) * (k + 1) / (jn + 1);
+          G.steel.push(...f.bx(ja - 0.18, ja + 0.18, cy - 0.3, cy + 0.15, 0, 0.15));
+          G.strips.push(f.glow([0xff3030, 0xffb020, 0x30e8ff][(k + Math.floor(b.seed * 5)) % 3], 1.2, ja + 0.08, ja + 0.12, cy + 0.02, cy + 0.06, 0.15, 0.165));
+        }
+      }
+      pipeBundles++;
+    }
 
     // 7B-4: sagging catenary cable bundles (2–3 thin cables, 6 segments each, sag 0.6–1.4 m) strung diagonally
     // across the alleys at 5.5–18 m — visual only (no collider), merged into the existing strip batch (+0 draws);
@@ -3891,7 +4696,8 @@ export class CityBuilder {
         const top = Math.min(C.CABLE_Y[1], lowTopOf(A) - 1.5, lowTopOf(B) - 1.5);
         if (top < C.CABLE_Y[0] + 0.5 || al.gap1 - al.gap0 > 14) continue;
         const span = al.ov1 - al.ov0;
-        const bundles = Math.min(3, 1 + Math.floor(span / 9));
+        // 9A-6: denser layered overhead cables (up to 5 bundles per alley).
+        const bundles = Math.min(5, 1 + Math.floor(span / 6));
         for (let k = 0; k < bundles; k++) {
           const o1 = al.ov0 + ((k + 0.5) / bundles) * span + (srng() - 0.5) * 2;
           const o2 = Math.min(al.ov1 - 0.5, Math.max(al.ov0 + 0.5, o1 + (srng() - 0.5) * 5));
@@ -3915,9 +4721,49 @@ export class CityBuilder {
             if (c === 0 && fibre) G.strips.push(withColor(tube, NEON_TINTS[Math.floor(srng() * NEON_TINTS.length)], 0.55));
             else G.strips.push(withColor(tube, 0x8a97ad, 0.16));
           }
+          // Wall bracket anchors at both ends.
+          for (const [ga, oo, yy] of [[al.gap0, o1, y1], [al.gap1, o2, y2]] as const) {
+            const out = ga === al.gap0 ? 0.12 : -0.12;
+            G.steel.push(al.axis === 'x' ? boxAt(0.24, 0.12, 0.3, ga + out, yy + 0.02, oo) : boxAt(0.3, 0.12, 0.24, oo, yy + 0.02, ga + out));
+          }
           cableBundles++;
           this.cableDebug.push({ x: (a0x(al, o1, o2)), y: (y1 + y2) / 2, z: a0z(al, o1, o2), axis: al.axis });
         }
+      }
+    }
+
+    // 9A-6 alley signage: staggered protruding vertical blades on both alley walls (3.6–24 m, 1.2–2.8 m reach,
+    // facing down the alley) and cross-alley hanging neon bars (6.5–14 m).
+    let alleyNeon = 0;
+    for (const al of alleyRecs) {
+      const A = buildings[al.a];
+      const B = buildings[al.b];
+      const wallTop = Math.min(lowTopOf(A), lowTopOf(B)) - 2;
+      if (wallTop < 6) continue;
+      const along = al.axis === 'x' ? 'z' : 'x';
+      void along;
+      for (const [wall, out] of [[al.gap0, 1], [al.gap1, -1]] as const) {
+        for (let o = al.ov0 + 1.5 + srng() * 2; o < al.ov1 - 1.2; o += 3.4 + srng() * 2.6) {
+          const reach = Math.min(al.gap1 - al.gap0 - 1.4, 1.2 + srng() * 1.6);
+          if (reach < 1) continue;
+          const hgt = 2.4 + srng() * 3.2;
+          const y = Math.min(wallTop - hgt / 2, 3.6 + hgt / 2 + srng() * Math.max(0, Math.min(24, wallTop) - 3.6 - hgt));
+          const c = wall + out * (reach / 2 + 0.1);
+          if (al.axis === 'x') addNeon(c, y, o, 0, 1, reach, hgt, Math.floor(srng() * 8));
+          else addNeon(o, y, c, 1, 0, reach, hgt, Math.floor(srng() * 8));
+          for (const yy of [y + hgt / 2 - 0.15, y - hgt / 2 + 0.15]) G.steel.push(al.axis === 'x' ? boxAt(reach + 0.1, 0.06, 0.06, wall + out * (reach / 2 + 0.05), yy, o) : boxAt(0.06, 0.06, reach + 0.1, o, yy, wall + out * (reach / 2 + 0.05)));
+          alleyNeon++;
+        }
+      }
+      const bars = Math.min(4, 1 + Math.floor((al.ov1 - al.ov0) / 9));
+      for (let k = 0; k < bars; k++) {
+        const o = al.ov0 + ((k + 0.5) / bars) * (al.ov1 - al.ov0);
+        const y = 6.5 + srng() * Math.max(0, Math.min(14, wallTop) - 6.5);
+        const w = al.gap1 - al.gap0 - 0.6;
+        const c = (al.gap0 + al.gap1) / 2;
+        if (al.axis === 'x') addNeon(c, y, o, 0, 1, w, 0.75, Math.floor(srng() * SIGN_ATLAS.WIDE_ROWS), 1);
+        else addNeon(o, y, c, 1, 0, w, 0.75, Math.floor(srng() * SIGN_ATLAS.WIDE_ROWS), 1);
+        alleyNeon++;
       }
     }
 
@@ -3952,6 +4798,8 @@ export class CityBuilder {
 
 
     // ------------------------------------------------------------------ 8. rooftop details, signs, vending
+    /** 9A-2 audit: every roof prop footprint (machine rooms, AC units, ducts, spawns) must sit on solid roof. */
+    const roofPropRects: Array<{ b: Building; r: RectXZ }> = [];
     const tryPlace = (b: Building, hw: number, hd: number, margin: number): RectXZ | null => {
       for (let attempt = 0; attempt < 24; attempt++) {
         const x = b.cx + (rng() * 2 - 1) * Math.max(0, b.halfW - hw - margin);
@@ -3959,6 +4807,7 @@ export class CityBuilder {
         const r = rectFrom(x - hw, z - hd, x + hw, z + hd);
         if (!roofRects[b.index].some((o) => rectsOverlap(r, o, 0.9))) {
           roofRects[b.index].push(r);
+          roofPropRects.push({ b, r });
           return r;
         }
       }
@@ -3966,9 +4815,10 @@ export class CityBuilder {
     };
     const facePoint = (b: Building, axis: Axis, sign: number, along01: number, out: THREE.Vector3): THREE.Vector3 =>
       axis === 'x'
-        ? out.set(b.cx + sign * b.lotHalfW, 0, b.cz + (along01 - 0.5) * b.lotHalfD * 2)
-        : out.set(b.cx + (along01 - 0.5) * b.lotHalfW * 2, 0, b.cz + sign * b.lotHalfD);
+        ? out.set(b.lcx + sign * b.lotHalfW, 0, b.lcz + (along01 - 0.5) * b.lotHalfD * 2)
+        : out.set(b.lcx + (along01 - 0.5) * b.lotHalfW * 2, 0, b.lcz + sign * b.lotHalfD);
 
+    let bulkheads = 0;
     buildings.forEach((b) => {
       const area = b.halfW * b.halfD * 4;
       // Machine room + antenna.
@@ -3980,6 +4830,35 @@ export class CityBuilder {
         if (r) {
           placeInstance(this.machineRooms, counts.room++, (r.x0 + r.x1) / 2, b.roofY, (r.z0 + r.z1) / 2, 0, rw, rh, rd);
           colliders.push({ min: new THREE.Vector3(r.x0, b.roofY, r.z0), max: new THREE.Vector3(r.x1, b.roofY + rh + 0.06, r.z1), kind: 'PROP', building: b.index });
+          // 9A-1 rooftop access bulkhead: recessed painted steel door (1.0 × 2.1 m) on the side facing the roof centre,
+          // with a small caged amber / cyan door light.
+          if (b.halfW * 2 >= GRAMMAR.BULKHEAD_MIN_ROOF_M && b.halfD * 2 >= GRAMMAR.BULKHEAD_MIN_ROOF_M) {
+            const mx = (r.x0 + r.x1) / 2;
+            const mz = (r.z0 + r.z1) / 2;
+            const dx = b.cx - mx;
+            const dz = b.cz - mz;
+            const fx = Math.abs(dx) > Math.abs(dz);
+            const sgn = fx ? Math.sign(dx) || 1 : Math.sign(dz) || 1;
+            const plane = fx ? (sgn > 0 ? r.x1 : r.x0) : sgn > 0 ? r.z1 : r.z0;
+            const along = fx ? mz : mx;
+            const P = (al: number, y: number, d: number): [number, number, number] => (fx ? [plane + sgn * d, y, al] : [al, y, plane + sgn * d]);
+            const pbox = (a0: number, a1: number, y0: number, y1: number, d0: number, d1: number): [number, number, number, number, number, number] => {
+              const [x0, , z0] = P(a0, y0, d0);
+              const [x1, , z1] = P(a1, y1, d1);
+              return [Math.abs(x1 - x0), y1 - y0, Math.abs(z1 - z0), (x0 + x1) / 2, (y0 + y1) / 2, (z0 + z1) / 2];
+            };
+            const ry = b.roofY;
+            const [w1, h1, d1, x1, y1, z1] = pbox(along - 0.5, along + 0.5, ry, ry + 2.1, 0.0, 0.05);
+            G.archPaint.push(...aoBox(w1, h1, d1, x1, y1, z1, { all: GRAMMAR.AO_RECESS + 0.1, tile: 1.6 }).map((g) => withTint(g, PAINT.DOORS[Math.floor(b.seed * 11) % PAINT.DOORS.length])));
+            for (const [a0, a1, y0, y2] of [[along - 0.62, along - 0.5, ry, ry + 2.22], [along + 0.5, along + 0.62, ry, ry + 2.22], [along - 0.62, along + 0.62, ry + 2.1, ry + 2.22]] as const) {
+              const [w2, h2, d2, x2, y2c, z2] = pbox(a0, a1, y0, y2, 0, 0.12);
+              G.steel.push(boxAt(w2, h2, d2, x2, y2c, z2));
+            }
+            const [w3, h3, d3, x3, y3, z3] = pbox(along - 0.1, along + 0.1, ry + 2.38, ry + 2.56, 0.04, 0.16);
+            const lightHex = b.seed < 0.5 ? 0xffb040 : COLORS.WALLRUN_CYAN;
+            G.strips.push(withColor(boxAt(w3, h3, d3, x3, y3, z3), lightHex, 1.0));
+            bulkheads++;
+          }
           if (counts.ant < CAP.ANTENNA) {
             const ah = 6 + rng() * 8;
             placeInstance(this.antennas, counts.ant++, r.x0 + 0.8, b.roofY + rh, r.z0 + 0.8, 0, 1, ah, 1);
@@ -4006,25 +4885,7 @@ export class CityBuilder {
           colliders.push({ min: new THREE.Vector3(r.x0, b.roofY, r.z0), max: new THREE.Vector3(r.x1, b.roofY + 1.5, r.z1), kind: 'PROP', building: b.index });
         }
       }
-      // Roof fences on edges that are not alley sides (alley edges stay open for jumps) nor the roof exit of a
-      // fire escape.
-      for (const [ax, sg] of FACES) {
-        if (alleyFaces.has(fkey(b, ax, sg)) || rng() < 0.4 || roofEscapes.has(fkey(b, ax, sg))) continue;
-        const len = ax === 'x' ? b.halfD * 2 : b.halfW * 2;
-        const segs = Math.floor((len - 5) / 3);
-        if (segs <= 0) continue;
-        const start = -((segs - 1) * 3) / 2;
-        for (let sI = 0; sI < segs && counts.fence < CAP.FENCE; sI++) {
-          const along = start + sI * 3;
-          const fx = ax === 'x' ? b.cx + sg * (b.halfW - 0.5) : b.cx + along;
-          const fz = ax === 'x' ? b.cz + along : b.cz + sg * (b.halfD - 0.5);
-          placeInstance(this.fences, counts.fence++, fx, b.roofY, fz, ax === 'x' ? Math.PI / 2 : 0);
-        }
-        const half = (segs * 3) / 2;
-        colliders.push(ax === 'x'
-          ? { min: new THREE.Vector3(b.cx + sg * (b.halfW - 0.5) - 0.05, b.roofY, b.cz - half), max: new THREE.Vector3(b.cx + sg * (b.halfW - 0.5) + 0.05, b.roofY + 1.2, b.cz + half), kind: 'PROP', building: b.index }
-          : { min: new THREE.Vector3(b.cx - half, b.roofY, b.cz + sg * (b.halfD - 0.5) - 0.05), max: new THREE.Vector3(b.cx + half, b.roofY + 1.2, b.cz + sg * (b.halfD - 0.5) + 0.05), kind: 'PROP', building: b.index });
-      }
+      // 9A-1: the 1.05 m parapets (with fire-escape landing gaps) replace the old roof fences.
       if (b.roofY >= 45) {
         addAviation(b.cx + b.halfW - 0.3, b.roofY + 0.4, b.cz + b.halfD - 0.3);
         addAviation(b.cx - b.halfW + 0.3, b.roofY + 0.4, b.cz - b.halfD + 0.3);
@@ -4033,37 +4894,11 @@ export class CityBuilder {
       // Street-facing faces: 1F canopies + wide banners, low-rise shop blade signs, Layer-2 projecting signs,
       // emblem holograms, vertical facade fins, vending machines. Balcony and fire-escape faces keep their
       // 3D structure clear of projecting signs.
-      const streetFaces = FACES.filter(([ax, sg]) => !alleyFaces.has(fkey(b, ax, sg)));
-      const signFaces = streetFaces.filter(([ax, sg]) => !balconyFaces.has(fkey(b, ax, sg)) && !escapeFaces.has(fkey(b, ax, sg)));
+      const streetFaces = FACES.filter(([ax, sg]) => !alleyFaces.has(fkey(b, ax, sg)) && !partialFaces.has(fkey(b, ax, sg)));
+      const signFaces = streetFaces.filter(([ax, sg]) => !balconyFaces.has(fkey(b, ax, sg)) && !escapeFaces.has(fkey(b, ax, sg)) && !galleryFaces.has(fkey(b, ax, sg)) && !spineFaces.has(fkey(b, ax, sg)));
       const lowTop = lowTopOf(b);
       const busyFaces = new Set<string>();
-      // 5B-3: 1F canopy (Y 4.2 m, 1.4 m deep) with an under-glow strip and a wide banner above it — never on the
-      // flat wall-run faces, the fire escape or a Type D shutter front (D has its own per-floor canopies).
-      for (const [ax, sg] of streetFaces) {
-        const key = fkey(b, ax, sg);
-        if (runFaces.has(key) || escapeFaces.has(key) || shutterFaces.has(key) || srng() < 0.22) continue;
-        const len = (ax === 'x' ? b.lotHalfD : b.lotHalfW) * 2;
-        const cl = len - 3;
-        if (cl < 4) continue;
-        const D = SB.CANOPY_DEPTH_M;
-        const cy = SB.CANOPY_Y;
-        const tint = NEON_TINTS[Math.floor(srng() * NEON_TINTS.length)];
-        if (ax === 'x') {
-          const fx = b.cx + sg * b.lotHalfW;
-          G.steel.push(boxAt(D, 0.16, cl, fx + (sg * D) / 2, cy, b.cz));
-          G.strips.push(withColor(boxAt(0.07, 0.04, cl - 0.4, fx + sg * (D - 0.12), cy - 0.1, b.cz), tint, 1.3));
-          G.strips.push(withColor(boxAt(0.05, 0.03, cl - 0.4, fx + sg * 0.2, cy - 0.09, b.cz), COLORS.STREET_LAMP, 1.1));
-          colliders.push({ min: new THREE.Vector3(Math.min(fx, fx + sg * D), cy - 0.08, b.cz - cl / 2), max: new THREE.Vector3(Math.max(fx, fx + sg * D), cy + 0.08, b.cz + cl / 2), kind: 'PROP', building: b.index });
-          addNeon(fx + sg * 0.1, cy + 1.0, b.cz, sg, 0, Math.min(cl * 0.8, 9), 0.85, Math.floor(srng() * SIGN_ATLAS.WIDE_ROWS), 1);
-        } else {
-          const fz = b.cz + sg * b.lotHalfD;
-          G.steel.push(boxAt(cl, 0.16, D, b.cx, cy, fz + (sg * D) / 2));
-          G.strips.push(withColor(boxAt(cl - 0.4, 0.04, 0.07, b.cx, cy - 0.1, fz + sg * (D - 0.12)), tint, 1.3));
-          G.strips.push(withColor(boxAt(cl - 0.4, 0.03, 0.05, b.cx, cy - 0.09, fz + sg * 0.2), COLORS.STREET_LAMP, 1.1));
-          colliders.push({ min: new THREE.Vector3(b.cx - cl / 2, cy - 0.08, Math.min(fz, fz + sg * D)), max: new THREE.Vector3(b.cx + cl / 2, cy + 0.08, Math.max(fz, fz + sg * D)), kind: 'PROP', building: b.index });
-          addNeon(b.cx, cy + 1.0, fz + sg * 0.1, 0, sg, Math.min(cl * 0.8, 9), 0.85, Math.floor(srng() * SIGN_ATLAS.WIDE_ROWS), 1);
-        }
-      }
+      // 9A-4: 1F canopies / awnings / marquees now belong to the ground-floor programs.
       // Blade signs: Type D commercial streets are packed (3–5, dense-neon sectors 4–6).
       const shopSigns = b.arch === ARCH_D
         ? (sector.denseNeon ? 4 : 3) + Math.floor(rng() * 3)
@@ -4115,19 +4950,19 @@ export class CityBuilder {
       if (b.arch === ARCH_B && lowTop >= 16) {
         for (const [ax, sg] of streetFaces) {
           const key = fkey(b, ax, sg);
-          if (runFaces.has(key) || balconyFaces.has(key) || busyFaces.has(key) || srng() < 0.45) continue;
+          if (runFaces.has(key) || balconyFaces.has(key) || busyFaces.has(key) || galleryFaces.has(key) || srng() < 0.45) continue;
           const len = (ax === 'x' ? b.lotHalfD : b.lotHalfW) * 2;
           const n = 3 + Math.floor(srng() * 3);
           const y0 = SB.CANOPY_Y + 0.9;
           const y1 = lowTop - 1.2;
           for (let k = 0; k < n; k++) {
             const along = -len / 2 + len * (0.15 + (0.7 * k) / Math.max(1, n - 1));
-            if (ax === 'x') G.bodies.push(plainBody(boxAt(0.42, y1 - y0, 0.2, b.cx + sg * (b.lotHalfW + 0.21), (y0 + y1) / 2, b.cz + along), b.seed, ARCH_B));
-            else G.bodies.push(plainBody(boxAt(0.2, y1 - y0, 0.42, b.cx + along, (y0 + y1) / 2, b.cz + sg * (b.lotHalfD + 0.21)), b.seed, ARCH_B));
+            if (ax === 'x') G.bodies.push(plainBody(boxAt(0.42, y1 - y0, 0.2, b.lcx + sg * (b.lotHalfW + 0.21), (y0 + y1) / 2, b.lcz + along), b.seed, ARCH_B));
+            else G.bodies.push(plainBody(boxAt(0.2, y1 - y0, 0.42, b.lcx + along, (y0 + y1) / 2, b.lcz + sg * (b.lotHalfD + 0.21)), b.seed, ARCH_B));
           }
         }
       }
-      const vendFaces = streetFaces.filter(([ax, sg]) => !escapeFaces.has(fkey(b, ax, sg)) && !ductFaces.has(fkey(b, ax, sg)));
+      const vendFaces = streetFaces.filter(([ax, sg]) => !escapeFaces.has(fkey(b, ax, sg)) && !ductFaces.has(fkey(b, ax, sg)) && !galleryFaces.has(fkey(b, ax, sg)) && !spineFaces.has(fkey(b, ax, sg)));
       if (vendFaces.length && rng() < 0.75) {
         const [ax, sg] = vendFaces[Math.floor(rng() * vendFaces.length)];
         facePoint(b, ax, sg, 0.2 + rng() * 0.5, fp);
@@ -4158,16 +4993,12 @@ export class CityBuilder {
         for (let r = r0; r <= r1; r++) facadeRooms[facadeRoomState(si, face, r, n)]++;
       }
     };
+    // 9A-2: census over the exposed wall spans of every massing box (L wings, courtyards, podium + tower, tiers).
     buildings.forEach((b) => {
-      const top = lowTopOf(b) - 0.45;
-      for (const [ax, sg] of FACES) {
-        const y0 = 0;
-        if (ax === 'x') censusFace(b, sg, 0, b.rect.z0, b.rect.z1, y0, top);
-        else censusFace(b, 0, sg, b.rect.x0, b.rect.x1, y0, top);
-        if (b.setbackY > 0) {
-          if (ax === 'x') censusFace(b, sg, 0, b.cz - b.halfD, b.cz + b.halfD, b.setbackY, b.roofY - 0.45);
-          else censusFace(b, 0, sg, b.cx - b.halfW, b.cx + b.halfW, b.setbackY, b.roofY - 0.45);
-        }
+      for (const span of b.plan.faces) {
+        const top = span.y1 - 0.45;
+        if (span.ax === 'x') censusFace(b, span.sg, 0, span.a0, span.a1, span.y0, top);
+        else censusFace(b, 0, span.sg, span.a0, span.a1, span.y0, top);
       }
     });
 
@@ -4459,6 +5290,8 @@ export class CityBuilder {
       this.sectorDisposables.push(geo);
       return m;
     };
+    // 9A-5: every geometry of the AO-shaded buckets carries `aAo` (1.0 where nothing occludes it).
+    for (const list of [G.concrete, G.steel, G.archPaint, G.bodies]) for (const gg of list) ensureAo(gg);
     mk(G.concrete, this.concreteMat, 'GroundConcreteRoofs');
     mk(G.road, this.roadMat, 'Roads');
     mk(G.water, this.waterMat, 'CanalWater');
@@ -4468,6 +5301,7 @@ export class CityBuilder {
     mk(G.glass, this.glassMat, 'SkybridgeGlass');
     mk(G.glassT, this.shopGlassMat, 'BalconyShopGlass');
     mk(G.bodies, this.buildingMat, 'Towers');
+    mk(G.archPaint, this.archPaintMat, 'ArchFacadesTrim');
     mk(G.barrier, this.barrierMat, 'LockdownBarrier', 8).frustumCulled = false;
 
     const commit = (m: THREE.InstancedMesh, n: number): void => {
@@ -4484,31 +5318,82 @@ export class CityBuilder {
     poolB.needsUpdate = true;
     commit(this.signals, signalCount);
     signalPhase.needsUpdate = true;
-    // 5B-3 steam: ~40 % canal mist just above the water, the rest from street manholes / curbside ducts.
+    // 9A-6 glowing cast-iron manholes: along street lanes (clear of intersections, crosswalks, ramps, cars) and on
+    // narrow-alley centre lines — flush at 0.016 m; 70 % warm amber / 30 % toxic cyan subterranean glow.
+    const manholePos: THREE.Vector3[] = [];
+    const glowAttr = this.manholes.geometry.getAttribute('aGlow') as THREE.InstancedBufferAttribute;
+    const nearCar = (x: number, z: number): boolean => pick.some((c) => c.y < 1 && Math.hypot(c.x - x, c.z - z) < 3.2);
+    const addManhole = (x: number, z: number): void => {
+      if (manholePos.length >= CAP.MANHOLE || !inArea(x, z, 2)) return;
+      if (manholePos.some((m) => Math.hypot(m.x - x, m.z - z) < 7)) return;
+      if (doorClearZones.some((r) => insideRect(x, z, r, 0.6))) return;
+      const i = manholePos.length;
+      _m4.makeTranslation(x, 0.016, z);
+      this.manholes.setMatrixAt(i, _m4);
+      const cyan = srng() < 0.3;
+      _col.setHex(cyan ? 0x1ce8ff : 0xff7828).multiplyScalar(0.55 + srng() * 0.5);
+      glowAttr.setXYZ(i, _col.r, _col.g, _col.b);
+      manholePos.push(new THREE.Vector3(x, 0.016, z));
+      if (!lightNear(x, 0.4, z, 3)) addLight(x, 0.35, z, cyan ? 0x1ce8ff : 0xff7828, 0.6);
+    };
+    for (let si = 0; si < streets.length; si++) {
+      const st = streets[si];
+      for (const [a0, a1] of segmentsByStreet[si]) {
+        for (let a = a0 + 6 + srng() * 8; a < a1 - 4; a += 16 + srng() * 14) {
+          const lat = st.coord + (srng() < 0.5 ? -1 : 1) * laneHalf(st.kind) * (0.35 + srng() * 0.3);
+          const q = pt(st.axis, a, 0, lat);
+          if (occupied(q.x, q.z, 1.0) || nearCar(q.x, q.z)) continue;
+          addManhole(q.x, q.z);
+        }
+      }
+    }
+    for (const al of alleyRecs) {
+      const c = (al.gap0 + al.gap1) / 2;
+      const n = al.ov1 - al.ov0 > 18 ? 2 : 1;
+      for (let k = 0; k < n; k++) {
+        const o = al.ov0 + ((k + 0.5) / n) * (al.ov1 - al.ov0) + (srng() - 0.5) * 3;
+        if (al.axis === 'x') addManhole(c, o);
+        else addManhole(o, c);
+      }
+    }
+    this.manholes.count = manholePos.length;
+    this.manholes.instanceMatrix.needsUpdate = true;
+    glowAttr.needsUpdate = true;
+
+    // Steam re-anchored: focused 2.5–6 m columns rising straight out of manholes and eatery exhaust mouths (two
+    // phase-offset puffs each), plus low canal mist.
     let steamN = 0;
-    const steamTotal = SB.STEAM_MIN + Math.floor(srng() * (SB.STEAM_MAX - SB.STEAM_MIN + 1));
-    const addSteam = (x: number, y: number, z: number, size: number): void => {
-      if (steamN >= steamTotal || steamN >= CAP.STEAM || !inArea(x, z, -10)) return;
+    const steamH = this.steam.geometry.getAttribute('aSteamH') as THREE.InstancedBufferAttribute;
+    const addSteam = (x: number, y: number, z: number, size: number, height: number, phase: number): void => {
+      if (steamN >= CAP.STEAM || !inArea(x, z, -10)) return;
       _m4.makeTranslation(x, y, z);
       this.steam.setMatrixAt(steamN, _m4);
-      steamAttr.setXYZW(steamN, srng(), size, 0.06 + srng() * 0.07, srng());
+      steamAttr.setXYZW(steamN, phase, size, 0.08 + srng() * 0.06, srng());
+      steamH.setX(steamN, height);
       steamN++;
     };
-    const canalSteam = canalWater.length ? Math.round(steamTotal * 0.4) : 0;
-    for (let k = 0; k < canalSteam * 4 && steamN < canalSteam; k++) {
+    let steamColumns = 0;
+    for (const m of manholePos) {
+      if (srng() < 0.25) continue;
+      const hgt = 2.5 + srng() * 3.5;
+      const ph = srng();
+      addSteam(m.x, 0.05, m.z, 0.9 + srng() * 0.5, hgt, ph);
+      addSteam(m.x, 0.05, m.z, 0.8 + srng() * 0.5, hgt, ph + 0.5);
+      steamColumns++;
+    }
+    for (const v of eateryVents) {
+      const ph = srng();
+      addSteam(v.x, v.y, v.z, 0.7 + srng() * 0.3, 2.5 + srng() * 2, ph);
+      addSteam(v.x, v.y, v.z, 0.6 + srng() * 0.3, 2.5 + srng() * 2, ph + 0.5);
+      steamColumns++;
+    }
+    const canalSteam = canalWater.length ? 24 : 0;
+    for (let k = 0; k < canalSteam * 4 && steamN < CAP.STEAM && k < 400; k++) {
+      if (k >= canalSteam) break;
       const r = canalWater[Math.floor(srng() * canalWater.length)];
-      addSteam(r.x0 + srng() * (r.x1 - r.x0), LEVEL.CANAL_WATER_Y + 0.4, r.z0 + srng() * (r.z1 - r.z0), 2.2 + srng() * 1.6);
+      addSteam(r.x0 + srng() * (r.x1 - r.x0), LEVEL.CANAL_WATER_Y + 0.4, r.z0 + srng() * (r.z1 - r.z0), 2.2 + srng() * 1.6, 0, srng());
     }
-    for (let k = 0; k < steamTotal * 6 && steamN < steamTotal; k++) {
-      const si = Math.floor(srng() * streets.length);
-      const segs = segmentsByStreet[si];
-      if (!segs.length) continue;
-      const [a0, a1] = segs[Math.floor(srng() * segs.length)];
-      const st = streets[si];
-      const q = pt(st.axis, a0 + srng() * (a1 - a0), 0.1, st.coord + (srng() * 2 - 1) * laneHalf(st.kind) * 0.8);
-      if (occupied(q.x, q.z, 0.5)) continue;
-      addSteam(q.x, q.y, q.z, 1.3 + srng() * 1.1);
-    }
+    steamH.needsUpdate = true;
     this.steam.count = steamN;
     this.steam.instanceMatrix.needsUpdate = true;
     steamAttr.needsUpdate = true;
@@ -4545,7 +5430,7 @@ export class CityBuilder {
     this.layout = {
       sector,
       loop,
-      buildings: buildings.map(({ index, cx, cz, halfW, halfD, roofY, arch }) => ({ index, cx, cz, halfW, halfD, roofY, arch })),
+      buildings: buildings.map(({ index, cx, cz, halfW, halfD, roofY, arch, massing, setbackY }) => ({ index, cx, cz, halfW, halfD, roofY, arch, massing, setbackY })),
       colliders,
       ramps: rampColliders,
       anchors,
@@ -4563,6 +5448,9 @@ export class CityBuilder {
       gate: { position: gatePos, normal: fwd.clone(), halfWidth: gateHalf, height: 16, open: false },
       center,
       cinematicPath,
+      propSockets,
+      doorClearZones,
+      manholes: manholePos,
       stats: {
         towers: buildings.length,
         cars: pick.length,
@@ -4583,6 +5471,32 @@ export class CityBuilder {
         carPaints: paintCounts,
         carPools: poolCount,
         facadeRooms,
+        massings: Object.fromEntries((['L_SHAPE', 'PODIUM_OFFSET', 'STEPPED_SETBACK', 'GALLERY_DANCHI', 'PENCIL_TOWER'] as const).map((k) => [k, buildings.filter((b) => b.massing === k).length])),
+        programs: { ...programCounts },
+        roofsOnGrid: buildings.filter((b) => b.plan.plates.every((pl) => isOnFloorGrid(b.arch, pl.y))).length,
+        setbacksOnGrid: buildings.filter((b) => b.setbackY === 0 || isOnFloorGrid(b.arch, b.setbackY)).length,
+        parapetLengthM: Math.round(parapetLen),
+        parapetGaps: parapetGapCount,
+        bulkheads,
+        galleryDoors,
+        galleryLevels,
+        galleryRamps,
+        galleriesLinked,
+        galleriesWithoutCorridor: buildings.filter((b) => b.massing === 'GALLERY_DANCHI' && !FACES.some(([ax, sg]) => galleryFaces.has(fkey(b, ax, sg)))).length,
+        spines: spineCount,
+        slabBands: bandCount,
+        piers: pierCount,
+        doors: doorSizes.length,
+        doorWidth: doorSizes.length ? [Math.min(...doorSizes.map((d) => d[0])), Math.max(...doorSizes.map((d) => d[0]))] : [0, 0],
+        doorHeight: doorSizes.length ? [Math.min(...doorSizes.map((d) => d[1])), Math.max(...doorSizes.map((d) => d[1]))] : [0, 0],
+        sockets: propSockets.length,
+        pipeBundles,
+        manholes: manholePos.length,
+        steamColumns,
+        neon: counts.neon,
+        alleyNeon,
+        minRunFaces: Math.min(...runFaceCount),
+        floatingRoofProps: roofPropRects.filter(({ b, r }) => !onSolidRoof(b.plan, r)).length,
       },
     };
     this.towers = buildings;
