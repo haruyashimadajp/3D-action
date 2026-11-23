@@ -133,14 +133,17 @@ Replace the robotic rail-flat walk camera and generic uniform `28 Hz` gunshot bu
 3. **Proximity-Only `LockdownBarrier` Fade (`CityBuilder.ts`)**:
    - Modify `createBarrierMaterial()` so the red perimeter hex barrier is **completely invisible (`alpha = 0`) when the camera is `> 14 m` away**, fading in smoothly only as the player approaches `14 m -> 3 m` from the sector boundary (keeping the open emerald next-sector gate always visible!). Eliminates the jarring bright-red honeycomb wall ruining distant vistas!
 
-### 10B-2. Giant Avenue-Facing Mega-Billboards, 90° L-Corner Wrap-Around Screens & Colored Mist Halos (`ProceduralTextures.ts`, `CityBuilder.ts`)
-1. **Procedural `2048 × 1024` Mega-Billboard Atlas (`tex.megaBillboard`, `4 × 2` = 8 Hero Ads)**:
+### 10B-2. 100% English-Only Signage Overhaul, Giant Avenue-Facing Mega-Billboards, 90° L-Corner Wrap-Around Screens & Colored Mist Halos (`ProceduralTextures.ts`, `CityBuilder.ts`)
+> [!IMPORTANT]
+> **STRICT ART RULE — 100% ENGLISH-ONLY SIGNAGE (ZERO JAPANESE CHARACTERS IN 3D WORLD)**: Replace ALL existing Japanese katakana/kanji strings in `ProceduralTextures.ts` (vertical neon strips ~L1241–1248, wide banners & scrolling tickers ~L1305–1312, kanji seal emblem ~L1457–1463, graffiti tag ~L2411) with crisp uppercase geometric English cyberpunk typography (e.g., `STRAND`, `NEON BAR`, `NOODLE 24H`, `CYBERNETICS`, `HOLO CAFE`, `ZERO-09`, `PHARMA+`, `HOTEL KOWLOON // VACANCY`, `KARAOKE // BAR`, `VALKYRIE-09 SIGHTED // GRID 480`, `09` seal, `NEO` tag). Every sign, billboard, ticker, emblem, vending machine, scaffold tube sign, and graffiti decal MUST be **100% English / numerals / symbols**.
+
+1. **Procedural `2048 × 1024` Mega-Billboard Atlas (`tex.megaBillboard`, `4 × 2` = 8 Hero Ads, 100% English)**:
    - Cell 0: `NEO-TOKYO REALTY` (cyan/white bold corporate typography + blueprint wireframe)
    - Cell 1: `DATA FLOW // 09` (magenta/violet diagonal tech bars + cascading matrix code)
    - Cell 2: `CYBERNETICS NOW` (acid-lime/yellow stencil + bionic eye/circuit emblem)
    - Cell 3: Tall Vertical Portrait Ad (`BELOW DECK` — glowing neon halftone face/silhouette in coral/magenta/gold for `1:3` tall screens!)
-   - Cell 4: Blazing Crimson Vertical Monolith Emblem (geometric hexagon sigil + vertical `サイバー・プロトコル // 禁区`)
-   - Cell 5: `KIROSHI // OPTICS` (teal/cyan reticle emblem + `その目で未来を`)
+   - Cell 4: Blazing Crimson Vertical Monolith Emblem (geometric hexagon sigil + vertical bold English column `STRAND // RESTRICTED ZONE 09`)
+   - Cell 5: `KIROSHI // OPTICS` (teal/cyan reticle emblem + sharp subhead `SEE THE FUTURE`)
    - Cell 6: `SYNTH NOODLES // 24H` (warm amber-orange neon ramen bowl emblem)
    - Cell 7: `SOFTSYS // CORE` (deep electric-blue isometric server wireframe + telemetry)
 2. **`MegaBillboards` `InstancedMesh` (`cap: 140`, `+1` draw call)**:
@@ -193,8 +196,8 @@ Replace the simple side-extruded car blocks with sculpted, multi-component high-
 ### 10C-3. High-Density Cyberpunk Streetscape Details (From Cyberpunk 2077 References!)
 1. **Glowing Sidewalk Curb LED Guide Strips (`+0` calls — merged into `G.strips` & `G.steel`)**:
    - Along major avenue curbs, embed periodic recessed **curb-edge LED guide bars** (`1.8 m` long every `5 m`, alternating cool cyan `#20D8FF`, warm white `#FFE0A8`, and muted crimson `#FF3050` at controlled luminance `0.95`) that cast rich colored reflections straight into the wet street gutters!
-2. **Open-Frame Scaffold Neon Tube Signs (`24時間営業` Style — `+0` calls, merged into `G.steel` + `MegaBillboards`/`neonSigns`)**:
-   - Add dedicated open **steel lattice scaffolding frames** (`G.steel`) mounting bright glowing tube-letter neon signs (`24時間営業`, `OPEN 24H`, `CYBER RAMEN`, `HOTEL`) atop low rooftops, podium parapets, and projecting over avenue storefronts!
+2. **Open-Frame Scaffold Neon Tube Signs (`OPEN 24H` Style — `+0` calls, merged into `G.steel` + `MegaBillboards`/`neonSigns`, 100% English)**:
+   - Add dedicated open **steel lattice scaffolding frames** (`G.steel`) mounting bright glowing English tube-letter neon signs (`OPEN 24H`, `CYBER RAMEN`, `NIGHT BAR`, `MOTEL 09`) atop low rooftops, podium parapets, and projecting over avenue storefronts!
 3. **Corrugated Sheet-Metal Low-Roof Shacks & Slum-Tech Extensions (`+0` calls — merged into `G.archPaint` & `G.steel`)**:
    - On low building podiums (`Y = 4–8 m`), alley corners, and `L_SHAPE` roofs, add compact **slanted corrugated sheet-metal roof huts/extensions** (`3–5 m` wide, dark rusted/gunmetal ribbed metal roofs with `aAo` catching vivid neon reflections from overhead signs + small exterior AC/pipe attachments).
 4. **Overhead Steel Gantry / Sign-Truss Arches With Red Beacon Dots (`+0` calls — merged into `G.steel` & `aviation`)**:
@@ -250,6 +253,6 @@ Replace the simple side-extruded car blocks with sculpted, multi-component high-
 
 ## Per-Sub-Phase Verification Checklist
 * **10A**: `npm run build` + `npm test` pass; MSAA `2`, half-res Bloom, `CITY_LIGHTS_MAX = 12`, pixel cap `<= 2.2M px`, late pre-render look sync, `shadows` & `showPerf` toggles; flat realistic wet asphalt (no mercury waves / X-seams); non-glow prop Bloom clamp (`<= 0.86`); weathered detail + city lights on props & steel; `PropContactShadows`; solid ramp abutment + T-piers; unit tests proving **zero floating neon signs** & **`>= 18 m` 360° blimp clearance**; 3D muzzle flash, cooling bullet scorches, sniper barrel steam/casings & 4x rangefinder; 5 live-preview screen filters; unit-tested mobile `ALERT` investigation movement + enemy flashlight scanner cones; top-left `136×136` circular pulse radar (Option C, zero 3D wallhack).
-* **10B**: `npm run build` + `npm test` pass; `>= 92%` lot fill (zero barren empty lots/edges); `LockdownBarrier` invisible beyond `14 m`; `2048×1024` Mega-Billboards + 90° L-corner wrap-around screens + vertical monolith blades + colored rain-mist halos (strictly bound to `FaceSpan`s); all 4 megastructures (`X_TRUSS_TOWER`, `CYLINDER_RING_TOWER`, `TWIN_ARCH_GATE`, `SLANT_CORP_TOWER`) & 5 distinct sector identities verified.
-* **10C**: `npm run build` + `npm test` pass; sculpted 3-variant hero vehicles (Supercar Coupe with splitter/scoops/GT wing/multi-spoke wheels, Pickup Truck with grille/plate/bed, Armored Van); high-detail recessed vending machines with `512×512` product/can atlas; glowing curb LED strips; open-frame `24時間営業` roof/facade neon scaffolds; corrugated low-roof shacks; overhead steel gantries with red beacon dots; detailed street lamps; hanging lantern strings (`chochin`) & sidewalk cafe umbrellas; `+1` net draw call verified.
+* **10B**: `npm run build` + `npm test` pass; **100% English-only signage verified** (zero Japanese characters anywhere in `ProceduralTextures.ts` signs/billboards/tickers/graffiti); `>= 92%` lot fill (zero barren empty lots/edges); `LockdownBarrier` invisible beyond `14 m`; `2048×1024` Mega-Billboards + 90° L-corner wrap-around screens + vertical monolith blades + colored rain-mist halos (strictly bound to `FaceSpan`s); all 4 megastructures (`X_TRUSS_TOWER`, `CYLINDER_RING_TOWER`, `TWIN_ARCH_GATE`, `SLANT_CORP_TOWER`) & 5 distinct sector identities verified.
+* **10C**: `npm run build` + `npm test` pass; sculpted 3-variant hero vehicles (Supercar Coupe with splitter/scoops/GT wing/multi-spoke wheels, Pickup Truck with grille/plate/bed, Armored Van); high-detail recessed vending machines with `512×512` product/can atlas; glowing curb LED strips; open-frame English `OPEN 24H` roof/facade neon scaffolds; corrugated low-roof shacks; overhead steel gantries with red beacon dots; detailed street lamps; hanging lantern strings (`chochin`) & sidewalk cafe umbrellas; `+1` net draw call verified.
 * **10D**: `npm run build` + `npm test` pass; flowing elevated highway cyber-traffic with headlight/taillight streaks; GPU-animated spinning exhaust fans, wind-swaying eatery `noren` curtains, and spinning rooftop corporate holograms; courtyard ramen carts & avenue bus-stop shelters; periodic alley junction sparks; 3D wet footsteps for approaching `ALERT` enemies, enemy radio vocoder squelch, and delayed rolling thunder synced to sky lightning; **`renderer.info.render.calls <= 120`** confirmed in Sector 4 at full density with smooth 60fps and zero WebGL warnings.
