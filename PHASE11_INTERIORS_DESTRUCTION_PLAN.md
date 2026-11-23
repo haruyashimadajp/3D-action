@@ -40,6 +40,29 @@ Eliminate the "solid rectangular block" illusion by carving genuine walkable 3D 
   4. **`INTERIOR_APARTMENT`** (`2–3` per sector, carved behind select 2F–3F doors of `GALLERY_DANCHI` blocks, `6.0 m × 5.0 m × 3.8 m`):
      - Gritty compact cyberpunk apartment unit: weathered concrete walls with dark corner `aAo`, low steel-frame bed/futon platform, corner desk with glowing cyan cyber-terminal monitor (destructible!), wall storage shelf, overhead caged fluorescent tube (`G.strips`), kickable front apartment door opening onto the exterior gallery corridor, and a **large destructible street-view window**!
 
+### 11A-1b. Deep 3D Architectural Relief — True Concavity & Protrusion (`BuildingGrammar.ts`, `CityBuilder.ts`, `+0` Extra Draw Calls!)
+Break the "flat slab / convex-only box" look across ALL buildings (strictly keeping `>= 2` flush `runFaces` per tower with `<= 0.22 m` trim so wall-running remains 100% snag-free!):
+1. **Mid-Tower Concave Mechanical Sky-Notches (Refuge Floors)**:
+   - On tall towers (`roofY >= 36 m`), carve **1 recessed open mechanical/refuge waist notch** (`height 4.0 m` at `Y = 20–36 m`) stepped **`1.8–2.4 m` inward** around the tower perimeter, revealing structural perimeter steel columns (`G.steel`), recessed louvered core walls (`aAo = 0.36` deep ceiling soffit shadow!), glowing amber/cyan safety rail strips, and a **walkable/grapple-able perimeter ledge**! Gives skyscrapers unmistakable concave silhouettes (just like Hong Kong / Cyberpunk 2077 megatowers).
+2. **Deep 3D Recessed Upper-Floor Window Reveals & Inset Loggias (`0.55 m` Depth)**:
+   - On feature faces (floors `2F–8F` where players closely view towers from streets, highways, and swings), frame window bays with **real `0.45–0.55 m` deep concrete structural piers, protruding window sills with drip lips, horizontal sun-breaker louver fins, and recessed dark-`aAo` shadow reveals** (`0.38` inner jamb AO) — ending flat painted wallpaper facades!
+3. **Cantilevered Bay-Window Pods & Protruding Exterior Service Pods**:
+   - Add staggered protruding **cantilevered glass/steel bay-window pods** (`width 3.2 m × depth 0.95 m × height 2.8 m`, supported by angled underside steel brackets with dark soffit `aAo`) and protruding **exterior HVAC/utility service pods** (`width 2.4 m × depth 1.2 m`) on feature walls (`Y = 8–32 m`) so vertical silhouettes have bold positive AND negative depth.
+4. **Deeper Ground-Floor Vestibules & Tie-Rod Canopies**:
+   - Deepen non-run 1F structural piers to `0.52 m`, deepen recessed entry vestibules to `0.85–1.20 m`, and add visible **angled diagonal steel tension tie-rods** anchoring storefront canopies back into upper facade columns (`G.steel`, `+0` draw calls!).
+
+### 11A-1c. High-Craft Close-Up Interior Micro-Props Kit (`InteriorPropsKit` `InstancedMesh`, `cap: 260`, `+1` Draw Call, `64 m` Vertex Cull)
+Every enterable interior MUST feel densely populated and modeled with fine close-up craft (all multi-part beveled/sculpted geometry with weathered surface detail, vertex `aAo`, and `injectCityLights`; packed via `aVariant 0..7` into ONE `InstancedMesh`):
+* **v0 — Eatery Counter Place-Setting Cluster**: Steaming ceramic ramen bowl with protruding chopsticks, stacked spare bowls, translucent soy/chili condiment bottles, brushed-steel napkin dispenser & tiny glowing tabletop menu stand.
+* **v1 — Kitchen Back-Counter Appliances**: Stainless-steel noodle boiler & fryer vat with wire strainer baskets, overhead hanging ladle rack, stacked metal prep trays & glowing digital temperature display.
+* **v2 — Tech Shop Illuminated Cyber-Gear Pedestal**: Angled steel/glass display stand showcasing a sculpted futuristic cybernetic visor helmet / bionic arm module under a focused cyan/magenta downlight strip + holographic spec placard.
+* **v3 — Tech Apparel Tactical Jacket Rack**: Matte-black tubular garment frame holding `4` beveled stylized cyberpunk jackets with angled collars & subtle neon shoulder piping.
+* **v4 — Cyber Apartment Desk & Dual-Monitor Terminal Rig**: Slotted steel desk topped with a **curved glowing dual-screen cyan cyber-terminal**, mechanical keyboard slab, coffee mug, desk lamp, hanging cable loops & tucked swivel chair.
+* **v5 — Apartment Compact Kitchenette / Mini-Fridge Clutter**: Mini cyber-fridge with glowing blue temp LED strip, microwave box on top, instant-noodle cups & stacked magazines.
+* **v6 — Hotel / Arcade Lobby Check-In Console & Lounge**: Curved backlit holographic reception desk terminal with dual monitors + sleek low cyber-lounge bench & corner illuminated planter.
+* **v7 — Interior Industrial Pendant Lamps, Wall Posters & Floor Fan**: Caged dome pendant lights on ceiling drop rods, framed glowing cyber wall art, stacked storage totes & small standing floor fan.
+* *(In Phase 11B, `v0`, `v2`, `v3`, `v4`, `v5`, and `v7` automatically register as shootable/slide-breakable destructible props so gunfights inside eateries, tech shops, and apartments shatter monitors, ramen bowls, bottles, and gear displays into tumbling digitally disintegrating debris!)*
+
 ### 11A-2. Kickable Breach Doors & Silent Stealth Opening (`src/entities/DestructibleManager.ts`, `src/player/PlayerController.ts`, `src/player/ViewModelRenderer.ts`, `src/engine/InputManager.ts`, `src/engine/AudioEngine.ts`)
 Every doorway leading into/out of an enterable interior (`12–22` interactive doors per sector) is a real **`InteractiveDoor`** rendered via a single pooled `InstancedMesh` (`InteractiveDoors`, `cap: 32`, `+1` draw call — weathered painted steel door with handle, peephole/glass slit, and subtle frame lock LED!):
 * **Input & Keybind (`InputManager.ts`, `HudManager.ts`)**:
@@ -115,12 +138,12 @@ Because the core `PhysicsWorld.ts` 2D spatial-grid broadphase (`12 m` cells + DD
 
 | Category | Phase 10D Total (With 10A–10C Consolidations) | Phase 11A Delta | Phase 11B Delta | Final Phase 11 Sector 4 Total |
 | :--- | :---: | :---: | :---: | :---: |
-| Static City + Enterable Interiors | `11` | **`+0`** (merged!) | `+0` | `11` |
-| Interactive Doors + Destructible Glass | `0` | `+2` (`Doors`, `Glass`) | `+0` | `2` |
+| Static City + Enterable Interiors + Deep Relief | `11` | **`+0`** (merged!) | `+0` | `11` |
+| Interactive Doors + Destructible Glass + `InteriorPropsKit` | `0` | `+3` (`Doors`, `Glass`, `InteriorProps`) | `+0` | `3` |
 | `DestructDebris` Digital Dissolve Pool | `0` | `+0` | `+1` | `1` |
-| Remaining Consolidated Instanced Kits | `~39` | `+0` | `-1` (optional roof merge) | `~38–39` |
+| Remaining Consolidated Instanced Kits | `~39` | `+0` | `-1` to `-2` (roof/socket merge) | `~37–38` |
 | Enemies (14), Effects, Rain, ViewModel, PostFX | `~50–58` | `+0` | `+0` | `~50–58` |
-| **TOTAL DRAW CALLS / FRAME** | **`101–109`** | **`+2`** | **`0` to `-1`** | **`102–111` (Hard Cap: `<= 120`!)** |
+| **TOTAL DRAW CALLS / FRAME** | **`101–109`** | **`+3`** | **`0` to `-1`** | **`102–111` (Hard Cap: `<= 120`!)** |
 
 ---
 
