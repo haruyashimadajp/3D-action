@@ -791,6 +791,14 @@ export class AudioEngine {
     }
   }
 
+  /** 10A-6: Faint subtle sonar ping SE every 3.5 s pulse-radar sweep while enemies remain alive. */
+  radarPing(): void {
+    const c = this.can();
+    if (!c) return;
+    const t = c.currentTime;
+    this.tone(c, 'sine', 1640, 1480, 0.065, 0.022, this.uiBus, t, 0.004);
+  }
+
   // =============================================================================================
   // 8A-5 awareness cues & stealth BGM
   // =============================================================================================

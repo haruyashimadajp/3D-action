@@ -80,9 +80,9 @@ export interface ShakeDef {
 export const SHAKE_FREQUENCY_HZ = 28;
 export const SHAKE_DECAY_PER_S = 2.2;
 export const SHAKE = {
-  /** v1.5 §2.2 */
-  PISTOL_FIRE: { trauma: 0.16, maxPitchYawDeg: 0.55, maxRollDeg: 0.35 },
-  SNIPER_FIRE: { trauma: 0.44, maxPitchYawDeg: 1.9, maxRollDeg: 1.2 },
+  /** 10A-3b: reduced gunshot trauma so physical spring-damper recoil kick carries the feel. */
+  PISTOL_FIRE: { trauma: 0.05, maxPitchYawDeg: 0.25, maxRollDeg: 0.15 },
+  SNIPER_FIRE: { trauma: 0.14, maxPitchYawDeg: 0.55, maxRollDeg: 0.35 },
   ANCHOR_IMPACT: { trauma: 0.15, maxPitchYawDeg: 0.5, maxRollDeg: 0.5 },
   HARD_LANDING: { trauma: 0.32, maxPitchYawDeg: 1.4, maxRollDeg: 0.8 },
   GRAZE: { trauma: 0.14, maxPitchYawDeg: 0.4, maxRollDeg: 1.0 },
@@ -711,11 +711,35 @@ export const FIRE_ESCAPE = {
   RAMP_THICKNESS_M: 0.25,
 } as const;
 
-/** 5B-4: hot impact scorch decals. */
+/** 5B-4 / 10A-3.3: cooling bullet impact scorch decals (48 pooled, 4.0 s cool into charred pockmark). */
 export const SCORCH = {
   POOL: 48,
-  COOL_S: 0.85,
-  SIZE_M: 0.34,
+  COOL_S: 4.0,
+  RADIUS_PISTOL_M: 0.08,
+  RADIUS_SNIPER_M: 0.15,
+  NORMAL_OFFSET_M: 0.015,
+  EMISSIVE: 2.8,
+  SIZE_M: 0.16,
+} as const;
+
+/** 10A-6: top-left circular pulse-scan mini-radar (Option C — no 3D wallhack markers). */
+export const RADAR = {
+  SIZE_PX: 136,
+  LEFT_PX: 24,
+  TOP_PX: 24,
+  RANGE_M: 75,
+  RINGS_M: [25, 50, 75] as readonly number[],
+  SWEEP_PERIOD_S: 3.5,
+  SWEEP_DURATION_S: 0.65,
+  BLIP_FADE_S: 3.2,
+  BLIP_MIN_ALPHA: 0.18,
+  ELEVATION_THRESHOLD_M: 3.5,
+  STATE_HEX: {
+    UNAWARE: '#38F8FF',
+    ALERT: '#FFCC22',
+    DETECTED: '#FF6A1A',
+    COMBAT: '#FF2244',
+  } as const,
 } as const;
 
 export const LIMITS = {

@@ -142,6 +142,15 @@ export interface LockWarning {
   active: boolean;
 }
 
+/** 10A-6: Per-enemy world position and awareness state sampled by the pulse-scan mini-radar. */
+export interface RadarEnemySample {
+  id: number;
+  x: number;
+  y: number;
+  z: number;
+  state: AlertState;
+}
+
 // =============================================================================================
 // Scratch (module scope, reused)
 // =============================================================================================
@@ -162,6 +171,7 @@ const _rayHit = createRayHit();
 const _move = createMoveResult();
 const UP = new THREE.Vector3(0, 1, 0);
 const DOWN = new THREE.Vector3(0, -1, 0);
+const FWD_Z = new THREE.Vector3(0, 0, 1);
 const _acqColor = new THREE.Color(TELEGRAPH.ACQ_COLOR);
 const _lockColor = new THREE.Color(TELEGRAPH.LOCK_COLOR);
 const _sightColor = new THREE.Color(0xff1030);
@@ -918,6 +928,13 @@ class Enemy implements StealthAgent {
   inspecting = false;
   readonly investigatePos = new THREE.Vector3();
   hasInvestigate = false;
+  /** 10A-5.1: Guaranteed mobile-enemy ALERT investigation state. */
+  investigating = false;
+  readonly investigateGoal = new THREE.Vector3();
+  readonly investigateOrigin = new THREE.Vector3(NaN, NaN, NaN);
+  investigateStallT = 0;
+  investigateBestDist = Infinity;
+  investigateSweepT = 0;
   locked = false;
   /** Engaged without LOS and not getting ≥ 1 m closer to the shared position (unreachable-rooftop fallback). */
   stallT = 0;
@@ -1116,8 +1133,8 @@ const PLAYER_TARGET_ID = 9999;
 const MISSILE_ID_BASE = 1000;
 /** Projectile tag of SK_15 head-shot ricochet rounds. */
 export const RICOCHET_TAG = 5;
-/** Tracking markers appear once this few enemies remain (5A-5). */
-const TRACK_REMAINING_MAX = 3;
+/** 10A-6 (Option C): Regular enemies never receive 3D wallhack tracking markers (boss-only). */
+const TRACK_REMAINING_MAX = 0;
 const DEBRIS_LIFE = TELEGRAPH.DEBRIS_LIFETIME_S;
 const DISSOLVE_S = 0.6;
 const LINE_IGNORE_NONE = undefined;
@@ -1132,6 +1149,8 @@ const PLAYER_SLIDE_H = 0.98;
 export class EnemyManager {
   readonly armor: THREE.BatchedMesh;
   readonly glow: THREE.BatchedMesh;
+  /** 10A-5.2: Diegetic volumetric tactical flashlight / visor scanner cones (InstancedMesh, cap: 14, +1 draw call when visible). */
+  readonly scannerCones: THREE.InstancedMesh;
   private readonly shieldMesh: THREE.InstancedMesh;
   private readonly shieldUniforms: { uTime: { value: number } };
   private readonly enemies: Enemy[] = [];
@@ -1490,6 +1509,56 @@ export class EnemyManager {
     this.markers.renderOrder = 18;
     scene.add(this.markers);
 
+    // ---- 10A-5.2: Diegetic enemy tactical flashlight / visor scanner cones (InstancedMesh, cap: 14, +1 draw call) ----
+    const coneGeo = new THREE.ConeGeometry(AI_PATROL.SCANNER_CONE_RADIUS_M, 1.0, 18, 1, true);
+    coneGeo.translate(0, -0.5, 0);
+    coneGeo.rotateX(-Math.PI / 2); // Apex at (0,0,0), base of radius 2.4 m at Z = +1.0
+    const coneMat = new THREE.ShaderMaterial({
+      transparent: true,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+      side: THREE.DoubleSide,
+      fog: false,
+      vertexShader: /* glsl */ `
+        varying float vAxial;
+        varying vec3 vN;
+        varying vec3 vV;
+        varying vec3 vTint;
+        void main() {
+          vAxial = clamp(position.z, 0.0, 1.0);
+          vec4 wp = modelMatrix * instanceMatrix * vec4(position, 1.0);
+          vN = normalize(mat3(modelMatrix * instanceMatrix) * normal);
+          vV = normalize(cameraPosition - wp.xyz);
+          #ifdef USE_INSTANCING_COLOR
+          vTint = instanceColor;
+          #else
+          vTint = vec3(0.11);
+          #endif
+          gl_Position = projectionMatrix * viewMatrix * wp;
+        }
+      `,
+      fragmentShader: /* glsl */ `
+        varying float vAxial;
+        varying vec3 vN;
+        varying vec3 vV;
+        varying vec3 vTint;
+        void main() {
+          float axial = smoothstep(0.0, 0.04, vAxial) * pow(1.0 - vAxial, 1.65);
+          float edge = pow(clamp(abs(dot(normalize(vN), normalize(vV))), 0.0, 1.0), 0.75);
+          float beam = axial * (0.42 + 0.58 * edge);
+          gl_FragColor = vec4(vTint * beam, 1.0);
+        }
+      `,
+    });
+    this.scannerCones = new THREE.InstancedMesh(coneGeo, coneMat, AI_PATROL.SCANNER_CONE_CAP);
+    this.scannerCones.name = 'EnemyScannerCones';
+    this.scannerCones.frustumCulled = false;
+    this.scannerCones.count = 0;
+    this.scannerCones.visible = false;
+    this.scannerCones.renderOrder = 14;
+    this.scannerCones.setColorAt(0, _col.setRGB(1, 1, 1));
+    scene.add(this.scannerCones);
+
     this.playerTarget = { id: PLAYER_TARGET_ID, alive: false, headCenter: new THREE.Vector3(), headRadius: 0, bodyCenter: new THREE.Vector3(), bodyHalf: new THREE.Vector3(0.38, 0.93, 0.38), bodyYaw: 0 };
     this.playerTargets = [this.playerTarget];
     this.graze = {
@@ -1532,6 +1601,8 @@ export class EnemyManager {
     this.clearAll();
     this.contactShadows.count = 0;
     this.markers.count = 0;
+    this.scannerCones.count = 0;
+    this.scannerCones.visible = false;
     this.stealth.reset();
     this.waveLists = [];
     this.wave = -1;
@@ -1549,6 +1620,8 @@ export class EnemyManager {
     this.boss = null;
     this.hooked = null;
     this.shieldMesh.count = 0;
+    this.scannerCones.count = 0;
+    this.scannerCones.visible = false;
   }
 
   private startWave(w: number): void {
@@ -1641,6 +1714,24 @@ export class EnemyManager {
       out[n].addVectors(e.pos, e.bodyOff);
       boss[n] = e.isBoss ? 1 : 0;
       n++;
+    }
+    return n;
+  }
+
+  /**
+   * 10A-6: Exports living enemy positions and awareness states for the top-left pulse-scan mini-radar
+   * (zero allocations per call).
+   */
+  radarTargets(out: RadarEnemySample[]): number {
+    let n = 0;
+    for (const e of this.enemies) {
+      if (!e.active || !e.alive || n >= out.length) continue;
+      const s = out[n++];
+      s.id = e.index;
+      s.x = e.pos.x;
+      s.y = e.pos.y;
+      s.z = e.pos.z;
+      s.state = e.alertState;
     }
     return n;
   }
@@ -1837,6 +1928,11 @@ export class EnemyManager {
     const bossSector = this.isBossSector;
     this.stealth.initAgent(e, bossSector ? 'COMBAT' : 'UNAWARE', bossSector);
     e.visionRange = kind === 'VEIL' ? AI_STEALTH.VISION_RANGE_VEIL : kind === 'DRONE' ? AI_STEALTH.VISION_RANGE_DRONE : AI_STEALTH.VISION_RANGE;
+    e.investigating = false;
+    e.investigateOrigin.set(NaN, NaN, NaN);
+    e.investigateStallT = 0;
+    e.investigateBestDist = Infinity;
+    e.investigateSweepT = 0;
     e.stallT = 0;
     e.searchBestD = Infinity;
     e.suppress = false;
@@ -2029,7 +2125,9 @@ export class EnemyManager {
       e.shieldFlash = Math.max(0, e.shieldFlash - dt);
       this.stepSprings(e, dt);
       this.perceive(e, dt);
+      if (e.alertState === 'ALERT' && e.hasInvestigate) this.syncInvestigation(e);
       this.stealth.stepAgent(e, dt, this.lastSeenPos);
+      this.syncInvestigation(e);
       if (!isEngaged(e.alertState)) {
         // UNAWARE / ALERT: patrol, scan, investigate — never fire, never telegraph.
         if (e.phase !== 'IDLE') this.cancelAttack(e, 0.5);
@@ -2079,6 +2177,7 @@ export class EnemyManager {
     this.stealth.fillMultiplier = this.modifiers.alertFillMultiplier;
     // The shared last-known position only ever receives a ray-confirmed sighting.
     this.stealth.stepGlobal(this.enemies, dt, this.lastSeenPos);
+    for (const e of this.enemies) if (e.active && e.alive && e.alertState === 'ALERT') this.syncInvestigation(e);
     this.updateMissiles(dt);
     this.updateHook();
   }
@@ -2199,8 +2298,75 @@ export class EnemyManager {
     }
   }
 
+  /**
+   * 10A-5.1: Computes a ground-reachable horizontal investigation target (`investigateGoal`) directly beneath or
+   * closest to `investigatePos` on the enemy's street/deck layer (NEVER aborting because `Math.abs(dy) >= 2.5`;
+   * Drones fly directly to `investigatePos + (0, 3.5, 0)`).
+   */
+  private computeInvestigateGoal(e: Enemy): void {
+    if (e.kind === 'DRONE') {
+      e.investigateGoal.set(
+        clamp(e.investigatePos.x, -LEVEL.HALF_EXTENT_M + 4, LEVEL.HALF_EXTENT_M - 4),
+        clamp(e.investigatePos.y + AI_PATROL.INVESTIGATE_DRONE_OFFSET_Y, DRONE_BEHAVIOUR.ALT_MIN, DRONE_BEHAVIOUR.ALT_MAX),
+        clamp(e.investigatePos.z, -LEVEL.HALF_EXTENT_M + 4, LEVEL.HALF_EXTENT_M - 4),
+      );
+      return;
+    }
+    const r = HUMANOID.RADIUS * e.scale + 0.1;
+    const h = HUMANOID.HEIGHT * e.scale;
+    const ix = clamp(e.investigatePos.x, -LEVEL.HALF_EXTENT_M + 2, LEVEL.HALF_EXTENT_M - 2);
+    const iz = clamp(e.investigatePos.z, -LEVEL.HALF_EXTENT_M + 2, LEVEL.HALF_EXTENT_M - 2);
+    const dx = e.pos.x - ix;
+    const dz = e.pos.z - iz;
+    const dist = Math.hypot(dx, dz);
+    e.investigateGoal.set(ix, e.pos.y, iz);
+    if (dist > 0.5) {
+      const ux = dx / dist;
+      const uz = dz / dist;
+      for (let s = 0; s <= dist; s += 1.0) {
+        _v3.set(ix + ux * s, e.pos.y + 0.05, iz + uz * s);
+        if (this.physics.boxFree(_v3, r, h)) {
+          e.investigateGoal.set(_v3.x, e.pos.y, _v3.z);
+          break;
+        }
+      }
+    }
+  }
+
+  /**
+   * 10A-5.1: Synchronizes `investigating` state for mobile enemies (`ENFORCER`, `AEGIS`, `PHANTOM`, `DRONE`)
+   * whenever they enter or update `ALERT` (`VEIL` snipers remain perched and sweep their gaze).
+   */
+  private syncInvestigation(e: Enemy): void {
+    if (e.alertState !== 'ALERT' || !e.hasInvestigate || e.kind === 'VEIL' || e.kind === 'VALKYRIE') {
+      e.investigating = false;
+      e.investigateSweepT = 0;
+      e.investigateStallT = 0;
+      e.investigateBestDist = Infinity;
+      e.investigateOrigin.set(NaN, NaN, NaN);
+      return;
+    }
+    const changed =
+      !e.investigating ||
+      Math.abs(e.investigatePos.x - e.investigateOrigin.x) > 0.05 ||
+      Math.abs(e.investigatePos.y - e.investigateOrigin.y) > 0.05 ||
+      Math.abs(e.investigatePos.z - e.investigateOrigin.z) > 0.05;
+    if (changed) {
+      e.investigateOrigin.copy(e.investigatePos);
+      this.computeInvestigateGoal(e);
+      e.investigating = true;
+      e.investigateStallT = 0;
+      e.investigateBestDist = Infinity;
+      e.investigateSweepT = 0;
+    } else if (e.seesPlayer || e.nearPlayer) {
+      e.investigateStallT = 0;
+      e.investigateSweepT = 0;
+    }
+    e.alertGauge = Math.max(e.alertGauge, AI_PATROL.INVESTIGATE_GAUGE_FLOOR);
+  }
+
   // ---------------------------------------------------------------------------------------------
-  // 8A-5 UNAWARE / ALERT behaviour: patrol + scan, investigate the last stimulus
+  // 8A-5 / 10A-5.1 UNAWARE / ALERT behaviour: patrol + scan, guaranteed mobile-enemy investigation
   // ---------------------------------------------------------------------------------------------
   private thinkStealth(e: Enemy, dt: number): void {
     const P = AI_PATROL;
@@ -2230,20 +2396,44 @@ export class EnemyManager {
       this.walk(e, 0, 0, 0, dt);
       return;
     }
-    if (alert) {
-      // Cautious advance toward the stimulus, then hold and scan around it.
-      const dx = e.investigatePos.x - e.pos.x;
-      const dz = e.investigatePos.z - e.pos.z;
-      const dh = Math.hypot(dx, dz);
-      const reachable = Math.abs(e.investigatePos.y - e.pos.y) < 2.5;
-      if (dh > P.INVESTIGATE_STOP_M && reachable) {
-        e.goal.set(e.investigatePos.x, e.pos.y, e.investigatePos.z);
-        this.moveToGoal(e, speed * P.INVESTIGATE_SPEED_K, dt);
-        if (Math.hypot(e.vel.x, e.vel.z) > 0.3) this.faceYaw(e, yawOf(dx, dz), turn, dt);
-        else this.faceYaw(e, yawOf(dx, dz) + Math.sin(e.scanT * 1.4) * P.SCAN_DEG * DEG2RAD, turn * 0.5, dt);
+    if (alert && e.investigating) {
+      // 10A-5.1: Walk toward ground-reachable investigateGoal at 0.80x combat speed (7.0 s stall timeout),
+      // then pause and sweep gaze ±60° for 2.0 s before clearing investigating = false and decaying.
+      const invSpeed = e.def.moveSpeed * P.INVESTIGATE_SPEED_K;
+      if (e.investigateSweepT <= 0) {
+        const dx = e.investigateGoal.x - e.pos.x;
+        const dz = e.investigateGoal.z - e.pos.z;
+        const dh = Math.hypot(dx, dz);
+        if (dh < e.investigateBestDist - 0.15) {
+          e.investigateBestDist = dh;
+          e.investigateStallT = 0;
+        } else {
+          e.investigateStallT += dt;
+        }
+        if (dh <= P.INVESTIGATE_STOP_M || e.investigateStallT >= P.INVESTIGATE_STALL_S) {
+          e.investigateSweepT = 1e-4;
+          const sx = e.investigatePos.x - e.pos.x;
+          const sz = e.investigatePos.z - e.pos.z;
+          e.scanYaw = Math.hypot(sx, sz) > 0.1 ? yawOf(sx, sz) : e.yaw;
+          this.walk(e, 0, 0, 0, dt);
+        } else {
+          e.goal.set(e.investigateGoal.x, e.pos.y, e.investigateGoal.z);
+          this.moveToGoal(e, invSpeed, dt);
+          if (Math.hypot(e.vel.x, e.vel.z) > 0.25) this.faceYaw(e, yawOf(dx, dz), turn, dt);
+          else this.faceYaw(e, yawOf(e.investigatePos.x - e.pos.x, e.investigatePos.z - e.pos.z), turn, dt);
+        }
       } else {
         this.walk(e, 0, 0, 0, dt);
-        this.faceYaw(e, yawOf(dx, dz) + Math.sin(e.scanT * 1.4) * P.SCAN_DEG * DEG2RAD, turn * 0.6, dt);
+        e.investigateSweepT += dt;
+        const sweepYaw = e.scanYaw + Math.sin((e.investigateSweepT / P.INVESTIGATE_SWEEP_S) * Math.PI * 2) * (P.INVESTIGATE_SWEEP_DEG * DEG2RAD);
+        this.faceYaw(e, sweepYaw, 220, dt);
+        if (e.investigateSweepT >= P.INVESTIGATE_SWEEP_S) {
+          e.investigating = false;
+          e.hasInvestigate = false;
+          e.alertHoldTimer = 0;
+          e.investigateSweepT = 0;
+          e.investigateOrigin.set(NaN, NaN, NaN);
+        }
       }
       e.patrolPause = P.PAUSE_MIN_S;
       this.stealthAim(e, dt);
@@ -2281,14 +2471,43 @@ export class EnemyManager {
     rotateToward(e.aimDir, _v2, 3 * dt);
   }
 
-  /** Drone patrol: calm oval / figure-8 loop at 8–18 m around its post; ALERT drifts over the stimulus. */
+  /** Drone patrol: calm oval / figure-8 loop at 8–18 m around its post; ALERT flies to investigatePos + (0, 3.5, 0) at 0.80x combat speed. */
   private droneStealth(e: Enemy, dt: number, alert: boolean, ready: boolean): void {
     const DB = DRONE_BEHAVIOUR;
-    const speed = AI_PATROL.SPEED.DRONE;
-    if (alert) {
-      _v1.set(e.investigatePos.x, Math.max(e.altitude, e.investigatePos.y + 8), e.investigatePos.z);
+    const P = AI_PATROL;
+    const patrolSpeed = P.SPEED.DRONE;
+    const invSpeed = e.def.moveSpeed * P.INVESTIGATE_SPEED_K;
+    if (alert && e.investigating) {
+      _v1.copy(e.investigateGoal);
+      if (ready) {
+        if (e.investigateSweepT <= 0) {
+          const d3 = e.pos.distanceTo(_v1);
+          const dh = Math.hypot(_v1.x - e.pos.x, _v1.z - e.pos.z);
+          if (d3 < e.investigateBestDist - 0.15) {
+            e.investigateBestDist = d3;
+            e.investigateStallT = 0;
+          } else {
+            e.investigateStallT += dt;
+          }
+          if ((dh <= P.INVESTIGATE_STOP_M && Math.abs(_v1.y - e.pos.y) <= 2.5) || e.investigateStallT >= P.INVESTIGATE_STALL_S) {
+            e.investigateSweepT = 1e-4;
+            const sx = e.investigatePos.x - e.pos.x;
+            const sz = e.investigatePos.z - e.pos.z;
+            e.scanYaw = Math.hypot(sx, sz) > 0.1 ? yawOf(sx, sz) : e.yaw;
+          }
+        } else {
+          e.investigateSweepT += dt;
+          if (e.investigateSweepT >= P.INVESTIGATE_SWEEP_S) {
+            e.investigating = false;
+            e.hasInvestigate = false;
+            e.alertHoldTimer = 0;
+            e.investigateSweepT = 0;
+            e.investigateOrigin.set(NaN, NaN, NaN);
+          }
+        }
+      }
     } else {
-      e.orbitAngle += (e.orbitDir * speed * dt) / Math.max(4, e.orbitR);
+      e.orbitAngle += (e.orbitDir * patrolSpeed * dt) / Math.max(4, e.orbitR);
       const t = e.orbitAngle;
       const fig8 = e.retargetT >= 0.5;
       _v1.set(
@@ -2301,11 +2520,12 @@ export class EnemyManager {
     _v1.z = clamp(_v1.z, -LEVEL.HALF_EXTENT_M + 4, LEVEL.HALF_EXTENT_M - 4);
     _v2.subVectors(_v1, e.pos);
     const dist = _v2.length();
-    const want = ready ? Math.min(alert ? speed * 0.8 : speed, dist * 1.4) : 0;
+    const sweeping = alert && e.investigating && e.investigateSweepT > 0;
+    const want = ready && !sweeping ? Math.min(alert && e.investigating ? invSpeed : patrolSpeed, dist * 1.6) : 0;
     if (dist > 1e-4) _v2.multiplyScalar(want / dist);
     else _v2.set(0, 0, 0);
     _v3.subVectors(_v2, e.vel);
-    const maxDv = DB.ACCEL * 0.5 * dt;
+    const maxDv = DB.ACCEL * (alert && e.investigating ? 0.85 : 0.5) * dt;
     if (_v3.length() > maxDv) _v3.setLength(maxDv);
     e.vel.add(_v3);
     _v4.copy(e.vel).multiplyScalar(dt);
@@ -2314,8 +2534,13 @@ export class EnemyManager {
     e.pos.y += 0.25;
     if (_move.hitWall) e.orbitDir = -e.orbitDir;
     e.pos.y = clamp(e.pos.y, DB.ALT_MIN - 1, DB.ALT_MAX + 1);
-    const look = alert ? yawOf(e.investigatePos.x - e.pos.x, e.investigatePos.z - e.pos.z) : Math.hypot(e.vel.x, e.vel.z) > 0.4 ? yawOf(e.vel.x, e.vel.z) : e.yaw;
-    this.faceYaw(e, look, 120, dt);
+    if (sweeping) {
+      const sweepYaw = e.scanYaw + Math.sin((e.investigateSweepT / P.INVESTIGATE_SWEEP_S) * Math.PI * 2) * (P.INVESTIGATE_SWEEP_DEG * DEG2RAD);
+      this.faceYaw(e, sweepYaw, 220, dt);
+    } else {
+      const look = alert ? yawOf(e.investigatePos.x - e.pos.x, e.investigatePos.z - e.pos.z) : Math.hypot(e.vel.x, e.vel.z) > 0.4 ? yawOf(e.vel.x, e.vel.z) : e.yaw;
+      this.faceYaw(e, look, 140, dt);
+    }
     // Optical lens scans downward.
     _v2.set(Math.sin(e.yaw), -0.45, Math.cos(e.yaw)).normalize();
     rotateToward(e.aimDir, _v2, 2.5 * dt);
@@ -2324,7 +2549,11 @@ export class EnemyManager {
   /** 8A-5 acoustic sensing: called on every player shot (14 m pistol, 58 m sniper, 8 m grapple). */
   onPlayerGunshot(origin: THREE.Vector3, soundRadius: number): number {
     if (!this.layout) return 0;
-    return this.stealth.hearGunshot(this.enemies, origin, soundRadius, this.player.position);
+    const n = this.stealth.hearGunshot(this.enemies, origin, soundRadius, this.player.position);
+    if (n > 0) {
+      for (const e of this.enemies) if (e.active && e.alive && e.alertState === 'ALERT') this.syncInvestigation(e);
+    }
+    return n;
   }
 
   /** Highest awareness state in the sector (HUD tag / BGM). */
@@ -3412,6 +3641,7 @@ export class EnemyManager {
     let shields = 0;
     let shadows = 0;
     let marks = 0;
+    let cones = 0;
     this.markerUniforms.uTime.value = this.realTime;
     const cam = this.renderer.camera;
     for (const e of this.enemies) {
@@ -3433,6 +3663,30 @@ export class EnemyManager {
         const ryaw = e.prevYaw + wrapAngle(e.yaw - e.prevYaw) * alpha;
         this.poseEnemy(e, _v4, ryaw, realDt, simDt);
         this.writeRig(e, blinkOn);
+        // 10A-5.2: Diegetic volumetric tactical flashlight / visor scanner cones for patrolling UNAWARE & ALERT ground units and Drones (hidden in DETECTED/COMBAT).
+        if (
+          !e.isBoss &&
+          (e.alertState === 'UNAWARE' || e.alertState === 'ALERT') &&
+          (e.kind === 'ENFORCER' || e.kind === 'AEGIS' || e.kind === 'PHANTOM' || e.kind === 'DRONE') &&
+          e.spawnT > HUMANOID.SPAWN_MATERIALIZE_S &&
+          cones < AI_PATROL.SCANNER_CONE_CAP
+        ) {
+          _v1.set(_v4.x + e.headOff.x, _v4.y + e.headOff.y, _v4.z + e.headOff.z);
+          const pitchY = e.kind === 'DRONE' ? -0.45 : -0.06;
+          _v2.set(Math.sin(ryaw), pitchY, Math.cos(ryaw)).normalize();
+          _q1.setFromUnitVectors(FWD_Z, _v2);
+          const coneLen = e.kind === 'DRONE' ? AI_PATROL.SCANNER_CONE_LENGTH_DRONE_M : AI_PATROL.SCANNER_CONE_LENGTH_GROUND_M;
+          _v3.set(1, 1, coneLen);
+          _m1.compose(_v1, _q1, _v3);
+          this.scannerCones.setMatrixAt(cones, _m1);
+          if (e.alertState === 'ALERT') {
+            _col.setHex(AI_PATROL.STATE_COLOR.ALERT).multiplyScalar(AI_PATROL.SCANNER_CONE_OPACITY_ALERT);
+          } else {
+            _col.setHex(0x88f4ff).multiplyScalar(AI_PATROL.SCANNER_CONE_OPACITY_UNAWARE);
+          }
+          this.scannerCones.setColorAt(cones, _col);
+          cones++;
+        }
         // 7B-6: contact shadow under grounded humanoids (and the downed boss).
         const onGround = e.kind === 'VALKYRIE' ? e.bossMode === 'DOWNED' : e.kind !== 'DRONE' && e.grounded;
         if (onGround && shadows < CONTACT_SHADOW.MAX) {
@@ -3461,6 +3715,12 @@ export class EnemyManager {
     this.shieldMesh.count = shields;
     this.contactShadows.count = shadows;
     this.markers.count = marks;
+    this.scannerCones.count = cones;
+    this.scannerCones.visible = cones > 0;
+    if (cones > 0) {
+      this.scannerCones.instanceMatrix.needsUpdate = true;
+      if (this.scannerCones.instanceColor) this.scannerCones.instanceColor.needsUpdate = true;
+    }
     if (marks > 0) {
       this.markers.instanceMatrix.needsUpdate = true;
       this.markerState.needsUpdate = true;
@@ -4329,13 +4589,48 @@ export class EnemyManager {
   // =============================================================================================
   // Debug / tests
   // =============================================================================================
-  debugState(): { kind: EnemyKind; hp: number; phase: AttackPhase; pos: number[]; alive: boolean; shield: number; boss: string; state: AlertState; gauge: number; detT: number; los: boolean; yaw: number; patrol: number; suppress: boolean; inspecting: boolean }[] {
+  debugState(): {
+    kind: EnemyKind;
+    hp: number;
+    phase: AttackPhase;
+    pos: number[];
+    alive: boolean;
+    shield: number;
+    boss: string;
+    state: AlertState;
+    gauge: number;
+    detT: number;
+    los: boolean;
+    yaw: number;
+    patrol: number;
+    suppress: boolean;
+    inspecting: boolean;
+    investigating: boolean;
+    sweepT: number;
+    goal: number[];
+  }[] {
     const out: ReturnType<EnemyManager['debugState']> = [];
     for (const e of this.enemies) {
       if (!e.active) continue;
       out.push({
-        kind: e.kind, hp: Math.round(e.hp), phase: e.phase, pos: [+e.pos.x.toFixed(2), +e.pos.y.toFixed(2), +e.pos.z.toFixed(2)], alive: e.alive, shield: Math.round(e.shieldHp), boss: e.isBoss ? e.bossMode : '',
-        state: e.alertState, gauge: +e.alertGauge.toFixed(1), detT: +e.detectedTimer.toFixed(2), los: e.hasPlayerLos, yaw: +e.yaw.toFixed(3), patrol: e.patrolCount, suppress: e.suppress, inspecting: e.inspecting,
+        kind: e.kind,
+        hp: Math.round(e.hp),
+        phase: e.phase,
+        pos: [+e.pos.x.toFixed(2), +e.pos.y.toFixed(2), +e.pos.z.toFixed(2)],
+        alive: e.alive,
+        shield: Math.round(e.shieldHp),
+        boss: e.isBoss ? e.bossMode : '',
+        state: e.alertState,
+        gauge: +e.alertGauge.toFixed(1),
+        detT: +e.detectedTimer.toFixed(2),
+        los: e.hasPlayerLos,
+        yaw: +e.yaw.toFixed(3),
+        patrol: e.patrolCount,
+        suppress: e.suppress,
+        inspecting: e.inspecting,
+        investigating: e.investigating,
+        sweepT: +e.investigateSweepT.toFixed(2),
+        goal: [+e.investigateGoal.x.toFixed(2), +e.investigateGoal.y.toFixed(2), +e.investigateGoal.z.toFixed(2)],
       });
     }
     return out;
@@ -4363,6 +4658,11 @@ export class EnemyManager {
       e.scanYaw = yaw;
       e.losTimer = 0;
       e.debugHold = true;
+      e.investigating = false;
+      e.investigateOrigin.set(NaN, NaN, NaN);
+      e.investigateStallT = 0;
+      e.investigateBestDist = Infinity;
+      e.investigateSweepT = 0;
       if (state) {
         this.stealth.initAgent(e, state, e.locked);
         if (state === 'ALERT') e.alertGauge = 1;

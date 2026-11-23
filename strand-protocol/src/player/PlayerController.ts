@@ -232,6 +232,23 @@ export class PlayerController {
   private shakeMaxRoll = 0;
   private shakeTime = 0;
   private swingRollTarget = 0;
+  /** 10A-3b: organic figure-8 stride head-bob phase, blend, ADS blend, and current gait offsets. */
+  stridePhase = 0;
+  strideBlend = 0;
+  adsBlend = 0;
+  strideBobY = 0;
+  strideBobX = 0;
+  strideBobRoll = 0;
+  /** 10A-3b: physical spring-damper gunshot recoil camera kick (pitch/roll in rad, Z in m). */
+  kickPitch = 0;
+  kickRoll = 0;
+  kickZ = 0;
+  kickPitchV = 0;
+  kickRollV = 0;
+  kickZV = 0;
+  kickSpringK = 260;
+  kickSpringC = 28;
+  private kickRollSign = 1;
   readonly eye = new THREE.Vector3();
   /** Final camera Euler angles (rad) after recoil, shake and roll. */
   readonly cameraEuler = new THREE.Euler(0, 0, 0, 'YXZ');
@@ -281,6 +298,17 @@ export class PlayerController {
     this.dipX = 0;
     this.dipV = 0;
     this.trauma = 0;
+    this.stridePhase = 0;
+    this.strideBlend = 0;
+    this.strideBobY = 0;
+    this.strideBobX = 0;
+    this.strideBobRoll = 0;
+    this.kickPitch = 0;
+    this.kickRoll = 0;
+    this.kickZ = 0;
+    this.kickPitchV = 0;
+    this.kickRollV = 0;
+    this.kickZV = 0;
     this.fov = this.settings.baseFov;
     this.lastWallCollider = -1;
     this.wallLostFor = 0;
@@ -417,6 +445,31 @@ export class PlayerController {
   /** Brief FOV pulse: widening (HS kill +2.5°) or a micro zoom-in (negative, boss finisher). Largest magnitude wins. */
   pulseFov(deg: number): void {
     if (Math.abs(deg) > Math.abs(this.fovPulse)) this.fovPulse = deg;
+  }
+
+  /**
+   * 10A-3b: physical spring-damper gunshot recoil camera kick (`kickPitch`, `kickRoll`, `kickZ` + sniper FOV punch).
+   *  - MK-IV Rail Pistol: +0.85° hip / +0.55° ADS upward pitch snap, +0.45° clockwise roll flick, -0.016 m Z-punch (k=260, c=28).
+   *  - K-90 Rail Sniper: +2.4° hip / +1.4° ADS upward pitch kick, ±1.1° roll whip, -0.048 m Z-punch, +1.8° FOV punch (k=175, c=21).
+   */
+  onWeaponKick(gunId: 'PISTOL' | 'SNIPER', ads = false): void {
+    const ss = this.settings.shakeScale;
+    const rs = this.settings.rollScale;
+    if (gunId === 'PISTOL') {
+      this.kickSpringK = 260;
+      this.kickSpringC = 28;
+      this.kickPitch += (ads ? 0.55 : 0.85) * DEG2RAD * ss;
+      this.kickRoll += 0.45 * DEG2RAD * rs;
+      this.kickZ += -0.016 * ss;
+    } else {
+      this.kickSpringK = 175;
+      this.kickSpringC = 21;
+      this.kickPitch += (ads ? 1.4 : 2.4) * DEG2RAD * ss;
+      this.kickRoll += this.kickRollSign * 1.1 * DEG2RAD * rs;
+      this.kickRollSign = -this.kickRollSign;
+      this.kickZ += -0.048 * ss;
+      this.pulseFov(1.8 * ss);
+    }
   }
 
   // ===============================================================================================
@@ -1241,14 +1294,53 @@ export class PlayerController {
     const sYaw = this.shakeMaxPitchYaw * shake * nY * DEG2RAD;
     const sRoll = this.shakeMaxRoll * shake * nR * DEG2RAD;
 
-    // Interpolated eye position.
+    // 10A-3b.1: Organic figure-8 stride head-bob (synced to ground footsteps, 0.15× in ADS).
+    const hs = Math.hypot(this.velocity.x, this.velocity.z);
+    const strideActive = (this.state === 'GROUNDED' || this.state === 'CROUCHING') && hs > 0.15;
+    if (strideActive) {
+      this.stridePhase += hs * 0.62 * realDt;
+      this.strideBlend += (1 - this.strideBlend) * lerpFactor(14, realDt);
+    } else {
+      this.strideBlend += (0 - this.strideBlend) * lerpFactor(10, realDt);
+      if (this.strideBlend < 1e-4) this.strideBlend = 0;
+    }
+    const crouching = this.state === 'CROUCHING';
+    const adsK = 1 - 0.85 * clamp(this.adsBlend > 0 ? this.adsBlend : this.gunZoom ? 1 : 0, 0, 1);
+    const bobScale = this.strideBlend * adsK * this.settings.shakeScale;
+    this.strideBobY = -Math.abs(Math.sin(this.stridePhase)) * (crouching ? 0.014 : 0.028) * bobScale;
+    this.strideBobX = Math.cos(this.stridePhase) * (crouching ? 0.006 : 0.012) * bobScale;
+    this.strideBobRoll = Math.sin(this.stridePhase) * (crouching ? 0.22 : 0.45) * DEG2RAD * rs * this.strideBlend * adsK;
+
+    // 10A-3b.2: Physical spring-damper gunshot recoil kick (critically damped sub-stepped integration).
+    if (realDt > 0) {
+      const subSteps = Math.max(1, Math.ceil(realDt / (1 / 240)));
+      const h = realDt / subSteps;
+      const k = this.kickSpringK;
+      const c = this.kickSpringC;
+      for (let s = 0; s < subSteps; s++) {
+        this.kickPitchV += (-k * this.kickPitch - c * this.kickPitchV) * h;
+        this.kickPitch += this.kickPitchV * h;
+        this.kickRollV += (-k * this.kickRoll - c * this.kickRollV) * h;
+        this.kickRoll += this.kickRollV * h;
+        this.kickZV += (-k * this.kickZ - c * this.kickZV) * h;
+        this.kickZ += this.kickZV * h;
+      }
+    }
+
+    // Interpolated eye position + stride head-bob + physical recoil Z-punch.
     this.eye.lerpVectors(this.prevPosition, this.position, alpha);
-    this.eye.y += this.eyeHeight + this.dipX;
+    this.eye.y += this.eyeHeight + this.dipX + this.strideBobY;
+    _right.set(Math.cos(this.yaw), 0, -Math.sin(this.yaw));
+    this.eye.addScaledVector(_right, this.strideBobX);
+    if (Math.abs(this.kickZ) > 1e-6) {
+      _fwd.set(-Math.sin(this.yaw) * Math.cos(this.pitch), Math.sin(this.pitch), -Math.cos(this.yaw) * Math.cos(this.pitch));
+      this.eye.addScaledVector(_fwd, this.kickZ);
+    }
 
     this.cameraEuler.set(
-      this.pitch + this.recoilPitchDeg * DEG2RAD + sPitch,
+      this.pitch + this.recoilPitchDeg * DEG2RAD + this.kickPitch + sPitch,
       this.yaw + this.recoilYawDeg * DEG2RAD + sYaw,
-      this.roll + sRoll,
+      this.roll + this.strideBobRoll - this.kickRoll + sRoll,
       'YXZ',
     );
     camera.position.copy(this.eye);

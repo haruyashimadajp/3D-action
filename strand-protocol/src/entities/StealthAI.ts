@@ -12,7 +12,7 @@
  *
  * `locked` agents (VALKYRIE-09 and its escorts) stay in COMBAT and never de-escalate.
  */
-import { AI_STEALTH, type AlertState } from '../config/enemies';
+import { AI_PATROL, AI_STEALTH, type AlertState } from '../config/enemies';
 
 export interface Vec3Like {
   x: number;
@@ -44,6 +44,8 @@ export interface StealthAgent {
   /** Where the last stimulus came from (gunshot origin, sighting); ALERT agents turn toward and approach it. */
   readonly investigatePos: Vec3Like;
   hasInvestigate: boolean;
+  /** 10A-5.1: true while a mobile ALERT unit is walking/flying toward investigateGoal or sweeping ±60° for 2.0 s. */
+  investigating?: boolean;
   /** Never leaves COMBAT (sector 5 boss and escorts). */
   locked: boolean;
 }
@@ -132,6 +134,7 @@ export class StealthDirector {
     a.nearPlayer = false;
     a.inspecting = false;
     a.hasInvestigate = false;
+    a.investigating = false;
     a.locked = locked;
   }
 
@@ -153,6 +156,7 @@ export class StealthDirector {
     a.alertState = 'DETECTED';
     a.alertGauge = 100;
     a.detectedTimer = 0;
+    a.investigating = false;
     if (player) {
       this.copyTo(this.sharedLastKnownPos, player);
       this.hasSharedLastKnown = true;
@@ -164,6 +168,7 @@ export class StealthDirector {
     if (a.alertState === 'COMBAT') return;
     a.alertState = 'COMBAT';
     a.alertGauge = 100;
+    a.investigating = false;
     this.events.onCombat?.(a);
   }
 
@@ -193,13 +198,18 @@ export class StealthDirector {
         this.copyTo(a.investigatePos, player);
         a.hasInvestigate = true;
       } else if (a.alertState === 'ALERT') {
-        a.alertHoldTimer -= dt;
-        if (a.alertHoldTimer <= 0) a.alertGauge -= S.DECAY_PER_S * dt;
-        if (a.alertGauge <= 0) {
-          a.alertGauge = 0;
-          a.alertState = 'UNAWARE';
-          a.hasInvestigate = false;
-          this.events.onCalm?.(a);
+        if (a.investigating) {
+          // 10A-5.1: freeze alertGauge decay (floor >= 25) while en route or sweeping at investigateGoal.
+          a.alertGauge = Math.max(a.alertGauge, AI_PATROL.INVESTIGATE_GAUGE_FLOOR);
+        } else {
+          a.alertHoldTimer -= dt;
+          if (a.alertHoldTimer <= 0) a.alertGauge -= S.DECAY_PER_S * dt;
+          if (a.alertGauge <= 0) {
+            a.alertGauge = 0;
+            a.alertState = 'UNAWARE';
+            a.hasInvestigate = false;
+            this.events.onCalm?.(a);
+          }
         }
       }
       if (a.alertGauge >= 100) this.toDetected(a, player, false);

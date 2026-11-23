@@ -127,6 +127,8 @@ export class EquipmentManager {
   private lastShotAt = -1e9;
   private grappleReadyAt = 0;
   private suppressCooldown = false;
+  /** 10A-3.2: periodic sniper barrel heat-vent steam emitter timer. */
+  private steamTimer = 0;
 
   // Hook flight
   hookInFlight = false;
@@ -251,10 +253,12 @@ export class EquipmentManager {
     this.player.zoomFovDeg = 0;
     this.player.zoomAbsFov = 0;
     this.player.zoomAbsBlend = 0;
+    this.player.adsBlend = 0;
     this.player.gunZoom = false;
     this.momentumLeft = 0;
     this.momentumUntil = -1;
     this.freeNextDetach = false;
+    this.steamTimer = 0;
   }
 
   // ===============================================================================================
@@ -395,11 +399,23 @@ export class EquipmentManager {
     this.events.onReloadStart?.(gun.id);
   }
 
-  /** 7A-5 / 8A-3: emits the reload SE cues whose beat the reload progress has crossed (each exactly once). */
-  private fireReloadCues(gun: GunId): void {
+  /** 7A-5 / 8A-3 / 10A-3.2: emits reload SE cues and ejects spent sniper rail casing on BOLT_OPEN. */
+  private fireReloadCues(gun: GunId, camera: THREE.PerspectiveCamera): void {
     const t = this.stateTime / Math.max(this.stateDuration, 1e-4);
     const cues = RELOAD_CUES[gun];
-    while (this.reloadCue < cues.length && t >= RELOAD_BEATS[cues[this.reloadCue]]) this.events.onReloadCue?.(gun, cues[this.reloadCue++]);
+    while (this.reloadCue < cues.length && t >= RELOAD_BEATS[cues[this.reloadCue]]) {
+      const cue = cues[this.reloadCue++];
+      this.events.onReloadCue?.(gun, cue);
+      if (gun === 'SNIPER' && cue === 'BOLT_OPEN' && this.viewModel.ejectWorld) {
+        this.player.aimDirection(_aim);
+        _right.crossVectors(_aim, Y_AXIS);
+        if (_right.lengthSq() < 1e-6) _right.set(1, 0, 0);
+        _right.normalize();
+        _up.crossVectors(_right, _aim).normalize();
+        this.viewModel.ejectWorld('SNIPER', camera, _a);
+        this.effects.spawnCasing?.(_a, _right, _up, true);
+      }
+    }
   }
 
   /**
@@ -501,7 +517,7 @@ export class EquipmentManager {
         }
         break;
       case 'RELOADING':
-        if (isGun(this.activeSlot)) this.fireReloadCues(this.activeSlot);
+        if (isGun(this.activeSlot)) this.fireReloadCues(this.activeSlot, camera);
         if (this.stateTime >= this.stateDuration && isGun(this.activeSlot)) {
           this.ammo[this.activeSlot] = GUNS[this.activeSlot].magazine;
           this.enter('IDLE', 0);
@@ -585,17 +601,31 @@ export class EquipmentManager {
       this.effects.spawnProjectile(_eye, _dir, spec, _muzzle);
     }
 
-    // Recoil (deg).
+    // Recoil (deg) + 10A-3b.2 physical spring-damper camera kick.
     const r = gun.recoil;
     const horiz = (Math.random() * 2 - 1) * r.horizontalDeg;
     this.player.addRecoil(r.verticalDeg * recoilK, horiz * recoilK, r.recoverDegPerS);
+    this.player.onWeaponKick?.(gun.id, zoomed);
     this.reticleKick = Math.min(1, this.reticleKick + RETICLE_KICK[gun.id] * recoilK);
     this.player.addTrauma(gun.shake, recoilK);
     this.player.notifyFired();
     this.viewModel.onFire(gun.id, recoilK);
-    // Suppressed pistol: a faint muzzle glow; the rail sniper lights up the street.
-    this.renderer.flashLight(_muzzle, this.plasma ? PLASMA_HEX : this.energyHex, gun.id === 'SNIPER' ? 18 : 5, 12, gun.id === 'SNIPER' ? 0.09 : 0.05);
+    // 10A-3.1: Suppressed pistol has a 45 ms flash; the rail sniper fires an intense 70 ms dynamic PointLight lighting surrounding walls.
+    this.renderer.flashLight(
+      _muzzle,
+      this.plasma ? PLASMA_HEX : this.energyHex,
+      gun.id === 'SNIPER' ? 22 : 6,
+      gun.id === 'SNIPER' ? 16 : 10,
+      gun.id === 'SNIPER' ? 0.07 : 0.045,
+    );
     this.effects.burst(_muzzle, _aim, BURST.MUZZLE, this.muzzleColor.getHex());
+    // 10A-3.2: Eject a visible 3D spent brass/rail cartridge from the Pistol ejection port on every shot.
+    if (gun.id === 'PISTOL' && this.viewModel.ejectWorld) {
+      this.viewModel.ejectWorld('PISTOL', camera, _a);
+      this.effects.spawnCasing?.(_a, _right, _up, false);
+    } else if (gun.id === 'SNIPER') {
+      this.steamTimer = 0.1;
+    }
     const airborne = !this.player.isGrounded;
     // 8A-5 acoustic sensing: 14 m suppressed pistol, 58 m rail crack.
     this.events.onGunshot?.(_eye, gun.soundRadius);
@@ -742,6 +772,17 @@ export class EquipmentManager {
     f.zoom = this.zoomBlend;
     f.zoomGun = this.zoomGun;
     this.viewModel.update(realDt, f);
+
+    // 10A-3.2: Sniper post-shot barrel heat-vent vapor puffs while the rail coils cool over 1.5 s.
+    const heat = this.viewModel.barrelHeat ?? 0;
+    if (realDt > 0 && heat > 0.08 && this.activeSlot === 'SNIPER') {
+      this.steamTimer += realDt;
+      if (this.steamTimer >= 0.13) {
+        this.steamTimer = 0;
+        this.viewModel.muzzleWorld('SNIPER', camera, _a);
+        this.effects.emitBarrelSteam?.(_a);
+      }
+    }
   }
 
   /**
@@ -761,6 +802,7 @@ export class EquipmentManager {
     this.zoomBlend += ((target ? 1 : 0) - this.zoomBlend) * Math.min(1, z.lerpRate * realDt);
     if (this.zoomBlend < 0.0005) this.zoomBlend = 0;
     this.player.gunZoom = target;
+    this.player.adsBlend = this.zoomBlend;
     const base = this.player.settings.baseFov;
     if (z.magnification > 0) {
       // 8A-3 true optical magnification from the user's base FOV (84° → 25.37° at 4x).

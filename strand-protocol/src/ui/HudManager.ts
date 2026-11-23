@@ -35,7 +35,8 @@
  *    the side panels + faint edge scales, title SETTINGS / PROTOCOL as right-side drawers
  * DOM is written only when values change (no per-frame layout churn).
  */
-import { BULLET_TIME, FLOW_RANKS, INPUT, JUICE, PLAYER, SAVE_KEY, TELEGRAPH, clamp } from '../config/constants';
+import { BULLET_TIME, FLOW_RANKS, INPUT, JUICE, PLAYER, RADAR, SAVE_KEY, TELEGRAPH, clamp } from '../config/constants';
+import type { AlertState } from '../config/enemies';
 import {
   ENERGY_COLORS,
   MODIFIERS,
@@ -53,7 +54,7 @@ import {
 } from '../config/skills';
 import { GUNS, type SlotId, isGun } from '../config/weapons';
 import type { GearState } from '../player/EquipmentManager';
-import type { HitMarkerKind } from '../entities/EnemyManager';
+import type { HitMarkerKind, RadarEnemySample } from '../entities/EnemyManager';
 
 export interface HudFrame {
   slot: SlotId;
@@ -124,6 +125,13 @@ export interface HudFrame {
   readonly awareRank: Uint8Array;
   /** 8A-5 district status ('' hides the badge, e.g. boss sector or gate open). */
   alertTag: string;
+  /** 10A-3.4: Sniper 4x ADS digital rangefinder distance in metres (−1 when hidden). */
+  rangefinderM: number;
+  /** 10A-6: Player world coordinates & yaw for the top-left pulse-scan mini-radar. */
+  playerX: number;
+  playerY: number;
+  playerZ: number;
+  playerYaw: number;
 }
 
 export const HUD_MAX_AWARE = 4;
@@ -132,9 +140,225 @@ const AWARE_LEN = 78 * 28 * (Math.PI / 180);
 
 export const HUD_MAX_WARNINGS = 8;
 export const HUD_MAX_TRACKS = 6;
+export const HUD_MAX_RADAR = 24;
 /** BT arc "refused" blink (ms) and armour alert (ms), 5A-1 / 5A-5. */
 const BT_DENIED_S = 0.35;
 const ALERT_S = 1.2;
+
+// =============================================================================================
+// 10A-6: Tactical Pulse-Scan Mini-Radar (pure math & state machine, Option C — no 3D wallhack)
+// =============================================================================================
+export type RadarElevation = 'UP' | 'DOWN' | 'LEVEL';
+
+export interface RadarProjection {
+  /** Horizontal offset in radar canvas pixels from center (+X right). */
+  xPx: number;
+  /** Vertical offset in radar canvas pixels from center (-Y up / player forward). */
+  yPx: number;
+  /** Player-relative right offset in metres. */
+  rightM: number;
+  /** Player-relative forward offset in metres. */
+  fwdM: number;
+  /** Horizontal distance in metres. */
+  distM: number;
+  /** True when horizontal distance exceeds the radar range (75 m). */
+  outOfRange: boolean;
+}
+
+export interface RadarBlipSnapshot {
+  id: number;
+  active: boolean;
+  x: number;
+  y: number;
+  z: number;
+  state: AlertState;
+  ageS: number;
+  alpha: number;
+}
+
+/** 10A-6: Elevation tick indicator (`▲` above if Δy >= +3.5 m, `▼` below if Δy <= −3.5 m). */
+export function computeRadarElevation(enemyY: number, playerY: number): RadarElevation {
+  const dy = enemyY - playerY;
+  if (dy >= RADAR.ELEVATION_THRESHOLD_M) return 'UP';
+  if (dy <= -RADAR.ELEVATION_THRESHOLD_M) return 'DOWN';
+  return 'LEVEL';
+}
+
+/** 10A-6: Blip alpha fading smoothly from 1.0 down to 0.18 over 3.2 s between 3.5 s sweeps. */
+export function computeRadarBlipAlpha(ageS: number): number {
+  const t = clamp(ageS / RADAR.BLIP_FADE_S, 0, 1);
+  return 1.0 - (1.0 - RADAR.BLIP_MIN_ALPHA) * t;
+}
+
+/**
+ * 10A-6: Projects an enemy world position `(enemyX, enemyZ)` into player-relative radar canvas coordinates
+ * rotating continuously with `-playerYaw` so "up" (`-Y`) is always the player's current forward view direction.
+ */
+export function projectRadarBlip(
+  enemyX: number,
+  enemyZ: number,
+  playerX: number,
+  playerZ: number,
+  playerYaw: number,
+  radiusPx: number,
+  rangeM: number = RADAR.RANGE_M,
+  out?: RadarProjection,
+): RadarProjection {
+  const dx = enemyX - playerX;
+  const dz = enemyZ - playerZ;
+  const distM = Math.hypot(dx, dz);
+  const cos = Math.cos(playerYaw);
+  const sin = Math.sin(playerYaw);
+  // Three.js camera yaw: forward = (-sin(yaw), 0, -cos(yaw)), right = (cos(yaw), 0, -sin(yaw)).
+  const rightM = dx * cos - dz * sin;
+  const fwdM = -dx * sin - dz * cos;
+  const outOfRange = distM > rangeM;
+  const clampedM = Math.min(distM, rangeM);
+  const scale = distM > 1e-5 ? ((clampedM / rangeM) * radiusPx) / distM : 0;
+  const xPx = rightM * scale;
+  const yPx = -fwdM * scale;
+  if (out) {
+    out.xPx = xPx;
+    out.yPx = yPx;
+    out.rightM = rightM;
+    out.fwdM = fwdM;
+    out.distM = distM;
+    out.outOfRange = outOfRange;
+    return out;
+  }
+  return { xPx, yPx, rightM, fwdM, distM, outOfRange };
+}
+
+/**
+ * 10A-6: Pulse-scan radar state machine (zero allocations per step).
+ * Every 3.5 s, an expanding cyan pulse ring sweeps from 0 -> 75 m over 0.65 s.
+ * As the pulse ring crosses each enemy's distance, it refreshes that enemy's blip snapshot
+ * `(x, y, z, state)` to `alpha = 1.0`, which then fades smoothly down to `0.18` over `3.2 s`.
+ */
+export class PulseRadar {
+  readonly blips: RadarBlipSnapshot[] = Array.from({ length: HUD_MAX_RADAR }, (_, i) => ({
+    id: i,
+    active: false,
+    x: 0,
+    y: 0,
+    z: 0,
+    state: 'UNAWARE',
+    ageS: 0,
+    alpha: RADAR.BLIP_MIN_ALPHA,
+  }));
+  private readonly aliveMask = new Uint8Array(HUD_MAX_RADAR);
+  private readonly sweptMask = new Uint8Array(HUD_MAX_RADAR);
+  sweepClock = 0;
+  /** Current expanding pulse ring radius in metres (0..75 m during the 0.65 s sweep, −1 between sweeps). */
+  sweepRadiusM = 0;
+  private initialized = false;
+
+  reset(): void {
+    for (const b of this.blips) {
+      b.active = false;
+      b.ageS = 0;
+      b.alpha = RADAR.BLIP_MIN_ALPHA;
+    }
+    this.aliveMask.fill(0);
+    this.sweptMask.fill(0);
+    this.sweepClock = 0;
+    this.sweepRadiusM = 0;
+    this.initialized = false;
+  }
+
+  /**
+   * Advances the pulse-scan cycle by `dt` real seconds.
+   * Returns `true` on the frame a new 3.5 s sweep starts while at least one enemy is alive (`targetCount > 0`).
+   */
+  step(
+    dt: number,
+    playerX: number,
+    playerY: number,
+    playerZ: number,
+    targets: readonly RadarEnemySample[],
+    targetCount: number,
+  ): boolean {
+    void playerY;
+    this.aliveMask.fill(0);
+    for (let i = 0; i < targetCount; i++) {
+      const id = targets[i].id;
+      if (id >= 0 && id < HUD_MAX_RADAR) this.aliveMask[id] = 1;
+    }
+    for (let i = 0; i < HUD_MAX_RADAR; i++) {
+      if (!this.aliveMask[i]) this.blips[i].active = false;
+      else if (this.blips[i].active) {
+        this.blips[i].ageS += dt;
+        this.blips[i].alpha = computeRadarBlipAlpha(this.blips[i].ageS);
+      }
+    }
+
+    let pingTriggered = false;
+    let prevR = this.sweepRadiusM < 0 ? 0 : this.sweepRadiusM;
+    if (!this.initialized) {
+      this.initialized = true;
+      this.sweepClock = 0;
+      this.sweepRadiusM = 0;
+      prevR = 0;
+      this.sweptMask.fill(0);
+      pingTriggered = targetCount > 0;
+    } else {
+      this.sweepClock += dt;
+      if (this.sweepClock >= RADAR.SWEEP_PERIOD_S) {
+        this.sweepClock %= RADAR.SWEEP_PERIOD_S;
+        this.sweepRadiusM = 0;
+        prevR = 0;
+        this.sweptMask.fill(0);
+        pingTriggered = targetCount > 0;
+      }
+    }
+
+    if (this.sweepClock <= RADAR.SWEEP_DURATION_S) {
+      const curR = clamp(this.sweepClock / RADAR.SWEEP_DURATION_S, 0, 1) * RADAR.RANGE_M;
+      this.sweepRadiusM = curR;
+      for (let i = 0; i < targetCount; i++) {
+        const t = targets[i];
+        const id = t.id;
+        if (id < 0 || id >= HUD_MAX_RADAR) continue;
+        const b = this.blips[id];
+        const d = Math.hypot(t.x - playerX, t.z - playerZ);
+        const crossD = Math.min(d, RADAR.RANGE_M);
+        if (!this.sweptMask[id] && crossD <= curR + 1e-4 && crossD >= prevR - 1e-4) {
+          this.sweptMask[id] = 1;
+          b.active = true;
+          b.x = t.x;
+          b.y = t.y;
+          b.z = t.z;
+          b.state = t.state;
+          b.ageS = 0;
+          b.alpha = 1.0;
+        }
+      }
+    } else {
+      // Ensure any target within the current sweep cycle that spawned or crossed at the boundary was captured.
+      for (let i = 0; i < targetCount; i++) {
+        const t = targets[i];
+        const id = t.id;
+        if (id < 0 || id >= HUD_MAX_RADAR) continue;
+        if (!this.sweptMask[id]) {
+          this.sweptMask[id] = 1;
+          const b = this.blips[id];
+          b.active = true;
+          b.x = t.x;
+          b.y = t.y;
+          b.z = t.z;
+          b.state = t.state;
+          b.ageS = Math.max(0, this.sweepClock - RADAR.SWEEP_DURATION_S);
+          b.alpha = computeRadarBlipAlpha(b.ageS);
+        }
+      }
+      this.sweepRadiusM = -1;
+    }
+
+    return pingTriggered;
+  }
+}
+
+const _radarProj: RadarProjection = { xPx: 0, yPx: 0, rightM: 0, fwdM: 0, distM: 0, outOfRange: false };
 
 /** Structural view of the input's 450 ms click lock (InputManager satisfies it). */
 export interface ClickGate {
@@ -199,6 +423,10 @@ function el<T extends HTMLElement | SVGElement = HTMLElement>(id: string): T {
 export class HudManager {
   private readonly root = el('hud');
   private readonly dot = el('xh-dot');
+  private readonly rangeEl = el('xh-range');
+  private readonly radarCanvas = el<HTMLCanvasElement>('radar-canvas');
+  private readonly radarCtx = this.radarCanvas.getContext('2d');
+  readonly radar = new PulseRadar();
   private readonly reticles: Record<SlotId, SVGElement>;
   private readonly anchor = el('xh-anchor');
   private readonly btArc = el<SVGPathElement>('xh-bt-arc');
@@ -795,6 +1023,15 @@ export class HudManager {
       const fq = Math.round(clamp(f.aimFrac, 0, 1) * 88) / 88;
       if (this.changed('aimF', fq)) this.aimHpFill.style.transform = `scaleX(${fq.toFixed(3)})`;
     }
+    // 10A-3.4: Sniper 4x ADS digital rangefinder readout (just bottom-right of reticle, 11px, subtle cyan 0.75 alpha).
+    const showRange = f.rangefinderM >= 0;
+    if (this.changed('rngV', showRange)) this.rangeEl.style.display = showRange ? 'block' : 'none';
+    if (showRange) {
+      const rm = Math.round(f.rangefinderM);
+      if (this.changed('rngM', rm)) this.rangeEl.textContent = `${rm}m`;
+    }
+    // 10A-6: Top-left 136×136 circular pulse-scan mini-radar (+0 WebGL draw calls).
+    this.drawRadar(f);
     const sharp = z > 0.2;
     if (this.changed('zs', sharp) || this.changed('zsl', f.slot)) {
       for (const k of Object.keys(this.reticles) as SlotId[]) {
@@ -968,6 +1205,141 @@ export class HudManager {
       }
       if (this.changed('bdn', f.bossDowned)) this.bossDown.classList.toggle('on', f.bossDowned);
     }
+  }
+
+  /**
+   * 10A-6: Renders the 136×136 top-left circular pulse-scan mini-radar (+0 WebGL draw calls).
+   * Rotates continuously with -player.yaw so "up" is always the player's forward view direction.
+   */
+  private drawRadar(f: HudFrame): void {
+    const ctx = this.radarCtx;
+    if (!ctx) return;
+    const size = RADAR.SIZE_PX;
+    const cx = size * 0.5;
+    const cy = size * 0.5;
+    const outerR = cx - 6; // 62 px radius inside 136x136 canvas
+    ctx.clearRect(0, 0, size, size);
+
+    // 1. Dark translucent circular backdrop
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(cx, cy, outerR, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(5, 7, 14, 0.72)';
+    ctx.fill();
+
+    // 2. Rotating compass crosshair ticks (-player.yaw)
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.rotate(f.playerYaw);
+    ctx.strokeStyle = 'rgba(56, 248, 255, 0.14)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(0, -outerR);
+    ctx.lineTo(0, -outerR + 5);
+    ctx.moveTo(0, outerR - 5);
+    ctx.lineTo(0, outerR);
+    ctx.moveTo(-outerR, 0);
+    ctx.lineTo(-outerR + 5, 0);
+    ctx.moveTo(outerR - 5, 0);
+    ctx.lineTo(outerR, 0);
+    ctx.stroke();
+    ctx.restore();
+
+    // 3. Concentric range rings (25 m / 50 m / 75 m)
+    for (let i = 0; i < RADAR.RINGS_M.length; i++) {
+      const rM = RADAR.RINGS_M[i];
+      const rPx = (rM / RADAR.RANGE_M) * outerR;
+      const isOuter = i === RADAR.RINGS_M.length - 1;
+      ctx.beginPath();
+      ctx.arc(cx, cy, rPx, 0, Math.PI * 2);
+      ctx.strokeStyle = isOuter ? 'rgba(56, 248, 255, 0.58)' : 'rgba(56, 248, 255, 0.16)';
+      ctx.lineWidth = isOuter ? 1.5 : 1.0;
+      ctx.stroke();
+    }
+
+    // 4. Subtle forward FOV cone wedge (pointing UP on the radar)
+    const fovHalfRad = 42 * (Math.PI / 180);
+    ctx.beginPath();
+    ctx.moveTo(cx, cy);
+    ctx.arc(cx, cy, outerR, -Math.PI * 0.5 - fovHalfRad, -Math.PI * 0.5 + fovHalfRad);
+    ctx.closePath();
+    ctx.fillStyle = 'rgba(56, 248, 255, 0.08)';
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(56, 248, 255, 0.22)';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+
+    // 5. Expanding cyan pulse-scan ring (0 -> 75 m over 0.65 s every 3.5 s)
+    if (this.radar.sweepRadiusM >= 0) {
+      const frac = clamp(this.radar.sweepRadiusM / RADAR.RANGE_M, 0, 1);
+      const pulseR = Math.max(1, frac * outerR);
+      ctx.beginPath();
+      ctx.arc(cx, cy, pulseR, 0, Math.PI * 2);
+      ctx.strokeStyle = `rgba(56, 248, 255, ${(0.82 * (1 - frac * 0.35)).toFixed(2)})`;
+      ctx.lineWidth = 1.6;
+      ctx.stroke();
+    }
+
+    // 6. State-colored enemy blips + ▲/▼ elevation ticks + outer-rim edge ticks (> 75 m)
+    const blips = this.radar.blips;
+    for (let i = 0; i < blips.length; i++) {
+      const b = blips[i];
+      if (!b.active) continue;
+      projectRadarBlip(b.x, b.z, f.playerX, f.playerZ, f.playerYaw, outerR - 2, RADAR.RANGE_M, _radarProj);
+      const color = RADAR.STATE_HEX[b.state];
+      ctx.save();
+      ctx.globalAlpha = clamp(b.alpha, RADAR.BLIP_MIN_ALPHA, 1);
+      ctx.fillStyle = color;
+      ctx.strokeStyle = color;
+      const bx = cx + _radarProj.xPx;
+      const by = cy + _radarProj.yPx;
+      if (_radarProj.outOfRange) {
+        // Subtle outer-rim directional tick for enemies beyond 75 m
+        const ang = Math.atan2(_radarProj.yPx, _radarProj.xPx);
+        ctx.translate(cx + Math.cos(ang) * (outerR - 1.5), cy + Math.sin(ang) * (outerR - 1.5));
+        ctx.rotate(ang);
+        ctx.beginPath();
+        ctx.moveTo(2, 0);
+        ctx.lineTo(-3, -2.4);
+        ctx.lineTo(-3, 2.4);
+        ctx.closePath();
+        ctx.fill();
+      } else {
+        // Blip dot
+        ctx.beginPath();
+        ctx.arc(bx, by, 3.0, 0, Math.PI * 2);
+        ctx.fill();
+        // Elevation tick: ▲ above if enemy.y - player.y >= +3.5 m, ▼ below if <= -3.5 m
+        const elev = computeRadarElevation(b.y, f.playerY);
+        if (elev === 'UP') {
+          ctx.beginPath();
+          ctx.moveTo(bx, by - 7.2);
+          ctx.lineTo(bx - 2.6, by - 4.2);
+          ctx.lineTo(bx + 2.6, by - 4.2);
+          ctx.closePath();
+          ctx.fill();
+        } else if (elev === 'DOWN') {
+          ctx.beginPath();
+          ctx.moveTo(bx, by + 7.2);
+          ctx.lineTo(bx - 2.6, by + 4.2);
+          ctx.lineTo(bx + 2.6, by + 4.2);
+          ctx.closePath();
+          ctx.fill();
+        }
+      }
+      ctx.restore();
+    }
+
+    // 7. Central player chevron pointing forward (up)
+    ctx.fillStyle = '#e8fbff';
+    ctx.beginPath();
+    ctx.moveTo(cx, cy - 4.5);
+    ctx.lineTo(cx + 3.4, cy + 3.5);
+    ctx.lineTo(cx, cy + 1.5);
+    ctx.lineTo(cx - 3.4, cy + 3.5);
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
   }
 }
 

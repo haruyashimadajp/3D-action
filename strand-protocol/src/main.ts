@@ -57,18 +57,19 @@ import {
   type SkillId,
   type SkillLevels,
 } from './config/skills';
+import { GUNS } from './config/weapons';
 import { AudioEngine } from './engine/AudioEngine';
 import { Renderer } from './engine/Renderer';
 import { getProceduralTextures } from './engine/ProceduralTextures';
 import { InputManager } from './engine/InputManager';
 import { CityBuilder, type SectorLayout, blimpPose, lightningAt } from './world/CityBuilder';
-import { PhysicsWorld, type HitboxTarget } from './world/PhysicsWorld';
+import { PhysicsWorld, createRayHit, createTargetHit, type HitboxTarget } from './world/PhysicsWorld';
 import { EffectsPool, BURST, type ProjectileImpact, type ProjectileOwner, type ProjectileSpec } from './entities/EffectsPool';
-import { EnemyManager, RICOCHET_TAG, type HitMarkerKind, type KillInfo } from './entities/EnemyManager';
+import { EnemyManager, RICOCHET_TAG, type HitMarkerKind, type KillInfo, type RadarEnemySample } from './entities/EnemyManager';
 import { PlayerController } from './player/PlayerController';
 import { EquipmentManager } from './player/EquipmentManager';
 import { ViewModelRenderer } from './player/ViewModelRenderer';
-import { HUD_MAX_AWARE, HUD_MAX_TRACKS, HUD_MAX_WARNINGS, HudManager, SaveStore, formatTime, type HudFrame } from './ui/HudManager';
+import { HUD_MAX_AWARE, HUD_MAX_RADAR, HUD_MAX_TRACKS, HUD_MAX_WARNINGS, HudManager, SaveStore, formatTime, type HudFrame } from './ui/HudManager';
 
 // ---------------------------------------------------------------------------
 // Game clock: simulation dt = real dt × min(bullet-time scale, hitstop scale).
@@ -307,6 +308,15 @@ const _flowOut = { label: '', points: 0 };
 const UP = new THREE.Vector3(0, 1, 0);
 const _trkPos = Array.from({ length: HUD_MAX_TRACKS }, () => new THREE.Vector3());
 const _trkBoss = new Uint8Array(HUD_MAX_TRACKS);
+const _rangeHit = createRayHit();
+const _rangeTargetHit = createTargetHit();
+const _radarTargets: RadarEnemySample[] = Array.from({ length: HUD_MAX_RADAR }, () => ({
+  id: 0,
+  x: 0,
+  y: 0,
+  z: 0,
+  state: 'UNAWARE',
+}));
 /** Tracking diamonds clamp this far inside the screen edge (px). */
 const TRACK_EDGE_MARGIN_PX = 44;
 /** Volume-slider preview tick throttle (s). */
@@ -583,6 +593,11 @@ class App {
       awareGauge: new Float32Array(HUD_MAX_AWARE),
       awareRank: new Uint8Array(HUD_MAX_AWARE),
       alertTag: '',
+      rangefinderM: -1,
+      playerX: 0,
+      playerY: 0,
+      playerZ: 0,
+      playerYaw: 0,
     };
 
     this.startSector = clamp(parseInt(params.get('sector') ?? '1', 10) || 1, 1, SECTORS.length);
@@ -865,6 +880,7 @@ class App {
     this.btKills = 0;
     this.wallStepTimer = 0;
     this.hud.eliminated(null);
+    this.hud.radar.reset();
     this.renderer.postFx.glitch = 0;
     this.renderer.postFx.fade = 0;
     this.renderer.postFx.critical = 0;
@@ -1463,6 +1479,7 @@ class App {
       f.calm = p.isAlive && quiet && p.speed < RENDER.SPEEDLINE_MIN_SPEED && e.zoomBlend < 0.05;
     }
     f.aimVisible = false;
+    f.rangefinderM = -1;
     if (e.zoomBlend > 0.3 && p.isAlive) {
       const cam = this.renderer.camera;
       cam.getWorldDirection(_aimFwd);
@@ -1471,7 +1488,24 @@ class App {
         f.aimFrac = _aimInfo.hp / Math.max(_aimInfo.maxHp, 1e-3);
         f.aimName = _aimInfo.name;
       }
+      // 10A-3.4: Sniper 4x ADS digital rangefinder (lightweight center-ray distance check).
+      if (e.activeSlot === 'SNIPER' && e.zoomBlend > 0.35) {
+        const maxR = GUNS.SNIPER.range;
+        this.physics.raycast(cam.position, _aimFwd, maxR, _rangeHit);
+        let dist = _rangeHit.hit ? _rangeHit.distance : maxR;
+        this.physics.raycastTargets(cam.position, _aimFwd, dist, this.enemies.targets, _rangeTargetHit);
+        if (_rangeTargetHit.hit && _rangeTargetHit.distance < dist) dist = _rangeTargetHit.distance;
+        f.rangefinderM = dist;
+      }
     }
+    // 10A-6: Top-left pulse-scan mini-radar (75 m range, 3.5 s sweep + faint sonar ping SE while enemies remain alive).
+    f.playerX = p.position.x;
+    f.playerY = p.position.y;
+    f.playerZ = p.position.z;
+    f.playerYaw = p.yaw;
+    const radarCount = this.enemies.radarTargets(_radarTargets);
+    const radarPing = this.hud.radar.step(realDt, f.playerX, f.playerY, f.playerZ, _radarTargets, radarCount);
+    if (radarPing && !this.enemies.isCleared && this.enemies.remaining > 0) this.audio.radarPing();
     f.reticleKick = e.reticleKick;
     f.buffPierce = e.momentumShotsLeft;
     f.buffZero = this.skills.SK_11 > 0 && p.speedBoostActive;

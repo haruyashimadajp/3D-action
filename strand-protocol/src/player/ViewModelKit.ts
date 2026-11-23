@@ -222,6 +222,8 @@ export interface KitUniforms {
   /** 7B-7 rain-wet gloss: clock (s) and world up in view space (from the main camera's pitch). */
   uWetTime: { value: number };
   uUpView: { value: THREE.Vector3 };
+  /** 10A-3.2: K-90 post-shot barrel coil heat (1 -> 0 over 1.5 s, white-cyan -> deep cyan). */
+  uBarrelHeat: { value: number };
 }
 
 export function createKitUniforms(): KitUniforms {
@@ -235,6 +237,7 @@ export function createKitUniforms(): KitUniforms {
     uHand: { value: 0 },
     uWetTime: { value: 0 },
     uUpView: { value: new THREE.Vector3(0, 1, 0) },
+    uBarrelHeat: { value: 0 },
   };
 }
 
@@ -283,6 +286,7 @@ export function kitMaterial(tex: PbrTextureSet, u: KitUniforms, key: string, nor
       .replace('#include <common>', `#include <common>
         uniform vec3 uEnergy;
         uniform float uCharge;
+        uniform float uBarrelHeat;
         uniform vec3 uBarColor;
         uniform float uWetTime;
         uniform vec3 uUpView;
@@ -313,7 +317,8 @@ export function kitMaterial(tex: PbrTextureSet, u: KitUniforms, key: string, nor
           normal = normalize(tbn * mapN);
         }`)
       .replace('#include <emissivemap_fragment>', `#include <emissivemap_fragment>
-        totalEmissiveRadiance += uEnergy * (vGlow.x + vGlow.y * uCharge) + uBarColor * vGlow.z + vColor.rgb * vSurf.z;
+        vec3 coilEnergy = mix(uEnergy, vec3(0.92, 0.99, 1.0), uBarrelHeat * step(0.05, vGlow.y));
+        totalEmissiveRadiance += coilEnergy * (vGlow.x + vGlow.y * (uCharge + uBarrelHeat * 1.65)) + uBarColor * vGlow.z + vColor.rgb * vSurf.z;
         // 7B-7: tiny bright droplets beading on the wet top surfaces, slowly creeping and refreshing.
         {
           vec2 dc = vKitUv * 46.0 + vec2(0.0, uWetTime * 0.35);

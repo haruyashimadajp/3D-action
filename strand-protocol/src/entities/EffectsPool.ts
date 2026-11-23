@@ -136,6 +136,8 @@ export const BURST = {
   MISSILE_TRAIL: { count: 1, color: 0xff6a2a, intensity: 1.6, speed: 1.2, spread: 1.0, life: 0.45, gravity: 1.0, size: 0.09, minor: true },
   /** Phantom dash-slash arc sparks. */
   SLASH: { count: 14, color: 0xd04dff, intensity: 3.6, speed: 9, spread: 0.7, life: 0.3, gravity: -4, size: 0.035 },
+  /** 10A-3.2: Sniper post-shot rising translucent barrel heat-vent vapor puffs. */
+  BARREL_STEAM: { count: 2, color: 0x9ceeff, intensity: 0.48, speed: 0.45, spread: 0.42, life: 0.55, gravity: 1.35, size: 0.022 },
 } as const satisfies Record<string, ParticleBurst>;
 
 /** Telegraph-line style (§5.1). */
@@ -154,7 +156,9 @@ const P_CAP = LIMITS.PROJECTILES;
 const L_CAP = LIMITS.TELEGRAPH_LINES;
 const R_CAP = LIMITS.SHOCK_RINGS;
 const S_CAP = LIMITS.VFX_PARTICLES;
+const CASING_CAP = 16;
 const MUZZLE_BLEND_S = 0.06;
+const _cEuler = new THREE.Euler();
 
 export class EffectsPool {
   readonly rain: THREE.InstancedMesh;
@@ -224,6 +228,18 @@ export class EffectsPool {
   private hasCamPos = false;
   private readonly rng = createRng(0x5a4c);
 
+  // ---- 10A-3.2 3D ejected brass/rail casings (pooled into sparks InstancedMesh, +0 extra draw calls) ----
+  private readonly cLife = new Float32Array(CASING_CAP);
+  private readonly cMax = new Float32Array(CASING_CAP);
+  private readonly cPos = new Float32Array(CASING_CAP * 3);
+  private readonly cVel = new Float32Array(CASING_CAP * 3);
+  private readonly cRot = new Float32Array(CASING_CAP * 3);
+  private readonly cAng = new Float32Array(CASING_CAP * 3);
+  private readonly cSniper = new Uint8Array(CASING_CAP);
+  private cNext = 0;
+  casingsSpawned = 0;
+  steamPuffsEmitted = 0;
+
   // ---- 7B-7 rain micro-splashes (ground-probed respawns, shader-animated) ----
   readonly splashes: THREE.InstancedMesh;
   private readonly splashAttr: THREE.InstancedBufferAttribute;
@@ -268,8 +284,8 @@ export class EffectsPool {
 
   // ---- shock rings / prediction circles (24-ring pool) ----
   readonly rings: THREE.InstancedMesh;
-  /** 5B-4 hot impact scorch decals (ring buffer). */
-  private readonly scorch: THREE.InstancedMesh;
+  /** 5B-4 / 10A-3.3 cooling bullet impact scorch decals (48-slot ring buffer, +1 draw call). */
+  readonly scorch: THREE.InstancedMesh;
   private readonly scorchAttr: THREE.InstancedBufferAttribute;
   private readonly scorchTime = { value: 0 };
   private scorchNext = 0;
@@ -631,18 +647,23 @@ export class EffectsPool {
     this.rings.setColorAt(0, _c.setRGB(1, 1, 1));
     scene.add(this.rings);
 
-    // ---- 5B-4 scorch decals: aScorch = (birth sim time, owner 0 player / 1 enemy, seed) ----
+    // ---- 5B-4 / 10A-3.3 scorch decals: aScorch = (birth sim time, owner 0 player / 1 enemy, seed) ----
     const scGeo = new THREE.PlaneGeometry(1, 1);
     this.scorchAttr = new THREE.InstancedBufferAttribute(new Float32Array(SCORCH.POOL * 3).fill(-1e6), 3);
     scGeo.setAttribute('aScorch', this.scorchAttr);
     const scMat = new THREE.ShaderMaterial({
       transparent: true,
       depthWrite: false,
-      blending: THREE.AdditiveBlending,
+      blending: THREE.NormalBlending,
       polygonOffset: true,
       polygonOffsetFactor: -4,
       polygonOffsetUnits: -8,
-      uniforms: { uTime: this.scorchTime, uCool: { value: SCORCH.COOL_S }, uRim: { value: new THREE.Color(COLORS.PLAYER_STRAND) } },
+      uniforms: {
+        uTime: this.scorchTime,
+        uCool: { value: SCORCH.COOL_S },
+        uEmissive: { value: SCORCH.EMISSIVE },
+        uRim: { value: new THREE.Color(COLORS.PLAYER_STRAND) },
+      },
       vertexShader: /* glsl */ `
         attribute vec3 aScorch;
         varying vec2 vUv; varying vec3 vSc;
@@ -653,47 +674,56 @@ export class EffectsPool {
         }
       `,
       fragmentShader: /* glsl */ `
-        uniform float uTime; uniform float uCool; uniform vec3 uRim;
+        uniform float uTime; uniform float uCool; uniform float uEmissive; uniform vec3 uRim;
         varying vec2 vUv; varying vec3 vSc;
         float h12(vec2 p) { vec3 p3 = fract(vec3(p.xyx) * 0.1031); p3 += dot(p3, p3.yzx + 33.33); return fract((p3.x + p3.y) * p3.z); }
         void main() {
-          float age = (uTime - vSc.x) / uCool;
-          if (age < 0.0 || age > 1.0) discard;
+          float elapsed = uTime - vSc.x;
+          if (elapsed < 0.0) discard;
+          // Cools smoothly over uCool (4.0 s) from hot orange-cyan (emissive 2.8) into a dark charred pockmark.
+          float cool = clamp(elapsed / uCool, 0.0, 1.0);
           vec2 c = vUv - 0.5;
           float r = length(c) * 2.0;
-          // Jagged burn edge.
           float ang = atan(c.y, c.x);
           float edge = 0.78 + 0.22 * h12(vec2(floor(ang * 5.0 + vSc.z * 40.0), vSc.z * 13.0));
           float mask = 1.0 - smoothstep(edge * 0.55, edge, r);
-          float core = exp(-r * r * 9.0);
-          vec3 hot = vSc.y > 0.5 ? vec3(1.0, 0.32, 0.22) : vec3(1.0, 0.72, 0.38);
-          vec3 cold = vec3(0.32, 0.03, 0.015);
-          float cool = smoothstep(0.0, 0.55, age);
-          vec3 col = mix(hot * 3.2, cold, cool) * (0.35 + 0.65 * core);
-          // Energy-cyan rim flash for the first instants.
-          col += uRim * smoothstep(0.35, 0.8, r) * mask * (1.0 - smoothstep(0.0, 0.18, age)) * 1.4 * (1.0 - vSc.y);
-          float a = mask * (1.0 - smoothstep(0.55, 1.0, age));
-          gl_FragColor = vec4(col * a, 1.0);
+          if (mask < 0.01) discard;
+          float core = exp(-r * r * 7.5);
+          vec3 hotBase = vSc.y > 0.5 ? vec3(1.0, 0.32, 0.22) : mix(vec3(1.0, 0.62, 0.26), uRim, 0.36);
+          vec3 hotGlow = hotBase * uEmissive * (0.42 + 0.58 * core);
+          // Energy-cyan rim flash in the initial impact phase.
+          hotGlow += uRim * smoothstep(0.32, 0.78, r) * mask * (1.0 - smoothstep(0.0, 0.28, cool)) * 1.45 * (1.0 - vSc.y);
+          // Dark charred pockmark center + soot ring remaining after the 4.0 s cooling phase.
+          vec3 charMark = vec3(0.025, 0.022, 0.020) * (0.35 + 0.65 * smoothstep(0.0, 0.65, r));
+          float heatK = pow(1.0 - cool, 1.55);
+          vec3 col = mix(charMark, hotGlow, heatK);
+          float a = mask * mix(0.78, 0.96, heatK);
+          gl_FragColor = vec4(col, a);
         }
       `,
     });
     this.scorch = new THREE.InstancedMesh(scGeo, scMat, SCORCH.POOL);
-    this.scorch.name = 'ScorchDecals';
+    this.scorch.name = 'BulletScorchDecals';
     this.scorch.frustumCulled = false;
     this.scorch.count = 0;
     this.scorch.renderOrder = 19;
     scene.add(this.scorch);
   }
 
-  /** 5B-4: hot impact decal on a world surface (point on the surface, outward unit normal). */
-  addScorch(point: THREE.Vector3, normal: THREE.Vector3, enemy: boolean): void {
+  /**
+   * 5B-4 / 10A-3.3: stamps a flush circular scorch decal on a world surface (`radius 0.08 m` Pistol / `0.15 m` Sniper,
+   * `+0.015 m` normal offset): center glows hot orange-cyan (`emissive 2.8`) at impact and cools smoothly over `4.0 s`
+   * into a dark charred pockmark.
+   */
+  addScorch(point: THREE.Vector3, normal: THREE.Vector3, enemy: boolean, sniper = false): void {
     const i = this.scorchNext;
     this.scorchNext = (i + 1) % SCORCH.POOL;
     _q.setFromUnitVectors(Z_AXIS, normal);
-    _d.copy(normal).multiplyScalar(0.015).add(point);
+    _d.copy(normal).multiplyScalar(SCORCH.NORMAL_OFFSET_M).add(point);
     const spin = Math.random() * Math.PI * 2;
-    const sz = SCORCH.SIZE_M * (0.75 + Math.random() * 0.55);
-    _s.set(sz, sz, 1);
+    const radius = sniper ? SCORCH.RADIUS_SNIPER_M : SCORCH.RADIUS_PISTOL_M;
+    const diameter = radius * 2;
+    _s.set(diameter, diameter, 1);
     _m4.compose(_d, _q.multiply(_qSpin.setFromAxisAngle(Z_AXIS, spin)), _s);
     this.scorch.setMatrixAt(i, _m4);
     this.scorchAttr.setXYZ(i, this.scorchTime.value, enemy ? 1 : 0, Math.random());
@@ -1102,7 +1132,9 @@ export class EffectsPool {
           im.region = 'BODY';
           im.travelled = this.pTravel[i] + _worldHit.distance;
           this.burst(im.point, im.normal, im.kind === 'WATER' ? BURST.WATER : BURST.SPARK);
-          if (im.kind !== 'WATER' && im.kind !== 'BARRIER') this.addScorch(im.point, im.normal, owner === 'ENEMY');
+          if (im.kind !== 'WATER' && im.kind !== 'BARRIER') {
+            this.addScorch(im.point, im.normal, owner === 'ENEMY', im.tag === 1 || im.damage >= 100);
+          }
         }
         if (im.pierce && _targetHit.target) {
           // Piercing round: keep flying from just past the hit, never re-hitting this body.
@@ -1256,6 +1288,52 @@ export class EffectsPool {
     }
   }
 
+  /**
+   * 10A-3.2: emits subtle rising translucent heat-vent vapor puffs from the K-90 Sniper barrel vents while
+   * cooling after a shot (pooled into `sparks`, zero allocations).
+   */
+  emitBarrelSteam(point: THREE.Vector3): void {
+    this.steamPuffsEmitted++;
+    this.burst(point, Y_UP, BURST.BARREL_STEAM);
+  }
+
+  /**
+   * 10A-3.2: ejects a visible spinning glowing spent brass/rail cartridge from `eject` on Pistol shots and
+   * Sniper breech-open reload beats (pooled 16-slot ring buffer rendered in `sparks`, zero allocations).
+   */
+  spawnCasing(origin: THREE.Vector3, rightDir: THREE.Vector3, upDir: THREE.Vector3, sniper = false): number {
+    const i = this.cNext;
+    this.cNext = (i + 1) % CASING_CAP;
+    const o = i * 3;
+    this.cPos[o] = origin.x;
+    this.cPos[o + 1] = origin.y;
+    this.cPos[o + 2] = origin.z;
+    const vr = (1.6 + this.rng() * 0.75) * (sniper ? 1.15 : 1.0);
+    const vu = (1.15 + this.rng() * 0.55) * (sniper ? 1.1 : 1.0);
+    this.cVel[o] = rightDir.x * vr + upDir.x * vu + (this.rng() - 0.5) * 0.35;
+    this.cVel[o + 1] = rightDir.y * vr + upDir.y * vu;
+    this.cVel[o + 2] = rightDir.z * vr + upDir.z * vu + (this.rng() - 0.5) * 0.35;
+    this.cRot[o] = this.rng() * Math.PI * 2;
+    this.cRot[o + 1] = this.rng() * Math.PI * 2;
+    this.cRot[o + 2] = this.rng() * Math.PI * 2;
+    this.cAng[o] = (14 + this.rng() * 12) * (this.rng() < 0.5 ? -1 : 1);
+    this.cAng[o + 1] = (10 + this.rng() * 10) * (this.rng() < 0.5 ? -1 : 1);
+    this.cAng[o + 2] = (12 + this.rng() * 10) * (this.rng() < 0.5 ? -1 : 1);
+    const life = sniper ? 1.05 : 0.85;
+    this.cLife[i] = life;
+    this.cMax[i] = life;
+    this.cSniper[i] = sniper ? 1 : 0;
+    this.casingsSpawned++;
+    return i;
+  }
+
+  /** Number of currently active 3D ejected casings in flight. */
+  get activeCasings(): number {
+    let n = 0;
+    for (let i = 0; i < CASING_CAP; i++) if (this.cLife[i] > 0) n++;
+    return n;
+  }
+
   private updateParticles(simDt: number): void {
     let n = 0;
     for (let i = 0; i < S_CAP; i++) {
@@ -1282,6 +1360,33 @@ export class EffectsPool {
       _m4.compose(_a, _q, _s);
       this.sparks.setMatrixAt(n, _m4);
       _c.setRGB(this.sColor[o] * t, this.sColor[o + 1] * t, this.sColor[o + 2] * t);
+      this.sparks.setColorAt(n, _c);
+      n++;
+    }
+    // 10A-3.2: integrate & render 3D tumbling ejected brass/rail casings into free slots of `sparks`.
+    for (let i = 0; i < CASING_CAP && n < S_CAP; i++) {
+      if (this.cLife[i] <= 0) continue;
+      this.cLife[i] -= simDt;
+      if (this.cLife[i] <= 0) continue;
+      const o = i * 3;
+      this.cVel[o + 1] -= 13.5 * simDt;
+      this.cPos[o] += this.cVel[o] * simDt;
+      this.cPos[o + 1] += this.cVel[o + 1] * simDt;
+      this.cPos[o + 2] += this.cVel[o + 2] * simDt;
+      this.cRot[o] += this.cAng[o] * simDt;
+      this.cRot[o + 1] += this.cAng[o + 1] * simDt;
+      this.cRot[o + 2] += this.cAng[o + 2] * simDt;
+      const t = this.cLife[i] / Math.max(this.cMax[i], 1e-4);
+      const sn = this.cSniper[i] === 1;
+      _cEuler.set(this.cRot[o], this.cRot[o + 1], this.cRot[o + 2]);
+      _q.setFromEuler(_cEuler);
+      _s.set(sn ? 0.014 : 0.011, sn ? 0.014 : 0.011, sn ? 0.064 : 0.036);
+      _a.set(this.cPos[o], this.cPos[o + 1], this.cPos[o + 2]);
+      _m4.compose(_a, _q, _s);
+      this.sparks.setMatrixAt(n, _m4);
+      const glow = 0.35 + 0.65 * t;
+      // Warm glowing brass with a hot cyan-white rail-charge tint on Sniper casings.
+      _c.setRGB((sn ? 1.85 : 2.15) * glow, (sn ? 1.82 : 1.55) * glow, (sn ? 2.15 : 0.72) * glow);
       this.sparks.setColorAt(n, _c);
       n++;
     }

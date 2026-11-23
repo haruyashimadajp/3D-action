@@ -391,9 +391,25 @@ export const AI_PATROL = {
   DRONE_ALT_MAX: 18,
   DRONE_LOOP_R_MIN: 9,
   DRONE_LOOP_R_MAX: 16,
-  /** ALERT: cautious advance toward the stimulus at this fraction of patrol speed; stop this close (m). */
+  /** 10A-5 ALERT investigation: advance toward investigateGoal at 0.80× combat speed; stop within <= 2.2 m. */
   INVESTIGATE_SPEED_K: 0.8,
-  INVESTIGATE_STOP_M: 2.5,
+  INVESTIGATE_STOP_M: 2.2,
+  /** 10A-5 movement-stall timeout safety while walking/flying toward investigateGoal (s). */
+  INVESTIGATE_STALL_S: 7.0,
+  /** 10A-5 upon arriving within <= 2.2 m (or stall timeout), pause and sweep gaze ±60° for 2.0 s. */
+  INVESTIGATE_SWEEP_S: 2.0,
+  INVESTIGATE_SWEEP_DEG: 60,
+  /** 10A-5 minimum alertGauge floor while investigating en route / sweeping. */
+  INVESTIGATE_GAUGE_FLOOR: 25,
+  /** 10A-5 drone hover offset above investigatePos (m). */
+  INVESTIGATE_DRONE_OFFSET_Y: 3.5,
+  /** 10A-5 diegetic enemy tactical flashlight / visor scanner cones (InstancedMesh, cap: 14). */
+  SCANNER_CONE_CAP: 14,
+  SCANNER_CONE_RADIUS_M: 2.4,
+  SCANNER_CONE_LENGTH_GROUND_M: 12.5,
+  SCANNER_CONE_LENGTH_DRONE_M: 11.5,
+  SCANNER_CONE_OPACITY_UNAWARE: 0.11,
+  SCANNER_CONE_OPACITY_ALERT: 0.14,
   /** Body turn rate while patrolling / investigating (deg/s). */
   TURN_DEG_PER_S: 150,
   /** Suppressive fire: max distance to the shared last-known position, pitch scatter (±deg). */

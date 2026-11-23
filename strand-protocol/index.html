@@ -282,6 +282,16 @@
         position: absolute; left: 50%; top: 50%; width: 2px; height: 2px; margin: -2px 0 0 -2px;
         background: #fff; border: 1px solid #000; box-sizing: content-box;
       }
+      #xh-range {
+        position: absolute; left: calc(50% + 20px); top: calc(50% + 14px);
+        font-family: var(--mono-font); font-size: 11px; letter-spacing: 0.08em;
+        color: rgba(56, 248, 255, 0.75); text-shadow: 0 0 4px rgba(0, 0, 0, 0.9);
+        pointer-events: none; display: none; white-space: nowrap;
+      }
+      #radar-canvas {
+        position: absolute; left: 24px; top: 24px; width: 136px; height: 136px;
+        border-radius: 50%; pointer-events: none;
+      }
       #xh-anchor {
         position: absolute; left: 0; top: 0; width: 12px; height: 12px; display: none;
         border: 1px solid rgba(255, 184, 0, 0.75); box-shadow: 0 0 6px rgba(255, 184, 0, 0.45);
@@ -293,8 +303,8 @@
       #dock { transform: perspective(900px) rotateY(-5deg); transform-origin: right center; }
       /* 7B-8 adaptive HUD: out of combat the peripheral read-outs settle to 55 % so the city takes the screen;
          any shot / hit / lock / speed ≥ 18 m/s / ADS snaps them back to 100 % in 120 ms. */
-      #hp, #spd, #dock, #flow, #buffs, #sector-hud { transition: opacity 0.12s linear; }
-      #hud.calm #hp, #hud.calm #spd, #hud.calm #dock, #hud.calm #flow, #hud.calm #buffs, #hud.calm #sector-hud { opacity: 0.55; transition: opacity 0.9s ease-in-out; }
+      #hp, #spd, #dock, #flow, #buffs, #sector-hud, #radar-canvas { transition: opacity 0.12s linear; }
+      #hud.calm #hp, #hud.calm #spd, #hud.calm #dock, #hud.calm #flow, #hud.calm #buffs, #hud.calm #sector-hud, #hud.calm #radar-canvas { opacity: 0.55; transition: opacity 0.9s ease-in-out; }
       .visor { position: absolute; top: 32vh; height: 36vh; width: 8px; opacity: 0.14; pointer-events: none;
         background: repeating-linear-gradient(to bottom, #00f0ff 0 1px, transparent 1px 10px); }
       .visor::after { content: ''; position: absolute; top: 0; bottom: 0; width: 4px;
@@ -698,6 +708,8 @@
         </g>
       </svg>
       <div id="xh-dot"></div>
+      <div id="xh-range"></div>
+      <canvas id="radar-canvas" width="136" height="136"></canvas>
       <div id="evade">EVADE +90</div>
       <div id="hud-alert"><b>ARMORED</b> — DESTROY WINGS</div>
       <div id="buffs"><span id="buff-pierce">PIERCE ×3</span><span id="buff-zero">ZERO-TIME</span><span id="buff-adren">ADRENALINE</span></div>

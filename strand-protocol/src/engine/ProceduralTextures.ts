@@ -2463,9 +2463,34 @@ function generateGraffitiAtlas(anisotropy: number): THREE.Texture {
 // ---------------------------------------------------------------------------
 let cache: ProceduralTextureLibrary | null = null;
 
-/** Generates (once) and returns the full procedural texture library. */
+/** Generates (once) and returns the full procedural texture library (falls back to placeholder textures in headless Node tests). */
 export function getProceduralTextures(renderer: THREE.WebGLRenderer): ProceduralTextureLibrary {
   if (cache) return cache;
+  if (typeof document === 'undefined') {
+    const pbr = (): Required<PbrTextureSet> => ({
+      map: new THREE.Texture(),
+      roughnessMap: new THREE.Texture(),
+      normalMap: new THREE.Texture(),
+      emissiveMap: new THREE.Texture(),
+    });
+    cache = {
+      facades: pbr(),
+      roof: pbr(),
+      roads: pbr(),
+      machinery: pbr(),
+      neonAtlas: new THREE.Texture(),
+      neonAtlasStrips: NEON_STRIPS.length,
+      signAtlas: new THREE.Texture(),
+      tech: pbr(),
+      archDetail: pbr(),
+      manhole: pbr(),
+      plaqueAtlas: new THREE.Texture(),
+      graffitiAtlas: new THREE.Texture(),
+      glove: pbr(),
+      gun: pbr(),
+    };
+    return cache;
+  }
   const aniso = Math.min(8, renderer.capabilities.getMaxAnisotropy());
   cache = {
     facades: generateFacadeAtlas(aniso),

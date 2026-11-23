@@ -262,47 +262,161 @@ function createLensMaterial(color: THREE.Color): THREE.ShaderMaterial {
   });
 }
 
-/** Additive star flash (muzzle) / spark (ejection port). */
+/**
+ * 10A-3.1: 3D first-person gunshot muzzle flash shader — crossed 3-plane additive star burst + tapered forward
+ * plasma cone + lateral muzzle-brake side vents (aKind 0 = transverse star disc, 1 = forward plasma cone/blades,
+ * 2 = lateral brake vents counter-rotated by -uRoll so they stay horizontal while the axial star rolls 0..2π).
+ */
 function createFlashMaterial(color: THREE.Color): THREE.ShaderMaterial {
   return new THREE.ShaderMaterial({
     transparent: true,
     depthWrite: false,
     blending: THREE.AdditiveBlending,
     side: THREE.DoubleSide,
-    uniforms: { uColor: { value: color }, uSeed: { value: 0 }, uAlpha: { value: 0 } },
-    vertexShader: /* glsl */ `varying vec2 vUv; void main() { vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
-    fragmentShader: /* glsl */ `
-      uniform vec3 uColor; uniform float uSeed; uniform float uAlpha; varying vec2 vUv;
+    uniforms: { uColor: { value: color }, uSeed: { value: 0 }, uAlpha: { value: 0 }, uRoll: { value: 0 } },
+    vertexShader: /* glsl */ `
+      attribute float aKind;
+      uniform float uRoll;
+      varying vec2 vUv;
+      varying float vKind;
       void main() {
-        vec2 p = vUv - 0.5;
-        float r = length(p) * 2.0;
-        float ang = atan(p.y, p.x);
-        float spikes = pow(abs(sin(ang * 3.0 + uSeed * 6.28)), 6.0);
-        float core = exp(-r * 6.0);
-        float a = (core * 2.4 + spikes * (1.0 - r) * 1.2) * uAlpha * step(r, 1.0);
-        gl_FragColor = vec4(mix(uColor, vec3(1.0), core) * a * 3.0, 1.0);
+        vUv = uv;
+        vKind = aKind;
+        vec3 p = position;
+        if (aKind > 1.5) {
+          float c = cos(-uRoll);
+          float s = sin(-uRoll);
+          p.xy = vec2(p.x * c - p.y * s, p.x * s + p.y * c);
+        }
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(p, 1.0);
+      }
+    `,
+    fragmentShader: /* glsl */ `
+      uniform vec3 uColor; uniform float uSeed; uniform float uAlpha;
+      varying vec2 vUv; varying float vKind;
+      void main() {
+        float a = 0.0;
+        float core = 0.0;
+        if (vKind < 0.5) {
+          vec2 p = vUv - 0.5;
+          float r = length(p) * 2.0;
+          float ang = atan(p.y, p.x);
+          float spikes = pow(abs(sin(ang * 3.0 + uSeed * 6.28318)), 5.0);
+          core = exp(-r * 5.2);
+          a = (core * 2.5 + spikes * max(0.0, 1.0 - r) * 1.35) * step(r, 1.0);
+        } else {
+          // Axial forward plasma cone/blades (aKind 1) or lateral muzzle-brake vents (aKind 2):
+          // vUv.x runs 0 (base at muzzle/port) -> 1 (tip); vUv.y runs 0..1 across width.
+          float along = clamp(vUv.x, 0.0, 1.0);
+          float across = abs(vUv.y - 0.5) * 2.0;
+          float taper = 1.0 - along * 0.72;
+          float radial = max(0.0, 1.0 - across / max(0.15, taper));
+          core = exp(-along * 3.2) * pow(radial, 1.5);
+          float jet = pow(radial, 2.0) * smoothstep(0.0, 0.08, along) * pow(1.0 - along, 1.25);
+          a = (core * 2.2 + jet * 1.8) * (vKind > 1.5 ? 1.15 : 1.0);
+        }
+        a *= uAlpha;
+        if (a < 0.004) discard;
+        vec3 hot = mix(uColor, vec3(1.0, 0.98, 0.95), clamp(core * 1.15, 0.0, 1.0));
+        gl_FragColor = vec4(hot * a * 3.1, 1.0);
       }
     `,
   });
 }
 
-/** Three crossed quads merged into one geometry (one draw). */
-function starGeometry(size: number): THREE.BufferGeometry {
-  const a = new THREE.PlaneGeometry(size, size);
-  const b = new THREE.PlaneGeometry(size, size).rotateY(Math.PI / 2);
-  const c = new THREE.PlaneGeometry(size, size).rotateX(Math.PI / 2);
-  const out = new THREE.BufferGeometry();
+/**
+ * 10A-3.1: Builds a merged 1-draw muzzle flash geometry in local muzzle space (-Z forward):
+ *  - Crossed 3-plane additive star burst (XY star disc + crossed XZ & YZ longitudinal plasma blades)
+ *  - Tapered forward plasma cone (length, radius)
+ *  - Optional blazing lateral muzzle-brake side vents extending ±lateralBrakeSpan along ±X (K-90 Rail Sniper).
+ */
+export function buildMuzzleFlashGeometry(length: number, radius: number, lateralBrakeSpan = 0): THREE.BufferGeometry {
   const pos: number[] = [];
   const uv: number[] = [];
-  for (const g of [a, b, c]) {
-    const ng = g.toNonIndexed();
-    pos.push(...(ng.getAttribute('position').array as Float32Array));
-    uv.push(...(ng.getAttribute('uv').array as Float32Array));
-    ng.dispose();
+  const kind: number[] = [];
+  const pushGeo = (g: THREE.BufferGeometry, k: number, flipUvX = false): void => {
+    const ng = g.index ? g.toNonIndexed() : g;
+    const pa = ng.getAttribute('position') as THREE.BufferAttribute;
+    const ua = ng.getAttribute('uv') as THREE.BufferAttribute;
+    for (let i = 0; i < pa.count; i++) {
+      pos.push(pa.getX(i), pa.getY(i), pa.getZ(i));
+      const ux = flipUvX ? 1 - ua.getX(i) : ua.getX(i);
+      uv.push(ux, ua.getY(i));
+      kind.push(k);
+    }
+    if (ng !== g) ng.dispose();
     g.dispose();
+  };
+  // 1. Transverse XY star burst disc at muzzle exit.
+  const disc = new THREE.PlaneGeometry(radius * 2, radius * 2);
+  disc.translate(0, 0, -0.004);
+  pushGeo(disc, 0);
+
+  // 2. Crossed longitudinal plasma blades (YZ and XZ planes) spanning z = 0 .. -length.
+  for (const rotZ of [0, Math.PI / 2, Math.PI / 4, -Math.PI / 4]) {
+    const blade = new THREE.PlaneGeometry(length, radius * 2);
+    // PlaneGeometry +X -> -Z (after rotateY(-PI/2), +X maps to +Z, so rotateY(+PI/2) maps +X to -Z -> uv.x = 1 at z = -length).
+    blade.rotateY(Math.PI / 2);
+    blade.rotateZ(rotZ);
+    blade.translate(0, 0, -length * 0.5);
+    pushGeo(blade, 1);
   }
+
+  // 3. Tapered forward plasma cone along -Z (z = 0 -> -length).
+  const cone = new THREE.CylinderGeometry(radius * 0.14, radius * 0.68, length, 8, 1, true);
+  // Cylinder +Y -> -Z via rotateX(-PI/2); swap UV so vUv.x = along (0 at base, 1 at tip) and vUv.y = 0.5 (center).
+  cone.rotateX(-Math.PI / 2);
+  cone.translate(0, 0, -length * 0.5);
+  {
+    const ng = cone.toNonIndexed();
+    const pa = ng.getAttribute('position') as THREE.BufferAttribute;
+    for (let i = 0; i < pa.count; i++) {
+      const z = pa.getZ(i);
+      const along = clamp(-z / Math.max(length, 1e-4), 0, 1);
+      pos.push(pa.getX(i), pa.getY(i), z);
+      uv.push(along, 0.5);
+      kind.push(1);
+    }
+    ng.dispose();
+    cone.dispose();
+  }
+
+  // 4. Blazing lateral muzzle-brake side vents (±lateralBrakeSpan along ±X at the brake ports z = +0.024).
+  if (lateralBrakeSpan > 0) {
+    const portZ = 0.024;
+    const ventH = radius * 0.78;
+    for (const sx of [-1, 1] as const) {
+      for (const rx of [0, Math.PI / 2]) {
+        const vPlane = new THREE.PlaneGeometry(lateralBrakeSpan, ventH);
+        vPlane.rotateX(rx);
+        // Slightly angled rearward/outward from the baffled muzzle brake vents.
+        vPlane.rotateY(-sx * 0.16);
+        vPlane.translate(sx * (0.012 + lateralBrakeSpan * 0.5), 0, portZ);
+        pushGeo(vPlane, 2, sx < 0);
+      }
+      const vCone = new THREE.CylinderGeometry(ventH * 0.1, ventH * 0.36, lateralBrakeSpan, 6, 1, true);
+      vCone.rotateZ(-sx * (Math.PI / 2));
+      vCone.rotateY(-sx * 0.16);
+      vCone.translate(sx * (0.012 + lateralBrakeSpan * 0.5), 0, portZ);
+      const ng = vCone.toNonIndexed();
+      const pa = ng.getAttribute('position') as THREE.BufferAttribute;
+      for (let i = 0; i < pa.count; i++) {
+        const x = pa.getX(i);
+        const along = clamp((Math.abs(x) - 0.012) / Math.max(lateralBrakeSpan, 1e-4), 0, 1);
+        pos.push(x, pa.getY(i), pa.getZ(i));
+        uv.push(along, 0.5);
+        kind.push(2);
+      }
+      ng.dispose();
+      vCone.dispose();
+    }
+  }
+
+  const out = new THREE.BufferGeometry();
   out.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
   out.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
+  out.setAttribute('aKind', new THREE.Float32BufferAttribute(kind, 1));
+  out.computeBoundingSphere();
   return out;
 }
 
@@ -313,6 +427,8 @@ export class ViewModelRenderer {
   private readonly winchDrum: THREE.Object3D;
   private readonly winchExit = new THREE.Object3D();
   private readonly rigs: Record<SlotId, WeaponRig>;
+  private readonly pistolFlashGeo = buildMuzzleFlashGeometry(0.09, 0.045, 0);
+  private readonly sniperFlashGeo = buildMuzzleFlashGeometry(0.24, 0.11, 0.10);
   private readonly flash: THREE.Mesh;
   private readonly flashMat: THREE.ShaderMaterial;
   private readonly spark: THREE.Mesh;
@@ -337,8 +453,15 @@ export class ViewModelRenderer {
   private tilt = 0;
   private lower = 0;
   private flashLife = 0;
+  private flashMaxLife = 0.045;
   private sparkLife = 0;
   private lightLife = 0;
+  private lightMaxLife = 0.06;
+  private lightPeak = 5.5;
+  /** 10A-3.2: K-90 post-shot barrel coil heat (1 -> 0 over 1.5 s). */
+  private sniperHeat = 0;
+  /** 10A-3.2: Pistol 3D spent brass/rail cartridge flight progress (0..1, -1 inactive). */
+  private pistolCasingT = -1;
   private triggerT = 1;
   private clawT = 1;
   private drumAngle = 0;
@@ -376,7 +499,7 @@ export class ViewModelRenderer {
     this.applyEnergyUniforms();
 
     // Dedicated view-model lighting: cool key from the upper left, strand-cyan rim from behind-right, warm
-    // low fill (street lamps) — plus the 60 ms muzzle light (always present, so programs never recompile).
+    // low fill (street lamps) — plus the dynamic muzzle light (always present, so programs never recompile).
     const key = new THREE.DirectionalLight(0xdfe9ff, 2.1);
     key.position.set(-0.6, 1.0, 0.8);
     const rim = new THREE.DirectionalLight(COLORS.PLAYER_STRAND, VM_RIM_INTENSITY);
@@ -384,7 +507,7 @@ export class ViewModelRenderer {
     this.rimLight = rim;
     const fill = new THREE.PointLight(0xffb070, 0.6, 2.5, 2);
     fill.position.set(0.1, -0.6, -0.2);
-    this.muzzleLight = new THREE.PointLight(0xffffff, 0, 1.3, 2);
+    this.muzzleLight = new THREE.PointLight(0xffffff, 0, 2.2, 2);
     scene.add(key, rim, fill, this.muzzleLight);
 
     // ---------------- Weapons (each with its own posed right hand) ----------------
@@ -405,11 +528,12 @@ export class ViewModelRenderer {
 
     // ---------------- Muzzle flash + ejection spark (one draw each, only while visible) ----------------
     this.flashMat = createFlashMaterial(new THREE.Color(COLORS.PLAYER_STRAND));
-    this.flash = new THREE.Mesh(starGeometry(0.16), this.flashMat);
+    this.flash = new THREE.Mesh(this.pistolFlashGeo, this.flashMat);
+    this.flash.name = 'MuzzleFlash';
     this.flash.visible = false;
     this.flash.renderOrder = 10;
     this.sparkMat = createFlashMaterial(new THREE.Color(0xffd9a0));
-    this.spark = new THREE.Mesh(starGeometry(0.05), this.sparkMat);
+    this.spark = new THREE.Mesh(buildMuzzleFlashGeometry(0.03, 0.022, 0), this.sparkMat);
     this.spark.visible = false;
     this.spark.renderOrder = 10;
     this.weaponPivot.add(this.flash, this.spark);
@@ -675,12 +799,18 @@ export class ViewModelRenderer {
     const magAxis = V(0, -Math.cos(grip.tilt), -Math.sin(grip.tilt));
     const mag = this.mesh(magKit, this.hardMat, 'PistolMag', group, magRest);
     mag.rotation.x = grip.tilt;
+    // 10A-3.2: spent brass/rail cartridge ejected from port on every pistol shot.
+    const casingKit = new MeshKit();
+    casingKit.add(lathe([[0.0, 0.0], [0.0046, 0.0], [0.0046, 0.024], [0.0036, 0.028], [0.0, 0.028]], 10), { tint: T.BRASS, zone: 0 }, at(0, 0, 0, -Math.PI / 2));
+    casingKit.add(lathe([[0.0, 0.024], [0.0037, 0.024], [0.0037, 0.029], [0.0, 0.03]], 10), { tint: 0x101214, zone: 0, glow: [0.22, 0, 0] }, at(0, 0, 0, -Math.PI / 2));
+    const casing = this.mesh(casingKit, this.hardMat, 'PistolCasing', group);
+    casing.visible = false;
     const muzzle = new THREE.Object3D();
     muzzle.position.set(0, 0.021, -0.316);
     const eject = new THREE.Object3D();
     eject.position.set(0.02, 0.032, -0.04);
     group.add(muzzle, eject);
-    return { group, muzzle, eject, lens, sight: lens.position.clone(), adsDist: 0.27, slide, slideTravel: 0.028, mag, magRest, magAxis, index, hasBar: true, shells: false, ejectAt: 0, kickBack: 0.045, kickPitch: 0.12 };
+    return { group, muzzle, eject, lens, sight: lens.position.clone(), adsDist: 0.27, slide, slideTravel: 0.028, mag, magRest, magAxis, index, hasBar: true, shells: false, ejectAt: 0, casing, kickBack: 0.045, kickPitch: 0.12 };
   }
 
   /**
@@ -1004,14 +1134,24 @@ export class ViewModelRenderer {
       this.clawT = 0;
       return;
     }
-    // Suppressed pistol: a small, brief flash at the can; the rail sniper's brake throws a big star.
-    this.flashLife = slot === 'SNIPER' ? 0.07 : 0.035;
+    const isSniper = slot === 'SNIPER';
+    // 10A-3.1: MK-IV Pistol = 45 ms compact burst (0.09 m × 0.045 m); K-90 Sniper = 75 ms plasma flash (0.24 m × 0.11 m + ±0.10 m lateral brake vents).
+    this.flash.geometry = isSniper ? this.sniperFlashGeo : this.pistolFlashGeo;
+    this.flashMaxLife = isSniper ? 0.075 : 0.045;
+    this.flashLife = this.flashMaxLife;
+    const roll = Math.random() * Math.PI * 2;
+    this.flash.rotation.z = roll;
+    this.flashMat.uniforms.uRoll.value = roll;
     this.flashMat.uniforms.uSeed.value = Math.random();
-    this.flash.scale.setScalar(slot === 'SNIPER' ? 1.5 : 0.5);
-    this.flash.rotation.z = Math.random() * Math.PI;
-    // 6B-1: 60 ms muzzle light — the barrel and the glove fingers flash with the shot.
-    this.lightLife = 0.06;
+    this.flash.scale.setScalar(0.85 + Math.random() * 0.33);
+    // 10A-3.1: 70 ms dynamic muzzle PointLight on Sniper (45 ms on Pistol) lighting the receiver.
+    this.lightMaxLife = isSniper ? 0.07 : 0.045;
+    this.lightLife = this.lightMaxLife;
+    this.lightPeak = isSniper ? 8.5 : 4.5;
     this.muzzleLight.color.setHex(this.plasma ? 0xdcf2ff : this.energyHex).lerp(_tmpWhite, 0.55);
+    // 10A-3.2: K-90 heats its rail-coil slits white-cyan and cools smoothly back to deep cyan over 1.5 s.
+    if (isSniper) this.sniperHeat = 1.0;
+    else this.pistolCasingT = 0;
     this.ejectPending = true;
   }
 
@@ -1234,8 +1374,10 @@ export class ViewModelRenderer {
     const pull = this.triggerT < 0.05 ? this.triggerT / 0.05 : this.triggerT < 0.13 ? 1 - (this.triggerT - 0.05) / 0.08 : 0;
     rig.index.rotation.x = pull * 0.24;
 
-    // Shader-driven parts: ammo bar length / colour, pistol coil charge, sniper rail-coil charge / bolt pulse.
+    // Shader-driven parts: ammo bar length / colour, pistol coil charge, sniper rail-coil charge / bolt pulse / 1.5 s heat cooldown.
     const u = this.hardU;
+    this.sniperHeat = Math.max(0, this.sniperHeat - realDt / 1.5);
+    u.uBarrelHeat.value = f.slot === 'SNIPER' ? this.sniperHeat : 0;
     const frac = f.magazine > 0 ? clamp(f.ammo / f.magazine, 0, 1) : 1;
     u.uAmmo.value = rig.hasBar ? (rt >= 0 && R.bar >= 0 ? R.bar : frac) : 1;
     u.uShells.value = rig.shells ? (rt >= 0 ? R.shells : f.ammo) : 4;
@@ -1250,6 +1392,22 @@ export class ViewModelRenderer {
       f.slot === 'PISTOL' ? (0.35 + 0.65 * clamp(f.sinceShot / 0.3, 0, 1)) * (S / 3)
       : f.slot === 'SNIPER' ? (f.ammo > 0 ? 0.85 : 0.15) + 2.2 * (this.boltPulse / 0.35)
       : 1;
+
+    // 10A-3.2: Pistol spent cartridge arc out of the ejection port (0.22 s).
+    if (this.pistolCasingT >= 0) {
+      this.pistolCasingT += realDt / 0.22;
+      const pc = this.rigs.PISTOL.casing;
+      if (pc && f.slot === 'PISTOL' && this.pistolCasingT < 1) {
+        const ct = this.pistolCasingT;
+        pc.visible = true;
+        const ej = this.rigs.PISTOL.eject.position;
+        pc.position.set(ej.x + 0.26 * ct, ej.y + 0.12 * ct - 0.28 * ct * ct, ej.z + 0.05 * ct);
+        pc.rotation.set(ct * 11, ct * 6, ct * 4);
+      } else {
+        if (pc) pc.visible = false;
+        if (this.pistolCasingT >= 1) this.pistolCasingT = -1;
+      }
+    }
 
     // Grapple: claws open on launch (90 ms) before the anchor leaves; drums spin while reeling / paying out.
     this.clawT += realDt;
@@ -1317,9 +1475,13 @@ export class ViewModelRenderer {
     rig.group.updateMatrix();
     if (this.flashLife > 0) {
       this.flashLife -= realDt;
-      this.flash.visible = true;
-      this.flashMat.uniforms.uAlpha.value = clamp(this.flashLife / 0.05, 0, 1);
-      this.flash.position.copy(rig.muzzle.position).applyMatrix4(rig.group.matrix);
+      if (this.flashLife > 0) {
+        this.flash.visible = true;
+        this.flashMat.uniforms.uAlpha.value = clamp(this.flashLife / Math.max(this.flashMaxLife, 1e-4), 0, 1);
+        this.flash.position.copy(rig.muzzle.position).applyMatrix4(rig.group.matrix);
+      } else {
+        this.flash.visible = false;
+      }
     } else {
       this.flash.visible = false;
     }
@@ -1335,7 +1497,7 @@ export class ViewModelRenderer {
     }
     if (this.lightLife > 0) {
       this.lightLife -= realDt;
-      this.muzzleLight.intensity = 5.5 * clamp(this.lightLife / 0.06, 0, 1);
+      this.muzzleLight.intensity = this.lightPeak * clamp(this.lightLife / Math.max(this.lightMaxLife, 1e-4), 0, 1);
       this.root.updateMatrixWorld(true);
       rig.muzzle.getWorldPosition(this.muzzleLight.position);
       this.muzzleLight.position.z += 0.05;
@@ -1372,6 +1534,11 @@ export class ViewModelRenderer {
     return this.lensMat.uniforms.uReticle.value as THREE.Vector2;
   }
 
+  /** 10A-3.2: current K-90 barrel heat (1 -> 0 over 1.5 s after firing). */
+  get barrelHeat(): number {
+    return this.sniperHeat;
+  }
+
   /**
    * World point that appears on screen exactly where `local` (view-model camera space) is drawn:
    * project with the view-model FOV, unproject with the main camera at the same view depth.
@@ -1390,6 +1557,11 @@ export class ViewModelRenderer {
 
   muzzleWorld(slot: SlotId, mainCamera: THREE.PerspectiveCamera, out: THREE.Vector3): THREE.Vector3 {
     return this.screenMatchedWorld(this.rigs[slot].muzzle, mainCamera, out);
+  }
+
+  /** 10A-3.2: world-matched position of the weapon's ejection port (`eject`). */
+  ejectWorld(slot: SlotId, mainCamera: THREE.PerspectiveCamera, out: THREE.Vector3): THREE.Vector3 {
+    return this.screenMatchedWorld(this.rigs[slot].eject, mainCamera, out);
   }
 
   winchWorld(mainCamera: THREE.PerspectiveCamera, out: THREE.Vector3): THREE.Vector3 {
