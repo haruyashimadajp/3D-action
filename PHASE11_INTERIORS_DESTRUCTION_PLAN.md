@@ -100,37 +100,27 @@ Turn small street, alley, corridor, and interior props into physically reactive 
     - Final `0.55 s` (`dissolveProgress: 0 -> 1`): bright **cyberpunk cyan/amber holographic scanline edge sweeps up the chunk**, pixels clip away in a crisp digital grid pattern (`discard` noise threshold), emitting `1–2` tiny rising digital sparks before vanishing cleanly at `dissolveProgress >= 1.0`!
   - **Material-Matched Procedural Impact SE (`AudioEngine.ts`)**: Distinct compact Web Audio impacts for cardboard thump, ceramic pot shatter, wooden splinter, plastic clatter, metallic drum clang, and electronic monitor spark pop!
 
-### 11B-3. Engine-Wide Lightweight Optimization & Draw-Call Consolidation Pass (CRITICAL USER REQUIREMENT!)
-Explicitly profile and lighten the entire engine so **Phase 11 runs FASTER and uses FEWER draw calls than Phase 10D**:
-1. **Static 2D Spatial-Grid Broadphase in `PhysicsWorld.ts` (`cellSize = 12 m`)**:
-   - Currently `PhysicsWorld` linearly scans all `300–600+` AABB colliders on every `movePlayer`, `raycast`, `lineOfSight`, and `findWallFaces` call (multiplied by 14 stealth enemies checking vision/LOS + bullets + 120Hz physics!).
-   - Build a flat pre-allocated 2D uniform grid (`Int32Array` cell offsets + collider index list) once per `loadLevel()` (and update dynamically in `O(1)` when a door/glass collider toggles inactive!).
-   - Use DDA grid traversal for `raycast` / `lineOfSight` and grid-cell AABB lookup for `movePlayer` / `findWallFaces` (with a `queryStamp` integer deduplication array — **zero allocations!**).
-   - **Expected CPU Win**: Cuts `PhysicsWorld` raycast & LOS CPU time by **`70–85%`**, eliminating micro-stutters during heavy 14-enemy combat & stealth sweeps!
-2. **Aggressive `InstancedMesh` Kit Consolidation (`-5` to `-6` Draw Calls!)**:
-   - Consolidate compatible instanced batches using `aVariant` / per-instance attributes so total Sector 4 draw calls drop **below `104` (well under the `120` cap!)**:
-     1. Merge `ClutterCardboard` + `ClutterTrashBins` → single `ClutterDebrisKit` (`-1` call).
-     2. Merge `StreetLifeKit` (lanterns/umbrellas) + `StreetLandmarksKit` (ramen carts/bus shelters) → single `StreetFurnishingsKit` (`-1` call).
-     3. Pack `BillboardMist` into `lampHalos` (using per-instance `aRadius` & `aColor`) (`-1` call).
-     4. Merge `guardrails` + `fences` + `antennas` (all share `steelMat`!) into a single `SteelFixturesInstanced` kit via `aVariant` (`-2` calls).
-     5. Merge `acUnits` + `ducts` (if compatible PBR) or keep tight bounding spheres (`-1` call optional).
-3. **True Frustum Culling (`frustumCulled = true`) & Tight Bounding Spheres**:
-   - Compute tight exact `boundingSphere` on all committed static meshes and non-global instanced meshes where safe (and keep `64 m` vertex-shader distance culling on all socket micro-props and interior small furnishings so distant buildings incur zero interior overdraw!).
-4. **Adaptive Particle & Debris Cap Guard**:
-   - Automatically skip spawning non-essential ambient sparks/rain-drips/minor debris beyond `52 m` from the camera, and enforce the `200`-piece ring-buffer ceiling on `DestructDebris` so rapid gunfire through a cluttered shop NEVER causes a frame drop.
+### 11B-3. Phase 11 Dynamic-Collider Integration & Final Performance Audit
+Because the core `PhysicsWorld.ts` 2D spatial-grid broadphase (`12 m` cells + DDA), `ClutterDebrisKit`, `SteelFixturesInstanced`, `lampHalos` mist packing, `StreetFurnishingsKit`, and frustum culling were already pulled forward into **Phase 10A–10C** (zero wasted rework!), Phase 11B focuses cleanly on finalizing destruction performance:
+1. **Dynamic Door & Glass Collider Toggle in the Existing `PhysicsWorld` Grid (`O(1)`)**:
+   - Hook `InteractiveDoor` and `DestructibleGlass` colliders directly into the `active: boolean` flag of the Phase 10A spatial grid so opening a door or shattering a window removes its collision in `O(1)` time without ever rebuilding the grid!
+2. **Optional Extra Roof-Prop Consolidation (`-1` to `-2` Calls)**:
+   - Consolidate `acUnits` + `ducts` (compatible PBR) or `SocketPottedPlants` + `SocketMiscProps` via `aVariant` if Sector 4 approaches `110+` calls, keeping a generous margin under `120`!
+3. **Debris & Interior Overdraw Caps**:
+   - Enforce the `200`-piece ring-buffer cap on `DestructDebris`, skip minor non-player debris spawns beyond `52 m`, and keep interior small destructible props inside the `64 m` vertex-shader distance cull so distant buildings pay zero interior overdraw.
 
 ---
 
-## Draw-Call Budget Audit (Phase 11 Net Savings!)
+## Draw-Call Budget Audit (Strictly `<= 112` — Well Below `120` Cap!)
 
-| Category | Phase 10D Total | Phase 11A Delta | Phase 11B Delta | Final Phase 11 Sector 4 Total |
+| Category | Phase 10D Total (With 10A–10C Consolidations) | Phase 11A Delta | Phase 11B Delta | Final Phase 11 Sector 4 Total |
 | :--- | :---: | :---: | :---: | :---: |
 | Static City + Enterable Interiors | `11` | **`+0`** (merged!) | `+0` | `11` |
 | Interactive Doors + Destructible Glass | `0` | `+2` (`Doors`, `Glass`) | `+0` | `2` |
 | `DestructDebris` Digital Dissolve Pool | `0` | `+0` | `+1` | `1` |
-| Instanced City Kit Consolidation (`11B-3`) | `~44` | `+0` | **`-5` to `-6`** | **`~38–39`** |
+| Remaining Consolidated Instanced Kits | `~39` | `+0` | `-1` (optional roof merge) | `~38–39` |
 | Enemies (14), Effects, Rain, ViewModel, PostFX | `~50–58` | `+0` | `+0` | `~50–58` |
-| **TOTAL DRAW CALLS / FRAME** | **`105–114`** | **`+2`** | **`-4` to `-5`** | **`102–111` (Net LOWER than 10D, strictly `<= 120`!)** |
+| **TOTAL DRAW CALLS / FRAME** | **`101–109`** | **`+2`** | **`0` to `-1`** | **`102–111` (Hard Cap: `<= 120`!)** |
 
 ---
 

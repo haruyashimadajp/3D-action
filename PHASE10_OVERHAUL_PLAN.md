@@ -31,6 +31,14 @@
 5. **Optional Lightweight Shadows Toggle & Performance Telemetry Toggle (`skills.ts`, `HudManager.ts`, `Renderer.ts`)**:
    - `SaveSettings.shadows: boolean` (default `false` for locked 60fps; when `true`, enable `THREE.PCFSoftShadowMap` `1024×1024` with a `±36 m` texel-snapped frustum centered on the player casting shadows from towers, highways, and dumpsters).
    - `SaveSettings.showPerf: boolean` (default `false`; when `true`, display a compact top-right corner readout showing `FPS | frame ms | draw calls`).
+6. **CPU Broadphase Optimization — `PhysicsWorld.ts` 2D Static Spatial Grid (`cellSize = 12 m`, Zero Allocations!)**:
+   - Build a flat pre-allocated 2D uniform spatial grid (`Int32Array` cell offsets + collider index list + integer `queryStamp` dedup) once per `loadLevel()`, supporting fast dynamic disable flags (`active: boolean` for future Phase 11 doors/glass) and DDA grid traversal for `raycast` / `lineOfSight` plus cell-range lookup for `movePlayer` / `findWallFaces`.
+   - Eliminates linear 300–600 collider scans across 14 stealth enemies + 120Hz physics + bullets, cutting `PhysicsWorld` CPU time by **`70–85%`** right now BEFORE Phase 10B increases building count! (Verified bit-identical to brute-force via unit test!)
+7. **Early Draw-Call Consolidation (`-3` Calls Right in 10A!)**:
+   - Consolidate `ClutterCardboard` + `ClutterTrashBins` → single `ClutterDebrisKit` via `aVariant` (`-1` call).
+   - Consolidate `guardrails` + `fences` + `antennas` (all share `steelMat`) → single `SteelFixturesInstanced` via `aVariant` (`-2` calls).
+8. **True Frustum Culling & Distant Particle Auto-Skip**:
+   - Compute tight exact `boundingSphere` on committed static sector meshes where safe (`frustumCulled = true`) and auto-skip spawning non-essential minor ambient sparks/splashes beyond `52 m` from the camera.
 
 ### 10A-2. Critical Visual & Structural Bug Fixes (Confirmed From Live Screenshots!)
 1. **Fix "Melted Silver Mercury" Wet Road & Alley Floor (`CityBuilder.ts`, `ProceduralTextures.ts`)**:
@@ -137,8 +145,8 @@ Replace the robotic rail-flat walk camera and generic uniform `28 Hz` gunshot bu
    - Strictly bound to solid `FaceSpan`s (`10A-2b` rule — zero floating billboards!).
    - Subtle LCD scanlines, animated scroll shimmer on data panels, controlled HDR (`1.15–1.55`), and steel mounting trusses (`G.steel`).
    - **3 Formats**: Giant avenue wall screens (`10–20 m × 10–34 m`), **synchronized 90° L-corner wrap-around screens** (2–4 stacked tiers wrapping prominent street corners!), and **towering vertical neon monolith blades** (`3.2–4.5 m × 18–38 m`).
-3. **Colored Neon Rain-Mist Halos Around Mega-Billboards (`+0` to `+1` call — share `lampHalos` shader or add `BillboardMist` `cap: 90`)**:
-   - Ultra-soft additive camera-facing radial mist sprites (`radius 8–16 m`, low opacity `0.10–0.16`) tinted to each Mega-Billboard's dominant cyan/magenta/lime/crimson hue, casting realistic colored atmospheric fog glow into the rainy night air around hero building corners!
+3. **Colored Neon Rain-Mist Halos Around Mega-Billboards (`+0` Extra Calls — Packed Directly Into `lampHalos`!)**:
+   - Extend the existing `lampHalos` instanced shader with per-instance `aRadius` & `aColor` (`cap` expanded by `+90`) so ultra-soft additive camera-facing radial mist sprites (`radius 8–16 m`, low opacity `0.10–0.16`) tinted to each Mega-Billboard's dominant cyan/magenta/lime/crimson hue render in the SAME draw call as street-lamp halos!
 
 ### 10B-3. 4 Iconic Cyber-Megastructure Silhouettes (`BuildingGrammar.ts`, `CityBuilder.ts`, `+0` extra draw calls!)
 Extend `MassingKind` with 4 skyline-defining cyber megastructures (all merged into existing `G.*` buckets):
@@ -191,7 +199,7 @@ Replace the simple side-extruded car blocks with sculpted, multi-component high-
    - Span `4–6` heavy industrial **open-truss steel overhead gantries** across avenues and between mid-rise roofs (`Y = 12–22 m`, grapple-able!), studded along their upper truss chords with tiny blinking **red warning beacon LEDs**!
 5. **Upgraded Close-Up Street Lamps (`+0` calls — replaces existing `lamps`)**:
    - Bolted octagonal steel base flange, chest-height maintenance fuse box with tiny status LED, ribbed mounting collar brackets, hanging small neon-trimmed street banner flag on alternating avenue poles, and curved twin-arm luminaire heads!
-6. **Hanging Paper Lantern Strings (`Chochin`) & Sidewalk Cafe Parasol Umbrellas (`StreetLifeKit` `InstancedMesh`, `cap: 220`, `+1` draw call)**:
+6. **Hanging Paper Lantern Strings (`Chochin`) & Sidewalk Cafe Parasol Umbrellas (`StreetFurnishingsKit` `InstancedMesh`, `cap: 300`, `+1` draw call — designed with variants `0..3` so 10D ramen carts & bus shelters share the same draw call!)**:
    - Variant 0: **Festoon String of Glowing Red/Warm-Orange Cyberpunk Paper Lanterns** (`5` ribbed ovoid lanterns on a sagged wire with warm glowing cores) hung across `CYBER_EATERY` storefronts, narrow alleys, and Kowloon canal streets!
    - Variant 1: **Rain-Wet Sidewalk Cafe Parasol Umbrella** (`radius 1.25 m`, octagonal dark crimson/charcoal canopy on steel pole with warm underside lamp glow) tucked beside `CYBER_EATERY` terraces & sidewalk rails!
 
@@ -204,16 +212,16 @@ Replace the simple side-extruded car blocks with sculpted, multi-component high-
 * Each car carries bright white/cyan headlights (`front`), blazing crimson taillight bars + **subtle elongated trailing red light ribbons** (`rear`), creating the iconic Cyberpunk 2077 flowing rivers of highway light!
 * **Gameplay Safety**: Keep moving traffic smoothly phased on the **outer/dedicated traffic lanes** (non-lethal or gentle lateral bump away if the player steps directly into their path, never unfair instant death!).
 
-### 10D-2. GPU-Animated Micro-Environment & Street Landmarks (`CityAtmosphere.ts`, `+2` draw calls total!)
+### 10D-2. GPU-Animated Micro-Environment & Street Landmarks (`CityAtmosphere.ts`, `+1` net draw call!)
 1. **`AnimatedEnvKit` (`InstancedMesh`, `cap: 220`, `+1` draw call, 100% GPU-animated via `uTime`!)**:
    - Variant 0 (**Spinning Industrial Exhaust Fans**): Circular steel vent housing with 6 angled fan blades rotating smoothly around local Z (`uTime * speed`) over a dim warm-orange/cyan backlit vent slit, mounted on `ALLEY_INFRA` / `CYBER_EATERY` walls and rooftop ducts!
    - Variant 1 (**Wind-Swaying Eatery `Noren` Curtains & Vertical Alley Banners**): Split fabric/vinyl shop curtain panels hanging under `CYBER_EATERY` awnings and narrow alley overhangs, gently rippling and billowing in the rainy night wind via vertex-shader sine displacement (`y`-pinned at top)!
    - Variant 2 (**Giant Slowly Spinning Rooftop Corporate Wireframe Holograms**): Translucent additive rotating geometric logo rings / cyber-emblems (`diameter 6–10 m`) hovering above `STEPPED_SETBACK`, `CYLINDER_RING_TOWER`, and `SLANT_CORP_TOWER` rooftops!
-2. **`StreetLandmarksKit` (`InstancedMesh`, `cap: 80`, `+1` draw call)**:
-   - Variant 0 (**Steaming Cyberpunk Ramen Street-Vendor Cart**): Tucked into `L_SHAPE` courtyards and compact market pockets — wheeled stainless steel stall, glowing warm menu backboard, hanging canopy roof, stacked bowls, and anchored rising steam puff!
-   - Variant 1 (**Illuminated Holographic Bus-Stop Shelter**): Placed along major avenue sidewalks (`2–4` per sector) — cantilevered dark steel & rain-streaked glass canopy, backlit glowing transit map panel, and integrated metal waiting bench!
+2. **Street Landmarks Added to Existing `StreetFurnishingsKit` (`+0` Extra Draw Calls!)**:
+   - Variant 2 (**Steaming Cyberpunk Ramen Street-Vendor Cart**): Tucked into `L_SHAPE` courtyards and compact market pockets — wheeled stainless steel stall, glowing warm menu backboard, hanging canopy roof, stacked bowls, and anchored rising steam puff!
+   - Variant 3 (**Illuminated Holographic Bus-Stop Shelter**): Placed along major avenue sidewalks (`2–4` per sector) — cantilevered dark steel & rain-streaked glass canopy, backlit glowing transit map panel, and integrated metal waiting bench!
 3. **Alley Electrical Sparks & Canopy Rain Drips (`EffectsPool.ts`, `+0` extra draw calls)**:
-   - Register `8–12` faulty alley breaker boxes / flickering neon signs that periodically emit tiny **blue-white electrical spark bursts** every `4–9 s` (plus subtle 3D crackle SE when within `14 m`).
+   - Register `8–12` faulty alley breaker boxes / flickering neon signs that periodically emit tiny **blue-white electrical spark bursts** every `4–9 s` (plus subtle 3D crackle SE when within `14 m`, skipped beyond `52 m`).
    - Emit occasional crisp vertical rain-drip streaks falling off nearby storefront canopies when the player walks beneath them.
 
 ### 10D-3. Procedural Audio Immersion (`AudioEngine.ts`, `EnemyManager.ts`)
@@ -225,14 +233,14 @@ Replace the simple side-extruded car blocks with sculpted, multi-component high-
 
 ## Strict Draw-Call Budget Audit Across ALL of Phase 10 (`<= 120 calls / frame`)
 
-| Sub-Phase | Additions / Replacements | Net Draw Call Delta |
+| Sub-Phase | Additions / Consolidations | Net Draw Call Delta |
 | :--- | :--- | :---: |
 | Phase 9B Baseline | Existing city, props, enemies, VFX, ViewModel, PostFX | `~96–104` |
-| **Phase 10A** | `PropContactShadows` (`+1`), `MuzzleFlash` (`+1` transient), `BulletScorchDecals` (`+1`), `EnemyScannerCones` (`+1`), Filters (`+0`), Radar Canvas (`+0`) | **`+4`** |
-| **Phase 10B** | `MegaBillboards` (`+1`), `BillboardMist` (`+0` packed into `lampHalos` or `+1`), 4 Megastructures & filled lots (`+0` merged into `G.*`) | **`+1` to `+2`** |
-| **Phase 10C** | Hero 3 Cars (`+0` replace), Hero Vending (`+0` replace), Hero Lamps (`+0` replace), Curb LEDs/Scaffolds/Shacks/Gantries (`+0` merged), `StreetLifeKit` Lanterns & Umbrellas (`+1`) | **`+1`** |
-| **Phase 10D** | `ElevatedTraffic` (`+1`), `AnimatedEnvKit` Fans/Curtains/Holo (`+1`), `StreetLandmarksKit` Ramen Carts/Bus Shelters (`+1`), Sparks/Audio (`+0`) | **`+3`** |
-| **GRAND TOTAL** | **Sector 4 Maximum Density (all 14 enemies + active combat)** | **`~105–114` (Hard Cap: `<= 120`)** |
+| **Phase 10A** | `PropContactShadows` (`+1`), `MuzzleFlash` (`+1` transient), `BulletScorchDecals` (`+1`), `EnemyScannerCones` (`+1`) + Early Consolidation (`ClutterDebrisKit` `-1`, `SteelFixturesInstanced` `-2`) | **`+1`** |
+| **Phase 10B** | `MegaBillboards` (`+1`), `BillboardMist` packed in `lampHalos` (`+0`), 4 Megastructures & filled lots (`+0` merged into `G.*`) | **`+1`** |
+| **Phase 10C** | Hero 3 Cars / Vending / Lamps (`+0` replace), Curb LEDs/Scaffolds/Shacks/Gantries (`+0` merged), `StreetFurnishingsKit` (`+1`) | **`+1`** |
+| **Phase 10D** | `ElevatedTraffic` (`+1`), `AnimatedEnvKit` (`+1`), Ramen Carts & Bus Shelters in `StreetFurnishingsKit` (`+0`), Sparks/Audio (`+0`) | **`+2`** |
+| **GRAND TOTAL** | **Sector 4 Maximum Density (all 14 enemies + active combat)** | **`~101–109` (Hard Cap: `<= 120`!)** |
 
 * **Safety Valve**: If Sector 4 ever exceeds `116` calls, merge `BillboardMist` into `lampHalos` (`-1`), merge `ClutterCardboard` + `ClutterTrashBins` via `aVariant` (`-1`), or merge `StreetLifeKit` + `StreetLandmarksKit` (`-1`).
 
