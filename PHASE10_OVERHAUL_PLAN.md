@@ -56,6 +56,30 @@ Live testing on macOS Chrome Retina revealed noticeable mouse lag caused by GPU 
 4. **Cheap Ground Contact Shadow Decals (`CityPropMeshes.ts`, `+1` draw call)**:
    - Add a single pooled `InstancedMesh` (`PropContactShadows`, `cap: 420`, `+1` call) rendering soft radial dark multiply/alpha shadow quads flush at `Y = 0.012 m` (`depthWrite: false`, `polygonOffset`) directly beneath every dumpster, jersey barrier, bench, trash-bin cluster, vending kiosk, and parked car. Instantly eliminates the "floating prop" look at virtually zero GPU cost even with real shadows `OFF`!
 
+### 10A-2b. Structural Geometry Bug Fixes (Verified From Live Screenshots `9.33.18` & `9.33.53`!)
+1. **Fix Unnatural On-Ramp Underside (`CityBuilder.ts` ~L3504–3525)**:
+   - Live screenshot `9.33.18` showed the highway on-ramp underside appearing as a thin twisted floating slab with awkward thin square poles and skewed side `beam()` parapets poking out underneath.
+   - **Exact Structural Fix**:
+     - **Solid Ground Abutment (`y <= 2.8 m`)**: For the lower section of every on-ramp where deck height is `0..2.8 m`, build a **solid sloped concrete retaining-wall abutment** extending cleanly all the way down to `Y = 0.0` (with dark ground-contact `aAo` and side concrete walls — zero thin floating ramp wedge!).
+     - **Clean Box-Girder Underside (`y > 2.8 m`)**: Thicken the elevated sloped ramp deck into a clean concrete box-girder (`0.85 m` deep, darkened underside `aAo = 0.45`, flanked by twin dark steel longitudinal underside beams).
+     - **Proper T-Pier Support Columns**: Space concrete piers every `10–12 m` along the elevated span (`y >= 2.8 m`), each with a `1.2 m × 1.2 m` column shaft topped by a **horizontal concrete cross-head cap beam (`width = RAMP_WIDTH_M - 0.6 m`, height `0.75 m`, depth `1.4 m`)** meeting cleanly flush into the sloped ramp underside (zero floating poles!).
+     - **Clean Vertical-Profile Side Parapets**: Replace the twisted `beam()` ramp rails with properly constructed upright prism/extruded concrete side parapet walls whose top AND bottom faces run strictly parallel to the ramp deck slope (`+0.0 m` to `+0.95 m` above the deck), NEVER jutting awkwardly below the slab!
+2. **Eliminate Floating Neon Signs Everywhere (`CityBuilder.ts` ~L5046–5072 & L5347)**:
+   - **Root Cause Confirmed** (Screenshot `9.33.53` showed yellow & pink signs floating in open sky): Old `addNeon` placement computed positions from the full lot rectangle `b.rect` up to `y = 35–42 m`, ignoring Phase 9A's `L_SHAPE` courtyard cutouts, `PODIUM_OFFSET` `8 m` podium heights, and `STEPPED_SETBACK` upper insets — AND `farTowers` placed signs along arbitrary diagonal `toC` vectors instead of cardinal box faces!
+   - **Exact Structural Fix**:
+     - **Mandatory `FaceSpan` Binding**: Place EVERY building-mounted `neonSign` (and every Phase 10B `MegaBillboard`) strictly on an actual solid `FaceSpan` from `b.plan.faces` (never `b.rect`!), enforcing:
+       - `y - signH * 0.5 >= span.y0 + 0.4` AND `y + signH * 0.5 <= span.y1 - 0.4`
+       - `along - signW * 0.5 >= span.a0 + 0.3` AND `along + signW * 0.5 <= span.a1 - 0.3` (for wall-mounted flat signs), or bracket-mount `along` inside `[span.a0 + 0.5, span.a1 - 0.5]` with steel mounting struts touching the solid `span.plane`!
+       - If no valid `FaceSpan` fits a sign's height, skip or clamp the sign height to fit `span` — **NEVER place a sign floating in empty air!**
+     - **`farTowers` Cardinal Face Snap**: Snap distant tower sign normal `(nx, nz)` to the nearest cardinal face (`±X` or `±Z`) using exact half-width `t.w * 0.5` (for X) or `t.d * 0.5` (for Z) and clamp `y + sh * 0.5 <= t.top - 4.0`.
+3. **Eliminate Blimp-Through-Building Clipping (`constants.ts` ~L667, `CityBuilder.ts` `layoutFarTowers`)**:
+   - **Root Cause Confirmed** (Screenshot `9.33.53` showed a distant blimp passing right through skyscrapers): Blimps orbited at `y = 138 / 158 m` across `radius = 262 / 322 m`, where `farTowers` rose up to `160–220 m` directly inside the blimp flight path!
+   - **Exact Structural Fix (Guaranteed Zero Clipping)**:
+     - Raise blimp cruise altitudes in `CITY_FX.BLIMPS` to **`y: 168`** (`radius: 265`) and **`y: 194`** (`radius: 335`).
+     - In `layoutFarTowers()`, for every distant tower at radial distance `dist = Math.hypot(x, z)` and half-diagonal `rad = Math.hypot(w, d) * 0.5`: for each blimp in `CITY_FX.BLIMPS`, if `Math.abs(dist - blimp.radius) <= CITY_FX.BLIMP_LENGTH * 0.5 + rad + 20`, **hard-clamp** `top = Math.min(top, blimp.y - CITY_FX.BLIMP_RADIUS - 24)`!
+     - Also verify `blimp.y - CITY_FX.BLIMP_RADIUS` exceeds every playable tower's `roofY + 25 m`.
+     - Add a **unit test** sweeping 360° around every blimp orbit asserting **>= 18 m clearance** from EVERY playable tower and EVERY `farTower`!
+
 ### 10A-3. First-Person 3D Gunshot Muzzle Flash (`src/player/ViewModelRenderer.ts`, `src/engine/Renderer.ts`)
 Add crisp, weapon-specific procedural 3D muzzle flash meshes parented directly to each gun's `muzzle` `Object3D` in the first-person viewmodel scene (`+1` shared additive material, `0` per-frame allocations):
 * **Geometry**: Crossed 3-plane star burst + tapered forward plasma jet cone + dual small lateral muzzle-brake vent jets (visible only on Sniper). Randomly rolls around Z (`0..2π`) and micro-scales (`0.85–1.18x`) on every shot for organic variety!
@@ -195,6 +219,9 @@ Give each of the 5 sectors a clear, unmistakable architectural & atmospheric per
    - Wet streets & alleys look like flat, crisp rain-soaked asphalt with subtle micro-ripples (NO wavy silver mercury plastic look, NO dark X-seams).
    - Highway underside strip glows cleanly without blinding laser blowout.
    - `WIRE_RACK` and all non-glow props never blow out into white Bloom; all props (`CityPropMeshes`) and steel (`steelMat`) display weathered surface detail and catch city light reflections; ground contact shadows anchor dumpsters, cars, benches, and kiosks.
+   - **On-ramp underside** has a solid concrete ground abutment for `y <= 2.8 m`, a clean `0.85 m` box-girder underside with T-pier cross-head caps, and upright slope-aligned side parapets (zero twisted underside strips or floating poles).
+   - **Zero floating neon signs**: Unit test asserting every building-mounted `neonSign` sits strictly within an actual solid `FaceSpan` of `b.plan.faces` (never floating over `L_SHAPE` cutouts or `PODIUM_OFFSET` terraces) and every `farTower` sign sits flush on a cardinal face.
+   - **Zero blimp clipping**: Unit test sweeping 360° around every blimp orbit asserting `>= 18 m` clearance from EVERY playable tower and EVERY `farTower`.
 4. **Muzzle Flash**: Both Suppressed Pistol (compact cyan-white burst) and K-90 Sniper (dramatic plasma burst + lateral brake vents + dynamic receiver light) visibly flash on every shot without blocking the holo sight.
 5. **5 Screen Filters**: Settings menu cycles `CYBER NOIR` / `NEON OVERDRIVE` / `COLD STEEL` / `AMBER DUST` / `RAW`, immediately updating the screen look and persisting across reloads.
 6. **ALERT Investigation AI**: Unit test + live check proving that when an `ENFORCER`/`AEGIS`/`PHANTOM`/`DRONE` enters `ALERT` (including when player is elevated on a car/ledge), it pauses gauge decay, physically moves to inspect `investigatePos`, sweeps gaze for `2.0 s`, and ONLY THEN decays back to `UNAWARE`.
