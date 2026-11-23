@@ -68,6 +68,20 @@
 4. **Sniper 4x ADS Digital Rangefinder (`HudManager.ts`)**:
    - While ADS with K-90 Sniper, perform a lightweight center-ray distance check (using existing `PhysicsWorld` / enemy raycast) and render a crisp minimal monospace distance readout (e.g., `64m`, `112m`) just bottom-right of the reticle (`11px`, subtle cyan `0.75` alpha).
 
+### 10A-3b. Realistic Stride Head-Bob & Physical Spring-Damper Recoil Camera Kick (`src/player/PlayerController.ts`)
+Replace the robotic rail-flat walk camera and generic uniform `28 Hz` gunshot buzz with physically grounded AAA FPS camera motion (scaled by `settings.shakeScale` / `settings.rollScale` for zero motion sickness):
+1. **Organic Figure-8 Stride Head-Bob (Synced to Ground Footsteps)**:
+   - Advance `stridePhase` proportional to grounded horizontal speed (`stridePhase += speed * 0.62 * realDt` when `GROUNDED` or `CROUCHING`, smoothly damping back to neutral when airborne, sliding, wall-running, or stationary).
+   - Apply subtle natural gait offsets to camera position & roll (scaled by `0.15×` during ADS so precision aiming stays rock-steady!):
+     - Vertical bob: `-Math.abs(Math.sin(stridePhase)) * (crouching ? 0.014 : 0.028)` m (crisp heel-strike dip, smooth push-off arc).
+     - Lateral shift: `Math.cos(stridePhase) * (crouching ? 0.006 : 0.012)` m.
+     - Footstep micro-roll: `Math.sin(stridePhase) * (crouching ? 0.22 : 0.45) * DEG2RAD * settings.rollScale` (subtle weight transfer left/right).
+2. **Physical Spring-Damper Gunshot Recoil Kick (Replacing Flat Vibrator Buzz)**:
+   - Maintain a critically damped camera impulse spring (`kickPitch`, `kickRoll`, `kickZ` with velocities) fired on every shot (`onWeaponKick(gunId, ads)`):
+     - **MK-IV Rail Pistol**: Sharp instant upward pitch snap (`+0.85°` hip / `+0.55°` ADS), tiny clockwise roll flick (`+0.45°`), and crisp `-0.016 m` backward Z-punch recovering cleanly (`k = 260, c = 28`).
+     - **K-90 Rail Sniper**: Visceral heavy shoulder-slam! Strong upward pitch kick (`+2.4°` hip / `+1.4°` ADS), crisp roll whip (`±1.1°`), noticeable `-0.048 m` backward Z-punch, and brief `+1.8°` instantaneous FOV punch settling heavily (`k = 175, c = 21`).
+   - Keep existing `trauma` shake for explosions, hard landings, and taking damage; reduce gunshot `trauma` so the crisp physical spring kick carries the feel instead of noisy vibration!
+
 ### 10A-4. 5 Selectable Atmospheric Full-Screen Filters With Live Pause Preview (`Renderer.ts`, `skills.ts`, `HudManager.ts`)
 * `export type ScreenFilterId = 'CYBER_NOIR' | 'NEON_OVERDRIVE' | 'COLD_STEEL' | 'AMBER_DUST' | 'RAW';` (persisted in `SaveSettings.filter`, default `'CYBER_NOIR'`, `+0` extra draw calls — executed inside `KineticPostFX`!).
   - **`CYBER_NOIR`** (Default): Deep rain-soaked teal-indigo shadows, richer blacks, crisp warm/cyan neon highlights, cinematic S-curve `0.16`, soft vignette `0.18`.
