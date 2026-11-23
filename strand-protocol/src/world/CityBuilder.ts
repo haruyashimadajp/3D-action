@@ -90,7 +90,7 @@ import {
   type KitId,
   type PropInstance,
 } from './CityProps';
-import { CityPropMeshes } from './CityPropMeshes';
+import { CityPropMeshes, type ContactShadowDesc } from './CityPropMeshes';
 
 // =============================================================================================
 // Public layout data (consumed by PhysicsWorld / PlayerController / EnemyManager / HUD)
@@ -116,6 +116,8 @@ export interface BoxCollider {
   readonly building: number;
   /** The district gate section of the lockdown barrier (passable once the gate opens). */
   readonly gate?: boolean;
+  /** 10A-1 dynamic enable/disable flag (default true when undefined; supports future destructible doors/glass). */
+  active?: boolean;
 }
 
 /** Sloped on-ramp: surface height interpolates linearly along `axis` from (alongStart, yStart) to (alongEnd, yEnd). */
@@ -193,6 +195,28 @@ export interface FacadeFeature {
   readonly top: number;
 }
 
+export interface NeonSignRecord {
+  readonly kind: 'BUILDING_FLAT' | 'BUILDING_BLADE' | 'ALLEY_BLADE' | 'ALLEY_BAR' | 'FAR_TOWER' | 'HIGHWAY' | 'BRIDGE';
+  readonly x: number;
+  readonly y: number;
+  readonly z: number;
+  readonly nx: number;
+  readonly nz: number;
+  readonly w: number;
+  readonly h: number;
+  readonly building: number;
+  readonly buildingB?: number;
+  readonly farIndex?: number;
+}
+
+export interface FarTowerInfo {
+  readonly x: number;
+  readonly z: number;
+  readonly w: number;
+  readonly d: number;
+  readonly top: number;
+}
+
 export interface SectorLayout {
   readonly sector: SectorDef;
   readonly loop: number;
@@ -233,6 +257,10 @@ export interface SectorLayout {
   readonly alleyBands: ReadonlyArray<RectXZ & { readonly width: number }>;
   /** 9A-6 manhole centres (steam anchors / Phase 9B clutter avoidance). */
   readonly manholes: readonly THREE.Vector3[];
+  /** 10A-2 audit records: placed neon signs, solid building FaceSpans (by building index), and far towers. */
+  readonly neonSignRecords: readonly NeonSignRecord[];
+  readonly buildingSpans: readonly (readonly FaceSpan[])[];
+  readonly farTowersInfo: readonly FarTowerInfo[];
   readonly stats: {
     readonly towers: number;
     readonly cars: number;
@@ -300,6 +328,7 @@ export interface SectorLayout {
       readonly clutterByStrip: Readonly<Record<string, number>>;
       readonly dumpstersByStrip: Readonly<Record<string, number>>;
       readonly decals: number;
+      readonly contactShadows: number;
     };
   };
 }
@@ -607,6 +636,74 @@ function quad(
   return g;
 }
 
+/**
+ * 10A-2: Sloped concrete prism with exact vertical sides (never twisted `beam()`), outward normals, world UVs,
+ * and per-vertex `aAo`. Spans along `axis` from `a0` (vertical `[y0Bot, y0Top]`) to `a1` (`[y1Bot, y1Top]`),
+ * across `[l0, l1]`.
+ */
+function slopedPrism(
+  axis: Axis,
+  a0: number,
+  a1: number,
+  l0: number,
+  l1: number,
+  y0Bot: number,
+  y0Top: number,
+  y1Bot: number,
+  y1Top: number,
+  ao: { ground?: boolean; bottom?: number; top?: number; side?: number } = {},
+): THREE.BufferGeometry {
+  const sA = Math.min(a0, a1);
+  const sB = Math.max(a0, a1);
+  const swap = a0 > a1;
+  const botA = swap ? y1Bot : y0Bot;
+  const topA = swap ? y1Top : y0Top;
+  const botB = swap ? y0Bot : y1Bot;
+  const topB = swap ? y0Top : y1Top;
+  const lMin = Math.min(l0, l1);
+  const lMax = Math.max(l0, l1);
+  const P = (al: number, y: number, lat: number): THREE.Vector3 => pt(axis, al, y, lat, new THREE.Vector3());
+  const A00 = P(sA, botA, lMin);
+  const A01 = P(sA, botA, lMax);
+  const A10 = P(sA, topA, lMin);
+  const A11 = P(sA, topA, lMax);
+  const B00 = P(sB, botB, lMin);
+  const B01 = P(sB, botB, lMax);
+  const B10 = P(sB, topB, lMin);
+  const B11 = P(sB, topB, lMax);
+  const T = RENDER.ROOF_TILE_M;
+  const vAo = (y: number, base: number): number => (ao.ground && y < 0.35 ? base * (0.46 + 0.54 * (Math.max(0, y) / 0.35)) : base);
+  const parts: THREE.BufferGeometry[] = [];
+  const emit = (
+    p: readonly [THREE.Vector3, THREE.Vector3, THREE.Vector3, THREE.Vector3],
+    hint: THREE.Vector3,
+    uv: readonly [number, number, number, number, number, number, number, number],
+    baseAo: number,
+  ): void => {
+    const q = quad(p, uv, hint);
+    const aArr = new Float32Array([vAo(p[0].y, baseAo), vAo(p[1].y, baseAo), vAo(p[2].y, baseAo), vAo(p[3].y, baseAo)]);
+    q.setAttribute('aAo', new THREE.BufferAttribute(aArr, 1));
+    parts.push(q);
+  };
+  const alLen = (sB - sA) / T;
+  const latLen = (lMax - lMin) / T;
+  // Top & bottom sloped slabs.
+  emit([A10, A11, B11, B10], new THREE.Vector3(0, 1, 0), [0, 0, latLen, 0, latLen, alLen, 0, alLen], ao.top ?? 1);
+  emit([A00, A01, B01, B00], new THREE.Vector3(0, -1, 0), [0, 0, latLen, 0, latLen, alLen, 0, alLen], ao.bottom ?? 1);
+  // Vertical lateral sides.
+  const nMin = axis === 'z' ? new THREE.Vector3(-1, 0, 0) : new THREE.Vector3(0, 0, -1);
+  const nMax = axis === 'z' ? new THREE.Vector3(1, 0, 0) : new THREE.Vector3(0, 0, 1);
+  const sideAo = ao.side ?? 1;
+  emit([A00, B00, B10, A10], nMin, [0, botA / T, alLen, botB / T, alLen, topB / T, 0, topA / T], sideAo);
+  emit([A01, B01, B11, A11], nMax, [0, botA / T, alLen, botB / T, alLen, topB / T, 0, topA / T], sideAo);
+  // End faces (skip degenerate zero-height ends).
+  const nA = axis === 'z' ? new THREE.Vector3(0, 0, -1) : new THREE.Vector3(-1, 0, 0);
+  const nB = axis === 'z' ? new THREE.Vector3(0, 0, 1) : new THREE.Vector3(1, 0, 0);
+  if (topA - botA > 1e-3) emit([A00, A01, A11, A10], nA, [0, botA / T, latLen, botA / T, latLen, topA / T, 0, topA / T], sideAo);
+  if (topB - botB > 1e-3) emit([B00, B01, B11, B10], nB, [0, botB / T, latLen, botB / T, latLen, topB / T, 0, topB / T], sideAo);
+  return mergeOrEmpty(parts);
+}
+
 function withColor(g: THREE.BufferGeometry, hex: number, intensity: number): THREE.BufferGeometry {
   _col.setHex(hex);
   const n = g.getAttribute('position').count;
@@ -762,7 +859,9 @@ const GLSL_CITY_LIGHTS = /* glsl */ `
   uniform float uStreakGain;
   uniform float uHeightFog;
   varying vec3 vCityWorld;
+  varying vec3 vCityWorldN;
   vec3 strandCityLights(vec3 P, vec3 N, vec3 V, vec3 albedo, float rough, float metal) {
+    const float R2 = ${(RENDER.CITY_LIGHT_RANGE_M * RENDER.CITY_LIGHT_RANGE_M).toFixed(1)};
     vec3 acc = vec3(0.0);
     float a = max(rough * rough, 0.0025);
     float a2 = a * a;
@@ -771,9 +870,11 @@ const GLSL_CITY_LIGHTS = /* glsl */ `
     for (int i = 0; i < ${MAX_LIGHTS}; i++) {
       if (i >= uCityLightCount) break;
       vec3 Lv = uCityLightPos[i] - P;
-      float d = length(Lv);
+      float d2 = dot(Lv, Lv);
+      if (d2 > R2) continue;
+      float d = sqrt(d2);
       vec3 L = Lv / max(d, 1e-3);
-      float att = (1.0 / (1.0 + d * d * 0.045)) * (1.0 - smoothstep(${(RENDER.CITY_LIGHT_RANGE_M * 0.6).toFixed(1)}, ${RENDER.CITY_LIGHT_RANGE_M.toFixed(1)}, d));
+      float att = (1.0 / (1.0 + d2 * 0.045)) * (1.0 - smoothstep(${(RENDER.CITY_LIGHT_RANGE_M * 0.6).toFixed(1)}, ${RENDER.CITY_LIGHT_RANGE_M.toFixed(1)}, d));
       float NdL = max(dot(N, L), 0.0);
       if (att * NdL <= 0.0) continue;
       vec3 Hh = normalize(L + V);
@@ -816,13 +917,13 @@ const GLSL_CITY_LIGHTS_APPLY = /* glsl */ `
   #include <opaque_fragment>
 `;
 
-/** Puddle ripple normals: puddles are detected from the sampled roughness (< ~0.2). */
+/** 10A-2 puddle micro-ripple normals: flat rain-soaked asphalt with crisp high-frequency raindrop micro-rings. */
 const GLSL_PUDDLE_RIPPLES = /* glsl */ `
   {
-    float strandPuddle = 1.0 - smoothstep(0.08, 0.22, roughnessFactor);
+    float strandPuddle = 1.0 - smoothstep(0.13, 0.26, roughnessFactor);
     vec3 strandNwUp = transformNormalByInverseViewMatrix(normal, viewMatrix);
     if (strandPuddle > 0.001 && strandNwUp.y > 0.5) {
-      vec2 g = strandRipples(vCityWorld.xz * 2.2, uTime) * 0.32 + strandRipples(vCityWorld.xz * 3.7 + 11.0, uTime * 1.21) * 0.22;
+      vec2 g = strandRipples(vCityWorld.xz * 4.5, uTime) * 0.055 + strandRipples(vCityWorld.xz * 7.8 + 11.0, uTime * 1.18) * 0.035;
       normal = normalize(normal + mat3(viewMatrix) * (vec3(g.x, 0.0, g.y) * strandPuddle));
     }
   }
@@ -857,6 +958,8 @@ const CAP = {
   LAMP: 170,
   VENDING: 90,
   GUARDRAIL: 220,
+  /** 10A-1 consolidated guardrails + roof fences + antennas (−2 draw calls). */
+  STEEL_FIXTURES: 220 + 240 + 44,
   /** 7B-1: lamps, crowns, balconies, neon signs, car head / tail lights, vending fronts. */
   CITY_LIGHTS: 1100,
   /** 9A-6: steam columns anchored on manholes and eatery vents (2 puffs each) + canal mist. */
@@ -947,11 +1050,10 @@ export class CityBuilder {
   private readonly cars: THREE.InstancedMesh[];
   private readonly lamps: THREE.InstancedMesh;
   private readonly vending: THREE.InstancedMesh;
-  private readonly guardrails: THREE.InstancedMesh;
+  /** 10A-1 consolidated guardrails (v0) + roof fences (v1) + antennas (v2) — 1 draw call (−2 calls). */
+  private readonly steelFixtures: THREE.InstancedMesh;
   private readonly acUnits: THREE.InstancedMesh;
   private readonly ducts: THREE.InstancedMesh;
-  private readonly fences: THREE.InstancedMesh;
-  private readonly antennas: THREE.InstancedMesh;
   private readonly machineRooms: THREE.InstancedMesh;
   private readonly aviation: THREE.InstancedMesh;
   private readonly neonSigns: THREE.InstancedMesh;
@@ -973,7 +1075,7 @@ export class CityBuilder {
   /** 5B-3: low steam from manholes / ducts and canal mist (one instanced draw, animated on the GPU). */
   private readonly steam: THREE.InstancedMesh;
   private readonly gatePillar: THREE.Mesh;
-  /** Phase 9B socket kits, clutter batches and graffiti decals (10 persistent instanced draws). */
+  /** Phase 9B / 10A socket kits, clutter batches, graffiti decals and prop contact shadows (10 persistent draws). */
   private readonly propMeshes: CityPropMeshes;
 
   private layout: SectorLayout | null = null;
@@ -999,9 +1101,7 @@ export class CityBuilder {
       depthWrite: false,
       envMapIntensity: 1.5,
     });
-    this.steelMat = new THREE.MeshStandardMaterial({ color: 0x2a303b, roughness: 0.42, metalness: 0.85 });
-    this.steelMat.onBeforeCompile = (shader) => injectVertexAo(shader);
-    this.steelMat.customProgramCacheKey = () => 'strand-steel-ao-v1';
+    this.steelMat = this.createSteelMaterial(false);
     this.archPaintMat = this.createArchPaintMaterial();
     this.glassMat = new THREE.MeshStandardMaterial({ color: 0x0a1018, roughness: 0.06, metalness: 0.9 });
     this.beaconMat = this.createBeaconMaterial();
@@ -1030,7 +1130,9 @@ export class CityBuilder {
       const g = this.createCarGeometry(v);
       g.setAttribute('aCar', new THREE.InstancedBufferAttribute(new Float32Array(LIMITS.PARKED_CARS * 4), 4));
       g.setAttribute('aPaint', new THREE.InstancedBufferAttribute(new Float32Array(LIMITS.PARKED_CARS), 1));
-      return this.makeInstanced(g, carMat, LIMITS.PARKED_CARS, `ParkedCars_${['Coupe', 'Sedan', 'Van'][v]}`);
+      const m = this.makeInstanced(g, carMat, LIMITS.PARKED_CARS, `ParkedCars_${['Coupe', 'Sedan', 'Van'][v]}`);
+      m.receiveShadow = true;
+      return m;
     });
     const lampGeo = this.createLampGeometry();
     lampGeo.setAttribute('aTint', new THREE.InstancedBufferAttribute(new Float32Array(CAP.LAMP * 3), 3));
@@ -1038,11 +1140,12 @@ export class CityBuilder {
     const vendGeo = this.createVendingGeometry();
     vendGeo.setAttribute('aTint', new THREE.InstancedBufferAttribute(new Float32Array(CAP.VENDING * 3), 3));
     this.vending = this.makeInstanced(vendGeo, this.createVendingMaterial(), CAP.VENDING, 'VendingKiosks');
-    this.guardrails = this.makeInstanced(ensureAo(this.createGuardrailGeometry()), this.steelMat, CAP.GUARDRAIL, 'Guardrails');
+    const steelFixGeo = this.createSteelFixturesGeometry();
+    steelFixGeo.setAttribute('aInstVar', new THREE.InstancedBufferAttribute(new Float32Array(CAP.STEEL_FIXTURES), 1));
+    this.steelFixtures = this.makeInstanced(steelFixGeo, this.createSteelMaterial(true), CAP.STEEL_FIXTURES, 'SteelFixturesInstanced');
+    this.steelFixtures.receiveShadow = true;
     this.acUnits = this.makeInstanced(this.createAcGeometry(), machinery, CAP.AC, 'ACUnits');
     this.ducts = this.makeInstanced(this.createDuctGeometry(), new THREE.MeshStandardMaterial({ color: 0x4a525e, roughness: 0.3, metalness: 0.9 }), CAP.DUCT, 'Ducts');
-    this.fences = this.makeInstanced(this.createFenceGeometry(), new THREE.MeshStandardMaterial({ color: 0x3a414d, roughness: 0.38, metalness: 0.88 }), CAP.FENCE, 'RoofFences');
-    this.antennas = this.makeInstanced(ensureAo(this.createAntennaGeometry()), this.steelMat, CAP.ANTENNA, 'Antennas');
     this.machineRooms = this.makeInstanced(this.createMachineRoomGeometry(), new THREE.MeshStandardMaterial({ color: 0x232934, roughness: 0.5, metalness: 0.55 }), CAP.MACHINE_ROOM, 'MachineRooms');
     this.aviation = this.createAviationLights();
     this.neonSigns = this.createNeonSigns();
@@ -1057,9 +1160,14 @@ export class CityBuilder {
     this.steam = this.createSteam();
     this.manholes = this.createManholes();
     this.gatePillar = this.createGatePillar();
-    this.propMeshes = new CityPropMeshes(tex.plaqueAtlas, tex.graffitiAtlas, (shader) => this.injectCityLights(shader));
+    this.propMeshes = new CityPropMeshes(
+      tex.plaqueAtlas,
+      tex.graffitiAtlas,
+      (shader, apply) => this.injectCityLights(shader, apply),
+      tex.archDetail,
+    );
     this.persistent.add(
-      ...this.cars, this.lamps, this.vending, this.guardrails, this.acUnits, this.ducts, this.fences, this.antennas,
+      ...this.cars, this.lamps, this.vending, this.steelFixtures, this.acUnits, this.ducts,
       this.machineRooms, this.aviation, this.neonSigns, this.searchlights, this.beacons, this.halos, this.lampHalos, this.steam, this.gatePillar,
       this.lampCones, this.signals, this.carPools, this.blimpHull, this.blimpBanner, this.manholes,
       ...this.propMeshes.meshes,
@@ -1111,7 +1219,7 @@ export class CityBuilder {
   // Materials
   // ===========================================================================================
   /**
-   * Shared city-light uniforms + world-position varying, injected into a MeshStandardMaterial shader.
+   * Shared city-light uniforms + world-position & world-normal varyings, injected into a MeshStandardMaterial shader.
    * The world position honours instancing (parked cars, far towers) as well as plain meshes (5B-2).
    * `apply` replaces the default lighting add-on (walls use a height-limited variant).
    */
@@ -1122,14 +1230,22 @@ export class CityBuilder {
     shader.uniforms.uCityLightCol = this.uCityLightCol;
     shader.uniforms.uCityLightCount = this.uCityLightCount;
     shader.vertexShader = shader.vertexShader
-      .replace('#include <common>', '#include <common>\nvarying vec3 vCityWorld;')
+      .replace('#include <common>', '#include <common>\nvarying vec3 vCityWorld;\nvarying vec3 vCityWorldN;')
       .replace(
         '#include <worldpos_vertex>',
         `#include <worldpos_vertex>
         #ifdef USE_INSTANCING
           vCityWorld = (modelMatrix * instanceMatrix * vec4(transformed, 1.0)).xyz;
+          {
+            vec3 strandWn = mat3(modelMatrix) * mat3(instanceMatrix) * objectNormal;
+            vCityWorldN = strandWn * inversesqrt(max(dot(strandWn, strandWn), 1e-8));
+          }
         #else
           vCityWorld = (modelMatrix * vec4(transformed, 1.0)).xyz;
+          {
+            vec3 strandWn = mat3(modelMatrix) * objectNormal;
+            vCityWorldN = strandWn * inversesqrt(max(dot(strandWn, strandWn), 1e-8));
+          }
         #endif`,
       );
     shader.fragmentShader = shader.fragmentShader
@@ -1417,7 +1533,7 @@ export class CityBuilder {
       roughnessMap: r.roughnessMap,
       metalness: MATERIALS.ROOF_WET.metalness,
       normalMap: r.normalMap,
-      normalScale: new THREE.Vector2(0.6, 0.6),
+      normalScale: new THREE.Vector2(0.42, 0.42),
     });
     mat.onBeforeCompile = (shader) => {
       shader.uniforms.uTime = this.uTime;
@@ -1427,7 +1543,7 @@ export class CityBuilder {
         .replace('#include <normal_fragment_maps>', `#include <normal_fragment_maps>\n${GLSL_PUDDLE_RIPPLES}`);
       injectVertexAo(shader);
     };
-    mat.customProgramCacheKey = () => 'strand-concrete-v12';
+    mat.customProgramCacheKey = () => 'strand-concrete-v13';
     return mat;
   }
 
@@ -1501,7 +1617,7 @@ export class CityBuilder {
       roughnessMap: r.roughnessMap,
       metalness: MATERIALS.ROOF_WET.metalness,
       normalMap: r.normalMap,
-      normalScale: new THREE.Vector2(0.7, 0.7),
+      normalScale: new THREE.Vector2(0.45, 0.45),
       polygonOffset: true,
       polygonOffsetFactor: -2,
       polygonOffsetUnits: -4,
@@ -1536,7 +1652,7 @@ export class CityBuilder {
         // … and a thin-film oil-slick tint on the glossiest puddle regions (subtle: 0.08–0.13).
         .replace('#include <lights_fragment_end>', `#include <lights_fragment_end>
           {
-            float sSlick = (1.0 - smoothstep(0.08, 0.16, roughnessFactor)) * smoothstep(0.35, 0.75, sNoise(vCityWorld.xz * 0.11 + 7.7));
+            float sSlick = (1.0 - smoothstep(0.13, 0.22, roughnessFactor)) * smoothstep(0.35, 0.75, sNoise(vCityWorld.xz * 0.11 + 7.7));
             vec3 sV = normalize(cameraPosition - vCityWorld);
             float sPh = dot(sV, vec3(0.0, 1.0, 0.0)) * 6.0 + sNoise(vCityWorld.xz * 0.6) * 4.0;
             vec3 sFilm = 0.5 + 0.5 * cos(6.2832 * (vec3(0.0, 0.33, 0.67) + sPh));
@@ -1545,7 +1661,7 @@ export class CityBuilder {
             reflectedLight.directSpecular *= mix(vec3(1.0), sFilm * 1.7, sK);
           }`);
     };
-    mat.customProgramCacheKey = () => 'strand-road-v12';
+    mat.customProgramCacheKey = () => 'strand-road-v13';
     return mat;
   }
 
@@ -1582,17 +1698,92 @@ export class CityBuilder {
     return mat;
   }
 
-  /** Expressway / bridge / canal-wall / pier concrete (#1A202C, R 0.48, M 0.30) + city lights. */
+  /** Expressway / bridge / canal-wall / pier / ramp concrete (#1A202C, R 0.48, M 0.30) + city lights + vertex AO. */
   private createHighwayConcreteMaterial(): THREE.MeshStandardMaterial {
     const mat = new THREE.MeshStandardMaterial({
       color: new THREE.Color(COLORS.HIGHWAY_CONCRETE),
       roughness: MATERIALS.HIGHWAY_CONCRETE.roughness,
       metalness: MATERIALS.HIGHWAY_CONCRETE.metalness,
       normalMap: this.tex.roof.normalMap,
-      normalScale: new THREE.Vector2(0.45, 0.45),
+      normalScale: new THREE.Vector2(0.42, 0.42),
     });
-    mat.onBeforeCompile = (shader) => this.injectCityLights(shader);
-    mat.customProgramCacheKey = () => 'strand-hwconcrete-v11';
+    mat.onBeforeCompile = (shader) => {
+      this.injectCityLights(shader);
+      injectVertexAo(shader);
+    };
+    mat.customProgramCacheKey = () => 'strand-hwconcrete-v12';
+    return mat;
+  }
+
+  /**
+   * 10A-2 weathered wet steel (pipes, fire escapes, railings, canopies, SteelFixturesInstanced):
+   * triplanar-lite `archDetail` at 1.2 m tile + `injectCityLights` + baked vertex AO.
+   */
+  private createSteelMaterial(instancedVariant: boolean): THREE.MeshStandardMaterial {
+    const t = this.tex.archDetail;
+    const mat = new THREE.MeshStandardMaterial({
+      color: 0x343b47,
+      roughness: 0.44,
+      metalness: 0.8,
+      envMapIntensity: 0.95,
+    });
+    const uArchMap = { value: t.map };
+    const uArchRough = { value: t.roughnessMap };
+    const uArchNormal = { value: t.normalMap };
+    mat.onBeforeCompile = (shader) => {
+      this.injectCityLights(shader);
+      injectVertexAo(shader);
+      shader.uniforms.uArchMap = uArchMap;
+      shader.uniforms.uArchRough = uArchRough;
+      shader.uniforms.uArchNormal = uArchNormal;
+      if (instancedVariant) {
+        shader.vertexShader = shader.vertexShader
+          .replace('#include <common>', '#include <common>\nattribute float aVar;\nattribute float aInstVar;')
+          .replace('#include <begin_vertex>', '#include <begin_vertex>\n  transformed *= (abs(aVar - aInstVar) < 0.5) ? 1.0 : 0.0;');
+      }
+      shader.fragmentShader = shader.fragmentShader
+        .replace(
+          '#include <common>',
+          `#include <common>
+uniform sampler2D uArchMap;
+uniform sampler2D uArchRough;
+uniform sampler2D uArchNormal;
+vec2 strandSteelTriUv(vec3 p, vec3 n) {
+  vec3 an = abs(n);
+  if (an.y >= an.x && an.y >= an.z) return p.xz * 0.833333;
+  if (an.x >= an.z) return p.zy * 0.833333;
+  return p.xy * 0.833333;
+}`,
+        )
+        .replace(
+          '#include <color_fragment>',
+          `#include <color_fragment>
+  vec2 strandSteelUv = strandSteelTriUv(vCityWorld, vCityWorldN);
+  vec3 strandSteelAlb = texture2D(uArchMap, strandSteelUv).rgb;
+  diffuseColor.rgb *= mix(vec3(1.0), strandSteelAlb * 1.22, 0.85);`,
+        )
+        .replace(
+          '#include <roughnessmap_fragment>',
+          `#include <roughnessmap_fragment>
+  float strandSteelR = texture2D(uArchRough, strandSteelUv).g;
+  roughnessFactor = clamp(roughnessFactor * mix(0.68, 1.32, strandSteelR), 0.18, 0.76);`,
+        )
+        .replace(
+          '#include <normal_fragment_maps>',
+          `#include <normal_fragment_maps>
+  {
+    vec3 sDn = texture2D(uArchNormal, strandSteelUv).xyz * 2.0 - 1.0;
+    vec3 sAn = abs(vCityWorldN);
+    vec3 sPert;
+    if (sAn.y >= sAn.x && sAn.y >= sAn.z) sPert = vec3(sDn.x, 0.0, sDn.y);
+    else if (sAn.x >= sAn.z) sPert = vec3(0.0, sDn.y, sDn.x);
+    else sPert = vec3(sDn.x, sDn.y, 0.0);
+    normal = normalize(normal + mat3(viewMatrix) * (sPert * 0.28));
+  }`,
+        );
+    };
+    const key = instancedVariant ? 'strand-steel-inst-v2' : 'strand-steel-v2';
+    mat.customProgramCacheKey = () => key;
     return mat;
   }
 
@@ -2099,6 +2290,16 @@ export class CityBuilder {
       boxAt(0.04, 0.02, 0.9, 0, 0.82, 0),
       boxAt(0.6, 0.02, 0.04, 0, 0.92, 0),
       boxAt(0.7, 0.04, 0.7, 0, 0.02, 0),
+    ]);
+  }
+
+  /** 10A-1 consolidated steel fixtures geometry: v0 guardrail, v1 fence, v2 antenna (−2 draw calls). */
+  private createSteelFixturesGeometry(): THREE.BufferGeometry {
+    const prep = (g: THREE.BufferGeometry, v: number): THREE.BufferGeometry => withAttr1(ensureAo(stripUv(g)), 'aVar', v);
+    return mergeOrEmpty([
+      prep(this.createGuardrailGeometry(), 0),
+      prep(this.createFenceGeometry(), 1),
+      prep(this.createAntennaGeometry(), 2),
     ]);
   }
 
@@ -2915,11 +3116,14 @@ export class CityBuilder {
     };
 
     // Instance counters & attributes
-    const counts = { ac: 0, duct: 0, fence: 0, ant: 0, room: 0, avi: 0, neon: 0, search: 0, beacon: 0, lamp: 0, vend: 0, rail: 0 };
+    const counts = { ac: 0, duct: 0, fence: 0, ant: 0, room: 0, avi: 0, neon: 0, search: 0, beacon: 0, lamp: 0, vend: 0, rail: 0, steelFix: 0 };
     const carCounts = [0, 0, 0];
+    const neonSignRecords: NeonSignRecord[] = [];
+    const extraShadows: ContactShadowDesc[] = [];
     const aviPhase = this.aviation.geometry.getAttribute('aPhase') as THREE.InstancedBufferAttribute;
     const neonStrip = this.neonSigns.geometry.getAttribute('aStrip') as THREE.InstancedBufferAttribute;
     const neonFormat = this.neonSigns.geometry.getAttribute('aFormat') as THREE.InstancedBufferAttribute;
+    const steelFixVar = this.steelFixtures.geometry.getAttribute('aInstVar') as THREE.InstancedBufferAttribute;
     const steamAttr = this.steam.geometry.getAttribute('aSteam') as THREE.InstancedBufferAttribute;
     const srng = createRng(0x51e7 + sector.index * 31 + loop * 977);
     const searchBase = this.searchlights.geometry.getAttribute('aBase') as THREE.InstancedBufferAttribute;
@@ -2981,7 +3185,18 @@ export class CityBuilder {
      * Neon sign plane: centre, plane normal (nx, nz), size, atlas index and format
      * (0 vertical blade · 1 wide banner / scrolling ticker · 2 emblem hologram — 5B-3).
      */
-    const addNeon = (x: number, y: number, z: number, nx: number, nz: number, w: number, h: number, strip: number, format: 0 | 1 | 2 = 0): void => {
+    const addNeon = (
+      x: number,
+      y: number,
+      z: number,
+      nx: number,
+      nz: number,
+      w: number,
+      h: number,
+      strip: number,
+      format: 0 | 1 | 2 = 0,
+      meta: { kind: NeonSignRecord['kind']; building?: number; buildingB?: number; farIndex?: number } = { kind: 'HIGHWAY' },
+    ): void => {
       if (counts.neon >= CAP.NEON) return;
       // 7B-1: low / mid-rise signs light the wet street (sign colour), one light per ~3.5 m.
       if (y < 30) {
@@ -2998,6 +3213,19 @@ export class CityBuilder {
       this.neonSigns.setMatrixAt(counts.neon, _m4);
       neonStrip.setX(counts.neon, format === 0 ? strip % this.tex.neonAtlasStrips : strip);
       neonFormat.setX(counts.neon, format);
+      neonSignRecords.push({
+        kind: meta.kind,
+        x,
+        y,
+        z,
+        nx,
+        nz,
+        w,
+        h,
+        building: meta.building ?? -1,
+        buildingB: meta.buildingB,
+        farIndex: meta.farIndex,
+      });
       counts.neon++;
     };
     const addSearch = (x: number, y: number, z: number): void => {
@@ -3014,9 +3242,16 @@ export class CityBuilder {
       _m4.compose(_pos, _quat, _scl);
       mesh.setMatrixAt(idx, _m4);
     };
+    const addSteelFixture = (variant: 0 | 1 | 2, x: number, y: number, z: number, yaw: number, sx = 1, sy = 1, sz = 1): void => {
+      if (counts.steelFix >= CAP.STEEL_FIXTURES) return;
+      placeInstance(this.steelFixtures, counts.steelFix, x, y, z, yaw, sx, sy, sz);
+      steelFixVar.setX(counts.steelFix, variant);
+      counts.steelFix++;
+    };
     const addRail = (x: number, z: number, alongX: boolean): void => {
       if (counts.rail >= CAP.GUARDRAIL) return;
-      placeInstance(this.guardrails, counts.rail++, x, 0, z, alongX ? 0 : Math.PI / 2);
+      counts.rail++;
+      addSteelFixture(0, x, 0, z, alongX ? 0 : Math.PI / 2);
     };
     const NEON_TINTS = [0xff2bd6, 0x00f0ff, 0xffa21f, 0x39ff88, 0xb44bff];
     /** 9B: lamp poles carry no collider; clutter keeps clear of them. */
@@ -3044,6 +3279,7 @@ export class CityBuilder {
       _col.setHex(vHex);
       vendTint.setXYZ(counts.vend, _col.r, _col.g, _col.b);
       counts.vend++;
+      extraShadows.push({ x, z, yaw, w: 1.24 * scale, d: 1.04 * scale, alpha: 0.62 });
       // 7B-1: the lit front panel (+Z) spills on the wet pavement.
       const fx = x + Math.sin(yaw) * 0.7 * scale;
       const fz = z + Math.cos(yaw) * 0.7 * scale;
@@ -3332,7 +3568,7 @@ export class CityBuilder {
       // 5B-3 girder banners facing up / down the canal.
       for (const side of [-1, 1]) {
         const q = pt(axis, (b.along0 + b.along1) / 2, -0.62, side < 0 ? b.lat0 - 0.32 : b.lat1 + 0.32);
-        addNeon(q.x, q.y, q.z, axis === 'z' ? side : 0, axis === 'x' ? side : 0, Math.min(L * 0.6, 10), 0.9, Math.floor(srng() * SIGN_ATLAS.WIDE_ROWS), 1);
+        addNeon(q.x, q.y, q.z, axis === 'z' ? side : 0, axis === 'x' ? side : 0, Math.min(L * 0.6, 10), 0.9, Math.floor(srng() * SIGN_ATLAS.WIDE_ROWS), 1, { kind: 'BRIDGE' });
       }
     });
 
@@ -3405,14 +3641,14 @@ export class CityBuilder {
           const ar = ROAD_ATLAS.ASPHALT;
           roadQuad(h.axis, h.coord - HW, h.coord + HW, j0, j1, DECK + ROAD_Y, DECK + ROAD_Y, ar, (HW * 2) / ar.tileAcross, j0 / ar.tileAlong, j1 / ar.tileAlong);
         }
-        // Underside industrial light strips (emissive 1.6) + their glow on the street below.
+        // 10A-2: toned-down underside industrial light strips (narrowed 0.14 → 0.09 m, emissive 0.85) + street glow.
         for (const side of [-1, 1]) {
           const color = side < 0 ? h.lightNeg : h.lightPos;
           const lat = h.coord + side * (HW - 1.6);
-          G.strips.push(withColor(boxGeoWorld(h.axis, d0, d1, lat - 0.14, lat + 0.14, UNDER - 0.07, UNDER), color, NEON_BLOOM.UNDERSIDE_STRIP));
+          G.strips.push(withColor(boxGeoWorld(h.axis, d0, d1, lat - 0.09, lat + 0.09, UNDER - 0.055, UNDER), color, NEON_BLOOM.UNDERSIDE_STRIP));
           for (let a = d0 + 6; a < d1; a += 12) {
             const q = pt(h.axis, a, UNDER - 0.3, lat);
-            if (inArea(q.x, q.z, -20)) addLight(q.x, q.y, q.z, color, 2.2);
+            if (inArea(q.x, q.z, -20)) addLight(q.x, q.y, q.z, color, 2.0);
           }
         }
         const c0 = Math.max(d0, -H);
@@ -3440,7 +3676,7 @@ export class CityBuilder {
           for (let a = w0 + 14; a < w1 - 8; a += 40) {
             const q = pt(h.axis, a, UNDER + 0.75, wallOuter + side * 0.09);
             if (!inArea(q.x, q.z, -30)) continue;
-            addNeon(q.x, q.y, q.z, h.axis === 'z' ? side : 0, h.axis === 'x' ? side : 0, 7, 1.0, Math.floor(srng() * SIGN_ATLAS.WIDE_ROWS), 1);
+            addNeon(q.x, q.y, q.z, h.axis === 'z' ? side : 0, h.axis === 'x' ? side : 0, 7, 1.0, Math.floor(srng() * SIGN_ATLAS.WIDE_ROWS), 1, { kind: 'HIGHWAY' });
           }
           // 6A-5: bare concrete outer face with restrained architectural edge lines (no chevron cladding).
           const e0 = Math.min(wallOuter, wallOuter + side * 0.04);
@@ -3499,29 +3735,63 @@ export class CityBuilder {
       }
     });
 
-    // On-ramps: sloped slab + asphalt + parapets + supports; RampCollider for physics.
+    // 10A-2 On-ramps: lower retaining-wall abutment (y ≤ 2.8 m), elevated 0.85 m box-girder underside with twin
+    // longitudinal beams, proper T-piers every 11 m, and upright concrete side parapets (+0.0 to +0.95 m above deck).
     rampInfo.forEach((ri) => {
       const axis = ri.s.axis;
       const len = ri.len;
-      const slope = Math.atan2(DECK, len);
-      const slabLen = len / Math.cos(slope);
-      const slab = axis === 'z' ? new THREE.BoxGeometry(LEVEL.RAMP_WIDTH_M, 0.5, slabLen) : new THREE.BoxGeometry(slabLen, 0.5, LEVEL.RAMP_WIDTH_M);
-      // Rising toward `top` (opposite of the descending dir).
-      if (axis === 'z') slab.rotateX(ri.r.dir > 0 ? slope : -slope);
-      else slab.rotateZ(ri.r.dir > 0 ? -slope : slope);
-      const mid = pt(axis, (ri.top + ri.bottom) / 2, DECK / 2 - 0.25 / Math.cos(slope), (ri.lat0 + ri.lat1) / 2);
-      slab.translate(mid.x, mid.y, mid.z);
-      G.hw.push(slab);
+      const latC = (ri.lat0 + ri.lat1) / 2;
+      const abutY = Math.min(2.8, DECK - 1.2);
+      const tSplit = 1 - abutY / DECK;
+      const aSplit = ri.top + ri.r.dir * tSplit * len;
+      const yDeckAt = (al: number): number => DECK * (1 - ((al - ri.top) * ri.r.dir) / len);
+
+      // Lower section (y ≤ 2.8 m): solid sloped concrete retaining-wall abutment resting cleanly on Y = 0.0.
+      G.hw.push(slopedPrism(axis, aSplit, ri.bottom, ri.lat0, ri.lat1, 0, abutY, 0, 0.02, { ground: true, side: 0.92 }));
+
+      // Elevated section (y > 2.8 m): 0.85 m-deep concrete box-girder underside (aAo = 0.45) + twin underside beams.
+      G.hw.push(slopedPrism(axis, ri.top, aSplit, ri.lat0, ri.lat1, DECK - 0.4, DECK, abutY - 0.4, abutY, { bottom: 0.45, side: 0.92 }));
+      G.hw.push(slopedPrism(axis, ri.top, aSplit, ri.lat0 + 0.55, ri.lat1 - 0.55, DECK - 0.85, DECK - 0.4, abutY - 0.85, abutY - 0.4, { bottom: 0.45, side: 0.72 }));
+      for (const off of [-1.65, 1.65]) {
+        G.hw.push(slopedPrism(axis, ri.top, aSplit, latC + off - 0.28, latC + off + 0.28, DECK - 0.96, DECK - 0.4, abutY - 0.96, abutY - 0.4, { bottom: 0.45, side: 0.65 }));
+      }
+
+      // Road asphalt surface flush atop the ramp deck.
       const ar = ROAD_ATLAS.ASPHALT;
       roadQuad(axis, ri.lat0, ri.lat1, ri.top, ri.bottom, DECK + ROAD_Y, ROAD_Y, ar, LEVEL.RAMP_WIDTH_M / ar.tileAcross, 0, len / ar.tileAlong);
-      for (const lat of [ri.lat0 + 0.15, ri.lat1 - 0.15]) G.hw.push(beam(pt(axis, ri.top, DECK + 0.45, lat), pt(axis, ri.bottom, 0.45, lat), 0.3, 0.9));
-      for (let d = 10; d < len - 6; d += 10) {
+
+      // Upright vertical concrete side parapets (+0.0 to +0.95 m above deck — never twisted beam()).
+      for (const [p0, p1] of [[ri.lat0, ri.lat0 + 0.3], [ri.lat1 - 0.3, ri.lat1]] as const) {
+        G.hw.push(slopedPrism(axis, ri.top, ri.bottom, p0, p1, DECK, DECK + 0.95, 0, 0.95, { side: 0.94 }));
+      }
+
+      // Proper T-pier columns every 11 m along the elevated span (1.2 m shaft + horizontal cross-head flush to underside).
+      const elevLen = tSplit * len;
+      const capHalfL = (LEVEL.RAMP_WIDTH_M - 0.6) / 2;
+      for (let d = 10; d < elevLen - 2.5; d += 11) {
         const al = ri.top + ri.r.dir * d;
-        const y = DECK * (1 - d / len) - 0.5;
-        if (y < 1.2) continue;
-        const qp = pt(axis, al, 0, (ri.lat0 + ri.lat1) / 2);
-        G.hw.push(boxAt(1.0, y, 1.0, qp.x, y / 2, qp.z));
-        if (inArea(qp.x, qp.z)) colliders.push({ min: new THREE.Vector3(qp.x - 0.5, 0, qp.z - 0.5), max: new THREE.Vector3(qp.x + 0.5, y, qp.z + 0.5), kind: 'HIGHWAY', building: -1 });
+        const yUnder = DECK * (1 - d / len) - 0.85;
+        if (yUnder < 1.2) continue;
+        const capBot = yUnder - 0.75;
+        // Cross-head cap: horizontal soffit at capBot, sloped top embedded 0.06 m into the box-girder underside.
+        G.hw.push(
+          slopedPrism(
+            axis,
+            al - 0.65,
+            al + 0.65,
+            latC - capHalfL,
+            latC + capHalfL,
+            capBot,
+            yDeckAt(al - 0.65) - 0.79,
+            capBot,
+            yDeckAt(al + 0.65) - 0.79,
+            { bottom: 0.48, side: 0.85 },
+          ),
+        );
+        // 1.2 m vertical pier shaft with ground-contact AO.
+        const qp = pt(axis, al, 0, latC);
+        G.hw.push(slopedPrism(axis, al - 0.6, al + 0.6, latC - 0.6, latC + 0.6, 0, capBot + 0.04, 0, capBot + 0.04, { ground: true, side: 0.9 }));
+        if (inArea(qp.x, qp.z)) colliders.push({ min: new THREE.Vector3(qp.x - 0.6, 0, qp.z - 0.6), max: new THREE.Vector3(qp.x + 0.6, yUnder, qp.z + 0.6), kind: 'HIGHWAY', building: -1 });
       }
       rampColliders.push({ axis, lateralMin: ri.lat0, lateralMax: ri.lat1, alongStart: ri.top, alongEnd: ri.bottom, yStart: DECK, yEnd: 0, thickness: 0.5 });
       const r0 = pt(axis, ri.top, 0, ri.lat0);
@@ -4198,8 +4468,22 @@ export class CityBuilder {
         if (j === 0) G.strips.push(withColor(f.box(f.a0 + 0.5, f.a1 - 0.5, y - 0.1, y - 0.07, DD - 0.12, DD - 0.06), tint, 1.3));
         if (y <= BALCONY.COLLIDER_MAX_Y) f.coll(f.a0 + 0.3, f.a1 - 0.3, y - 0.07, y + 0.07, 0, DD);
         if (j === 0 || srng() < 0.55) {
-          const p = f.P3(f.c + (srng() - 0.5) * f.len * 0.3, y + 0.95, 0.1);
-          addNeon(p.x, p.y, p.z, f.nx, f.nz, Math.min(f.len * 0.7, 9), 0.85, Math.floor(srng() * SIGN_ATLAS.WIDE_ROWS), 1);
+          const yBan = y + 0.95;
+          const bh = 0.85;
+          const span = b.plan.faces.find(
+            (sp) => sp.ax === ax && sp.sg === sg && sp.a1 - sp.a0 >= 2.6 && yBan - bh / 2 >= sp.y0 + 0.4 && yBan + bh / 2 <= sp.y1 - 0.4,
+          );
+          if (span) {
+            const bw = Math.min(span.a1 - span.a0 - 0.6, Math.min(f.len * 0.7, 9));
+            const aMid = (span.a0 + span.a1) / 2;
+            const maxShift = Math.max(0, (span.a1 - span.a0 - 0.6 - bw) / 2);
+            const along = aMid + (srng() * 2 - 1) * maxShift;
+            const nx = span.ax === 'x' ? span.sg : 0;
+            const nz = span.ax === 'z' ? span.sg : 0;
+            const px = span.ax === 'x' ? span.plane + span.sg * 0.1 : along;
+            const pz = span.ax === 'z' ? span.plane + span.sg * 0.1 : along;
+            addNeon(px, yBan, pz, nx, nz, bw, bh, Math.floor(srng() * SIGN_ATLAS.WIDE_ROWS), 1, { kind: 'BUILDING_FLAT', building: b.index });
+          }
         }
       }
     };
@@ -4428,13 +4712,21 @@ export class CityBuilder {
         G.steel.push(...f.bx(a - 1.05, a - 0.45, y - 0.7, y - 0.25, SD, SD + 0.05), ...f.bx(a + 0.45, a + 1.05, y - 0.7, y - 0.25, SD, SD + 0.05));
         if (n % 2 === 0) G.strips.push(f.glow(COLORS.WALLRUN_CYAN, 0.7, a + 1.1, a + 1.25, y - 0.55, y - 0.4, SD, SD + 0.02));
       }
-      // Dense stacked vertical neon blades on the spine flanks.
-      for (let y = 6 + grng() * 2, k = 0; y < Math.min(top - 4, 44); y += 5.5 + grng() * 2.5, k++) {
-        const side = k % 2 === 0 ? -1 : 1;
-        const w = 1.2 + grng() * 0.8;
-        const hgt = 3.2 + grng() * 1.6;
-        const p = f.P3(a + side * (W2 + w / 2 + 0.05), y, SD * 0.5);
-        addNeon(p.x, p.y, p.z, ax === 'x' ? 0 : 1, ax === 'x' ? 1 : 0, w, hgt, Math.floor(grng() * 8));
+      // 10A-2: dense stacked vertical neon blades strictly bound to a solid FaceSpan beside the spine, with brackets.
+      const spineSpan = b.plan.faces.find((sp) => sp.ax === ax && sp.sg === sg && sp.lot);
+      if (spineSpan) {
+        const fs = sf(spineSpan.ax, spineSpan.sg, spineSpan.plane);
+        for (let y = 6 + grng() * 2, k = 0; y < Math.min(spineSpan.y1 - 3.2, 44); y += 5.5 + grng() * 2.5, k++) {
+          const side = k % 2 === 0 ? -1 : 1;
+          const w = 1.2 + grng() * 0.8;
+          const hgt = 3.2 + grng() * 1.6;
+          const along = a + side * (W2 + 0.35);
+          if (along < spineSpan.a0 + 0.3 || along > spineSpan.a1 - 0.3) continue;
+          if (y - hgt / 2 < spineSpan.y0 + 0.4 || y + hgt / 2 > spineSpan.y1 - 0.4) continue;
+          const p = fs.P3(along, y, w / 2 + 0.14);
+          addNeon(p.x, p.y, p.z, ax === 'x' ? 0 : 1, ax === 'x' ? 1 : 0, w, hgt, Math.floor(grng() * 8), 0, { kind: 'BUILDING_BLADE', building: b.index });
+          for (const yy of [y + hgt / 2 - 0.18, y - hgt / 2 + 0.18]) G.steel.push(...fs.bx(along - 0.03, along + 0.03, yy - 0.03, yy + 0.03, 0, w + 0.14));
+        }
       }
       blockRange(fkey(b, ax, sg), a - W2 - 0.3, a + W2 + 0.3);
       facadeFeatures.push({ kind: 'SPINE', building: b.index, center: f.P3(a, 0, SD), normal: new THREE.Vector3(f.nx, 0, f.nz), top });
@@ -4511,21 +4803,27 @@ export class CityBuilder {
               for (let a = a0 + 0.25; a < a1 - 0.1; a += 0.3) G.concrete.push(...f.bx(a - 0.04, a + 0.04, 0.3, oT - 0.1, 0.1, 0.14, { ground: true, tile: T }));
               G.strips.push(f.glow(0xffb45a, 0.55, m - 0.04, m + 0.04, 0.6, oT - 0.3, 0.14, 0.16));
             } else {
-              // Eatery: timber / slate panelling (0.38 m reveal) + warm frosted ribbed glass, never hollow.
+              // 10A-2 Eatery: timber / slate panelling + calm frosted ribbed glass (emissive 0.24) with recessed dark mullions.
               G.archPaint.push(...f.paint(PAINT.TIMBER, a0, a1, 0, 0.92, 0.02, 0.1, { ground: true }), ...f.paint(PAINT.SLATE, a0, a1, oT - 0.4, oT, 0.02, 0.1));
-              G.strips.push(f.glow(0xff9b42, 0.48, a0 + 0.12, a1 - 0.12, 0.98, oT - 0.46, 0.03, 0.05));
-              for (let y = 1.1; y < oT - 0.5; y += 0.2) G.archPaint.push(...f.paint(0x1a1512, a0 + 0.1, a1 - 0.1, y, y + 0.025, 0.06, 0.09));
+              G.strips.push(f.glow(0xff9b42, 0.24, a0 + 0.12, a1 - 0.12, 0.98, oT - 0.46, 0.03, 0.05));
+              for (let y = 1.12; y < oT - 0.5; y += 0.28) G.archPaint.push(...f.paint(0x121010, a0 + 0.1, a1 - 0.1, y, y + 0.032, 0.05, 0.1));
+              for (let k = 1; k < 4; k++) {
+                const a = a0 + ((a1 - a0) * k) / 4;
+                G.archPaint.push(...f.paint(0x0f1115, a - 0.035, a + 0.035, 0.96, oT - 0.44, 0.05, 0.11));
+              }
             }
             break;
           case 'VITRINE': {
-            // Matte black frame, opaque backlit display niches with silhouette dividers, half-lowered ribbed shutter.
+            // 10A-2 Matte black frame, deep backlit display niches (emissive 0.24) with recessed dark mullions, ribbed shutter.
             G.archPaint.push(...f.paint(PAINT.BLACK_ALU, a0, a1, 0, 0.42, 0.02, 0.14, { ground: true }), ...f.paint(PAINT.BLACK_ALU, a0, a0 + 0.1, 0.42, oT, 0.02, 0.14), ...f.paint(PAINT.BLACK_ALU, a1 - 0.1, a1, 0.42, oT, 0.02, 0.14));
             const shutterY = 0.42 + (oT - 0.42) * 0.62;
-            G.strips.push(f.glow(tint(Math.floor(m)), 0.5, a0 + 0.12, a1 - 0.12, 0.45, shutterY, 0.02, 0.04));
+            G.strips.push(f.glow(tint(Math.floor(m)), 0.24, a0 + 0.12, a1 - 0.12, 0.45, shutterY, 0.02, 0.04));
             for (let k = 1; k < 4; k++) {
               const a = a0 + ((a1 - a0) * k) / 4;
-              G.archPaint.push(...f.paint(0x07080a, a - 0.05, a + 0.05, 0.45, shutterY, 0.04, 0.09));
+              G.archPaint.push(...f.paint(0x080a0e, a - 0.055, a + 0.055, 0.45, shutterY, 0.04, 0.11));
             }
+            const midV = 0.45 + (shutterY - 0.45) * 0.5;
+            G.archPaint.push(...f.paint(0x080a0e, a0 + 0.1, a1 - 0.1, midV - 0.03, midV + 0.03, 0.04, 0.1));
             G.archPaint.push(...f.paint(PAINT.SHUTTER[0], a0 + 0.1, a1 - 0.1, shutterY, oT, 0.04, 0.08, { all: 0.85 }));
             for (let y = shutterY + 0.06; y < oT; y += 0.11) G.archPaint.push(...f.paint(0x1d2025, a0 + 0.1, a1 - 0.1, y, y + 0.02, 0.08, 0.095));
             break;
@@ -4647,9 +4945,18 @@ export class CityBuilder {
           G.steel.push(...f.bx(ca0, ca1, 3.29, 3.41, 0, 1.45, { bottom: GR.AO_UNDERSIDE }));
           G.strips.push(f.glow(tint(0), 1.35, ca0, ca1, 3.29, 3.33, 1.43, 1.47), f.glow(0xe8f4ff, 0.85, ca0 + 0.3, ca1 - 0.3, 3.26, 3.29, 0.3, 0.36));
           f.coll(ca0, ca1, 3.29, 3.41, 0, 1.45, b.index);
-          const ba = ca1 - 0.6;
-          const sp = f.P3(ba, 5.6 + grng(), 0.75);
-          addNeon(sp.x, sp.y, sp.z, span.ax === 'x' ? 0 : 1, span.ax === 'x' ? 1 : 0, 1.2, 3.4, Math.floor(grng() * 8));
+          const ba = Math.min(span.a1 - 0.3, Math.max(span.a0 + 0.3, ca1 - 0.6));
+          const maxH = span.y1 - 0.4 - Math.max(span.y0 + 0.4, 3.9);
+          if (maxH >= 1.8 && span.a1 - span.a0 >= 0.8) {
+            const hgt = Math.min(3.4, maxH);
+            const yLo = Math.max(span.y0 + 0.4, 3.9) + hgt / 2;
+            const yHi = span.y1 - 0.4 - hgt / 2;
+            const y = Math.min(yHi, Math.max(yLo, 5.6 + grng()));
+            const w = 1.2;
+            const sp = f.P3(ba, y, w / 2 + 0.14);
+            addNeon(sp.x, sp.y, sp.z, span.ax === 'x' ? 0 : 1, span.ax === 'x' ? 1 : 0, w, hgt, Math.floor(grng() * 8), 0, { kind: 'BUILDING_BLADE', building: b.index });
+            for (const yy of [y + hgt / 2 - 0.16, y - hgt / 2 + 0.16]) G.steel.push(...f.bx(ba - 0.03, ba + 0.03, yy - 0.03, yy + 0.03, 0, w + 0.14));
+          }
         } else if (program === 'CAPSULE_HOTEL' && door0) {
           const half = Math.min((ca1 - ca0) / 2, 3 + grng());
           const ma = Math.min(ca1 - half, Math.max(ca0 + half, door0.a));
@@ -4657,11 +4964,22 @@ export class CityBuilder {
           G.strips.push(f.glow(0xffb040, 1.3, ma - half, ma + half, 3.47, 3.52, 1.88, 1.92), f.glow(0xff2a50, 1.2, ma - half, ma + half, 3.58, 3.63, 1.88, 1.92));
           for (let a = ma - half + 0.6; a < ma + half - 0.4; a += 1.2) G.strips.push(f.glow(0xfff0d8, 0.6, a - 0.35, a + 0.35, 3.44, 3.47, 0.6, 1.5));
           f.coll(ma - half, ma + half, 3.47, 3.63, 0, 1.9, b.index);
-          const tp = f.P3(ma, 4.25, 0.12);
-          addNeon(tp.x, tp.y, tp.z, f.nx, f.nz, Math.min(2 * half - 0.4, 6), 0.7, 6 + Math.floor(grng() * 2), 1);
-          const mh = 8 + grng() * 8;
-          const vp = f.P3(ma + half - 0.3, 4.4 + mh / 2, 0.85);
-          addNeon(vp.x, Math.min(vp.y, span.y1 - mh / 2 - 0.5), vp.z, span.ax === 'x' ? 0 : 1, span.ax === 'x' ? 1 : 0, 1.4, mh, Math.floor(grng() * 8));
+          const banW = Math.min(2 * half - 0.4, 6, span.a1 - span.a0 - 0.6);
+          if (banW >= 1.2 && 4.25 - 0.35 >= span.y0 + 0.4 && 4.25 + 0.35 <= span.y1 - 0.4) {
+            const bAlong = Math.min(span.a1 - 0.3 - banW / 2, Math.max(span.a0 + 0.3 + banW / 2, ma));
+            const tp = f.P3(bAlong, 4.25, 0.12);
+            addNeon(tp.x, tp.y, tp.z, f.nx, f.nz, banW, 0.7, 6 + Math.floor(grng() * 2), 1, { kind: 'BUILDING_FLAT', building: b.index });
+          }
+          const maxMh = span.y1 - 0.4 - Math.max(span.y0 + 0.4, 4.4);
+          if (maxMh >= 2.2 && span.a1 - span.a0 >= 0.8) {
+            const mh = Math.min(8 + grng() * 8, maxMh);
+            const vAlong = Math.min(span.a1 - 0.3, Math.max(span.a0 + 0.3, ma + half - 0.3));
+            const vy = Math.min(span.y1 - 0.4 - mh / 2, Math.max(span.y0 + 0.4 + mh / 2, 4.4 + mh / 2));
+            const w = 1.4;
+            const vp = f.P3(vAlong, vy, w / 2 + 0.14);
+            addNeon(vp.x, vp.y, vp.z, span.ax === 'x' ? 0 : 1, span.ax === 'x' ? 1 : 0, w, mh, Math.floor(grng() * 8), 0, { kind: 'BUILDING_BLADE', building: b.index });
+            for (const yy of [vy + mh / 2 - 0.2, vy - mh / 2 + 0.2]) G.steel.push(...f.bx(vAlong - 0.035, vAlong + 0.035, yy - 0.035, yy + 0.035, 0, w + 0.14));
+          }
           const lp = f.P3(ma, 2.8, 1.2);
           addLight(lp.x, lp.y, lp.z, 0xffc070, 1.0);
         } else if (program === 'CYBER_APARTMENT' && door0) {
@@ -4702,13 +5020,17 @@ export class CityBuilder {
       for (let k = 1; k < r.piers.length - 1; k += dense ? 1 : 2) {
         if (grng() < 0.35) continue;
         const a = r.piers[k];
+        if (a < span.a0 + 0.3 || a > span.a1 - 0.3) continue;
         const reach = 1.2 + grng() * 1.6;
-        const hgt = 2.6 + grng() * 3.4;
-        const y = Math.min(span.y1 - hgt / 2 - 1, 4.6 + hgt / 2 + grng() * 13);
-        if (y - hgt / 2 < 4.4) continue;
+        const maxH = span.y1 - 0.4 - Math.max(4.4, span.y0 + 0.4);
+        if (maxH < 2.2) continue;
+        const hgt = Math.min(2.6 + grng() * 3.4, maxH);
+        const yLo = Math.max(4.4, span.y0 + 0.4) + hgt / 2;
+        const yHi = span.y1 - 0.4 - hgt / 2;
+        const y = Math.min(yHi, Math.max(yLo, 4.6 + hgt / 2 + grng() * 13));
         const f = sf(span.ax, span.sg, span.plane);
         const p = f.P3(a, y, reach / 2 + 0.1);
-        addNeon(p.x, p.y, p.z, span.ax === 'x' ? 0 : 1, span.ax === 'x' ? 1 : 0, reach, hgt, Math.floor(grng() * 8));
+        addNeon(p.x, p.y, p.z, span.ax === 'x' ? 0 : 1, span.ax === 'x' ? 1 : 0, reach, hgt, Math.floor(grng() * 8), 0, { kind: 'BUILDING_BLADE', building: b.index });
         for (const yy of [y + hgt / 2 - 0.15, y - hgt / 2 + 0.15]) G.steel.push(...f.bx(a - 0.03, a + 0.03, yy - 0.03, yy + 0.03, 0, reach + 0.1));
       }
     });
@@ -4856,38 +5178,57 @@ export class CityBuilder {
       }
     }
 
-    // 9A-6 alley signage: staggered protruding vertical blades on both alley walls (3.6–24 m, 1.2–2.8 m reach,
-    // facing down the alley) and cross-alley hanging neon bars (6.5–14 m).
+    // 10A-2 alley signage: staggered protruding vertical blades & cross-alley hanging bars strictly bound to solid FaceSpans.
     let alleyNeon = 0;
     for (const al of alleyRecs) {
       const A = buildings[al.a];
       const B = buildings[al.b];
-      const wallTop = Math.min(lowTopOf(A), lowTopOf(B)) - 2;
-      if (wallTop < 6) continue;
-      const along = al.axis === 'x' ? 'z' : 'x';
-      void along;
-      for (const [wall, out] of [[al.gap0, 1], [al.gap1, -1]] as const) {
-        for (let o = al.ov0 + 1.5 + srng() * 2; o < al.ov1 - 1.2; o += 3.4 + srng() * 2.6) {
-          const reach = Math.min(al.gap1 - al.gap0 - 1.4, 1.2 + srng() * 1.6);
-          if (reach < 1) continue;
-          const hgt = 2.4 + srng() * 3.2;
-          const y = Math.min(wallTop - hgt / 2, 3.6 + hgt / 2 + srng() * Math.max(0, Math.min(24, wallTop) - 3.6 - hgt));
-          const c = wall + out * (reach / 2 + 0.1);
-          if (al.axis === 'x') addNeon(c, y, o, 0, 1, reach, hgt, Math.floor(srng() * 8));
-          else addNeon(o, y, c, 1, 0, reach, hgt, Math.floor(srng() * 8));
-          for (const yy of [y + hgt / 2 - 0.15, y - hgt / 2 + 0.15]) G.steel.push(al.axis === 'x' ? boxAt(reach + 0.1, 0.06, 0.06, wall + out * (reach / 2 + 0.05), yy, o) : boxAt(0.06, 0.06, reach + 0.1, o, yy, wall + out * (reach / 2 + 0.05)));
-          alleyNeon++;
+      const spansA = A.plan.faces.filter((sp) => sp.ax === al.axis && sp.sg === 1 && Math.abs(sp.plane - al.gap0) < 0.05);
+      const spansB = B.plan.faces.filter((sp) => sp.ax === al.axis && sp.sg === -1 && Math.abs(sp.plane - al.gap1) < 0.05);
+      for (const [bld, spans, out, wall] of [[A, spansA, 1, al.gap0], [B, spansB, -1, al.gap1]] as const) {
+        for (const sp of spans) {
+          const a0 = Math.max(al.ov0, sp.a0) + 0.3;
+          const a1 = Math.min(al.ov1, sp.a1) - 0.3;
+          const yLoLim = Math.max(3.6, sp.y0 + 0.4);
+          const yHiLim = Math.min(24, sp.y1 - 0.4);
+          if (a1 <= a0 + 0.4 || yHiLim - yLoLim < 2.2) continue;
+          for (let o = a0 + 0.6 + srng() * 1.4; o <= a1 - 0.1; o += 3.4 + srng() * 2.6) {
+            const reach = Math.min(al.gap1 - al.gap0 - 1.4, 1.2 + srng() * 1.6);
+            if (reach < 1) continue;
+            const hgt = Math.min(2.4 + srng() * 3.2, yHiLim - yLoLim);
+            const y = yLoLim + hgt / 2 + srng() * Math.max(0, yHiLim - yLoLim - hgt);
+            const c = wall + out * (reach / 2 + 0.1);
+            if (al.axis === 'x') addNeon(c, y, o, 0, 1, reach, hgt, Math.floor(srng() * 8), 0, { kind: 'ALLEY_BLADE', building: bld.index });
+            else addNeon(o, y, c, 1, 0, reach, hgt, Math.floor(srng() * 8), 0, { kind: 'ALLEY_BLADE', building: bld.index });
+            for (const yy of [y + hgt / 2 - 0.15, y - hgt / 2 + 0.15]) {
+              G.steel.push(al.axis === 'x' ? boxAt(reach + 0.1, 0.06, 0.06, wall + out * (reach / 2 + 0.05), yy, o) : boxAt(0.06, 0.06, reach + 0.1, o, yy, wall + out * (reach / 2 + 0.05)));
+            }
+            alleyNeon++;
+          }
         }
       }
-      const bars = Math.min(4, 1 + Math.floor((al.ov1 - al.ov0) / 9));
-      for (let k = 0; k < bars; k++) {
-        const o = al.ov0 + ((k + 0.5) / bars) * (al.ov1 - al.ov0);
-        const y = 6.5 + srng() * Math.max(0, Math.min(14, wallTop) - 6.5);
-        const w = al.gap1 - al.gap0 - 0.6;
-        const c = (al.gap0 + al.gap1) / 2;
-        if (al.axis === 'x') addNeon(c, y, o, 0, 1, w, 0.75, Math.floor(srng() * SIGN_ATLAS.WIDE_ROWS), 1);
-        else addNeon(o, y, c, 1, 0, w, 0.75, Math.floor(srng() * SIGN_ATLAS.WIDE_ROWS), 1);
-        alleyNeon++;
+      // Cross-alley hanging bars: only where BOTH walls have solid FaceSpans at the mounting height & along coordinate.
+      const barH = 0.75;
+      for (const spA of spansA) {
+        for (const spB of spansB) {
+          const a0 = Math.max(al.ov0, spA.a0, spB.a0) + 0.3;
+          const a1 = Math.min(al.ov1, spA.a1, spB.a1) - 0.3;
+          const y0 = Math.max(6.5, spA.y0 + 0.4, spB.y0 + 0.4);
+          const y1 = Math.min(14, spA.y1 - 0.4, spB.y1 - 0.4);
+          if (a1 <= a0 + 0.8 || y1 - y0 < barH + 0.1) continue;
+          const bars = Math.min(4, 1 + Math.floor((a1 - a0) / 9));
+          for (let k = 0; k < bars; k++) {
+            const o = a0 + ((k + 0.5) / bars) * (a1 - a0);
+            const y = y0 + barH / 2 + srng() * Math.max(0, y1 - y0 - barH);
+            const w = al.gap1 - al.gap0 - 0.6;
+            const c = (al.gap0 + al.gap1) / 2;
+            if (al.axis === 'x') addNeon(c, y, o, 0, 1, w, barH, Math.floor(srng() * SIGN_ATLAS.WIDE_ROWS), 1, { kind: 'ALLEY_BAR', building: A.index, buildingB: B.index });
+            else addNeon(o, y, c, 1, 0, w, barH, Math.floor(srng() * SIGN_ATLAS.WIDE_ROWS), 1, { kind: 'ALLEY_BAR', building: A.index, buildingB: B.index });
+            // Mounting steel cross-bar touching both solid alley walls.
+            G.steel.push(al.axis === 'x' ? boxAt(al.gap1 - al.gap0, 0.06, 0.06, c, y + barH / 2 + 0.03, o) : boxAt(0.06, 0.06, al.gap1 - al.gap0, o, y + barH / 2 + 0.03, c));
+            alleyNeon++;
+          }
+        }
       }
     }
 
@@ -4985,7 +5326,8 @@ export class CityBuilder {
           }
           if (counts.ant < CAP.ANTENNA) {
             const ah = 6 + rng() * 8;
-            placeInstance(this.antennas, counts.ant++, r.x0 + 0.8, b.roofY + rh, r.z0 + 0.8, 0, 1, ah, 1);
+            counts.ant++;
+            addSteelFixture(2, r.x0 + 0.8, b.roofY + rh, r.z0 + 0.8, 0, 1, ah, 1);
             addAviation(r.x0 + 0.8, b.roofY + rh + ah + 0.15, r.z0 + 0.8);
           }
         }
@@ -5022,53 +5364,80 @@ export class CityBuilder {
       const signFaces = streetFaces.filter(([ax, sg]) => !balconyFaces.has(fkey(b, ax, sg)) && !escapeFaces.has(fkey(b, ax, sg)) && !galleryFaces.has(fkey(b, ax, sg)) && !spineFaces.has(fkey(b, ax, sg)));
       const lowTop = lowTopOf(b);
       const busyFaces = new Set<string>();
-      // 9A-4: 1F canopies / awnings / marquees now belong to the ground-floor programs.
-      // Blade signs: Type D commercial streets are packed (3–5, dense-neon sectors 4–6).
+      // 10A-2: bind EVERY building-mounted neonSign strictly inside a solid FaceSpan of b.plan.faces.
       const shopSigns = b.arch === ARCH_D
         ? (sector.denseNeon ? 4 : 3) + Math.floor(rng() * 3)
         : sector.denseNeon ? 3 + Math.floor(rng() * 3) : 1 + Math.floor(rng() * 2);
       const fp = new THREE.Vector3();
       for (let s = 0; s < shopSigns && signFaces.length; s++) {
         const [ax, sg] = signFaces[Math.floor(rng() * signFaces.length)];
+        const minY = SB.CANOPY_Y + 0.5;
+        const cands = b.plan.faces.filter((sp) => sp.ax === ax && sp.sg === sg && sp.a1 - sp.a0 >= 0.8 && sp.y1 - 0.4 - Math.max(minY, sp.y0 + 0.4) >= 3.0);
+        if (!cands.length) continue;
+        const span = cands[Math.floor(rng() * cands.length)];
         busyFaces.add(fkey(b, ax, sg));
-        facePoint(b, ax, sg, 0.12 + rng() * 0.76, fp);
         const w = 1.7;
-        const hgt = 5 + rng() * 4;
-        // Blade signs start above the 1F canopy (5B-3).
-        const y = SB.CANOPY_Y + 0.5 + hgt / 2 + rng() * 1.5;
-        const nx = ax === 'x' ? sg : 0;
-        const nz = ax === 'z' ? sg : 0;
-        addNeon(fp.x + nx * (w / 2 + 0.3), y, fp.z + nz * (w / 2 + 0.3), ax === 'x' ? 0 : 1, ax === 'x' ? 1 : 0, w, hgt, Math.floor(rng() * 8));
+        const yLoLim = Math.max(minY, span.y0 + 0.4);
+        const yHiLim = span.y1 - 0.4;
+        const hgt = Math.min(5 + rng() * 4, yHiLim - yLoLim);
+        const y = Math.min(yHiLim - hgt / 2, yLoLim + hgt / 2 + rng() * Math.min(1.5, Math.max(0, yHiLim - yLoLim - hgt)));
+        const along = span.a0 + 0.3 + rng() * (span.a1 - span.a0 - 0.6);
+        const fSpan = sf(span.ax, span.sg, span.plane);
+        const p = fSpan.P3(along, y, w / 2 + 0.3);
+        addNeon(p.x, p.y, p.z, span.ax === 'x' ? 0 : 1, span.ax === 'x' ? 1 : 0, w, hgt, Math.floor(rng() * 8), 0, { kind: 'BUILDING_BLADE', building: b.index });
         for (const yy of [y + hgt / 2 - 0.2, y - hgt / 2 + 0.2]) {
-          G.steel.push(boxAt(Math.abs(nx) * (w + 0.3) + 0.08, 0.08, Math.abs(nz) * (w + 0.3) + 0.08, fp.x + (nx * (w + 0.3)) / 2, yy, fp.z + (nz * (w + 0.3)) / 2));
+          G.steel.push(...fSpan.bx(along - 0.04, along + 0.04, yy - 0.04, yy + 0.04, 0, w + 0.3));
         }
       }
       if (b.roofY >= 36 && signFaces.length) {
         const [ax, sg] = signFaces[Math.floor(rng() * signFaces.length)];
-        busyFaces.add(fkey(b, ax, sg));
-        facePoint(b, ax, sg, 0.2 + rng() * 0.6, fp);
-        const w = 2.6;
-        const hgt = 11 + rng() * 4;
-        const y = LEVEL.SKYBRIDGE_Y_MIN + hgt / 2 + rng() * Math.max(0, LEVEL.SKYBRIDGE_Y_MAX - LEVEL.SKYBRIDGE_Y_MIN - hgt);
-        const nx = ax === 'x' ? sg : 0;
-        const nz = ax === 'z' ? sg : 0;
-        const cx = fp.x + nx * (w / 2 + 0.4);
-        const cz = fp.z + nz * (w / 2 + 0.4);
-        addNeon(cx, y, cz, ax === 'x' ? 0 : 1, ax === 'x' ? 1 : 0, w, hgt, Math.floor(rng() * 8));
-        G.steel.push(boxAt(Math.abs(nx) * (w + 0.4) + 0.12, 0.12, Math.abs(nz) * (w + 0.4) + 0.12, fp.x + (nx * (w + 0.4)) / 2, y + hgt / 2 + 0.1, fp.z + (nz * (w + 0.4)) / 2));
-        if (rng() < 0.6) addBeacon(new THREE.Vector3(cx, y + hgt / 2 + 0.9, cz), 'SIGN');
+        const cands = b.plan.faces.filter((sp) => {
+          if (sp.ax !== ax || sp.sg !== sg || sp.a1 - sp.a0 < 0.8) return false;
+          const lo = Math.max(LEVEL.SKYBRIDGE_Y_MIN, sp.y0 + 0.4);
+          const hi = Math.min(LEVEL.SKYBRIDGE_Y_MAX, sp.y1 - 0.4);
+          return hi - lo >= 6.0;
+        });
+        if (cands.length) {
+          const span = cands[Math.floor(rng() * cands.length)];
+          busyFaces.add(fkey(b, ax, sg));
+          const w = 2.6;
+          const lo = Math.max(LEVEL.SKYBRIDGE_Y_MIN, span.y0 + 0.4);
+          const hi = Math.min(LEVEL.SKYBRIDGE_Y_MAX, span.y1 - 0.4);
+          const hgt = Math.min(11 + rng() * 4, hi - lo);
+          const y = lo + hgt / 2 + rng() * Math.max(0, hi - lo - hgt);
+          const along = span.a0 + 0.3 + (0.15 + rng() * 0.7) * (span.a1 - span.a0 - 0.6);
+          const fSpan = sf(span.ax, span.sg, span.plane);
+          const p = fSpan.P3(along, y, w / 2 + 0.4);
+          addNeon(p.x, p.y, p.z, span.ax === 'x' ? 0 : 1, span.ax === 'x' ? 1 : 0, w, hgt, Math.floor(rng() * 8), 0, { kind: 'BUILDING_BLADE', building: b.index });
+          for (const yy of [y + hgt / 2 - 0.25, y - hgt / 2 + 0.25]) {
+            G.steel.push(...fSpan.bx(along - 0.06, along + 0.06, yy - 0.06, yy + 0.06, 0, w + 0.4));
+          }
+          if (rng() < 0.6) addBeacon(new THREE.Vector3(p.x, y + hgt / 2 + 0.9, p.z), 'SIGN');
+        }
       }
-      // 5B-3 emblem / geometric hologram on the mid floors (14 m … below the terrace / 42 m).
+      // 5B-3 emblem / geometric hologram on the mid floors (14 m … below the top / 42 m), strictly inside a solid FaceSpan.
       if (lowTop >= 26 && signFaces.length && srng() < 0.42) {
         const [ax, sg] = signFaces[Math.floor(srng() * signFaces.length)];
-        busyFaces.add(fkey(b, ax, sg));
         const sz = 4.5 + srng() * 2.5;
-        const top = Math.min(lowTop - 6, 42);
-        const y = 14 + sz / 2 + srng() * Math.max(0, top - 14 - sz);
-        facePoint(b, ax, sg, 0.3 + srng() * 0.4, fp);
-        const nx = ax === 'x' ? sg : 0;
-        const nz = ax === 'z' ? sg : 0;
-        addNeon(fp.x + nx * (b.arch === ARCH_A ? AR.MULLION_D + 0.12 : 0.12), y, fp.z + nz * (b.arch === ARCH_A ? AR.MULLION_D + 0.12 : 0.12), nx, nz, sz, sz, Math.floor(srng() * SIGN_ATLAS.EMBLEMS), 2);
+        const cands = b.plan.faces.filter((sp) => {
+          if (sp.ax !== ax || sp.sg !== sg || sp.a1 - sp.a0 < sz + 0.6) return false;
+          const lo = Math.max(14, sp.y0 + 0.4);
+          const hi = Math.min(42, sp.y1 - 0.4);
+          return hi - lo >= sz;
+        });
+        if (cands.length) {
+          const span = cands[Math.floor(srng() * cands.length)];
+          busyFaces.add(fkey(b, ax, sg));
+          const lo = Math.max(14, span.y0 + 0.4);
+          const hi = Math.min(42, span.y1 - 0.4);
+          const y = lo + sz / 2 + srng() * Math.max(0, hi - lo - sz);
+          const aMin = span.a0 + 0.3 + sz / 2;
+          const aMax = span.a1 - 0.3 - sz / 2;
+          const along = aMin + srng() * Math.max(0, aMax - aMin);
+          const fSpan = sf(span.ax, span.sg, span.plane);
+          const p = fSpan.P3(along, y, b.arch === ARCH_A ? AR.MULLION_D + 0.12 : 0.12);
+          addNeon(p.x, p.y, p.z, fSpan.nx, fSpan.nz, sz, sz, Math.floor(srng() * SIGN_ATLAS.EMBLEMS), 2, { kind: 'BUILDING_FLAT', building: b.index });
+        }
       }
       // 5B-3 vertical concrete fins on Type B street faces without balconies (decorative, ≤ 0.45 m: no collider).
       if (b.arch === ARCH_B && lowTop >= 16) {
@@ -5284,6 +5653,7 @@ export class CityBuilder {
       const hz = (alongZ ? l : w) / 2;
       colliders.push({ min: new THREE.Vector3(c.x - hx, c.y, c.z - hz), max: new THREE.Vector3(c.x + hx, c.y + hgt, c.z + hz), kind: 'CAR', building: -1 });
       if (!c.onHighway) {
+        extraShadows.push({ x: c.x, z: c.z, yaw: c.yaw, w: w * 1.18, d: l * 1.08, alpha: 0.72 });
         // Cover position beside the car (toward the district centre).
         const ox = alongZ ? -Math.sign(c.x || 1) * 2.2 : 0;
         const oz = alongZ ? 0 : -Math.sign(c.z || 1) * 2.2;
@@ -5339,12 +5709,23 @@ export class CityBuilder {
       if (i % 2 === 0) addAviation(t.x, t.top + 0.4, t.z);
       if (i % 6 === 0) addSearch(t.x, t.top + 0.5, t.z);
       if (i % 3 === 0) {
-        const toC = Math.atan2(-t.x, -t.z);
-        const nx = Math.sin(toC);
-        const nz = Math.cos(toC);
-        const sh = 26 + (i % 7) * 5;
-        const y = Math.min(t.top - sh / 2 - 6, 70 + (i % 5) * 18);
-        addNeon(t.x + nx * (Math.min(t.w, t.d) / 2 + 1.5), y, t.z + nz * (Math.min(t.w, t.d) / 2 + 1.5), nx, nz, sh / 6.5, sh, i);
+        // 10A-2: snap farTower signs strictly to the exact cardinal face (±X / ±Z) facing the city centre.
+        const faceX = Math.abs(t.x) >= Math.abs(t.z);
+        const sg = faceX ? (t.x > 0 ? -1 : 1) : t.z > 0 ? -1 : 1;
+        const nx = faceX ? sg : 0;
+        const nz = faceX ? 0 : sg;
+        const halfDepth = (faceX ? t.w : t.d) / 2;
+        const faceWidth = faceX ? t.d : t.w;
+        const sh = Math.min(26 + (i % 7) * 5, t.top - 12);
+        if (sh >= 8 && faceWidth >= 4) {
+          const sw = Math.min(sh / 6.5, faceWidth - 2);
+          const yLo = sh / 2 + 4.0;
+          const yHi = t.top - sh / 2 - 4.0;
+          if (yHi >= yLo) {
+            const y = Math.min(yHi, Math.max(yLo, 70 + (i % 5) * 18));
+            addNeon(t.x + nx * (halfDepth + 0.35), y, t.z + nz * (halfDepth + 0.35), nx, nz, sw, sh, i, 0, { kind: 'FAR_TOWER', farIndex: i });
+          }
+        }
       }
     });
     [...buildings].sort((p, o) => o.roofY - p.roofY).slice(0, 2).forEach((b) => addSearch(b.cx, b.roofY + 0.6, b.cz));
@@ -5542,38 +5923,58 @@ export class CityBuilder {
     const mk = (geos: THREE.BufferGeometry[], mat: THREE.Material, name: string, renderOrder = 0): THREE.Mesh => {
       const geo = mergeOrEmpty(geos);
       for (const gg of geos) gg.dispose();
+      const posAttr = geo.getAttribute('position');
+      const hasVerts = !!posAttr && posAttr.count > 0;
+      if (hasVerts) geo.computeBoundingSphere();
       const m = new THREE.Mesh(geo, mat);
       m.name = name;
       m.renderOrder = renderOrder;
+      m.visible = hasVerts;
+      m.frustumCulled = hasVerts;
       this.sectorGroup.add(m);
       this.sectorDisposables.push(geo);
       return m;
     };
-    // 9A-5: every geometry of the AO-shaded buckets carries `aAo` (1.0 where nothing occludes it).
-    for (const list of [G.concrete, G.steel, G.archPaint, G.bodies]) for (const gg of list) ensureAo(gg);
-    mk(G.concrete, this.concreteMat, 'GroundConcreteRoofs');
-    mk(G.road, this.roadMat, 'Roads');
+    // 9A-5 / 10A-2: every geometry of the AO-shaded buckets (including highway/ramp concrete) carries `aAo`.
+    for (const list of [G.concrete, G.hw, G.steel, G.archPaint, G.bodies]) for (const gg of list) ensureAo(gg);
+    const mConcrete = mk(G.concrete, this.concreteMat, 'GroundConcreteRoofs');
+    mConcrete.receiveShadow = true;
+    const mRoad = mk(G.road, this.roadMat, 'Roads');
+    mRoad.receiveShadow = true;
     mk(G.water, this.waterMat, 'CanalWater');
-    mk(G.hw, this.hwConcreteMat, 'ExpresswayBridgeConcrete');
+    const mHw = mk(G.hw, this.hwConcreteMat, 'ExpresswayBridgeConcrete');
+    mHw.castShadow = true;
+    mHw.receiveShadow = true;
     mk(G.strips, this.stripMat, 'LightStrips');
-    mk(G.steel.map(stripUv), this.steelMat, 'Steel');
+    const mSteel = mk(G.steel.map(stripUv), this.steelMat, 'Steel');
+    mSteel.receiveShadow = true;
     mk(G.glass, this.glassMat, 'SkybridgeGlass');
     mk(G.glassT, this.shopGlassMat, 'BalconyShopGlass');
-    mk(G.bodies, this.buildingMat, 'Towers');
-    mk(G.archPaint, this.archPaintMat, 'ArchFacadesTrim');
+    const mTowers = mk(G.bodies, this.buildingMat, 'Towers');
+    mTowers.castShadow = true;
+    mTowers.receiveShadow = true;
+    const mTrim = mk(G.archPaint, this.archPaintMat, 'ArchFacadesTrim');
+    mTrim.receiveShadow = true;
     mk(G.barrier, this.barrierMat, 'LockdownBarrier', 8).frustumCulled = false;
 
-    const kitStats = this.propMeshes.commit([...socketProps, ...clutter.items], decals);
-    const commit = (m: THREE.InstancedMesh, n: number): void => {
+    const kitStats = this.propMeshes.commit([...socketProps, ...clutter.items], decals, extraShadows);
+    const commit = (m: THREE.InstancedMesh, n: number, cull = true): void => {
       m.count = n;
+      m.visible = n > 0;
       m.instanceMatrix.needsUpdate = true;
+      if (cull && n > 0) {
+        m.computeBoundingSphere();
+        m.frustumCulled = true;
+      } else {
+        m.frustumCulled = false;
+      }
     };
     this.cars.forEach((m, i) => {
       commit(m, carCounts[i]);
       (m.geometry.getAttribute('aCar') as THREE.InstancedBufferAttribute).needsUpdate = true;
       (m.geometry.getAttribute('aPaint') as THREE.InstancedBufferAttribute).needsUpdate = true;
     });
-    commit(this.carPools, poolCount);
+    commit(this.carPools, poolCount, false);
     poolA.needsUpdate = true;
     poolB.needsUpdate = true;
     commit(this.signals, signalCount);
@@ -5616,8 +6017,7 @@ export class CityBuilder {
         else addManhole(o, c);
       }
     }
-    this.manholes.count = manholePos.length;
-    this.manholes.instanceMatrix.needsUpdate = true;
+    commit(this.manholes, manholePos.length);
     glowAttr.needsUpdate = true;
 
     // Steam re-anchored: focused 2.5–6 m columns rising straight out of manholes and eatery exhaust mouths (two
@@ -5654,33 +6054,32 @@ export class CityBuilder {
       addSteam(r.x0 + srng() * (r.x1 - r.x0), LEVEL.CANAL_WATER_Y + 0.4, r.z0 + srng() * (r.z1 - r.z0), 2.2 + srng() * 1.6, 0, srng());
     }
     steamH.needsUpdate = true;
-    this.steam.count = steamN;
-    this.steam.instanceMatrix.needsUpdate = true;
+    commit(this.steam, steamN, false);
     steamAttr.needsUpdate = true;
 
     commit(this.lamps, counts.lamp);
-    commit(this.lampHalos, counts.lamp);
-    commit(this.lampCones, counts.lamp);
+    commit(this.lampHalos, counts.lamp, false);
+    commit(this.lampCones, counts.lamp, false);
     coneTint.needsUpdate = true;
     lampTint.needsUpdate = true;
     commit(this.vending, counts.vend);
     vendTint.needsUpdate = true;
-    commit(this.guardrails, counts.rail);
+    commit(this.steelFixtures, counts.steelFix);
+    steelFixVar.needsUpdate = true;
     commit(this.acUnits, counts.ac);
     commit(this.ducts, counts.duct);
-    commit(this.fences, counts.fence);
-    commit(this.antennas, counts.ant);
     commit(this.machineRooms, counts.room);
-    commit(this.aviation, counts.avi);
+    commit(this.aviation, counts.avi, false);
     aviPhase.needsUpdate = true;
     commit(this.neonSigns, counts.neon);
     neonStrip.needsUpdate = true;
     neonFormat.needsUpdate = true;
     this.searchlights.count = counts.search;
+    this.searchlights.visible = counts.search > 0;
     searchBase.needsUpdate = true;
     searchParams.needsUpdate = true;
     commit(this.beacons, counts.beacon);
-    commit(this.halos, counts.beacon);
+    commit(this.halos, counts.beacon, false);
     this.gatePillar.position.copy(gatePos).addScaledVector(fwd, 6);
 
     const center = new THREE.Vector3();
@@ -5713,6 +6112,9 @@ export class CityBuilder {
       propFootprints: [...socketProps, ...clutter.items].map(toAabb),
       alleyBands,
       manholes: manholePos,
+      neonSignRecords,
+      buildingSpans: buildings.map((b) => b.plan.faces),
+      farTowersInfo: this.farInfo.map((t) => ({ ...t })),
       stats: {
         towers: buildings.length,
         cars: pick.length,
@@ -5773,6 +6175,7 @@ export class CityBuilder {
           clutterByStrip: clutter.byKind,
           dumpstersByStrip: clutter.dumpstersByKind,
           decals: kitStats.decals,
+          contactShadows: kitStats.contactShadows,
         },
       },
     };
@@ -5868,18 +6271,28 @@ export class CityBuilder {
     const place = (x: number, z: number, w: number, d: number, top: number): void => {
       if (this.farInfo.length >= LIMITS.FAR_BUILDINGS) return;
       for (const o of this.farInfo) if (Math.abs(o.x - x) < (o.w + w) / 2 + 6 && Math.abs(o.z - z) < (o.d + d) / 2 + 6) return;
+      // 10A-2: hard-clamp any far tower whose radial swath enters a blimp cruise corridor (guarantees >= 18 m 360° clearance).
+      const dist = Math.hypot(x, z);
+      const rad = Math.hypot(w * 0.5, d * 0.5);
+      let clampedTop = top;
+      for (const blimp of CITY_FX.BLIMPS) {
+        if (Math.abs(dist - blimp.radius) <= CITY_FX.BLIMP_LENGTH * 0.5 + rad + 20) {
+          const cap = blimp.y - CITY_FX.BLIMP_RADIUS - 30;
+          if (clampedTop > cap) clampedTop = cap;
+        }
+      }
       const i = this.farInfo.length;
-      _pos.set(x, top / 2, z);
+      _pos.set(x, clampedTop / 2, z);
       _quat.identity();
-      _scl.set(w, top, d);
+      _scl.set(w, clampedTop, d);
       _m4.compose(_pos, _quat, _scl);
       this.farTowers.setMatrixAt(i, _m4);
       const seed = rng();
       seedAttr.setX(i, seed);
       // Distant supertalls: mostly glass corporate towers, some residential slabs and industrial blocks.
       const h = (seed * 13.37) % 1;
-      archAttr.setX(i, top < 70 ? (h < 0.5 ? ARCH_B : ARCH_C) : h < 0.62 ? ARCH_A : h < 0.9 ? ARCH_B : ARCH_D);
-      this.farInfo.push({ x, z, w, d, top });
+      archAttr.setX(i, clampedTop < 70 ? (h < 0.5 ? ARCH_B : ARCH_C) : h < 0.62 ? ARCH_A : h < 0.9 ? ARCH_B : ARCH_D);
+      this.farInfo.push({ x, z, w, d, top: clampedTop });
     };
     // Corridor caps just past the visual extent so no street / canal / expressway runs into the void.
     for (const c of corridors) {
@@ -5906,10 +6319,12 @@ export class CityBuilder {
       if (!hitsCorridor) place(x, z, w, d, 50 + rng() * 210 + (dist - LEVEL.FAR_RING_INNER_M) * 0.08);
     }
     this.farTowers.count = this.farInfo.length;
+    this.farTowers.visible = this.farInfo.length > 0;
     this.farTowers.instanceMatrix.needsUpdate = true;
     seedAttr.needsUpdate = true;
     archAttr.needsUpdate = true;
     this.farTowers.computeBoundingSphere();
+    this.farTowers.frustumCulled = true;
   }
 
   private clearSector(): void {

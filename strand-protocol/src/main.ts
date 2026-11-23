@@ -31,6 +31,7 @@ import {
   ENERGY_COLORS,
   MODIFIERS,
   ONE_SHOT_HP,
+  SCREEN_FILTERS,
   SECTORS,
   SKILL_BY_ID,
   SKILL_CONSTANTS,
@@ -52,6 +53,7 @@ import {
   type ModifierId,
   type RunStats,
   type SaveSettings,
+  type ScreenFilterId,
   type SkillId,
   type SkillLevels,
 } from './config/skills';
@@ -287,6 +289,7 @@ class AttractCamera {
 type AppState = 'TITLE' | 'PLAYING' | 'PAUSED' | 'SKILL' | 'TRANSITION' | 'RESULT';
 
 const _lookDelta = { yaw: 0, pitch: 0 };
+const _lateLookDelta = { yaw: 0, pitch: 0 };
 const _camRight = new THREE.Vector3();
 const _camUp = new THREE.Vector3();
 const _camBack = new THREE.Vector3();
@@ -355,6 +358,8 @@ class App {
   private readonly debugGate: boolean;
   /** `?quality=` overrides the saved preset for this session. */
   private readonly qualityOverride: boolean;
+  /** `?filter=` overrides the saved screen filter for this session. */
+  private readonly filterOverride: boolean;
   private readonly attract = new AttractCamera();
   private layout: SectorLayout;
   private state: AppState = 'TITLE';
@@ -403,6 +408,9 @@ class App {
   private fpsFrames = 0;
   private fpsTime = 0;
   private fps = 0;
+  private perfFrames = 0;
+  private perfTime = 0;
+  private perfLast = performance.now();
 
   constructor(container: HTMLElement) {
     this.renderer = new Renderer(container);
@@ -410,6 +418,9 @@ class App {
     const q = params.get('quality')?.toUpperCase();
     this.qualityOverride = !!q && q in QUALITY_PRESETS;
     if (this.qualityOverride) this.renderer.setQuality(q as QualityPreset);
+    const flt = params.get('filter')?.toUpperCase() as ScreenFilterId | undefined;
+    this.filterOverride = !!flt && SCREEN_FILTERS.some((f) => f.id === flt);
+    if (this.filterOverride && flt) this.renderer.setFilter(flt);
 
     const t0 = performance.now();
     const textures = getProceduralTextures(this.renderer.renderer);
@@ -700,18 +711,32 @@ class App {
       case 'lowLatency':
         this.renderer.setLowLatency(s.lowLatency);
         break;
+      case 'shadows':
+        this.renderer.setShadows(s.shadows);
+        break;
+      case 'showPerf':
+        this.hud.setPerfVisible(s.showPerf);
+        break;
+      case 'filter':
+        if (!this.filterOverride) this.renderer.setFilter(s.filter);
+        break;
       default:
         break;
     }
   }
 
   private applyAllSettings(): void {
-    for (const k of ['sensitivity', 'shake', 'roll', 'centerDot', 'fov', 'quality', 'volume', 'lowLatency'] as const) this.applySetting(k);
+    for (const k of ['sensitivity', 'shake', 'roll', 'centerDot', 'fov', 'quality', 'volume', 'lowLatency', 'shadows', 'showPerf', 'filter'] as const) this.applySetting(k);
   }
 
   private onSettingChanged(key: keyof SaveSettings): void {
     this.applySetting(key);
     this.store.write();
+    if (key === 'filter' || key === 'shadows') {
+      // 10A-4: immediate 1-frame live preview in Pause / Title Settings when switching screen filter or shadows.
+      this.renderer.updateShadowFocus(this.renderer.camera.position);
+      this.renderer.render();
+    }
     if (key === 'volume') {
       // Volume preview: only the UI tick sounds (the world bus is muted on the title / pause screens).
       this.audio.init();
@@ -1294,6 +1319,16 @@ class App {
       this.enemies.zoomScan.value = 0;
     } else {
       const frozen = this.state !== 'PLAYING';
+      // 10A-1.4: late-frame pre-render mouse sync so pointer deltas arriving during fixed physics/AI
+      // steps are reflected on the current frame with zero extra frame delay.
+      if (!frozen) {
+        this.input.consumeLook(_lateLookDelta);
+        if (_lateLookDelta.yaw !== 0 || _lateLookDelta.pitch !== 0) {
+          this.player.applyLook(_lateLookDelta.yaw, _lateLookDelta.pitch);
+          _lookDelta.yaw += _lateLookDelta.yaw;
+          _lookDelta.pitch += _lateLookDelta.pitch;
+        }
+      }
       this.player.updateCamera(frozen ? 0 : realDt, alpha, cam);
       cam.updateMatrixWorld();
       this.viewModel.syncEnvironment(this.player.cameraEuler);
@@ -1355,8 +1390,10 @@ class App {
     this.city.update(this.clock.simTime, cam.position);
     this.effects.update(simDt, realDt, cam.position, this.camVel, this.clock.realTime, this.renderer.viewportHeight);
     this.renderer.update(realDt);
+    this.renderer.updateShadowFocus(cam.position);
     this.renderer.render();
 
+    if (this.store.data.settings.showPerf) this.updatePerfOverlay();
     if (this.debugEl) this.updateDebug();
   }
 
@@ -1532,6 +1569,21 @@ class App {
       `GEAR ${this.equipment.activeSlot}/${this.equipment.state}  ROPE ${p.ropeAttached ? p.ropeLength.toFixed(1) : '-'}  BT ${p.btGauge.toFixed(0)}  HP ${p.hp.toFixed(0)}\n` +
       `ENEMIES  WAVE ${this.enemies.waveNumber}/${this.enemies.waveTotal}  REMAINING ${this.enemies.remaining}  ${this.enemies.isCleared ? 'CLEARED' : ''}  |  ` +
       `FLOW ${FLOW_RANKS[this.flow.rankIndex].id} ${this.flow.points.toFixed(0)}  LOOP ${this.loop + 1}`;
+  }
+
+  private updatePerfOverlay(): void {
+    this.perfFrames++;
+    const now = performance.now();
+    const dt = (now - this.perfLast) / 1000;
+    this.perfLast = now;
+    // Clamp jumps after paused/hidden tabs so the first sample after resuming is clean.
+    this.perfTime += Math.min(dt, 0.25);
+    if (this.perfTime < 0.25) return;
+    const fps = this.perfFrames / this.perfTime;
+    const frameMs = (this.perfTime / this.perfFrames) * 1000;
+    this.perfFrames = 0;
+    this.perfTime = 0;
+    this.hud.updatePerf(fps, frameMs, this.renderer.drawCalls);
   }
 
   // =============================================================================================

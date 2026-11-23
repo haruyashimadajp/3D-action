@@ -472,6 +472,17 @@ export function rankAtLeast(r: RunRankId, min: RunRankId): boolean {
 // ---------------------------------------------------------------------------
 // Persistent save (§8.3: best time, best FLOW score, max loop, total HS, unlocked energy colours)
 // ---------------------------------------------------------------------------
+/** 10A-4 selectable full-screen atmospheric grades (zero extra draw calls, inside KineticPostFX). */
+export type ScreenFilterId = 'CYBER_NOIR' | 'NEON_OVERDRIVE' | 'COLD_STEEL' | 'AMBER_DUST' | 'RAW';
+export const SCREEN_FILTERS: readonly { readonly id: ScreenFilterId; readonly label: string }[] = [
+  { id: 'CYBER_NOIR', label: 'CYBER NOIR' },
+  { id: 'NEON_OVERDRIVE', label: 'OVERDRIVE' },
+  { id: 'COLD_STEEL', label: 'COLD STEEL' },
+  { id: 'AMBER_DUST', label: 'AMBER DUST' },
+  { id: 'RAW', label: 'RAW' },
+];
+const SCREEN_FILTER_IDS: readonly ScreenFilterId[] = SCREEN_FILTERS.map((f) => f.id);
+
 export interface SaveSettings {
   sensitivity: number;
   /** 0 / 0.5 / 1 */
@@ -482,8 +493,14 @@ export interface SaveSettings {
   fov: number;
   quality: 'HIGH' | 'MEDIUM' | 'LOW';
   volume: number;
-  /** 7A-2 LOW LATENCY: DPR 1.0 + lighter MSAA regardless of the quality preset. */
+  /** 7A-2 LOW LATENCY: DPR 1.0 + 0× MSAA regardless of the quality preset. */
   lowLatency: boolean;
+  /** 10A-1 optional lightweight player-centered directional shadows (default false for locked 60fps). */
+  shadows: boolean;
+  /** 10A-1 compact top-right FPS | frame ms | draw calls telemetry toggle. */
+  showPerf: boolean;
+  /** 10A-4 selectable atmospheric screen filter (default CYBER_NOIR). */
+  filter: ScreenFilterId;
 }
 
 export interface SaveData {
@@ -512,7 +529,19 @@ export function defaultSave(): SaveData {
     bestRank: null,
     cleared: false,
     activeModifiers: [],
-    settings: { sensitivity: 1, shake: 1, roll: 1, centerDot: true, fov: 84, quality: 'HIGH', volume: 0.8, lowLatency: false },
+    settings: {
+      sensitivity: 1,
+      shake: 1,
+      roll: 1,
+      centerDot: true,
+      fov: 84,
+      quality: 'HIGH',
+      volume: 0.8,
+      lowLatency: false,
+      shadows: false,
+      showPerf: false,
+      filter: 'CYBER_NOIR',
+    },
   };
 }
 
@@ -561,6 +590,9 @@ export function sanitizeSave(raw: unknown): SaveData {
       quality: pick(st.quality, ['HIGH', 'MEDIUM', 'LOW'] as const, 'HIGH'),
       volume: num(st.volume, d.settings.volume, 0, 1),
       lowLatency: st.lowLatency === true,
+      shadows: st.shadows === true,
+      showPerf: st.showPerf === true,
+      filter: pick(st.filter, SCREEN_FILTER_IDS, 'CYBER_NOIR'),
     },
   };
 }

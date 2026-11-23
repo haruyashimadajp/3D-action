@@ -29,6 +29,97 @@ import {
   DEG2RAD,
   clamp,
 } from '../config/constants';
+import type { ScreenFilterId } from '../config/skills';
+
+/** 10A-1 pure helper: effective DPR obeying HIGH ≤ 1.25 and total pixel budget ≤ 2.2M px. */
+export function computeEffectiveDpr(
+  width: number,
+  height: number,
+  devicePixelRatio: number,
+  preset: QualityPreset,
+  lowLatency: boolean,
+): number {
+  if (lowLatency || preset !== 'HIGH') return 1.0;
+  const pxCapDpr = Math.sqrt(RENDER.MAX_RENDER_PIXELS / Math.max(1, width * height));
+  return Math.min(Math.max(devicePixelRatio || 1, 1), QUALITY_PRESETS.HIGH.dpr, RENDER.DPR_CAP, pxCapDpr);
+}
+
+/** 10A-4 grade parameters executed inside KineticPostFX (+0 extra draw calls). */
+interface FilterGrade {
+  readonly active: number;
+  readonly shadow: readonly [number, number, number];
+  readonly high: readonly [number, number, number];
+  readonly tint: readonly [number, number, number];
+  readonly sat: number;
+  readonly curve: number;
+  readonly black: number;
+  readonly vig: number;
+  readonly warmKeep: number;
+  readonly grain: number;
+}
+
+const FILTER_GRADES: Readonly<Record<ScreenFilterId, FilterGrade>> = {
+  CYBER_NOIR: {
+    active: 1,
+    shadow: [-0.014, 0.006, 0.022],
+    high: [0.016, 0.008, 0.004],
+    tint: [0.97, 1.0, 1.03],
+    sat: 1.06,
+    curve: 0.16,
+    black: -0.012,
+    vig: 0.18,
+    warmKeep: 0,
+    grain: RENDER.FILM_GRAIN,
+  },
+  NEON_OVERDRIVE: {
+    active: 1,
+    shadow: [-0.01, -0.006, 0.032],
+    high: [0.024, 0.004, 0.026],
+    tint: [1.03, 0.98, 1.06],
+    sat: 1.22,
+    curve: 0.18,
+    black: -0.01,
+    vig: 0.16,
+    warmKeep: 0,
+    grain: RENDER.FILM_GRAIN,
+  },
+  COLD_STEEL: {
+    active: 1,
+    shadow: [-0.014, 0.006, 0.024],
+    high: [-0.006, 0.01, 0.02],
+    tint: [0.91, 0.98, 1.06],
+    sat: 0.72,
+    curve: 0.15,
+    black: -0.008,
+    vig: 0.18,
+    warmKeep: 0.85,
+    grain: RENDER.FILM_GRAIN,
+  },
+  AMBER_DUST: {
+    active: 1,
+    shadow: [0.014, 0.004, -0.016],
+    high: [0.042, 0.02, -0.024],
+    tint: [1.08, 0.98, 0.85],
+    sat: 0.94,
+    curve: 0.15,
+    black: -0.008,
+    vig: 0.2,
+    warmKeep: 0,
+    grain: RENDER.FILM_GRAIN * 1.15,
+  },
+  RAW: {
+    active: 0,
+    shadow: [0, 0, 0],
+    high: [0, 0, 0],
+    tint: [1, 1, 1],
+    sat: 1.0,
+    curve: 0,
+    black: 0,
+    vig: 0,
+    warmKeep: 0,
+    grain: 0,
+  },
+};
 
 // ---------------------------------------------------------------------------
 // Pass 2: first-person view-model pass (depth cleared so weapons never clip into walls)
@@ -90,8 +181,7 @@ const HdrSanitizeShader = {
 // ---------------------------------------------------------------------------
 // Pass 4: KineticPostFX (single fragment shader to save draw calls)
 // ---------------------------------------------------------------------------
-/** 7B-2 helper: GLSL vec3 literal from a 3-number array. */
-const v3 = (a: readonly number[]): string => `vec3(${a.map((x) => x.toFixed(4)).join(', ')})`;
+const DEF_GRADE = FILTER_GRADES.CYBER_NOIR;
 
 const KineticPostFXShader = {
   name: 'KineticPostFX',
@@ -120,8 +210,18 @@ const KineticPostFXShader = {
     uGlitch: { value: 0 },
     uFade: { value: 0 },
     uFadeColor: { value: new THREE.Color(0x000000) },
+    /** 10A-4 selectable screen filter uniforms (default CYBER_NOIR). */
+    uGradeActive: { value: DEF_GRADE.active },
+    uGradeShadow: { value: new THREE.Vector3(...DEF_GRADE.shadow) },
+    uGradeHigh: { value: new THREE.Vector3(...DEF_GRADE.high) },
+    uGradeTint: { value: new THREE.Vector3(...DEF_GRADE.tint) },
+    uGradeSat: { value: DEF_GRADE.sat },
+    uGradeCurve: { value: DEF_GRADE.curve },
+    uGradeBlack: { value: DEF_GRADE.black },
+    uGradeVig: { value: DEF_GRADE.vig },
+    uGradeWarmKeep: { value: DEF_GRADE.warmKeep },
     /** 7B-2 film grain strength (display-referred). */
-    uGrain: { value: RENDER.FILM_GRAIN as number },
+    uGrain: { value: DEF_GRADE.grain },
   },
   vertexShader: /* glsl */ `
     varying vec2 vUv;
@@ -154,11 +254,17 @@ const KineticPostFXShader = {
     uniform float uGlitch;
     uniform float uFade;
     uniform vec3 uFadeColor;
-    varying vec2 vUv;
-    const vec3 GRADE_SHADOW = ${v3(RENDER.GRADE_SHADOW_TINT)};
-    const vec3 GRADE_HIGH = ${v3(RENDER.GRADE_HIGHLIGHT_TINT)};
-    const float GRADE_CURVE = ${RENDER.GRADE_S_CURVE.toFixed(3)};
+    uniform float uGradeActive;
+    uniform vec3 uGradeShadow;
+    uniform vec3 uGradeHigh;
+    uniform vec3 uGradeTint;
+    uniform float uGradeSat;
+    uniform float uGradeCurve;
+    uniform float uGradeBlack;
+    uniform float uGradeVig;
+    uniform float uGradeWarmKeep;
     uniform float uGrain;
+    varying vec2 vUv;
 
     float hash12(vec2 p) {
       vec3 p3 = fract(vec3(p.xyx) * 0.1031);
@@ -305,22 +411,29 @@ const KineticPostFXShader = {
         vec3 gcol = mix(vec3(1.6, 0.08, 0.15), vec3(1.6), step(0.5, hash12(vec2(band, frame * 1.7))));
         col = mix(col, gcol, hit * 0.85);
       }
-      // --- 7B-2 cinematic grade + film grain (display-referred approximation, before tone mapping) -----
-      #ifndef LITE
-      {
+      // --- 10A-4 selectable screen filter grade + film grain (before ACES OutputPass) ---------
+      if (uGradeActive > 0.5) {
         vec3 s = pow(max(col, vec3(0.0)), vec3(1.0 / 2.2));
         float l = dot(s, vec3(0.2126, 0.7152, 0.0722));
-        // Cold teal in the shadows (< 0.25), clear warm lift in the highlights (> 0.65), gentle S-curve.
-        s += GRADE_SHADOW * (1.0 - smoothstep(0.0, 0.25, l)) + GRADE_HIGH * smoothstep(0.65, 1.0, l);
+        vec3 graded = mix(vec3(l), s, uGradeSat);
+        if (uGradeWarmKeep > 0.0) {
+          float warmChroma = clamp((s.r - s.b) * 1.6, 0.0, 1.0) * smoothstep(0.18, 0.72, s.r);
+          graded = mix(graded, s * vec3(1.12, 1.03, 0.96), warmChroma * uGradeWarmKeep);
+        }
+        s = graded * uGradeTint;
+        s += uGradeShadow * (1.0 - smoothstep(0.0, 0.30, l)) + uGradeHigh * smoothstep(0.55, 1.0, l);
+        s += vec3(uGradeBlack) * (1.0 - smoothstep(0.0, 0.28, l));
         vec3 sc = clamp(s, 0.0, 1.0);
-        s = mix(s, sc * sc * (3.0 - 2.0 * sc), GRADE_CURVE * step(s, vec3(1.0)));
+        s = mix(s, sc * sc * (3.0 - 2.0 * sc), uGradeCurve * step(s, vec3(1.0)));
+        s *= 1.0 - uGradeVig * vig;
+        #ifndef LITE
         // Temporal interleaved-gradient grain (blue-noise-like): kills 8-bit banding in the night sky / fog.
         vec2 gp = gl_FragCoord.xy + vec2(47.0, 17.0) * floor(uTime * 60.0);
         float ign = fract(52.9829189 * fract(dot(gp, vec2(0.06711056, 0.00583715))));
         s += (ign - 0.5) * 2.0 * uGrain;
+        #endif
         col = pow(max(s, vec3(0.0)), vec3(2.2));
       }
-      #endif
       col = mix(col, uFadeColor, clamp(uFade, 0.0, 1.0));
 
       gl_FragColor = vec4(col, 1.0);
@@ -393,11 +506,17 @@ export class Renderer {
   private readonly lights: PooledLight[] = [];
   private quality: QualityPreset = 'HIGH';
   private lowLatency = false;
+  private shadowsEnabled = false;
+  private filter: ScreenFilterId = 'CYBER_NOIR';
   private chromaSpike = 0;
   private chromaSpikeDecayPerS = 0;
   private time = 0;
   private width = 1;
   private height = 1;
+  private readonly moonDir = new THREE.Vector3(-0.45, 0.62, -0.64).normalize();
+  private readonly moonRight = new THREE.Vector3();
+  private readonly moonUp = new THREE.Vector3();
+  private readonly shadowTarget = new THREE.Vector3();
 
   constructor(container: HTMLElement) {
     const renderer = new THREE.WebGLRenderer({
@@ -411,6 +530,7 @@ export class Renderer {
     renderer.toneMappingExposure = RENDER.TONE_MAPPING_EXPOSURE;
     renderer.outputColorSpace = THREE.SRGBColorSpace;
     renderer.shadowMap.enabled = false;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     renderer.setClearColor(COLORS.SKY_ZENITH, 1);
     renderer.info.autoReset = false;
     container.appendChild(renderer.domElement);
@@ -429,8 +549,21 @@ export class Renderer {
     // --- Lights ------------------------------------------------------------------------------
     // 7A-4: moon 0.55 → 0.72, hemisphere 0.35 → 0.50 (sky 0x2b4070 / ground bounce 0x16223a) — no crushed blacks.
     this.moonLight = new THREE.DirectionalLight(COLORS.MOON, 0.72);
-    this.moonLight.position.set(-0.45, 0.62, -0.64).multiplyScalar(100);
+    this.moonLight.position.copy(this.moonDir).multiplyScalar(120);
     this.moonLight.castShadow = false;
+    // 10A-1 optional lightweight player-centered shadow map (1024×1024, ±36 m texel-snapped frustum).
+    const sh = RENDER.SHADOW_FRUSTUM_HALF;
+    this.moonLight.shadow.mapSize.set(RENDER.SHADOW_MAP_SIZE, RENDER.SHADOW_MAP_SIZE);
+    this.moonLight.shadow.camera.left = -sh;
+    this.moonLight.shadow.camera.right = sh;
+    this.moonLight.shadow.camera.top = sh;
+    this.moonLight.shadow.camera.bottom = -sh;
+    this.moonLight.shadow.camera.near = 1;
+    this.moonLight.shadow.camera.far = 260;
+    this.moonLight.shadow.bias = -0.0005;
+    this.moonLight.shadow.normalBias = 0.04;
+    this.moonRight.crossVectors(new THREE.Vector3(0, 1, 0), this.moonDir).normalize();
+    this.moonUp.crossVectors(this.moonDir, this.moonRight).normalize();
     this.scene.add(this.moonLight);
     this.scene.add(this.moonLight.target);
     this.hemiLight = new THREE.HemisphereLight(0x2b4070, 0x16223a, 0.5);
@@ -467,8 +600,9 @@ export class Renderer {
     // Guard against NaN / Inf before the bloom blur chain (prevents black-square artifacts).
     this.composer.addPass(new ShaderPass(HdrSanitizeShader));
 
+    // 10A-1: Half-resolution UnrealBloomPass (~75% lower GPU fill cost, identical soft glow).
     this.bloomPass = new UnrealBloomPass(
-      new THREE.Vector2(256, 256),
+      new THREE.Vector2(Math.max(128, Math.floor(window.innerWidth * 0.5)), Math.max(128, Math.floor(window.innerHeight * 0.5))),
       RENDER.BLOOM_STRENGTH,
       RENDER.BLOOM_RADIUS,
       RENDER.BLOOM_THRESHOLD,
@@ -480,8 +614,8 @@ export class Renderer {
 
     this.composer.addPass(new OutputPass());
 
+    this.setFilter('CYBER_NOIR');
     this.setQuality('HIGH');
-    this.resize();
     window.addEventListener('resize', () => this.resize());
   }
 
@@ -617,14 +751,22 @@ export class Renderer {
   }
 
   // -------------------------------------------------------------------------------------------
-  // Quality presets: HIGH (DPR 1.5 + Bloom) / MEDIUM (DPR 1.0 + Bloom) / LOW (DPR 1.0 + lite PostFX)
+  // Quality presets: HIGH (DPR ≤ 1.25 / ≤ 2.2M px, MSAA 2 + half-res Bloom)
+  //                  MEDIUM (DPR 1.0, MSAA 0 + half-res Bloom) / LOW (DPR 1.0, MSAA 0, lite PostFX)
   // -------------------------------------------------------------------------------------------
+  private syncComposerSamples(): void {
+    const samples = !this.lowLatency && this.quality === 'HIGH' ? RENDER.MSAA_SAMPLES : RENDER.MSAA_SAMPLES_LOW_LATENCY;
+    for (const rt of [this.composer.renderTarget1, this.composer.renderTarget2]) {
+      if (rt.samples === samples) continue;
+      rt.samples = samples;
+      rt.dispose();
+    }
+  }
+
   setQuality(preset: QualityPreset): void {
     this.quality = preset;
     const def = QUALITY_PRESETS[preset];
-    const dpr = this.lowLatency ? 1 : Math.min(window.devicePixelRatio || 1, def.dpr, RENDER.DPR_CAP);
-    this.renderer.setPixelRatio(dpr);
-    this.composer.setPixelRatio(dpr);
+    this.syncComposerSamples();
     this.bloomPass.enabled = def.bloom;
     const mat = this.postFxPass.material as THREE.ShaderMaterial;
     if (def.litePostFx) mat.defines.LITE = 1;
@@ -634,17 +776,12 @@ export class Renderer {
   }
 
   /**
-   * 7A-2 LOW LATENCY: whatever the preset, render at DPR 1.0 and drop the composer's MSAA from 4 to 2 samples,
-   * so high-refresh / laptop GPUs keep the frame queue short.
+   * 7A-2 / 10A-1 LOW LATENCY: render at DPR 1.0 and 0× MSAA regardless of quality preset
+   * so high-refresh / laptop GPUs keep the frame queue as short as possible.
    */
   setLowLatency(on: boolean): void {
     this.lowLatency = on;
-    const samples = on ? RENDER.MSAA_SAMPLES_LOW_LATENCY : RENDER.MSAA_SAMPLES;
-    for (const rt of [this.composer.renderTarget1, this.composer.renderTarget2]) {
-      if (rt.samples === samples) continue;
-      rt.samples = samples;
-      rt.dispose();
-    }
+    this.syncComposerSamples();
     this.setQuality(this.quality);
   }
 
@@ -656,20 +793,87 @@ export class Renderer {
     return this.quality;
   }
 
+  /** 10A-1 optional lightweight directional shadows (default false for locked 60fps). */
+  setShadows(enabled: boolean): void {
+    if (this.shadowsEnabled === enabled) return;
+    this.shadowsEnabled = enabled;
+    this.renderer.shadowMap.enabled = enabled;
+    this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    this.moonLight.castShadow = enabled;
+    this.renderer.shadowMap.needsUpdate = true;
+    this.scene.traverse((obj) => {
+      const m = (obj as THREE.Mesh).material;
+      if (!m) return;
+      if (Array.isArray(m)) {
+        for (const sub of m) sub.needsUpdate = true;
+      } else {
+        m.needsUpdate = true;
+      }
+    });
+  }
+
+  get shadows(): boolean {
+    return this.shadowsEnabled;
+  }
+
+  /** Snaps the ±36 m shadow frustum to shadow-map texels around `focus` to eliminate shimmer (zero alloc). */
+  updateShadowFocus(focus: THREE.Vector3): void {
+    if (!this.shadowsEnabled) return;
+    const texel = (RENDER.SHADOW_FRUSTUM_HALF * 2) / RENDER.SHADOW_MAP_SIZE;
+    const u = Math.round(focus.dot(this.moonRight) / texel) * texel;
+    const v = Math.round(focus.dot(this.moonUp) / texel) * texel;
+    const w = focus.dot(this.moonDir);
+    this.shadowTarget
+      .copy(this.moonRight)
+      .multiplyScalar(u)
+      .addScaledVector(this.moonUp, v)
+      .addScaledVector(this.moonDir, w);
+    this.moonLight.target.position.copy(this.shadowTarget);
+    this.moonLight.position.copy(this.shadowTarget).addScaledVector(this.moonDir, 120);
+    this.moonLight.target.updateMatrixWorld();
+  }
+
+  /** 10A-4 selectable screen filter executed inside KineticPostFX (+0 extra draw calls). */
+  setFilter(id: ScreenFilterId): void {
+    this.filter = id;
+    const g = FILTER_GRADES[id] ?? FILTER_GRADES.CYBER_NOIR;
+    const u = (this.postFxPass.material as THREE.ShaderMaterial).uniforms;
+    u.uGradeActive.value = g.active;
+    (u.uGradeShadow.value as THREE.Vector3).set(g.shadow[0], g.shadow[1], g.shadow[2]);
+    (u.uGradeHigh.value as THREE.Vector3).set(g.high[0], g.high[1], g.high[2]);
+    (u.uGradeTint.value as THREE.Vector3).set(g.tint[0], g.tint[1], g.tint[2]);
+    u.uGradeSat.value = g.sat;
+    u.uGradeCurve.value = g.curve;
+    u.uGradeBlack.value = g.black;
+    u.uGradeVig.value = g.vig;
+    u.uGradeWarmKeep.value = g.warmKeep;
+    u.uGrain.value = g.grain;
+  }
+
+  getFilter(): ScreenFilterId {
+    return this.filter;
+  }
+
   resize(): void {
     const w = window.innerWidth;
     const h = window.innerHeight;
     this.width = w;
     this.height = h;
+    const dpr = computeEffectiveDpr(w, h, window.devicePixelRatio || 1, this.quality, this.lowLatency);
+    this.renderer.setPixelRatio(dpr);
+    this.composer.setPixelRatio(dpr);
     this.renderer.setSize(w, h);
     this.composer.setSize(w, h);
+    // 10A-1: Keep UnrealBloomPass at half effective viewport resolution after composer.setSize().
+    const effW = Math.floor(w * dpr);
+    const effH = Math.floor(h * dpr);
+    this.bloomPass.setSize(Math.max(128, Math.floor(effW * 0.5)), Math.max(128, Math.floor(effH * 0.5)));
     this.camera.aspect = w / h;
     this.camera.updateProjectionMatrix();
     this.viewModelCamera.aspect = w / h;
     this.viewModelCamera.updateProjectionMatrix();
-    const dpr = this.renderer.getPixelRatio();
     const u = (this.postFxPass.material as THREE.ShaderMaterial).uniforms;
-    (u.uResolution.value as THREE.Vector2).set(w * dpr, h * dpr);
+    (u.uResolution.value as THREE.Vector2).set(effW, effH);
   }
 
   // -------------------------------------------------------------------------------------------

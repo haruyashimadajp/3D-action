@@ -30,12 +30,12 @@ export const PROPS = {
     STORAGE: 360,
     FIXTURES: 420,
     MISC: 220,
-    CARDBOARD: 280,
-    TRASH: 200,
+    DEBRIS: 480,
     DUMPSTER: 65,
     BENCH: 110,
     SCRAP: 200,
     DECAL: 340,
+    CONTACT_SHADOW: 420,
   },
   /** Raw tidy roll; ~15 % of doors end up tidy once adjacent tidy pairs are broken up. */
   TIDY_CHANCE: 0.175,
@@ -66,15 +66,14 @@ export const PLAQUE_LABELS: readonly string[] = [
 // =============================================================================================
 // Catalogue
 // =============================================================================================
-export type KitId = 'PLANTS' | 'STORAGE' | 'FIXTURES' | 'MISC' | 'CARDBOARD' | 'TRASH' | 'DUMPSTER' | 'BENCH' | 'SCRAP';
-export const KIT_IDS: readonly KitId[] = ['PLANTS', 'STORAGE', 'FIXTURES', 'MISC', 'CARDBOARD', 'TRASH', 'DUMPSTER', 'BENCH', 'SCRAP'];
+export type KitId = 'PLANTS' | 'STORAGE' | 'FIXTURES' | 'MISC' | 'DEBRIS' | 'DUMPSTER' | 'BENCH' | 'SCRAP';
+export const KIT_IDS: readonly KitId[] = ['PLANTS', 'STORAGE', 'FIXTURES', 'MISC', 'DEBRIS', 'DUMPSTER', 'BENCH', 'SCRAP'];
 export const KIT_CAP: Readonly<Record<KitId, number>> = {
   PLANTS: PROPS.CAP.PLANTS,
   STORAGE: PROPS.CAP.STORAGE,
   FIXTURES: PROPS.CAP.FIXTURES,
   MISC: PROPS.CAP.MISC,
-  CARDBOARD: PROPS.CAP.CARDBOARD,
-  TRASH: PROPS.CAP.TRASH,
+  DEBRIS: PROPS.CAP.DEBRIS,
   DUMPSTER: PROPS.CAP.DUMPSTER,
   BENCH: PROPS.CAP.BENCH,
   SCRAP: PROPS.CAP.SCRAP,
@@ -109,43 +108,42 @@ export interface PropDef {
 const D = (kit: KitId, v: number, w: number, d: number, h: number, tints: readonly number[], wall = false, colliderH = 0): PropDef => ({ kit, v, w, d, h, wall, tints, colliderH });
 
 export const PROP_DEFS: Readonly<Record<PropId, PropDef>> = {
-  // SocketPottedPlants: pot tint = terracotta / off-white ceramic / matte slate.
-  POT_PLANT: D('PLANTS', 0, 0.44, 0.44, 0.95, [0xa4583a, 0xd9d2c3, 0x4a5058]),
-  PLANTER: D('PLANTS', 1, 0.78, 0.32, 0.8, [0x6d6a66, 0x3a3f46, 0x8a8174]),
-  PLANT_ON_BIN: D('PLANTS', 2, 0.52, 0.42, 1.2, [0xe8e2d4, 0xe0692a, 0x2c4a78]),
-  SUCCULENTS: D('PLANTS', 3, 0.48, 0.26, 0.42, [0xa4583a, 0xd9d2c3, 0x31363d]),
-  // SocketStorageCrates: bin / crate tint = cream / safety orange / slate / dark blue / amber / teal / charcoal.
-  WIRE_RACK: D('STORAGE', 0, 0.72, 0.34, 1.45, [0xe8dcc0, 0xe0692a, 0x56606c]),
-  BINS: D('STORAGE', 1, 0.62, 0.46, 0.66, [0xe8e2d4, 0xe0692a, 0x2c4a78]),
-  CRATES: D('STORAGE', 2, 0.56, 0.4, 0.84, [0xd99a2b, 0x1f8a86, 0x33373d]),
-  TOTE_BUCKET: D('STORAGE', 3, 0.76, 0.4, 0.6, [0x3a6fb0, 0xd4c25a, 0x5b6470]),
+  // SocketPottedPlants: rain-wet terracotta / weathered stone ceramic / matte slate (10A-2 damped).
+  POT_PLANT: D('PLANTS', 0, 0.44, 0.44, 0.95, [0x78402a, 0x7c786e, 0x383d44]),
+  PLANTER: D('PLANTS', 1, 0.78, 0.32, 0.8, [0x4e4c49, 0x2c3036, 0x5c564d]),
+  PLANT_ON_BIN: D('PLANTS', 2, 0.52, 0.42, 1.2, [0x6a675f, 0x9c481e, 0x263d5e]),
+  SUCCULENTS: D('PLANTS', 3, 0.48, 0.26, 0.42, [0x78402a, 0x7c786e, 0x2b3036]),
+  // SocketStorageCrates: muted rain-wet storage bins / crates (no white blow-out).
+  WIRE_RACK: D('STORAGE', 0, 0.72, 0.34, 1.45, [0x5c584e, 0x924620, 0x3d444d]),
+  BINS: D('STORAGE', 1, 0.62, 0.46, 0.66, [0x68655d, 0x984820, 0x243b5c]),
+  CRATES: D('STORAGE', 2, 0.56, 0.4, 0.84, [0x9a6e22, 0x1a6664, 0x2b2f35]),
+  TOTE_BUCKET: D('STORAGE', 3, 0.76, 0.4, 0.6, [0x2d5485, 0x8f823d, 0x444b54]),
   // SocketWallFixtures (wall: w × h face, d out from the wall).
   PLAQUE: D('FIXTURES', 0, 0.3, 0.04, 0.14, [0x1c2026], true),
-  BREAKER: D('FIXTURES', 1, 0.42, 0.18, 0.56, [0x8c9096, 0xb7ab92, 0x8e2a26], true),
+  BREAKER: D('FIXTURES', 1, 0.42, 0.18, 0.56, [0x565a60, 0x6c6556, 0x6a2420], true),
   KEYPAD: D('FIXTURES', 2, 0.14, 0.05, 0.28, [0x3ad8ff, 0x4a7dff, 0x5cffc8], true),
   SCONCE: D('FIXTURES', 3, 0.24, 0.16, 0.3, [0xffb054, 0xffd9a0, 0xff5a3a], true),
   // SocketMiscProps.
-  STOOLS: D('MISC', 0, 0.86, 0.4, 0.7, [0x9aa1a8, 0xb23a2c, 0x2e3238]),
+  STOOLS: D('MISC', 0, 0.86, 0.4, 0.7, [0x585e64, 0x7d2c22, 0x26292e]),
   AFRAME: D('MISC', 1, 0.6, 0.62, 1.02, [0xff3fa8, 0x3ae8ff, 0xffb23a, 0x8cff5a]),
-  CANISTERS: D('MISC', 2, 0.62, 0.36, 0.62, [0x9c3a2a, 0x2f6c8c, 0xb8a43a]),
-  UMBRELLA: D('MISC', 3, 0.3, 0.3, 0.86, [0x2a2d33, 0x7a2030, 0x23485e]),
-  // ClutterCardboard (damp corrugated #5A4634 – #3A2D21).
-  BOXES: D('CARDBOARD', 0, 0.66, 0.5, 0.58, [0x5a4634, 0x4c3b2b, 0x3a2d21]),
-  BOX_TOWER: D('CARDBOARD', 1, 0.72, 0.58, 1.02, [0x5a4634, 0x4c3b2b, 0x3a2d21]),
-  BOX_PILE: D('CARDBOARD', 2, 0.95, 0.66, 0.32, [0x5a4634, 0x4c3b2b, 0x3a2d21]),
-  // ClutterTrashBins.
-  BIN_BAGS: D('TRASH', 0, 1.05, 0.62, 0.96, [0x3d434b, 0x2c4a3a, 0x4a3a2a]),
-  BAG_MOUND: D('TRASH', 1, 0.95, 0.72, 0.56, [0x101114, 0x1a1d22, 0x2a2d35]),
+  CANISTERS: D('MISC', 2, 0.62, 0.36, 0.62, [0x742d22, 0x24526a, 0x86782c]),
+  UMBRELLA: D('MISC', 3, 0.3, 0.3, 0.86, [0x2a2d33, 0x6a1e2b, 0x23485e]),
+  // ClutterDebrisKit (10A-1 consolidated Cardboard v0..2 + TrashBins v3..4; damp cardboard 0x3e3024).
+  BOXES: D('DEBRIS', 0, 0.66, 0.5, 0.58, [0x3e3024, 0x35291e, 0x2a2018]),
+  BOX_TOWER: D('DEBRIS', 1, 0.72, 0.58, 1.02, [0x3e3024, 0x35291e, 0x2a2018]),
+  BOX_PILE: D('DEBRIS', 2, 0.95, 0.66, 0.32, [0x3e3024, 0x35291e, 0x2a2018]),
+  BIN_BAGS: D('DEBRIS', 3, 1.05, 0.62, 0.96, [0x32373e, 0x233b2e, 0x3b2e22]),
+  BAG_MOUND: D('DEBRIS', 4, 0.95, 0.72, 0.56, [0x101114, 0x1a1d22, 0x252830]),
   // ClutterDumpsters (1.80 × 1.15 × 1.10 m, crouch cover).
   DUMPSTER: D('DUMPSTER', 0, 1.8, 1.15, 1.1, [0x1e3328, 0x492a1f, 0x222730], false, 1.1),
   DUMPSTER_OPEN: D('DUMPSTER', 1, 1.8, 1.15, 1.1, [0x1e3328, 0x492a1f, 0x222730], false, 1.1),
   // ClutterBenches (1.85 × 0.62 × 0.82 m, low seat collider — a step-over / sit-on surface).
-  BENCH: D('BENCH', 0, 1.85, 0.62, 0.82, [0x6b5038, 0x4e3a2a, 0x5c5a52], false, 0.44),
-  // ClutterScrapBarriers.
-  PALLETS: D('SCRAP', 0, 1.22, 1.02, 0.62, [0x7a6248, 0x5e4c38, 0x6a5a44]),
-  DRUMS: D('SCRAP', 1, 1.28, 0.64, 0.9, [0x5a2e22, 0x1f5a5a, 0xc8a020]),
-  JERSEY: D('SCRAP', 2, 1.8, 0.52, 0.85, [0xb8b4aa, 0xa8a49a, 0xc4beb0], false, 0.85),
-  CONES: D('SCRAP', 3, 0.92, 0.46, 0.72, [0xff5a12, 0xff6a20, 0xff4a0a]),
+  BENCH: D('BENCH', 0, 1.85, 0.62, 0.82, [0x523e2c, 0x3c2d20, 0x484640], false, 0.44),
+  // ClutterScrapBarriers (10A-2 rain-wet concrete jersey 0x4e5258 & muted industrial scrap).
+  PALLETS: D('SCRAP', 0, 1.22, 1.02, 0.62, [0x584634, 0x463829, 0x4f4333]),
+  DRUMS: D('SCRAP', 1, 1.28, 0.64, 0.9, [0x4c271d, 0x1a4848, 0x8c701b]),
+  JERSEY: D('SCRAP', 2, 1.8, 0.52, 0.85, [0x4e5258, 0x45494f, 0x565a60], false, 0.85),
+  CONES: D('SCRAP', 3, 0.92, 0.46, 0.72, [0xb84210, 0xc44c18, 0xa8380c]),
 };
 
 // =============================================================================================

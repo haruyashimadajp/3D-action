@@ -300,14 +300,14 @@ test('9B-3 decals: flush +0.032 m on their surface, inside it, capped at 340, de
   }
 });
 
-test('9B kits: 10 instanced meshes, every catalogue variant present, plan capacities', () => {
+test('9B kits: 10 instanced meshes (consolidated debris + contact shadows), every catalogue variant present, plan capacities', () => {
   const kits = new CityPropMeshes(new THREE.Texture(), new THREE.Texture(), () => {});
   assert.equal(kits.meshes.length, 10);
   assert.deepEqual(
     kits.meshes.map((m) => m.name),
-    ['SocketPottedPlants', 'SocketStorageCrates', 'SocketWallFixtures', 'SocketMiscProps', 'ClutterCardboard', 'ClutterTrashBins', 'ClutterDumpsters', 'ClutterBenches', 'ClutterScrapBarriers', 'GraffitiDecals'],
+    ['SocketPottedPlants', 'SocketStorageCrates', 'SocketWallFixtures', 'SocketMiscProps', 'ClutterDebrisKit', 'ClutterDumpsters', 'ClutterBenches', 'ClutterScrapBarriers', 'GraffitiDecals', 'PropContactShadows'],
   );
-  assert.deepEqual(KIT_CAP, { PLANTS: 260, STORAGE: 360, FIXTURES: 420, MISC: 220, CARDBOARD: 280, TRASH: 200, DUMPSTER: 65, BENCH: 110, SCRAP: 200 });
+  assert.deepEqual(KIT_CAP, { PLANTS: 260, STORAGE: 360, FIXTURES: 420, MISC: 220, DEBRIS: 480, DUMPSTER: 65, BENCH: 110, SCRAP: 200 });
   KIT_IDS.forEach((k, i) => {
     const m = kits.meshes[i];
     assert.equal(m.count, 0);

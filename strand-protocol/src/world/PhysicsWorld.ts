@@ -141,9 +141,12 @@ export interface AnchorSnap {
 const EPS = 1e-4;
 const SKIN = 0.001;
 const STEP_HEIGHT = 0.45;
-const CELL = 8;
-const GRID_MIN = -LEVEL.HALF_EXTENT_M - 16;
-const GRID_SIZE = Math.ceil((LEVEL.HALF_EXTENT_M * 2 + 32) / CELL);
+/** 10A-1: 12 m flat uniform 2D spatial grid (Int32Array CSR + integer queryStamp dedup, zero per-frame allocs). */
+export const PHYSICS_GRID_CELL_M = 12;
+const CELL = PHYSICS_GRID_CELL_M;
+const DEFAULT_GRID_MIN = -LEVEL.HALF_EXTENT_M - 24;
+const DEFAULT_GRID_MAX = LEVEL.HALF_EXTENT_M + 24;
+const DEFAULT_GRID_SIZE = Math.ceil((DEFAULT_GRID_MAX - DEFAULT_GRID_MIN) / CELL);
 const MAX_CANDIDATES = 4096;
 
 const _bmin = new THREE.Vector3();
@@ -174,9 +177,16 @@ export class PhysicsWorld {
   private readonly wallFaces: WallFace[] = Array.from({ length: MAX_WALL_FACES }, createWallFace);
   private wallFaceCount = 0;
   private anchors: readonly GrappleAnchor[] = [];
-  private readonly cells: number[][] = Array.from({ length: GRID_SIZE * GRID_SIZE }, () => []);
-  private stamps = new Int32Array(1);
-  private stamp = 1;
+  // Flat CSR 2D spatial grid: cell `idx` spans cellItems[cellStart[idx] .. cellStart[idx + 1] - 1].
+  private gridMinX = DEFAULT_GRID_MIN;
+  private gridMinZ = DEFAULT_GRID_MIN;
+  private gridSizeX = DEFAULT_GRID_SIZE;
+  private gridSizeZ = DEFAULT_GRID_SIZE;
+  private cellStart = new Int32Array(DEFAULT_GRID_SIZE * DEFAULT_GRID_SIZE + 1);
+  private cellCounts = new Int32Array(DEFAULT_GRID_SIZE * DEFAULT_GRID_SIZE);
+  private cellItems = new Int32Array(4096);
+  private stamps = new Int32Array(1024);
+  private stamp = 0;
   private readonly cand = new Int32Array(MAX_CANDIDATES);
   private candCount = 0;
   private gateOpen = false;
@@ -187,16 +197,80 @@ export class PhysicsWorld {
     this.ramps = layout.ramps;
     this.anchors = layout.anchors;
     this.gateOpen = layout.gate.open;
-    for (const c of this.cells) c.length = 0;
-    this.stamps = new Int32Array(this.colliders.length);
-    this.stamp = 1;
-    this.colliders.forEach((c, i) => {
-      const x0 = this.cellIndex(c.min.x);
-      const x1 = this.cellIndex(c.max.x);
-      const z0 = this.cellIndex(c.min.z);
-      const z1 = this.cellIndex(c.max.z);
-      for (let gx = x0; gx <= x1; gx++) for (let gz = z0; gz <= z1; gz++) this.cells[gz * GRID_SIZE + gx].push(i);
-    });
+    this.buildSpatialGrid();
+  }
+
+  /** Builds the flat pre-allocated Int32Array CSR 2D grid once per sector load (zero per-frame allocs). */
+  private buildSpatialGrid(): void {
+    const cols = this.colliders;
+    const n = cols.length;
+    let minX = DEFAULT_GRID_MIN;
+    let maxX = DEFAULT_GRID_MAX;
+    let minZ = DEFAULT_GRID_MIN;
+    let maxZ = DEFAULT_GRID_MAX;
+    for (let i = 0; i < n; i++) {
+      const c = cols[i];
+      if (c.min.x - CELL < minX) minX = Math.floor((c.min.x - CELL) / CELL) * CELL;
+      if (c.max.x + CELL > maxX) maxX = Math.ceil((c.max.x + CELL) / CELL) * CELL;
+      if (c.min.z - CELL < minZ) minZ = Math.floor((c.min.z - CELL) / CELL) * CELL;
+      if (c.max.z + CELL > maxZ) maxZ = Math.ceil((c.max.z + CELL) / CELL) * CELL;
+    }
+    this.gridMinX = minX;
+    this.gridMinZ = minZ;
+    this.gridSizeX = Math.max(1, Math.ceil((maxX - minX) / CELL));
+    this.gridSizeZ = Math.max(1, Math.ceil((maxZ - minZ) / CELL));
+    const totalCells = this.gridSizeX * this.gridSizeZ;
+    if (this.cellStart.length < totalCells + 1) this.cellStart = new Int32Array(totalCells + 1);
+    if (this.cellCounts.length < totalCells) this.cellCounts = new Int32Array(totalCells);
+    this.cellCounts.fill(0, 0, totalCells);
+
+    if (this.stamps.length < n) this.stamps = new Int32Array(Math.max(n, this.stamps.length * 2));
+    else this.stamps.fill(0, 0, n);
+    this.stamp = 0;
+
+    // Pass 1: count entries per cell (pad by EPS so boundary-touching AABBs register in adjacent cells).
+    let totalRefs = 0;
+    for (let i = 0; i < n; i++) {
+      const c = cols[i];
+      const x0 = this.cellX(c.min.x - EPS);
+      const x1 = this.cellX(c.max.x + EPS);
+      const z0 = this.cellZ(c.min.z - EPS);
+      const z1 = this.cellZ(c.max.z + EPS);
+      for (let gz = z0; gz <= z1; gz++) {
+        const row = gz * this.gridSizeX;
+        for (let gx = x0; gx <= x1; gx++) {
+          this.cellCounts[row + gx]++;
+          totalRefs++;
+        }
+      }
+    }
+
+    // Prefix sums → cellStart[0..totalCells].
+    let offset = 0;
+    for (let idx = 0; idx < totalCells; idx++) {
+      this.cellStart[idx] = offset;
+      offset += this.cellCounts[idx];
+      this.cellCounts[idx] = this.cellStart[idx]; // reuse as write cursor
+    }
+    this.cellStart[totalCells] = offset;
+
+    if (this.cellItems.length < totalRefs) this.cellItems = new Int32Array(Math.max(totalRefs, this.cellItems.length * 2));
+
+    // Pass 2: scatter collider indices in ascending order into each cell's contiguous slice.
+    for (let i = 0; i < n; i++) {
+      const c = cols[i];
+      const x0 = this.cellX(c.min.x - EPS);
+      const x1 = this.cellX(c.max.x + EPS);
+      const z0 = this.cellZ(c.min.z - EPS);
+      const z1 = this.cellZ(c.max.z + EPS);
+      for (let gz = z0; gz <= z1; gz++) {
+        const row = gz * this.gridSizeX;
+        for (let gx = x0; gx <= x1; gx++) {
+          const ci = row + gx;
+          this.cellItems[this.cellCounts[ci]++] = i;
+        }
+      }
+    }
   }
 
   get currentLayout(): SectorLayout | null {
@@ -208,40 +282,62 @@ export class PhysicsWorld {
     this.gateOpen = open;
   }
 
+  /** Fast O(1) dynamic enable/disable for a static collider without rebuilding the spatial grid. */
+  setColliderActive(index: number, active: boolean): void {
+    const c = this.colliders[index];
+    if (c) c.active = active;
+  }
+
   // ===============================================================================================
   // Broadphase
   // ===============================================================================================
-  private cellIndex(v: number): number {
-    return Math.max(0, Math.min(GRID_SIZE - 1, Math.floor((v - GRID_MIN) / CELL)));
+  private cellX(v: number): number {
+    return Math.max(0, Math.min(this.gridSizeX - 1, Math.floor((v - this.gridMinX) / CELL)));
   }
 
-  /** Collects candidate collider indices overlapping the XZ box into `this.cand`. */
-  private gather(minX: number, minZ: number, maxX: number, maxZ: number): void {
+  private cellZ(v: number): number {
+    return Math.max(0, Math.min(this.gridSizeZ - 1, Math.floor((v - this.gridMinZ) / CELL)));
+  }
+
+  private nextStamp(): number {
     this.stamp++;
     if (this.stamp > 0x3fffffff) {
-      this.stamps.fill(0);
+      this.stamps.fill(0, 0, this.colliders.length);
       this.stamp = 1;
     }
+    return this.stamp;
+  }
+
+  /** Collects candidate collider indices overlapping the XZ box into `this.cand` (zero alloc). */
+  private gather(minX: number, minZ: number, maxX: number, maxZ: number): void {
+    const stamp = this.nextStamp();
     this.candCount = 0;
-    const x0 = this.cellIndex(minX);
-    const x1 = this.cellIndex(maxX);
-    const z0 = this.cellIndex(minZ);
-    const z1 = this.cellIndex(maxZ);
+    const x0 = this.cellX(minX);
+    const x1 = this.cellX(maxX);
+    const z0 = this.cellZ(minZ);
+    const z1 = this.cellZ(maxZ);
+    const start = this.cellStart;
+    const items = this.cellItems;
+    const stamps = this.stamps;
+    const cand = this.cand;
+    const sizeX = this.gridSizeX;
     for (let gz = z0; gz <= z1; gz++) {
+      const row = gz * sizeX;
       for (let gx = x0; gx <= x1; gx++) {
-        const cell = this.cells[gz * GRID_SIZE + gx];
-        for (let k = 0; k < cell.length; k++) {
-          const i = cell[k];
-          if (this.stamps[i] === this.stamp) continue;
-          this.stamps[i] = this.stamp;
-          if (this.candCount < MAX_CANDIDATES) this.cand[this.candCount++] = i;
+        const cellIdx = row + gx;
+        const end = start[cellIdx + 1];
+        for (let k = start[cellIdx]; k < end; k++) {
+          const i = items[k];
+          if (stamps[i] === stamp) continue;
+          stamps[i] = stamp;
+          if (this.candCount < MAX_CANDIDATES) cand[this.candCount++] = i;
         }
       }
     }
   }
 
   private solid(c: BoxCollider): boolean {
-    return !(c.gate && this.gateOpen);
+    return c.active !== false && !(c.gate && this.gateOpen);
   }
 
   // ===============================================================================================
@@ -647,7 +743,8 @@ export class PhysicsWorld {
   // Rays
   // ===============================================================================================
   /**
-   * Ray vs world AABBs (slab test). `ignore` filters collider kinds (e.g. WATER / GROUND for the grapple).
+   * Ray vs world AABBs (slab test) via zero-alloc 2D DDA traversal over the 12 m CSR spatial grid.
+   * `ignore` filters collider kinds (e.g. WATER / GROUND for the grapple).
    * Returns `out` (hit = false when nothing within maxDist).
    */
   raycast(origin: THREE.Vector3, dir: THREE.Vector3, maxDist: number, out: RayHit, ignore?: ReadonlySet<ColliderKind>): RayHit {
@@ -655,73 +752,140 @@ export class PhysicsWorld {
     out.distance = maxDist;
     out.collider = null;
     out.kind = null;
-    const ex = origin.x + dir.x * maxDist;
-    const ez = origin.z + dir.z * maxDist;
-    this.gather(Math.min(origin.x, ex) - 0.5, Math.min(origin.z, ez) - 0.5, Math.max(origin.x, ex) + 0.5, Math.max(origin.z, ez) + 0.5);
     let best = maxDist;
     let bestIdx = -1;
     let bestAxis = 0;
     let bestSign = 0;
-    const ix = 1 / (Math.abs(dir.x) > 1e-12 ? dir.x : 1e-12);
-    const iy = 1 / (Math.abs(dir.y) > 1e-12 ? dir.y : 1e-12);
-    const iz = 1 / (Math.abs(dir.z) > 1e-12 ? dir.z : 1e-12);
-    for (let k = 0; k < this.candCount; k++) {
-      const c = this.colliders[this.cand[k]];
-      if (!this.solid(c) || (ignore && ignore.has(c.kind))) continue;
-      let t0 = 0;
-      let t1 = best;
-      let axis = -1;
-      let sign = 0;
-      // X slab
-      let ta = (c.min.x - origin.x) * ix;
-      let tb = (c.max.x - origin.x) * ix;
-      if (ta > tb) {
-        const sw = ta;
-        ta = tb;
-        tb = sw;
+    const cols = this.colliders;
+    if (cols.length > 0 && maxDist > 0) {
+      let tEntry = 0;
+      let tExit = maxDist;
+      const gridMaxX = this.gridMinX + this.gridSizeX * CELL;
+      const gridMaxZ = this.gridMinZ + this.gridSizeZ * CELL;
+      if (Math.abs(dir.x) < 1e-12) {
+        if (origin.x < this.gridMinX || origin.x > gridMaxX) tEntry = Infinity;
+      } else {
+        let ta = (this.gridMinX - origin.x) / dir.x;
+        let tb = (gridMaxX - origin.x) / dir.x;
+        if (ta > tb) {
+          const sw = ta;
+          ta = tb;
+          tb = sw;
+        }
+        if (ta > tEntry) tEntry = ta;
+        if (tb < tExit) tExit = tb;
       }
-      if (ta > t0) {
-        t0 = ta;
-        axis = 0;
-        sign = dir.x > 0 ? -1 : 1;
+      if (tEntry <= tExit) {
+        if (Math.abs(dir.z) < 1e-12) {
+          if (origin.z < this.gridMinZ || origin.z > gridMaxZ) tEntry = Infinity;
+        } else {
+          let ta = (this.gridMinZ - origin.z) / dir.z;
+          let tb = (gridMaxZ - origin.z) / dir.z;
+          if (ta > tb) {
+            const sw = ta;
+            ta = tb;
+            tb = sw;
+          }
+          if (ta > tEntry) tEntry = ta;
+          if (tb < tExit) tExit = tb;
+        }
       }
-      if (tb < t1) t1 = tb;
-      if (t0 > t1) continue;
-      // Y slab
-      ta = (c.min.y - origin.y) * iy;
-      tb = (c.max.y - origin.y) * iy;
-      if (ta > tb) {
-        const sw = ta;
-        ta = tb;
-        tb = sw;
-      }
-      if (ta > t0) {
-        t0 = ta;
-        axis = 1;
-        sign = dir.y > 0 ? -1 : 1;
-      }
-      if (tb < t1) t1 = tb;
-      if (t0 > t1) continue;
-      // Z slab
-      ta = (c.min.z - origin.z) * iz;
-      tb = (c.max.z - origin.z) * iz;
-      if (ta > tb) {
-        const sw = ta;
-        ta = tb;
-        tb = sw;
-      }
-      if (ta > t0) {
-        t0 = ta;
-        axis = 2;
-        sign = dir.z > 0 ? -1 : 1;
-      }
-      if (tb < t1) t1 = tb;
-      if (t0 > t1 || axis < 0) continue; // axis < 0 ⇒ origin inside the box: ignore
-      if (t0 < best) {
-        best = t0;
-        bestIdx = this.cand[k];
-        bestAxis = axis;
-        bestSign = sign;
+      if (tEntry <= tExit) {
+        const stamp = this.nextStamp();
+        const start = this.cellStart;
+        const items = this.cellItems;
+        const stamps = this.stamps;
+        const sizeX = this.gridSizeX;
+        const sizeZ = this.gridSizeZ;
+        const ix = 1 / (Math.abs(dir.x) > 1e-12 ? dir.x : 1e-12);
+        const iy = 1 / (Math.abs(dir.y) > 1e-12 ? dir.y : 1e-12);
+        const iz = 1 / (Math.abs(dir.z) > 1e-12 ? dir.z : 1e-12);
+        let gx = this.cellX(origin.x + dir.x * tEntry);
+        let gz = this.cellZ(origin.z + dir.z * tEntry);
+        const stepX = dir.x > 1e-12 ? 1 : dir.x < -1e-12 ? -1 : 0;
+        const stepZ = dir.z > 1e-12 ? 1 : dir.z < -1e-12 ? -1 : 0;
+        const tDeltaX = stepX !== 0 ? Math.abs(CELL / dir.x) : Infinity;
+        const tDeltaZ = stepZ !== 0 ? Math.abs(CELL / dir.z) : Infinity;
+        let tMaxX = stepX !== 0 ? (this.gridMinX + (gx + (stepX > 0 ? 1 : 0)) * CELL - origin.x) / dir.x : Infinity;
+        let tMaxZ = stepZ !== 0 ? (this.gridMinZ + (gz + (stepZ > 0 ? 1 : 0)) * CELL - origin.z) / dir.z : Infinity;
+        const maxSteps = sizeX + sizeZ + 2;
+        for (let step = 0; step < maxSteps; step++) {
+          const cellIdx = gz * sizeX + gx;
+          const end = start[cellIdx + 1];
+          for (let k = start[cellIdx]; k < end; k++) {
+            const ci = items[k];
+            if (stamps[ci] === stamp) continue;
+            stamps[ci] = stamp;
+            const c = cols[ci];
+            if (!this.solid(c) || (ignore && ignore.has(c.kind))) continue;
+            let t0 = 0;
+            let t1 = best;
+            let axis = -1;
+            let sign = 0;
+            // X slab
+            let ta = (c.min.x - origin.x) * ix;
+            let tb = (c.max.x - origin.x) * ix;
+            if (ta > tb) {
+              const sw = ta;
+              ta = tb;
+              tb = sw;
+            }
+            if (ta > t0) {
+              t0 = ta;
+              axis = 0;
+              sign = dir.x > 0 ? -1 : 1;
+            }
+            if (tb < t1) t1 = tb;
+            if (t0 > t1) continue;
+            // Y slab
+            ta = (c.min.y - origin.y) * iy;
+            tb = (c.max.y - origin.y) * iy;
+            if (ta > tb) {
+              const sw = ta;
+              ta = tb;
+              tb = sw;
+            }
+            if (ta > t0) {
+              t0 = ta;
+              axis = 1;
+              sign = dir.y > 0 ? -1 : 1;
+            }
+            if (tb < t1) t1 = tb;
+            if (t0 > t1) continue;
+            // Z slab
+            ta = (c.min.z - origin.z) * iz;
+            tb = (c.max.z - origin.z) * iz;
+            if (ta > tb) {
+              const sw = ta;
+              ta = tb;
+              tb = sw;
+            }
+            if (ta > t0) {
+              t0 = ta;
+              axis = 2;
+              sign = dir.z > 0 ? -1 : 1;
+            }
+            if (tb < t1) t1 = tb;
+            if (t0 > t1 || axis < 0) continue; // axis < 0 ⇒ origin inside the box: ignore
+            if (t0 < best || (t0 === best && ci < bestIdx)) {
+              best = t0;
+              bestIdx = ci;
+              bestAxis = axis;
+              bestSign = sign;
+            }
+          }
+          const tCellExit = tMaxX < tMaxZ ? tMaxX : tMaxZ;
+          if (tCellExit >= tExit || (bestIdx >= 0 && best < tCellExit - 1e-5)) break;
+          if (tMaxX < tMaxZ) {
+            gx += stepX;
+            tMaxX += tDeltaX;
+            if (gx < 0 || gx >= sizeX) break;
+          } else {
+            gz += stepZ;
+            tMaxZ += tDeltaZ;
+            if (gz < 0 || gz >= sizeZ) break;
+          }
+        }
       }
     }
     if (bestIdx >= 0) {
@@ -729,7 +893,7 @@ export class PhysicsWorld {
       out.distance = best;
       out.point.copy(dir).multiplyScalar(best).add(origin);
       out.normal.set(bestAxis === 0 ? bestSign : 0, bestAxis === 1 ? bestSign : 0, bestAxis === 2 ? bestSign : 0);
-      out.collider = this.colliders[bestIdx];
+      out.collider = cols[bestIdx];
       out.kind = out.collider.kind;
     }
     // Sloped on-ramp slabs (top y(along), bottom y − thickness): rounds, strand hooks and enemy sight lines
@@ -858,15 +1022,141 @@ export class PhysicsWorld {
     return this.raycast(a, _tmp2, len, out, ignore);
   }
 
-  /** Line of sight between two points (true when unobstructed). */
+  /** Line of sight between two points (true when unobstructed), using DDA early-out on first occluder. */
   lineOfSight(a: THREE.Vector3, b: THREE.Vector3, endTolerance = 0.6): boolean {
     _dir.subVectors(b, a);
     const len = _dir.length();
     if (len < 1e-6) return true;
+    const maxT = len - endTolerance;
+    if (maxT <= 0) return true;
     _dir.divideScalar(len);
-    _tmp2.copy(_dir);
-    this.raycast(a, _tmp2, len, _hit, LOS_IGNORE);
-    return !_hit.hit || _hit.distance >= len - endTolerance;
+    const dx = _dir.x;
+    const dy = _dir.y;
+    const dz = _dir.z;
+    const cols = this.colliders;
+    if (cols.length > 0) {
+      let tEntry = 0;
+      let tExit = maxT;
+      const gridMaxX = this.gridMinX + this.gridSizeX * CELL;
+      const gridMaxZ = this.gridMinZ + this.gridSizeZ * CELL;
+      if (Math.abs(dx) < 1e-12) {
+        if (a.x < this.gridMinX || a.x > gridMaxX) tEntry = Infinity;
+      } else {
+        let ta = (this.gridMinX - a.x) / dx;
+        let tb = (gridMaxX - a.x) / dx;
+        if (ta > tb) {
+          const sw = ta;
+          ta = tb;
+          tb = sw;
+        }
+        if (ta > tEntry) tEntry = ta;
+        if (tb < tExit) tExit = tb;
+      }
+      if (tEntry <= tExit) {
+        if (Math.abs(dz) < 1e-12) {
+          if (a.z < this.gridMinZ || a.z > gridMaxZ) tEntry = Infinity;
+        } else {
+          let ta = (this.gridMinZ - a.z) / dz;
+          let tb = (gridMaxZ - a.z) / dz;
+          if (ta > tb) {
+            const sw = ta;
+            ta = tb;
+            tb = sw;
+          }
+          if (ta > tEntry) tEntry = ta;
+          if (tb < tExit) tExit = tb;
+        }
+      }
+      if (tEntry <= tExit) {
+        const stamp = this.nextStamp();
+        const start = this.cellStart;
+        const items = this.cellItems;
+        const stamps = this.stamps;
+        const sizeX = this.gridSizeX;
+        const sizeZ = this.gridSizeZ;
+        const ix = 1 / (Math.abs(dx) > 1e-12 ? dx : 1e-12);
+        const iy = 1 / (Math.abs(dy) > 1e-12 ? dy : 1e-12);
+        const iz = 1 / (Math.abs(dz) > 1e-12 ? dz : 1e-12);
+        let gx = this.cellX(a.x + dx * tEntry);
+        let gz = this.cellZ(a.z + dz * tEntry);
+        const stepX = dx > 1e-12 ? 1 : dx < -1e-12 ? -1 : 0;
+        const stepZ = dz > 1e-12 ? 1 : dz < -1e-12 ? -1 : 0;
+        const tDeltaX = stepX !== 0 ? Math.abs(CELL / dx) : Infinity;
+        const tDeltaZ = stepZ !== 0 ? Math.abs(CELL / dz) : Infinity;
+        let tMaxX = stepX !== 0 ? (this.gridMinX + (gx + (stepX > 0 ? 1 : 0)) * CELL - a.x) / dx : Infinity;
+        let tMaxZ = stepZ !== 0 ? (this.gridMinZ + (gz + (stepZ > 0 ? 1 : 0)) * CELL - a.z) / dz : Infinity;
+        const maxSteps = sizeX + sizeZ + 2;
+        for (let step = 0; step < maxSteps; step++) {
+          const cellIdx = gz * sizeX + gx;
+          const end = start[cellIdx + 1];
+          for (let k = start[cellIdx]; k < end; k++) {
+            const ci = items[k];
+            if (stamps[ci] === stamp) continue;
+            stamps[ci] = stamp;
+            const c = cols[ci];
+            if (!this.solid(c) || LOS_IGNORE.has(c.kind)) continue;
+            let t0 = 0;
+            let t1 = maxT;
+            let entered = false;
+            let ta = (c.min.x - a.x) * ix;
+            let tb = (c.max.x - a.x) * ix;
+            if (ta > tb) {
+              const sw = ta;
+              ta = tb;
+              tb = sw;
+            }
+            if (ta > t0) {
+              t0 = ta;
+              entered = true;
+            }
+            if (tb < t1) t1 = tb;
+            if (t0 > t1) continue;
+            ta = (c.min.y - a.y) * iy;
+            tb = (c.max.y - a.y) * iy;
+            if (ta > tb) {
+              const sw = ta;
+              ta = tb;
+              tb = sw;
+            }
+            if (ta > t0) {
+              t0 = ta;
+              entered = true;
+            }
+            if (tb < t1) t1 = tb;
+            if (t0 > t1) continue;
+            ta = (c.min.z - a.z) * iz;
+            tb = (c.max.z - a.z) * iz;
+            if (ta > tb) {
+              const sw = ta;
+              ta = tb;
+              tb = sw;
+            }
+            if (ta > t0) {
+              t0 = ta;
+              entered = true;
+            }
+            if (tb < t1) t1 = tb;
+            if (t0 <= t1 && entered && t0 < maxT) return false;
+          }
+          const tCellExit = tMaxX < tMaxZ ? tMaxX : tMaxZ;
+          if (tCellExit >= tExit) break;
+          if (tMaxX < tMaxZ) {
+            gx += stepX;
+            tMaxX += tDeltaX;
+            if (gx < 0 || gx >= sizeX) break;
+          } else {
+            gz += stepZ;
+            tMaxZ += tDeltaZ;
+            if (gz < 0 || gz >= sizeZ) break;
+          }
+        }
+      }
+    }
+    _tmp2.set(dx, dy, dz);
+    for (let i = 0; i < this.ramps.length; i++) {
+      if (this.rayRamp(this.ramps[i], a, _tmp2, maxT, _rampN) >= 0) return false;
+    }
+    return true;
   }
 
   // ===============================================================================================

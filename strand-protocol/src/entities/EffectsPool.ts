@@ -104,18 +104,21 @@ export interface ParticleBurst {
   readonly life: number;
   readonly gravity: number;
   readonly size: number;
+  /** 10A-1: non-essential ambient/minor bursts auto-skip beyond 52 m from the camera. */
+  readonly minor?: boolean;
 }
 
 const TELEGRAPH_VISOR_SHARDS = JUICE.HEADSHOT_VISOR_PARTICLES;
+const MINOR_SKIP_DIST_SQ = RENDER.MINOR_PARTICLE_SKIP_DIST_M * RENDER.MINOR_PARTICLE_SKIP_DIST_M;
 
 export const BURST = {
-  SPARK: { count: 10, color: 0xffc27a, intensity: 2.4, speed: 9, spread: 0.85, life: 0.35, gravity: -14, size: 0.035 },
-  WATER: { count: 14, color: 0x9fdcff, intensity: 1.1, speed: 5.5, spread: 0.45, life: 0.6, gravity: -11, size: 0.05 },
-  LAND_SPLASH: { count: 26, color: 0xb6e6ff, intensity: 1.0, speed: 6.5, spread: 0.7, life: 0.7, gravity: -12, size: 0.06 },
+  SPARK: { count: 10, color: 0xffc27a, intensity: 2.4, speed: 9, spread: 0.85, life: 0.35, gravity: -14, size: 0.035, minor: true },
+  WATER: { count: 14, color: 0x9fdcff, intensity: 1.1, speed: 5.5, spread: 0.45, life: 0.6, gravity: -11, size: 0.05, minor: true },
+  LAND_SPLASH: { count: 26, color: 0xb6e6ff, intensity: 1.0, speed: 6.5, spread: 0.7, life: 0.7, gravity: -12, size: 0.06, minor: true },
   MUZZLE: { count: 6, color: 0x7ffcff, intensity: 2.8, speed: 7, spread: 0.35, life: 0.12, gravity: 0, size: 0.03 },
   HOOK: { count: 12, color: 0xffd26a, intensity: 2.6, speed: 7, spread: 0.9, life: 0.3, gravity: -10, size: 0.04 },
   /** Body hit: fine sparks only (no hitstop). */
-  HIT_SPARK: { count: 6, color: 0xfff0d0, intensity: 3.0, speed: 7, spread: 0.9, life: 0.22, gravity: -12, size: 0.028 },
+  HIT_SPARK: { count: 6, color: 0xfff0d0, intensity: 3.0, speed: 7, spread: 0.9, life: 0.22, gravity: -12, size: 0.028, minor: true },
   /** Head-shot visor shatter: exactly 12 shards (§2.1), tinted with the visor colour. */
   VISOR_SHARD: { count: TELEGRAPH_VISOR_SHARDS, color: 0xff3b5c, intensity: 3.6, speed: 8.5, spread: 1.0, life: 0.6, gravity: -16, size: 0.05 },
   /** Kill: core rupture. */
@@ -130,7 +133,7 @@ export const BURST = {
   GLITCH: { count: 10, color: 0x38f8ff, intensity: 2.2, speed: 2.5, spread: 1.0, life: 0.5, gravity: 1.5, size: 0.05 },
   /** GRAZE: wind-cut streaks along the bullet path. */
   GRAZE: { count: 8, color: 0x7ffcff, intensity: 3.0, speed: 6, spread: 0.3, life: 0.25, gravity: 0, size: 0.025 },
-  MISSILE_TRAIL: { count: 1, color: 0xff6a2a, intensity: 1.6, speed: 1.2, spread: 1.0, life: 0.45, gravity: 1.0, size: 0.09 },
+  MISSILE_TRAIL: { count: 1, color: 0xff6a2a, intensity: 1.6, speed: 1.2, spread: 1.0, life: 0.45, gravity: 1.0, size: 0.09, minor: true },
   /** Phantom dash-slash arc sparks. */
   SLASH: { count: 14, color: 0xd04dff, intensity: 3.6, speed: 9, spread: 0.7, life: 0.3, gravity: -4, size: 0.035 },
 } as const satisfies Record<string, ParticleBurst>;
@@ -218,6 +221,7 @@ export class EffectsPool {
   private readonly sSize = new Float32Array(S_CAP);
   private readonly sColor = new Float32Array(S_CAP * 3);
   private sNext = 0;
+  private hasCamPos = false;
   private readonly rng = createRng(0x5a4c);
 
   // ---- 7B-7 rain micro-splashes (ground-probed respawns, shader-animated) ----
@@ -1205,6 +1209,7 @@ export class EffectsPool {
       n++;
     }
     this.tracers.count = n;
+    this.tracers.visible = n > 0;
     this.tracers.instanceMatrix.needsUpdate = true;
     if (this.tracers.instanceColor) this.tracers.instanceColor.needsUpdate = true;
   }
@@ -1214,6 +1219,14 @@ export class EffectsPool {
   // =============================================================================================
   /** Emits a burst around `normal` (unit) at `point`. */
   burst(point: THREE.Vector3, normal: THREE.Vector3, b: ParticleBurst, colorOverride = -1): void {
+    // 10A-1: auto-skip non-essential minor sparks/splashes beyond 52 m from the camera.
+    if (b.minor && this.hasCamPos) {
+      const cam = this.rainUniforms.uCamPos.value;
+      const dx = point.x - cam.x;
+      const dy = point.y - cam.y;
+      const dz = point.z - cam.z;
+      if (dx * dx + dy * dy + dz * dz > MINOR_SKIP_DIST_SQ) return;
+    }
     _c.setHex(colorOverride >= 0 ? colorOverride : b.color);
     for (let k = 0; k < b.count; k++) {
       const i = this.sNext;
@@ -1273,6 +1286,7 @@ export class EffectsPool {
       n++;
     }
     this.sparks.count = n;
+    this.sparks.visible = n > 0;
     this.sparks.instanceMatrix.needsUpdate = true;
     if (this.sparks.instanceColor) this.sparks.instanceColor.needsUpdate = true;
   }
@@ -1288,6 +1302,9 @@ export class EffectsPool {
    * @param cameraVel current camera world velocity (m/s, simulation space)
    */
   update(simDt: number, realDt: number, cameraPos: THREE.Vector3, cameraVel: THREE.Vector3, realTime = 0, viewportH = 1080): void {
+    const u = this.rainUniforms;
+    u.uCamPos.value.copy(cameraPos);
+    this.hasCamPos = true;
     this.vfxTime.value += simDt;
     if (simDt > 0) this.updateSplashes(cameraPos);
     this.syncTracers(realDt);
@@ -1298,9 +1315,7 @@ export class EffectsPool {
     this.rainTime += simDt;
     // Keep float precision in the shader: rebase the rain clock once per hour (one imperceptible reshuffle).
     if (this.rainTime > 3600) this.rainTime -= 3600;
-    const u = this.rainUniforms;
     u.uRainTime.value = this.rainTime;
-    u.uCamPos.value.copy(cameraPos);
     _relVel.copy(u.uFall.value).sub(cameraVel);
     u.uRelVel.value.copy(_relVel);
   }

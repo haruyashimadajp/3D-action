@@ -39,6 +39,7 @@ import { BULLET_TIME, FLOW_RANKS, INPUT, JUICE, PLAYER, SAVE_KEY, TELEGRAPH, cla
 import {
   ENERGY_COLORS,
   MODIFIERS,
+  SCREEN_FILTERS,
   SKILL_MAX_LEVEL,
   defaultSave,
   sanitizeSave,
@@ -284,6 +285,8 @@ export class HudManager {
   private readonly btLen: number;
   private readonly swLen: number;
   private readonly last = new Map<string, string | number | boolean>();
+  private readonly perfEl = el('perf-overlay');
+  private perfVisible = false;
 
   constructor() {
     this.reticles = {
@@ -593,6 +596,19 @@ export class HudManager {
       s.quality = v === 'LOW' ? 'LOW' : v === 'MEDIUM' ? 'MEDIUM' : 'HIGH';
       onChange('quality');
     });
+    seg('set-filter', s.filter, (v) => {
+      const hit = SCREEN_FILTERS.find((f) => f.id === v);
+      s.filter = hit ? hit.id : 'CYBER_NOIR';
+      onChange('filter');
+    });
+    seg('set-shadows', s.shadows ? '1' : '0', (v) => {
+      s.shadows = v === '1';
+      onChange('shadows');
+    });
+    seg('set-perf', s.showPerf ? '1' : '0', (v) => {
+      s.showPerf = v === '1';
+      onChange('showPerf');
+    });
     const fov = el('set-fov') as unknown as HTMLInputElement;
     const fovVal = el('set-fov-val');
     fov.value = String(s.fov);
@@ -611,6 +627,20 @@ export class HudManager {
       volVal.textContent = String(Math.round(s.volume * 100));
       onChange('volume');
     });
+  }
+
+  /** 10A-1 compact top-right performance telemetry overlay (`FPS | frame ms | draw calls`). */
+  setPerfVisible(on: boolean): void {
+    this.perfVisible = on;
+    this.perfEl.hidden = !on;
+  }
+
+  updatePerf(fps: number, frameMs: number, calls: number): void {
+    if (!this.perfVisible) return;
+    const f = Math.round(fps);
+    const ms = frameMs.toFixed(1);
+    const text = `${f} FPS | ${ms} ms | ${calls} calls`;
+    if (this.changed('perfTxt', text)) this.perfEl.textContent = text;
   }
 
   // =============================================================================================

@@ -389,11 +389,11 @@ export interface PbrToken {
   readonly emissiveMax?: number;
 }
 export const MATERIALS = {
-  /** Wet road & rooftop asphalt: roughness map 0.06 (puddle) … 0.42 (wet). */
-  ROOF_WET: { roughness: 0.06, roughnessMax: 0.42, metalness: 0.25, emissive: 0.0 },
+  /** Wet road & rooftop asphalt: roughness map 0.13 (puddle) … 0.44 (damp concrete/asphalt). */
+  ROOF_WET: { roughness: 0.13, roughnessMax: 0.44, metalness: 0.25, emissive: 0.0 },
   CANAL_WATER: { roughness: 0.04, metalness: 0.85, emissive: 0.0 },
-  /** Elevated highway / bridge concrete; underside industrial light strips at emissive 1.6. */
-  HIGHWAY_CONCRETE: { roughness: 0.48, metalness: 0.3, emissive: 1.6 },
+  /** Elevated highway / bridge concrete; underside industrial light strips toned to ~0.85. */
+  HIGHWAY_CONCRETE: { roughness: 0.48, metalness: 0.3, emissive: 0.85 },
   /** Parked cyber-car body; LED bands 2.2 … 2.8. */
   CAR_BODY: { roughness: 0.22, metalness: 0.78, emissive: 2.2, emissiveMax: 2.8 },
   BUILDING_GLASS: { roughness: 0.15, metalness: 0.85, emissive: 0.45 },
@@ -412,11 +412,11 @@ export const MATERIALS = {
 
 /** Max linear luminance of background architecture (keeps it below the HDR bloom threshold). */
 export const BACKGROUND_MAX_LUMINANCE = 0.28;
-/** Puddle mirror roughness and wet-surface roughness (§6.2-2). */
-export const ROOF_PUDDLE_ROUGHNESS = 0.06;
-export const ROOF_WET_ROUGHNESS = 0.42;
-/** 7B-1: rain-soaked asphalt (below the 0.40 streak threshold, puddles far lower). */
-export const ROAD_WET_ROUGHNESS = 0.22;
+/** 10A-2: Puddle mirror roughness (0.13) and damp concrete/asphalt roughness (0.36–0.48). */
+export const ROOF_PUDDLE_ROUGHNESS = 0.13;
+export const ROOF_WET_ROUGHNESS = 0.44;
+/** 10A-2: Damp asphalt base roughness (modulated 0.36–0.48 with grain; puddles down to 0.13). */
+export const ROAD_WET_ROUGHNESS = 0.40;
 
 // ---------------------------------------------------------------------------
 // §6.2 Rendering pipeline
@@ -424,9 +424,9 @@ export const ROAD_WET_ROUGHNESS = 0.22;
 export const RENDER = {
   /** 7A-4: 1.15 → 1.28 (no crushed blacks; neon contrast kept). */
   TONE_MAPPING_EXPOSURE: 1.28,
-  MSAA_SAMPLES: 4,
-  /** 7A-2 LOW LATENCY composer MSAA. */
-  MSAA_SAMPLES_LOW_LATENCY: 2,
+  /** 10A-1: 2× MSAA on HIGH, 0× on MEDIUM / LOW or when lowLatency is enabled. */
+  MSAA_SAMPLES: 2,
+  MSAA_SAMPLES_LOW_LATENCY: 0,
   ENV_CUBE_SIZE: 256,
   /** v1.1: FogExp2(0x0D1628, 0.0036) — the cloud-deck mesh is abolished. */
   FOG_DENSITY: 0.0036,
@@ -440,16 +440,22 @@ export const RENDER = {
   BT_SATURATION: 0.55,
   SPEEDLINE_MIN_SPEED: 18,
   SPEEDLINE_INNER_RADIUS: 0.62,
-  DPR_CAP: 1.5,
+  /** 10A-1: HIGH DPR cap (1.25) and total pixel budget (≤ 2.2M px). */
+  DPR_CAP: 1.25,
+  MAX_RENDER_PIXELS: 2_200_000,
+  /** 10A-1: optional lightweight player-centered shadow map. */
+  SHADOW_MAP_SIZE: 1024,
+  SHADOW_FRUSTUM_HALF: 36,
+  /** 10A-1: skip non-essential minor sparks/splashes beyond this distance from camera. */
+  MINOR_PARTICLE_SKIP_DIST_M: 52,
   ROOF_TEX_SIZE: 512,
   ROAD_TEX_SIZE: 512,
   ROOF_TILE_M: 14,
-  /** City-light reflections (street lamps / bridge neon / highway strips) evaluated in ground, road & water shaders. */
-  /** 7B-1: nearest 20 of all registered lights (lamps, neon signs, car head / tail lights, vending fronts). */
-  CITY_LIGHTS_MAX: 20,
-  /** 7B-1 anisotropic wet streaks: horizontal surfaces (n.y > 0.75) with roughness < 0.40. */
+  /** 10A-1: nearest 12 of all registered city lights (with squared-dist early-out). */
+  CITY_LIGHTS_MAX: 12,
+  /** 7B-1 / 10A-2 anisotropic wet streaks: horizontal surfaces (n.y > 0.75) with roughness < 0.40. */
   STREAK_MAX_ROUGHNESS: 0.4,
-  STREAK_GAIN: 1.0,
+  STREAK_GAIN: 0.72,
   CITY_LIGHT_RANGE_M: 20,
   /**
    * 7B-2 height fog: a blue-violet / teal street haze (#101E38) thickening exponentially toward Y ≤ 26 m, gone
@@ -476,7 +482,7 @@ export interface QualityDef {
   readonly litePostFx: boolean;
 }
 export const QUALITY_PRESETS: Readonly<Record<QualityPreset, QualityDef>> = {
-  HIGH: { dpr: 1.5, bloom: true, litePostFx: false },
+  HIGH: { dpr: 1.25, bloom: true, litePostFx: false },
   MEDIUM: { dpr: 1.0, bloom: true, litePostFx: false },
   LOW: { dpr: 1.0, bloom: false, litePostFx: true },
 };
@@ -487,14 +493,14 @@ export const QUALITY_PRESETS: Readonly<Record<QualityPreset, QualityDef>> = {
 // ---------------------------------------------------------------------------
 // Phase 5B — art pass (PHASE5_BRUSHUP_PLAN.md 5B-1 … 5B-5). Draw calls stay ≤ 120.
 // ---------------------------------------------------------------------------
-/** 5B-1: point / line accents above the 0.92 bloom threshold (window walls stay ≤ 0.28). */
+/** 5B-1 / 10A-2: point / line accents above the 0.92 bloom threshold (window walls stay ≤ 0.28). */
 export const NEON_BLOOM = {
   SIGN: 1.38,
   LAMP_HEAD: 1.45,
   LAMP_RING: 1.3,
   HOVER_TRAIL: 1.55,
   AVIATION_PEAK: 1.6,
-  UNDERSIDE_STRIP: 1.6,
+  UNDERSIDE_STRIP: 0.85,
   /** Soft additive halo around every lamp head: radius 2.2 m, alpha 0.28 · exp(−r² · 3.5). */
   LAMP_HALO_RADIUS_M: 2.2,
   LAMP_HALO_FALLOFF: 3.5,
@@ -663,10 +669,10 @@ export const CITY_FX = {
   SKY_GLOW_AMBER: 0x5a3614,
   LIGHTNING_PERIOD_S: 22,
   LIGHTNING_JITTER_S: 2,
-  /** 7B-5 two advertising blimps cruising the far sky. */
+  /** 7B-5 / 10A-2 two advertising blimps cruising well above the far skyline (zero clipping). */
   BLIMPS: [
-    { radius: 262, y: 138, speed: 5.2, phase: 0.4 },
-    { radius: 322, y: 158, speed: -4.4, phase: 3.3 },
+    { radius: 265, y: 168, speed: 5.2, phase: 0.4 },
+    { radius: 335, y: 194, speed: -4.4, phase: 3.3 },
   ] as ReadonlyArray<{ radius: number; y: number; speed: number; phase: number }>,
   BLIMP_LENGTH: 112,
   BLIMP_RADIUS: 16,

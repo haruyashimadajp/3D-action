@@ -929,15 +929,16 @@ function generateRoofSet(anisotropy: number): PbrTextureSet {
   rgh.putImageData(rghData, 0, 0);
   hgt.putImageData(hgtData, 0, 0);
 
-  // Slab expansion joints (tile-aligned so seams stay continuous).
+  // 10A-2: Subtle weathered slab hairlines (no harsh dark X-seam trenches across narrow alley tiles).
   const joints = 2;
   for (let j = 0; j <= joints; j++) {
     const pos = (j / joints) * S;
-    for (const ctx of [alb, hgt]) {
-      ctx.fillStyle = ctx === alb ? 'rgba(4,6,10,0.85)' : grayCss(0.15);
-      ctx.fillRect(pos - 1.5, 0, 3, S);
-      ctx.fillRect(0, pos - 1.5, S, 3);
-    }
+    alb.fillStyle = 'rgba(8,10,14,0.14)';
+    alb.fillRect(pos - 0.5, 0, 1, S);
+    alb.fillRect(0, pos - 0.5, S, 1);
+    hgt.fillStyle = grayCss(0.46);
+    hgt.fillRect(pos - 0.5, 0, 1, S);
+    hgt.fillRect(0, pos - 0.5, S, 1);
   }
 
   // Cracks: wrapped random walks (drawn at 9 offsets so they tile seamlessly).
@@ -959,23 +960,23 @@ function generateRoofSet(anisotropy: number): PbrTextureSet {
           ctx.moveTo(pts[0] + ox * S, pts[1] + oy * S);
           for (let k = 2; k < pts.length; k += 2) ctx.lineTo(pts[k] + ox * S, pts[k + 1] + oy * S);
           if (ctx === alb) {
-            ctx.strokeStyle = 'rgba(2,3,6,0.9)';
-            ctx.lineWidth = 1.4;
+            ctx.strokeStyle = 'rgba(4,6,10,0.42)';
+            ctx.lineWidth = 1.0;
           } else if (ctx === hgt) {
-            ctx.strokeStyle = grayCss(0.08);
-            ctx.lineWidth = 1.8;
-          } else {
-            ctx.strokeStyle = grayCss(0.55);
+            ctx.strokeStyle = grayCss(0.32);
             ctx.lineWidth = 1.2;
+          } else {
+            ctx.strokeStyle = grayCss(0.54);
+            ctx.lineWidth = 1.0;
           }
           ctx.stroke();
         }
       }
     }
   };
-  for (let c = 0; c < 22; c++) drawCrack(rng() * S, rng() * S, 14 + Math.floor(rng() * 30), rng() * Math.PI * 2);
+  for (let c = 0; c < 18; c++) drawCrack(rng() * S, rng() * S, 14 + Math.floor(rng() * 30), rng() * Math.PI * 2);
 
-  // Re-flatten puddles over cracks (water fills them): restore puddle roughness & flat height.
+  // Re-flatten puddles over cracks (water fills them): restore puddle roughness (0.13) & flat height.
   const rghAfter = rgh.getImageData(0, 0, S, S);
   const hgtAfter = hgt.getImageData(0, 0, S, S);
   for (let i = 0; i < S * S; i++) {
@@ -996,7 +997,7 @@ function generateRoofSet(anisotropy: number): PbrTextureSet {
   return {
     map: finalizeTexture(albC, THREE.SRGBColorSpace, anisotropy),
     roughnessMap: finalizeTexture(rghC, THREE.NoColorSpace, anisotropy),
-    normalMap: normalTextureFromHeight(hgt, S, S, 1.1, anisotropy),
+    normalMap: normalTextureFromHeight(hgt, S, S, 0.65, anisotropy),
   };
 }
 
@@ -1079,10 +1080,12 @@ function generateRoadAtlas(anisotropy: number): PbrTextureSet {
         albD.data[i + 1] = linearToSrgbByte(gg);
         albD.data[i + 2] = linearToSrgbByte(bb);
         albD.data[i + 3] = 255;
-        const rv = Math.round(ROAD_WET_ROUGHNESS * 255);
+        // 10A-2: Damp asphalt varies naturally in 0.36–0.48; puddles drop smoothly to 0.13 below.
+        const dampRough = clamp(ROAD_WET_ROUGHNESS + (g - 0.5) * 0.14 + (speck - 0.5) * 0.04, 0.36, 0.48);
+        const rv = Math.round(dampRough * 255);
         rghD.data[i] = rghD.data[i + 1] = rghD.data[i + 2] = rv;
         rghD.data[i + 3] = 255;
-        const hv = Math.round(clamp(0.55 + (g - 0.5) * 0.3 + (speck - 0.5) * 0.15, 0, 1) * 255);
+        const hv = Math.round(clamp(0.55 + (g - 0.5) * 0.22 + (speck - 0.5) * 0.1, 0, 1) * 255);
         hgtD.data[i] = hgtD.data[i + 1] = hgtD.data[i + 2] = hv;
         hgtD.data[i + 3] = 255;
       }
@@ -1092,15 +1095,15 @@ function generateRoadAtlas(anisotropy: number): PbrTextureSet {
   rgh.putImageData(rghD, 0, 0);
   hgt.putImageData(hgtD, 0, 0);
 
-  // --- Paint helpers (wet road paint: dull, slightly raised, roughness 0.3) ---
+  // --- Paint helpers (wet road paint: dull, slightly raised, roughness 0.36) ---
   const WHITE = '#bfc5cc';
   const AMBER = '#c79a3c';
   const paint = (x: number, y: number, w: number, h: number, color: string): void => {
     alb.fillStyle = color;
     alb.fillRect(x, y, w, h);
-    rgh.fillStyle = grayCss(0.3);
+    rgh.fillStyle = grayCss(0.36);
     rgh.fillRect(x, y, w, h);
-    hgt.fillStyle = grayCss(0.72);
+    hgt.fillStyle = grayCss(0.64);
     hgt.fillRect(x, y, w, h);
   };
   const manhole = (cx: number, cy: number, rad: number): void => {
@@ -1108,7 +1111,7 @@ function generateRoadAtlas(anisotropy: number): PbrTextureSet {
     alb.beginPath();
     alb.arc(cx, cy, rad, 0, Math.PI * 2);
     alb.fill();
-    rgh.fillStyle = grayCss(0.28);
+    rgh.fillStyle = grayCss(0.32);
     rgh.beginPath();
     rgh.arc(cx, cy, rad, 0, Math.PI * 2);
     rgh.fill();
@@ -1116,7 +1119,7 @@ function generateRoadAtlas(anisotropy: number): PbrTextureSet {
     hgt.beginPath();
     hgt.arc(cx, cy, rad, 0, Math.PI * 2);
     hgt.fill();
-    hgt.strokeStyle = grayCss(0.2);
+    hgt.strokeStyle = grayCss(0.28);
     hgt.lineWidth = 2;
     for (let r = rad * 0.3; r < rad; r += rad * 0.22) {
       hgt.beginPath();
@@ -1129,7 +1132,7 @@ function generateRoadAtlas(anisotropy: number): PbrTextureSet {
     hgt.moveTo(cx, cy - rad);
     hgt.lineTo(cx, cy + rad);
     hgt.stroke();
-    hgt.strokeStyle = grayCss(0.85);
+    hgt.strokeStyle = grayCss(0.74);
     hgt.lineWidth = 2;
     hgt.beginPath();
     hgt.arc(cx, cy, rad, 0, Math.PI * 2);
@@ -1184,15 +1187,15 @@ function generateRoadAtlas(anisotropy: number): PbrTextureSet {
       const ph = 14 + rng() * 60;
       const xx = x0 + rng() * (w - pw);
       const yy = y0 + rng() * (h - ph);
-      alb.fillStyle = 'rgba(8,10,14,0.35)';
+      alb.fillStyle = 'rgba(8,10,14,0.22)';
       alb.fillRect(xx, yy, pw, ph);
-      hgt.strokeStyle = grayCss(0.35);
-      hgt.lineWidth = 2;
+      hgt.strokeStyle = grayCss(0.47);
+      hgt.lineWidth = 1;
       hgt.strokeRect(xx, yy, pw, ph);
     }
     for (let k = 0; k < 8; k++) {
       const g = alb.createRadialGradient(0, 0, 0, 0, 0, 1);
-      g.addColorStop(0, 'rgba(10,8,18,0.55)');
+      g.addColorStop(0, 'rgba(10,8,18,0.45)');
       g.addColorStop(1, 'rgba(10,8,18,0)');
       alb.save();
       alb.translate(x0 + 8 + rng() * (w - 16), y0 + 8 + rng() * (h - 16));
@@ -1206,7 +1209,7 @@ function generateRoadAtlas(anisotropy: number): PbrTextureSet {
     manhole(x0 + w * 0.5, y0 + h * 0.3, 0.55 * (w / 6));
   }
 
-  // --- Water over paint: re-apply puddles (darker albedo, mirror roughness, flat height) ---
+  // --- Water over paint: re-apply puddles (darker albedo, 0.13 wet-puddle roughness, flat height) ---
   const a2 = alb.getImageData(0, 0, S, S);
   const r2 = rgh.getImageData(0, 0, S, S);
   const h2 = hgt.getImageData(0, 0, S, S);
@@ -1228,7 +1231,7 @@ function generateRoadAtlas(anisotropy: number): PbrTextureSet {
 
   const map = finalizeTexture(albC, THREE.SRGBColorSpace, anisotropy);
   const roughnessMap = finalizeTexture(rghC, THREE.NoColorSpace, anisotropy);
-  const normalMap = normalTextureFromHeight(hgt, S, S, 1.2, anisotropy);
+  const normalMap = normalTextureFromHeight(hgt, S, S, 0.65, anisotropy);
   return { map, roughnessMap, normalMap };
 }
 
