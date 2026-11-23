@@ -3,7 +3,9 @@
 **Target Implementer**: Claude (TypeScript / Three.js / WebGL2 / Web Audio API)  
 **Target Codebase**: `strand-protocol/` (on top of Phase 9B `7fdf96c`)  
 **Master Spec Alignment**: `GAME_DESIGN_SPEC.md` v1.7  
-**Execution Strategy (Token-Safe 4-Step Split)**: Execute strictly one sub-phase at a time (**10A → 10B → 10C → 10D**), passing `npm run build` and `npm test` after each sub-phase before proceeding to the next.
+**Execution Strategy (Token-Optimal 5-Step Split)**: Execute strictly one bounded step at a time (**10A-1 → 10A-2 → 10B → 10C → 10D**), touching only 3–5 files per step and passing `npm run build` + `npm test` (plus headless visual screenshot check if available) before proceeding.
+- **10A-1**: `10A-1`, `10A-2`, `10A-4` (GPU/CPU pipeline optimization, `PhysicsWorld` spatial grid, early kit consolidation, all visual/geometry bug fixes, 5 live-preview screen filters).
+- **10A-2**: `10A-3`, `10A-3b`, `10A-5`, `10A-6` (muzzle flash, cooling scorch decals, sniper steam/casings/rangefinder, realistic walk bob & recoil kick, fixed `ALERT` investigation AI + enemy flashlight cones, circular pulse mini-radar).
 
 > [!IMPORTANT]
 > **Hard Non-Negotiable Constraints (Zero Regression Across All 4 Sub-Phases)**
