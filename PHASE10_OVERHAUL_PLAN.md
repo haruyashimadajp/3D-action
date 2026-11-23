@@ -146,8 +146,9 @@ Replace the robotic rail-flat walk camera and generic uniform `28 Hz` gunshot bu
    - Cell 5: `KIROSHI // OPTICS` (teal/cyan reticle emblem + sharp subhead `SEE THE FUTURE`)
    - Cell 6: `SYNTH NOODLES // 24H` (warm amber-orange neon ramen bowl emblem)
    - Cell 7: `SOFTSYS // CORE` (deep electric-blue isometric server wireframe + telemetry)
-2. **`MegaBillboards` `InstancedMesh` (`cap: 140`, `+1` draw call)**:
+2. **`MegaBillboards` `InstancedMesh` (`cap: 140`, `+1` draw call) & Global Sign 3D Non-Overlap Guard**:
    - Strictly bound to solid `FaceSpan`s (`10A-2b` rule — zero floating billboards!).
+   - **MANDATORY 3D AABB Non-Overlap Guard (Fixes Overlapping Neon Blade Signs Confirmed in Sector 1!)**: Inside BOTH `addNeon()` and `addMegaBillboard()`, compute each sign's exact world 3D AABB (`margin = 0.35 m` padding around width/height/thickness) and **reject/skip** any candidate sign whose 3D AABB intersects ANY previously placed `neonSign` or `MegaBillboard`! Add a **unit test** asserting **zero overlapping neon signs or Mega-Billboards** across all 5 sectors.
    - Subtle LCD scanlines, animated scroll shimmer on data panels, controlled HDR (`1.15–1.55`), and steel mounting trusses (`G.steel`).
    - **3 Formats**: Giant avenue wall screens (`10–20 m × 10–34 m`), **synchronized 90° L-corner wrap-around screens** (2–4 stacked tiers wrapping prominent street corners!), and **towering vertical neon monolith blades** (`3.2–4.5 m × 18–38 m`).
 3. **Colored Neon Rain-Mist Halos Around Mega-Billboards (`+0` Extra Calls — Packed Directly Into `lampHalos`!)**:
