@@ -88,6 +88,7 @@ Define `SECTOR_WEATHER` profiles across Sectors 1–5 (zero extra draw calls!):
 * **Wind-Slanted Rain Streaks (`EffectsPool.ts`)**: Pass `windX` into the existing `1800`-streak rain `InstancedMesh` so Sector 3 & Sector 5 rain visibly lashes diagonally across neon streetlights!
 
 ### 12B-3. Enemy Visual Overhaul: Visible Armor Stripping, Exposed Sparking Cyber-Skeleton & Wet-Asphalt Ragdoll Slide (`src/entities/EnemyManager.ts`, `src/entities/EffectsPool.ts`)
+*(Follow **`HERO_3D_MODELING_SPEC.md`** §5.3 for exact inner titanium ribcage, glowing reactor core, clavicle conduits, and detachable chest/shoulder armor plates.)*
 1. **Damage-Driven Armor Stripping & Glowing Endo-Skeleton Core (`+0` Extra Draw Calls!)**:
    - Inside the existing articulated humanoid rig (`ENFORCER`, `AEGIS`, `VEIL`, `PHANTOM`), tag left/right shoulder pauldrons & outer chest plate as strippable armor parts over a **pre-built recessed inner cyber-endo core** (dark ribbed titanium spine/ribs + exposed flickering orange/cyan power conduit tubes).
    - When an enemy drops below `60%` HP (or suffers an Aegis shield shatter / heavy non-lethal hit), detach `1–2` armor plates (hide on rig + launch matching dark armored plates into the existing `DestructDebris` pool!) and emit periodic tiny electrical micro-sparks from the exposed chest/shoulder conduits (`EffectsPool`, zero extra calls)!

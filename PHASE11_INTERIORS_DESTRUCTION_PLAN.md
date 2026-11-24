@@ -52,6 +52,9 @@ Break the "flat slab / convex-only box" look across ALL buildings (strictly keep
    - Deepen non-run 1F structural piers to `0.52 m`, deepen recessed entry vestibules to `0.85–1.20 m`, and add visible **angled diagonal steel tension tie-rods** anchoring storefront canopies back into upper facade columns (`G.steel`, `+0` draw calls!).
 
 ### 11A-1c. High-Craft Close-Up Interior Micro-Props Kit (`InteriorPropsKit` `InstancedMesh`, `cap: 260`, `+1` Draw Call, `64 m` Vertex Cull)
+> [!IMPORTANT]
+> **Mandatory Blueprint Reference**: Follow **`HERO_3D_MODELING_SPEC.md`** (§4 for all 8 `InteriorPropsKit` variants, §5.1–§5.2 for the first-person cyber-boot kick rig & stamped interactive door panel, and §6 for ground-contact & triangle-budget unit tests).
+
 Every enterable interior MUST feel densely populated and modeled with fine close-up craft (all multi-part beveled/sculpted geometry with weathered surface detail, vertex `aAo`, and `injectCityLights`; packed via `aVariant 0..7` into ONE `InstancedMesh`):
 * **v0 — Eatery Counter Place-Setting Cluster**: Steaming ceramic ramen bowl with protruding chopsticks, stacked spare bowls, translucent soy/chili condiment bottles, brushed-steel napkin dispenser & tiny glowing tabletop menu stand.
 * **v1 — Kitchen Back-Counter Appliances**: Stainless-steel noodle boiler & fryer vat with wire strainer baskets, overhead hanging ladle rack, stacked metal prep trays & glowing digital temperature display.
