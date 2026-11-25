@@ -305,6 +305,8 @@
          any shot / hit / lock / speed ≥ 18 m/s / ADS snaps them back to 100 % in 120 ms. */
       #hp, #spd, #dock, #flow, #buffs, #sector-hud, #radar-canvas { transition: opacity 0.12s linear; }
       #hud.calm #hp, #hud.calm #spd, #hud.calm #dock, #hud.calm #flow, #hud.calm #buffs, #hud.calm #sector-hud, #hud.calm #radar-canvas { opacity: 0.55; transition: opacity 0.9s ease-in-out; }
+      /* 10B-2: outside PLAYING the radar is frozen (no sweep / redraw / ping) and dims behind the overlays. */
+      #hud.radar-frozen #radar-canvas { opacity: 0.22; filter: grayscale(0.85); transition: opacity 0.12s linear; }
       .visor { position: absolute; top: 32vh; height: 36vh; width: 8px; opacity: 0.14; pointer-events: none;
         background: repeating-linear-gradient(to bottom, #00f0ff 0 1px, transparent 1px 10px); }
       .visor::after { content: ''; position: absolute; top: 0; bottom: 0; width: 4px;

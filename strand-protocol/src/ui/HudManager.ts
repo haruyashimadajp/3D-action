@@ -251,6 +251,11 @@ export class PulseRadar {
   sweepClock = 0;
   /** Current expanding pulse ring radius in metres (0..75 m during the 0.65 s sweep, −1 between sweeps). */
   sweepRadiusM = 0;
+  /**
+   * 10B-2: true whenever the app is not `PLAYING` (PAUSED / TITLE / SKILL / RESULT / TRANSITION). While frozen,
+   * `step()` is a no-op: the sweep clock, pulse radius, blip ages / alphas and snapshots hold, and no ping fires.
+   */
+  frozen = false;
   private initialized = false;
 
   reset(): void {
@@ -279,6 +284,7 @@ export class PulseRadar {
     targetCount: number,
   ): boolean {
     void playerY;
+    if (this.frozen) return false;
     this.aliveMask.fill(0);
     for (let i = 0; i < targetCount; i++) {
       const id = targets[i].id;
@@ -967,6 +973,21 @@ export class HudManager {
     this.root.classList.toggle('visible', on);
   }
 
+  /**
+   * 10B-2: freezes the mini-radar outside `PLAYING` — `radar.step()` stops advancing, the canvas is no longer
+   * redrawn (it keeps the last live frame) and it dims to 22 % grey behind the pause / modal overlays.
+   */
+  setRadarFrozen(on: boolean): void {
+    this.radar.frozen = on;
+    this.root.classList.toggle('radar-frozen', on);
+  }
+
+  /** Clears the radar state and canvas (new sector / retry) so no stale blips linger behind a frozen overlay. */
+  resetRadar(): void {
+    this.radar.reset();
+    this.radarCtx?.clearRect(0, 0, RADAR.SIZE_PX, RADAR.SIZE_PX);
+  }
+
   private changed(key: string, v: string | number | boolean): boolean {
     if (this.last.get(key) === v) return false;
     this.last.set(key, v);
@@ -1213,7 +1234,7 @@ export class HudManager {
    */
   private drawRadar(f: HudFrame): void {
     const ctx = this.radarCtx;
-    if (!ctx) return;
+    if (!ctx || this.radar.frozen) return;
     const size = RADAR.SIZE_PX;
     const cx = size * 0.5;
     const cy = size * 0.5;

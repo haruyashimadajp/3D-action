@@ -54,6 +54,8 @@ import {
   assignPrograms,
   baySocket,
   doorClearZone,
+  DOOR_PIER_GAP_M,
+  DOOR_SURROUND_M,
   doorSockets,
   galleryDoorFit,
   groundDoorFit,
@@ -184,6 +186,38 @@ export interface DoorZone extends RectXZ {
   readonly y: number;
 }
 
+/**
+ * 10B-2 audit record of one 1F street doorway, in its face frame (along `a`, wall plane `plane`, outward `sg`).
+ * `e0 … e1` is the full built assembly (jambs + portal pillars / canopy / access panel); `top` its highest point.
+ */
+export interface GroundDoorRecord {
+  readonly building: number;
+  readonly ax: Axis;
+  readonly sg: number;
+  readonly plane: number;
+  readonly program: GroundProgram;
+  readonly a: number;
+  readonly w: number;
+  readonly h: number;
+  readonly e0: number;
+  readonly e1: number;
+  readonly top: number;
+  /** Host solid FaceSpan and the 4 m-grammar bay (between pier faces) the door sits in. */
+  readonly span: { readonly a0: number; readonly a1: number; readonly y0: number; readonly y1: number };
+  readonly bay: { readonly a0: number; readonly a1: number };
+}
+
+/** 10B-2 audit record of one 1F stone pier (along extent on its face plane). */
+export interface GroundPierRecord {
+  readonly building: number;
+  readonly ax: Axis;
+  readonly sg: number;
+  readonly plane: number;
+  readonly a0: number;
+  readonly a1: number;
+  readonly top: number;
+}
+
 export interface GateInfo {
   /** Centre of the gate opening at street level. */
   readonly position: THREE.Vector3;
@@ -274,6 +308,9 @@ export interface SectorLayout {
   readonly megaBillboards: readonly MegaBillboardRecord[];
   /** 10B-1 the open pocket(s) built as a covered cyber street-market (≤ 1 per district). */
   readonly marketRects: readonly RectXZ[];
+  /** 10B-2 audit: every 1F street doorway assembly and every 1F pier (face frame). */
+  readonly groundDoors: readonly GroundDoorRecord[];
+  readonly groundPiers: readonly GroundPierRecord[];
   readonly stats: {
     readonly towers: number;
     readonly cars: number;
@@ -5254,6 +5291,13 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
     /** 9A: fire-escape landing gaps in the roof parapet, and along ranges kept free of 1F doors per face. */
     const escapeGaps: Array<{ building: number; ax: Axis; sg: number; plane: number; a0: number; a1: number }> = [];
     const blockedRanges = new Map<string, Array<[number, number]>>();
+    /** 10B-2: along ranges with a ground-standing obstacle in front of the wall (gallery columns): no 1F doorway. */
+    const noDoorRanges = new Map<string, Array<[number, number]>>();
+    const noDoorRange = (key: string, a0: number, a1: number): void => {
+      const l = noDoorRanges.get(key) ?? [];
+      l.push([a0, a1]);
+      noDoorRanges.set(key, l);
+    };
     const blockRange = (key: string, a0: number, a1: number): void => {
       const l = blockedRanges.get(key) ?? [];
       l.push([Math.min(a0, a1), Math.max(a0, a1)]);
@@ -5443,6 +5487,8 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
     const eateryVents: THREE.Vector3[] = [];
     const programCounts: Record<GroundProgram, number> = { CYBER_EATERY: 0, TECH_APPAREL: 0, CAPSULE_HOTEL: 0, CYBER_APARTMENT: 0, ALLEY_INFRA: 0 };
     const doorSizes: Array<[number, number]> = [];
+    const groundDoors: GroundDoorRecord[] = [];
+    const groundPiers: GroundPierRecord[] = [];
     let doorId = 0;
     let galleryDoors = 0;
     let galleryLevels = 0;
@@ -5554,6 +5600,7 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
         if (gp.landings.some((l) => a + 0.12 > l.a0 - 0.05 && a - 0.12 < l.a1 + 0.05)) continue;
         G.concrete.push(...f.bx(a - 0.12, a + 0.12, 0, gp.capY - S, D - 0.26, D - 0.02, { ground: true, tile: RENDER.ROOF_TILE_M }));
         f.coll(a - 0.12, a + 0.12, 0, gp.capY - S, D - 0.26, D - 0.02, b.index);
+        noDoorRange(fkey(b, ax, sg), a - 0.12, a + 0.12);
       }
       // Zig-zag external stair: flights + landings (steel grating, outer and end guard rails).
       for (const r of gp.ramps) ramp(f, ax, r.aLow, r.aHigh, r.yLow, r.yHigh, r.d0, r.d1);
@@ -5650,7 +5697,10 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
     const groundFace = (g: GroundFace, program: GroundProgram): { piers: number[] } => {
       const { b, span, run } = g;
       const f = sf(span.ax, span.sg, span.plane);
-      const plan = planGroundFace(program, span.a0, span.a1, grng, span.lot ? blockedRanges.get(g.key) ?? [] : []);
+      // 10B-2: an outward perimeter face closer than the 1.8 m door clear zone to the lockdown wall's inner face
+      // (±(H − 0.5)) has no street in front of it — no doorway opens into the 0.7 m crack.
+      const toWall = span.sg * span.plane > 0 ? LEVEL.HALF_EXTENT_M - 0.5 - Math.abs(span.plane) : Infinity;
+      const plan = planGroundFace(program, span.a0, span.a1, grng, span.lot ? blockedRanges.get(g.key) ?? [] : [], toWall >= GR.DOOR_CLEAR_M, noDoorRanges.get(g.key) ?? []);
       programCounts[program]++;
       const gTop = Math.min(span.y1, floorTopY(b.arch, 1));
       const sTop = Math.min(gTop, GR.GROUND_TOP_M);
@@ -5664,6 +5714,7 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
         }
         G.concrete.push(...f.bx(a - GR.PIER_W_M / 2, a + GR.PIER_W_M / 2, 0, gTop, 0, PD, { ground: true, tile: T }));
         G.steel.push(...f.bx(a - GR.PIER_W_M / 2 - 0.02, a + GR.PIER_W_M / 2 + 0.02, 0, GR.KICK_H_M, 0, PD + 0.03, { ground: true }));
+        groundPiers.push({ building: b.index, ax: span.ax, sg: span.sg, plane: span.plane, a0: a - GR.PIER_W_M / 2, a1: a + GR.PIER_W_M / 2, top: gTop });
         pierCount++;
       }
       // Lintel band over the storefronts (Type B adds a 2 m mezzanine fascia above it).
@@ -5758,8 +5809,12 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
       // Doors: human-scale, recessed inside bevelled surrounds; clear entry zone + sockets.
       const sockets = PROGRAM_SOCKETS[program];
       for (const door of plan.doors) {
-        const { a, w, h } = door;
+        const { a, w, h, half } = door;
         const r = run ? Math.min(door.recess, GR.PIER_D_RUN_M) : door.recess;
+        // 10B-2: optional assembly parts are built only when they fit inside `half` (clear of the bay's piers).
+        const fits = (outer: number): boolean => outer <= half + 1e-6;
+        let reach = w / 2 + DOOR_SURROUND_M;
+        let top = h + 0.2;
         const hx = PAINT.DOORS[(Math.floor(b.seed * 53) + doorId) % PAINT.DOORS.length];
         const leaf = program === 'CYBER_APARTMENT' || program === 'ALLEY_INFRA' ? hx : program === 'CYBER_EATERY' ? 0x5a6068 : PAINT.STEEL_BRUSHED;
         // Surround (jambs + lintel), threshold step.
@@ -5774,10 +5829,14 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
         if (door.double) G.archPaint.push(...f.paint(0x0b0c0e, a - 0.012, a + 0.012, 0.08, h, 0.06, 0.065));
         G.archPaint.push(...f.paint(PAINT.FRAME_DARK, a - w / 2, a + w / 2, h * 0.52, h * 0.52 + 0.02, 0.06, 0.065), ...f.paint(PAINT.STEEL_BRUSHED, a - w / 2 + 0.05, a + w / 2 - 0.05, 0.1, 0.32, 0.06, 0.07));
         G.archPaint.push(...f.paint(PAINT.STEEL_BRUSHED, a + w / 2 - 0.3, a + w / 2 - 0.08, 0.98, 1.04, 0.06, 0.11));
-        if (program === 'TECH_APPAREL') G.strips.push(f.glow(0x58f0ff, 0.9, a + w / 2 + 0.25, a + w / 2 + 0.38, 1.2, 1.42, 0.01, 0.04));
+        if (program === 'TECH_APPAREL' && fits(w / 2 + 0.38)) {
+          G.strips.push(f.glow(0x58f0ff, 0.9, a + w / 2 + 0.25, a + w / 2 + 0.38, 1.2, 1.42, 0.01, 0.04));
+          reach = Math.max(reach, w / 2 + 0.38);
+        }
         if (program === 'ALLEY_INFRA') {
           G.strips.push(f.glow(0xffb34a, 0.95, a - 0.12, a + 0.12, h + 0.32, h + 0.5, 0.05, 0.17));
           G.steel.push(...f.bx(a - 0.16, a + 0.16, h + 0.28, h + 0.3, 0, 0.22), ...f.bx(a - 0.16, a + 0.16, h + 0.52, h + 0.54, 0, 0.22));
+          top = h + 0.54;
         }
         doorSizes.push([w, h]);
         doorClearZones.push({ ...doorClearZone(f.ref, a), y: 0 });
@@ -5785,17 +5844,33 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
         const fit = groundDoorFit(program, door, dBay, floorReach, lowProps, run);
         propSockets.push(...doorSockets(f.ref, { a, w, h }, 0, sockets.group, sockets.slots, b.index, doorId++, grng, fit));
         // Program portals in front of the door.
-        if (program === 'CAPSULE_HOTEL') {
+        if (program === 'CAPSULE_HOTEL' && fits(w / 2 + 0.47)) {
           const dp = run ? GR.PIER_D_RUN_M : 0.8;
           for (const s of [-1, 1]) {
             const ai = a + s * (w / 2 + 0.36);
             G.concrete.push(...f.bx(ai - 0.11, ai + 0.11, 0, sTop - 0.4, 0, dp, { ground: true, tile: T }));
             G.strips.push(f.glow(0xffb45a, 0.7, ai - 0.02, ai + 0.02, 0.4, sTop - 0.7, dp, dp + 0.015));
           }
-        } else if (program === 'CYBER_APARTMENT') {
+          reach = Math.max(reach, w / 2 + 0.47);
+          top = Math.max(top, sTop - 0.4);
+        } else if (program === 'CYBER_APARTMENT' && fits(w / 2 + 0.4)) {
           const dp = run ? GR.PIER_D_RUN_M : 0.68;
           for (const s of [-1, 1]) G.concrete.push(...f.bx(a + s * (w / 2 + 0.3) - 0.1, a + s * (w / 2 + 0.3) + 0.1, 0, 2.85, 0, dp, { ground: true, tile: T }));
+          reach = Math.max(reach, w / 2 + 0.4);
+          top = Math.max(top, 2.85);
         }
+        if (program === 'CYBER_APARTMENT' && feature && door === plan.doors[0]) {
+          // Entry canopy (built below with the feature fittings) is clamped to the assembly half-width.
+          reach = Math.max(reach, half);
+          top = Math.max(top, 3.05);
+        }
+        const bayR = dBay ?? { a0: a - half - DOOR_PIER_GAP_M, a1: a + half + DOOR_PIER_GAP_M };
+        groundDoors.push({
+          building: b.index, ax: span.ax, sg: span.sg, plane: span.plane, program, a, w, h,
+          e0: a - reach, e1: a + reach, top,
+          span: { a0: span.a0, a1: span.a1, y0: span.y0, y1: span.y1 },
+          bay: { a0: bayR.a0, a1: bayR.a1 },
+        });
       }
       // Canopies / awnings / exhaust (feature faces only — run faces stay ≤ 0.28 m relief).
       const ca0 = span.a0 + 0.4;
@@ -5811,15 +5886,16 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
           f.coll(ca0, ca1, 3.12, 3.22, 0, 1.35, b.index);
           const lp = f.P3((ca0 + ca1) / 2, 2.8, 1.0);
           addLight(lp.x, lp.y, lp.z, 0xffa860, 1.3);
-          if (door0) {
-            // Counter shelf beside the door.
-            const sa = door0.a + door0.w / 2 + 1.4;
-            if (sa + 0.9 < span.a1 - 0.3) {
-              G.steel.push(...f.bx(sa - 0.9, sa + 0.9, 1.03, 1.08, 0, 0.35), ...f.bx(sa - 0.85, sa - 0.8, 0.7, 1.03, 0, 0.3), ...f.bx(sa + 0.8, sa + 0.85, 0.7, 1.03, 0, 0.3));
-              const c0 = f.P3(sa - 0.92, 0, 0);
-              const c1 = f.P3(sa + 0.92, 0, 0.37);
-              propObstacles.push({ minX: Math.min(c0.x, c1.x), minY: 0.72, minZ: Math.min(c0.z, c1.z), maxX: Math.max(c0.x, c1.x), maxY: 1.08, maxZ: Math.max(c0.z, c1.z) });
-            }
+          // 10B-2: counter shelf centred in the bay right of the entrance (never across a pier); skipped when that
+          // bay is a door / too narrow for the 1.8 m shelf + 0.05 m pier gap.
+          const di = door0 ? plan.bays.findIndex((bb) => door0.a > bb.a0 && door0.a < bb.a1) : -1;
+          const shelfBay = [plan.bays[di + 1], plan.bays[di - 1]].find((bb) => di >= 0 && bb && bb.use === 'PANEL' && bb.a1 - bb.a0 >= 1.8 + 2 * DOOR_PIER_GAP_M);
+          if (shelfBay) {
+            const sa = (shelfBay.a0 + shelfBay.a1) / 2;
+            G.steel.push(...f.bx(sa - 0.9, sa + 0.9, 1.03, 1.08, 0, 0.35), ...f.bx(sa - 0.85, sa - 0.8, 0.7, 1.03, 0, 0.3), ...f.bx(sa + 0.8, sa + 0.85, 0.7, 1.03, 0, 0.3));
+            const c0 = f.P3(sa - 0.92, 0, 0);
+            const c1 = f.P3(sa + 0.92, 0, 0.37);
+            propObstacles.push({ minX: Math.min(c0.x, c1.x), minY: 0.72, minZ: Math.min(c0.z, c1.z), maxX: Math.max(c0.x, c1.x), maxY: 1.08, maxZ: Math.max(c0.z, c1.z) });
           }
           // Stainless exhaust hood + grease duct climbing the wall; its mouth breathes steam.
           const top = Math.min(span.y1 - 1.0, 12 + grng() * 8);
@@ -5873,8 +5949,8 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
           const lp = f.P3(ma, 2.8, 1.2);
           addLight(lp.x, lp.y, lp.z, 0xffc070, 1.0);
         } else if (program === 'CYBER_APARTMENT' && door0) {
-          const ea0 = door0.a - door0.w / 2 - 0.7;
-          const ea1 = door0.a + door0.w / 2 + 0.7;
+          const ea0 = door0.a - door0.half;
+          const ea1 = door0.a + door0.half;
           G.concrete.push(...f.bx(ea0, ea1, 2.85, 3.05, 0, 1.15, { bottom: GR.AO_UNDERSIDE, tile: T }));
           G.strips.push(f.glow(0xdcecff, 0.85, door0.a - 0.55, door0.a + 0.55, 2.79, 2.83, 0.55, 0.6));
           G.steel.push(...f.bx(door0.a - 0.6, door0.a + 0.6, 2.77, 2.78, 0.5, 0.66));
@@ -6185,6 +6261,15 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
       }
       return null;
     };
+    /** 10B-2: true when a ground prop of half-size `r` at (x, z) would stand in a 1F doorway or against its assembly. */
+    const blocksDoor = (x: number, z: number, r: number): boolean => {
+      if (doorClearZones.some((c) => c.y < 1 && x + r > c.x0 && x - r < c.x1 && z + r > c.z0 && z - r < c.z1)) return true;
+      return groundDoors.some((d) => {
+        const along = d.ax === 'x' ? z : x;
+        const out = d.sg * ((d.ax === 'x' ? x : z) - d.plane);
+        return out > -0.1 && out - r < 1.2 && along + r > d.e0 - 0.1 && along - r < d.e1 + 0.1;
+      });
+    };
     const facePoint = (b: Building, axis: Axis, sign: number, along01: number, out: THREE.Vector3): THREE.Vector3 =>
       axis === 'x'
         ? out.set(b.lcx + sign * b.lotHalfW, 0, b.lcz + (along01 - 0.5) * b.lotHalfD * 2)
@@ -6376,7 +6461,8 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
         for (let k = 0; k < n; k++) {
           const x = fp.x + (ax === 'x' ? sg * off : k * 1.05);
           const z = fp.z + (ax === 'z' ? sg * off : k * 1.05);
-          if (inArea(x, z, 2)) addVending(x, z, yaw);
+          // 10B-2: never in a doorway's 1.8 m clear zone or against its assembly (jambs / portal / canopy).
+          if (inArea(x, z, 2) && !blocksDoor(x, z, 0.55)) addVending(x, z, yaw);
         }
       }
     });
@@ -7099,6 +7185,8 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
       farTowersInfo: this.farInfo.map((t) => ({ ...t })),
       megaBillboards: megaRecords,
       marketRects: plazas,
+      groundDoors,
+      groundPiers,
       stats: {
         towers: buildings.length,
         cars: pick.length,

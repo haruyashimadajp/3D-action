@@ -963,6 +963,35 @@ export interface DoorSpec {
   recess: number;
   double: boolean;
   program: GroundProgram;
+  /**
+   * 10B-2: half-width of the whole 3D doorway assembly actually built (jambs, portal pillars, entry canopy, access
+   * panel), clamped so it stays `DOOR_PIER_GAP_M` clear of the bay's piers: [a − half, a + half] ⊂ bay.
+   */
+  half: number;
+}
+
+/** 10B-2 minimum clearance between a doorway assembly and the 0.48 m piers bounding its bay. */
+export const DOOR_PIER_GAP_M = 0.05;
+/** 10B-2 jamb / lintel surround width either side of the leaf. */
+export const DOOR_SURROUND_M = 0.2;
+
+/**
+ * 10B-2: full half-width of each program's doorway assembly in face coordinates — surround (all), access panel glow
+ * (tech, +0.38), capsule portal pillars (hotel, +0.47), entry canopy (apartment, +0.7). Optional parts are dropped /
+ * clamped when the bay is narrower; the jamb surround (`w / 2 + 0.2`) is never clipped.
+ */
+export function doorAssemblyHalf(program: GroundProgram): number {
+  const w = PROGRAM_DOOR[program].w / 2;
+  switch (program) {
+    case 'TECH_APPAREL':
+      return w + 0.38;
+    case 'CAPSULE_HOTEL':
+      return w + 0.47;
+    case 'CYBER_APARTMENT':
+      return w + 0.7;
+    default:
+      return w + DOOR_SURROUND_M;
+  }
 }
 
 export interface GroundFacePlan {
@@ -976,9 +1005,18 @@ export interface GroundFacePlan {
 /**
  * 9A-4 shared 4 m bay grammar: piers (0.48 m) every ~4 m along [a0, a1], one entrance per face for most programs
  * (hotel portico centred over two bays when the face allows it), program-specific fills elsewhere. `blocked` along
- * ranges (fire-escape flights, loading docks) never receive doors.
+ * ranges (fire-escape flights, loading docks) never receive doors. 10B-2: doors sit centred in bays whose half-width
+ * clears the jamb surround + `DOOR_PIER_GAP_M`; `DoorSpec.half` bounds the whole built assembly inside that bay.
  */
-export function planGroundFace(program: GroundProgram, a0: number, a1: number, rng: () => number, blocked: ReadonlyArray<readonly [number, number]> = []): GroundFacePlan {
+export function planGroundFace(
+  program: GroundProgram,
+  a0: number,
+  a1: number,
+  rng: () => number,
+  blocked: ReadonlyArray<readonly [number, number]> = [],
+  allowDoors = true,
+  noDoor: ReadonlyArray<readonly [number, number]> = [],
+): GroundFacePlan {
   const G = GRAMMAR;
   const len = a1 - a0;
   const nb = Math.max(1, Math.round((len - G.PIER_W_M) / G.BAY_M));
@@ -993,7 +1031,22 @@ export function planGroundFace(program: GroundProgram, a0: number, a1: number, r
     bays.push({ a0: b0, a1: b1, use: isBlocked ? 'BLOCKED' : 'PANEL' });
   }
   const spec = PROGRAM_DOOR[program];
-  const free = bays.map((b, i) => ({ b, i })).filter(({ b }) => b.use !== 'BLOCKED' && b.a1 - b.a0 >= spec.w + 0.5);
+  const core = spec.w / 2 + DOOR_SURROUND_M + DOOR_PIER_GAP_M;
+  const full = doorAssemblyHalf(program) + DOOR_PIER_GAP_M;
+  const bayHalf = (b: { a0: number; a1: number }): number => (b.a1 - b.a0) / 2;
+  // 10B-2: a bay takes a door only when the jamb surround clears both piers; bays that also fit the full program
+  // assembly (portal pillars / canopy / panel) are preferred so nothing is clipped by a pier.
+  // `allowDoors` false: the face has no walkable ground in front of it (e.g. 0.7 m from the lockdown wall).
+  // `noDoor` along ranges (e.g. gallery outer columns standing in front of the wall) keep their bay fill but never
+  // take a doorway whose jamb surround (+ 0.15 m) would line up with them.
+  const clearOf = (b: { a0: number; a1: number }): boolean => {
+    const m = (b.a0 + b.a1) / 2;
+    const r = spec.w / 2 + DOOR_SURROUND_M + 0.15;
+    return !noDoor.some(([c0, c1]) => c1 > m - r && c0 < m + r);
+  };
+  const open = allowDoors ? bays.map((b, i) => ({ b, i })).filter(({ b }) => b.use !== 'BLOCKED' && bayHalf(b) >= core && clearOf(b)) : [];
+  const roomy = open.filter(({ b }) => bayHalf(b) >= full);
+  const free = roomy.length ? roomy : open;
   const doors: DoorSpec[] = [];
   const fill: Readonly<Record<GroundProgram, BayUse>> = {
     CYBER_EATERY: 'PANEL',
@@ -1003,22 +1056,30 @@ export function planGroundFace(program: GroundProgram, a0: number, a1: number, r
     ALLEY_INFRA: 'SHUTTER',
   };
   for (const b of bays) if (b.use !== 'BLOCKED') b.use = fill[program];
+  const addDoor = (bay: { a0: number; a1: number }): void => {
+    // Centred in its bay; the built assembly never reaches past the bay minus the pier gap.
+    const half = Math.min(doorAssemblyHalf(program), bayHalf(bay) - DOOR_PIER_GAP_M);
+    doors.push({ a: (bay.a0 + bay.a1) / 2, w: spec.w, h: spec.h, recess: spec.recess, double: spec.double, program, half });
+  };
   if (free.length) {
     // Entrance bay: near the centre with a small seeded offset; infra / long eateries get a second door.
     const mid = (free.length - 1) / 2;
-    const pick = free[Math.min(free.length - 1, Math.max(0, Math.round(mid + (rng() - 0.5) * Math.min(2, free.length - 1))))];
+    const k = Math.min(free.length - 1, Math.max(0, Math.round(mid + (rng() - 0.5) * Math.min(2, free.length - 1))));
+    const pick = free[k];
     const bay = pick.b;
     bay.use = program === 'CAPSULE_HOTEL' ? 'PORTICO' : 'DOOR';
-    doors.push({ a: (bay.a0 + bay.a1) / 2, w: spec.w, h: spec.h, recess: spec.recess, double: spec.double, program });
+    addDoor(bay);
     if (program === 'CYBER_APARTMENT') {
       const next = bays[pick.i + 1] ?? bays[pick.i - 1];
-      if (next && next.use !== 'BLOCKED') next.use = 'MAILBOX';
+      // Mailbox bank + meter cabinet span m − 0.9 … m + 1.05: only in a bay wide enough to clear its piers.
+      if (next && next.use !== 'BLOCKED' && next.a1 - next.a0 >= 2.2) next.use = 'MAILBOX';
     }
     if ((program === 'ALLEY_INFRA' || program === 'CYBER_EATERY') && free.length >= 4) {
-      const far = free[pick.i < free.length / 2 ? free.length - 1 : 0];
+      // Second door at the far end of the candidate list from the first (index into `free`, not `bays`).
+      const far = free[k < free.length / 2 ? free.length - 1 : 0];
       if (far.b !== bay && far.b.use !== 'MAILBOX') {
         far.b.use = 'DOOR';
-        doors.push({ a: (far.b.a0 + far.b.a1) / 2, w: spec.w, h: spec.h, recess: spec.recess, double: spec.double, program });
+        addDoor(far.b);
       }
     }
   }

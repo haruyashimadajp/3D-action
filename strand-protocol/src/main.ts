@@ -835,6 +835,8 @@ class App {
     this.hud.showPanels(s === 'PAUSED' && !this.pauseMini, false, s === 'TITLE');
     this.hud.setVisible(s !== 'TITLE');
     this.hud.setDim(s === 'SKILL' || s === 'RESULT');
+    // 10B-2: the pulse-scan radar is live only while PLAYING (no sweep, blip fade, redraw or ping otherwise).
+    this.hud.setRadarFrozen(!playing);
     this.viewModel.root.visible = s !== 'TITLE';
     if (playing) (document.activeElement as HTMLElement | null)?.blur?.();
     if (s === 'PAUSED') this.refreshPauseInfo();
@@ -880,7 +882,7 @@ class App {
     this.btKills = 0;
     this.wallStepTimer = 0;
     this.hud.eliminated(null);
-    this.hud.radar.reset();
+    this.hud.resetRadar();
     this.renderer.postFx.glitch = 0;
     this.renderer.postFx.fade = 0;
     this.renderer.postFx.critical = 0;
@@ -1503,9 +1505,12 @@ class App {
     f.playerY = p.position.y;
     f.playerZ = p.position.z;
     f.playerYaw = p.yaw;
-    const radarCount = this.enemies.radarTargets(_radarTargets);
-    const radarPing = this.hud.radar.step(realDt, f.playerX, f.playerY, f.playerZ, _radarTargets, radarCount);
-    if (radarPing && !this.enemies.isCleared && this.enemies.remaining > 0) this.audio.radarPing();
+    // 10B-2: updateHud() also runs while PAUSED / SKILL / RESULT / TRANSITION; the radar only steps (and pings) in PLAYING.
+    if (this.state === 'PLAYING') {
+      const radarCount = this.enemies.radarTargets(_radarTargets);
+      const radarPing = this.hud.radar.step(realDt, f.playerX, f.playerY, f.playerZ, _radarTargets, radarCount);
+      if (radarPing && !this.enemies.isCleared && this.enemies.remaining > 0) this.audio.radarPing();
+    }
     f.reticleKick = e.reticleKick;
     f.buffPierce = e.momentumShotsLeft;
     f.buffZero = this.skills.SK_11 > 0 && p.speedBoostActive;
