@@ -8,7 +8,7 @@
  *    Normal; blinds, curtains, desk silhouettes, rain streaks, rust, panel joints, louvres
  *  - Wet rooftop / sidewalk concrete with cracks & puddles (512²): Albedo / Roughness (puddle 0.06, wet 0.42) / Normal
  *  - Wet road atlas (512²): lanes, centre line, white dashes, crosswalk, manholes, puddles
- *  - Hologram neon sign atlas (1024²): 8 vertical katakana / English-symbol strips
+ *  - Hologram neon sign atlas (1024²): 8 vertical stacked-English / symbol strips (10B-2: 100 % English signage)
  *  - Sign atlas (1024², 5B-3): 6 wide banners + 2 seamless scrolling LED tickers, 8 emblems / holograms
  *  - Tactical tech PBR set (512², 5B-4): carbon weave, panel grooves, screw heads, edge wear, brushed metal
  *  - Rooftop machinery (256²): AC-unit fan grille Albedo / Roughness / Normal
@@ -62,6 +62,8 @@ export interface ProceduralTextureLibrary {
   plaqueAtlas: THREE.Texture;
   /** 9B-3 graffiti / torn-poster decal atlas (1024 × 512, 4 × 2 alpha-masked cells: 0–3 spray, 4–7 posters). */
   graffitiAtlas: THREE.Texture;
+  /** 10B-2 Mega-Billboard hero-ad atlas (2048 × 1024, 4 × 2 cells, 100 % English) — see MEGA_ATLAS. */
+  megaBillboard: THREE.Texture;
   /** 6B-1 tactical glove & wear set (512², four zones; roughnessMap packs G roughness · B metalness). */
   glove: PbrTextureSet;
   /** 6B-1 gun micro hard-surface set (512², four zones; roughnessMap packs G roughness · B metalness). */
@@ -70,6 +72,32 @@ export interface ProceduralTextureLibrary {
 
 /** Rows in the wide-banner half of the sign atlas and emblem cells (4 × 2). */
 export const SIGN_ATLAS = { WIDE_ROWS: 8, SCROLL_ROWS: [6, 7] as readonly number[], EMBLEMS: 8 } as const;
+
+/** 10B-2: crisp uppercase geometric Latin typography for every in-world sign (zero CJK font fallbacks). */
+export const SIGN_FONT = "'Arial Black','Helvetica Neue','Arial Narrow',Impact,Arial,sans-serif";
+
+/**
+ * 10B-2 Mega-Billboard atlas (2048 × 1024, 4 × 2 cells of 512², 100 % English). `ASPECT` is each cell's designed
+ * content aspect (cell 3 is drawn 3× squashed for 1:3 portrait screens, cell 4 6× for 1:6 monolith blades);
+ * `TITLE_V` is the title band centre (cell v from the bottom) that wide crops anchor on.
+ */
+export const MEGA_ATLAS = {
+  W: 2048,
+  H: 1024,
+  CELLS: 8,
+  ASPECT: [1, 1, 1, 1 / 3, 1 / 6, 1, 1, 1] as readonly number[],
+  TITLE_V: [0.48, 0.5, 0.46, 0.3, 0.5, 0.47, 0.47, 0.48] as readonly number[],
+  TITLES: [
+    'NEO-TOKYO REALTY',
+    'DATA FLOW // 09',
+    'CYBERNETICS NOW',
+    'BELOW DECK',
+    'STRAND // RESTRICTED ZONE 09',
+    'KIROSHI // OPTICS',
+    'SYNTH NOODLES // 24H',
+    'SOFTSYS // CORE',
+  ] as readonly string[],
+} as const;
 
 // ---------------------------------------------------------------------------
 // Low-level helpers
@@ -1241,14 +1269,14 @@ function generateRoadAtlas(anisotropy: number): PbrTextureSet {
 /** 7B-1: glow colour of each vertical blade strip (reflection lights on the wet street). */
 export const NEON_STRIP_GLOW: readonly number[] = [0x00f0ff, 0xff2bd6, 0xffa21f, 0x38f8ff, 0xff2bd6, 0x00f0ff, 0xffa21f, 0xff2b6d];
 const NEON_STRIPS: ReadonlyArray<{ text: string; color: string; glow: string }> = [
-  { text: 'ストランド', color: '#7ff8ff', glow: '#00f0ff' },
-  { text: 'ネオンバー', color: '#ff8ae8', glow: '#ff2bd6' },
-  { text: 'ラーメン', color: '#ffd28a', glow: '#ffa21f' },
+  { text: 'STRAND', color: '#7ff8ff', glow: '#00f0ff' },
+  { text: 'NEON BAR', color: '#ff8ae8', glow: '#ff2bd6' },
+  { text: 'NOODLE 24H', color: '#ffd28a', glow: '#ffa21f' },
   { text: 'STRAND//09', color: '#aefcff', glow: '#38f8ff' },
-  { text: 'サイバネティクス', color: '#ff9ef0', glow: '#ff2bd6' },
-  { text: 'ホロカフェ', color: '#9ffcff', glow: '#00f0ff' },
+  { text: 'CYBERNETICS', color: '#ff9ef0', glow: '#ff2bd6' },
+  { text: 'HOLO CAFE', color: '#9ffcff', glow: '#00f0ff' },
   { text: '▲ZONE-480▼', color: '#ffc96a', glow: '#ffa21f' },
-  { text: 'ゼロナイン', color: '#ff86b0', glow: '#ff2b6d' },
+  { text: 'ZERO-09', color: '#ff86b0', glow: '#ff2b6d' },
 ];
 
 function generateNeonAtlas(anisotropy: number): THREE.Texture {
@@ -1258,7 +1286,7 @@ function generateNeonAtlas(anisotropy: number): THREE.Texture {
   const sw = W / strips;
   const [c, ctx] = makeCanvas(W, H);
   ctx.clearRect(0, 0, W, H);
-  const font = "'Hiragino Kaku Gothic ProN','Yu Gothic','Meiryo','Noto Sans CJK JP','Noto Sans JP','Arial Black',sans-serif";
+  const font = SIGN_FONT;
 
   for (let s = 0; s < strips; s++) {
     const x0 = s * sw;
@@ -1275,7 +1303,7 @@ function generateNeonAtlas(anisotropy: number): THREE.Texture {
     ctx.strokeRect(x0 + 12, 12, sw - 24, H - 24);
     ctx.restore();
 
-    // Vertical text: one glyph per row.
+    // Vertical stacked uppercase English: one glyph per row.
     const chars = Array.from(def.text);
     const rows = chars.length;
     const cell = Math.min((H - 80) / rows, sw * 0.9);
@@ -1302,17 +1330,390 @@ function generateNeonAtlas(anisotropy: number): THREE.Texture {
 }
 
 // ---------------------------------------------------------------------------
+// 4c. Mega-Billboard hero-ad atlas (10B-2): 2048 × 1024, 4 × 2 cells, 100 % English
+// ---------------------------------------------------------------------------
+function generateMegaBillboardAtlas(anisotropy: number): THREE.Texture {
+  const { W, H } = MEGA_ATLAS;
+  const C = 512;
+  const [c, ctx] = makeCanvas(W, H);
+  const rng = createRng(0x10b2);
+  const font = SIGN_FONT;
+  /** Draws cell `i` in a virtual C × (C / aspect) space (squashed back into the 512² cell). */
+  const cell = (i: number, draw: (w: number, h: number) => void): void => {
+    const ox = (i % 4) * C;
+    const oy = Math.floor(i / 4) * C;
+    const k = 1 / MEGA_ATLAS.ASPECT[i];
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(ox, oy, C, C);
+    ctx.clip();
+    ctx.translate(ox, oy);
+    ctx.scale(1, 1 / k);
+    draw(C, C * k);
+    ctx.restore();
+  };
+  const grad = (w: number, h: number, c0: string, c1: string): void => {
+    const g = ctx.createLinearGradient(0, 0, 0, h);
+    g.addColorStop(0, c0);
+    g.addColorStop(1, c1);
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, w, h);
+  };
+  const fit = (text: string, maxW: number, size: number, weight = 900): number => {
+    let sz = size;
+    ctx.font = `${weight} ${sz}px ${font}`;
+    while (ctx.measureText(text).width > maxW && sz > 8) {
+      sz -= 2;
+      ctx.font = `${weight} ${sz}px ${font}`;
+    }
+    return sz;
+  };
+  const glow = (text: string, x: number, y: number, maxW: number, size: number, color: string, glowC: string, weight = 900, blur = 22): void => {
+    fit(text, maxW, size, weight);
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.save();
+    ctx.shadowColor = glowC;
+    ctx.shadowBlur = blur;
+    ctx.fillStyle = glowC;
+    ctx.fillText(text, x, y);
+    ctx.shadowBlur = blur * 0.3;
+    ctx.fillStyle = color;
+    ctx.fillText(text, x, y);
+    ctx.restore();
+  };
+  const bezel = (w: number, h: number, col: string): void => {
+    ctx.save();
+    ctx.strokeStyle = col;
+    ctx.shadowColor = col;
+    ctx.shadowBlur = 12;
+    ctx.lineWidth = 5;
+    ctx.strokeRect(10, 10, w - 20, h - 20);
+    ctx.lineWidth = 2;
+    ctx.globalAlpha = 0.5;
+    ctx.strokeRect(22, 22, w - 44, h - 44);
+    ctx.restore();
+  };
+  const line = (pts: Array<[number, number]>, col: string, lw: number, alpha = 1): void => {
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.strokeStyle = col;
+    ctx.lineWidth = lw;
+    ctx.beginPath();
+    pts.forEach(([x, y], k) => (k ? ctx.lineTo(x, y) : ctx.moveTo(x, y)));
+    ctx.stroke();
+    ctx.restore();
+  };
+
+  // 0 NEO-TOKYO REALTY — cyan / white corporate typography over a blueprint wireframe.
+  cell(0, (w, h) => {
+    grad(w, h, '#03132c', '#08294c');
+    ctx.globalAlpha = 0.16;
+    ctx.fillStyle = '#5fe8ff';
+    for (let x = 0; x < w; x += 32) ctx.fillRect(x, 0, 1, h);
+    for (let y = 0; y < h; y += 32) ctx.fillRect(0, y, w, 1);
+    ctx.globalAlpha = 1;
+    const tower = (x: number, base: number, tw: number, th: number): void => {
+      const d = tw * 0.45;
+      line([[x, base], [x, base - th], [x + tw, base - th], [x + tw, base], [x, base]], '#7ff8ff', 2.5, 0.8);
+      line([[x, base - th], [x + d, base - th - d * 0.5], [x + tw + d, base - th - d * 0.5], [x + tw, base - th]], '#7ff8ff', 2, 0.6);
+      line([[x + tw, base], [x + tw + d, base - d * 0.5], [x + tw + d, base - th - d * 0.5]], '#7ff8ff', 2, 0.6);
+      for (let y = base - 14; y > base - th; y -= 14) line([[x + 4, y], [x + tw - 4, y]], '#38f8ff', 1, 0.35);
+    };
+    tower(118, 196, 52, 150);
+    tower(210, 196, 70, 176);
+    tower(320, 196, 48, 120);
+    line([[60, 198], [452, 198]], '#aefcff', 3, 0.9);
+    glow('NEO-TOKYO', w / 2, 262, w - 64, 92, '#ffffff', '#00f0ff');
+    glow('REALTY', w / 2, 340, w - 120, 74, '#e8fdff', '#38f8ff');
+    glow('SKY RESIDENCES // FROM 480K', w / 2, 404, w - 80, 26, '#aefcff', '#00f0ff', 700, 10);
+    ctx.fillStyle = 'rgba(0,240,255,0.85)';
+    ctx.fillRect(64, 446, w - 128, 34);
+    glow('LEASING NOW ▶ LEVEL 88', w / 2, 464, w - 150, 22, '#03132c', '#03132c', 900, 0);
+    bezel(w, h, '#38f8ff');
+  });
+
+  // 1 DATA FLOW // 09 — magenta / violet diagonal tech bars + cascading code.
+  cell(1, (w, h) => {
+    grad(w, h, '#12021e', '#2c0644');
+    ctx.font = `700 15px ${font}`;
+    ctx.textAlign = 'left';
+    for (let x = 14; x < w; x += 22) {
+      for (let y = 16; y < h; y += 19) {
+        ctx.globalAlpha = 0.12 + rng() * 0.35;
+        ctx.fillStyle = rng() < 0.15 ? '#ffffff' : '#ff4fd8';
+        ctx.fillText('0123456789ABCDEF'[Math.floor(rng() * 16)], x, y);
+      }
+    }
+    ctx.globalAlpha = 1;
+    for (let k = 0; k < 6; k++) {
+      ctx.save();
+      ctx.globalAlpha = 0.28 + 0.1 * (k % 3);
+      ctx.fillStyle = k % 2 ? '#b44bff' : '#ff2bd6';
+      ctx.beginPath();
+      const x0 = -120 + k * 110;
+      ctx.moveTo(x0, h);
+      ctx.lineTo(x0 + 46, h);
+      ctx.lineTo(x0 + 46 + 300, 0);
+      ctx.lineTo(x0 + 300, 0);
+      ctx.fill();
+      ctx.restore();
+    }
+    ctx.fillStyle = 'rgba(10,0,20,0.72)';
+    ctx.fillRect(30, 190, w - 60, 150);
+    glow('DATA FLOW', w / 2, 248, w - 80, 96, '#ffffff', '#ff2bd6');
+    glow('// 09', w / 2, 314, w - 200, 54, '#ffb8f4', '#d040ff');
+    for (let k = 0; k < 18; k++) {
+      const bh = 12 + rng() * 60;
+      ctx.fillStyle = k % 3 ? '#ff2bd6' : '#ffffff';
+      ctx.globalAlpha = 0.75;
+      ctx.fillRect(48 + k * 23, 470 - bh, 14, bh);
+    }
+    ctx.globalAlpha = 1;
+    glow('STREAM 480 TB/S', w / 2, 120, w - 120, 30, '#ffd6fa', '#ff2bd6', 800, 10);
+    bezel(w, h, '#d040ff');
+  });
+
+  // 2 CYBERNETICS NOW — acid-lime / yellow stencil + bionic eye / circuit emblem.
+  cell(2, (w, h) => {
+    grad(w, h, '#090e02', '#1c2806');
+    const ex = w / 2;
+    const ey = 128;
+    ctx.save();
+    ctx.shadowColor = '#c8ff2e';
+    ctx.shadowBlur = 18;
+    ctx.strokeStyle = '#c8ff2e';
+    ctx.lineWidth = 6;
+    ctx.beginPath();
+    ctx.moveTo(ex - 150, ey);
+    ctx.quadraticCurveTo(ex, ey - 96, ex + 150, ey);
+    ctx.quadraticCurveTo(ex, ey + 96, ex - 150, ey);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(ex, ey, 42, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.fillStyle = '#f4ff6a';
+    ctx.beginPath();
+    ctx.arc(ex, ey, 16, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+    for (const [sx, dy] of [[-1, -1], [1, 1], [-1, 1], [1, -1]] as const) {
+      line([[ex + sx * 160, ey + dy * 8], [ex + sx * 200, ey + dy * 8], [ex + sx * 220, ey + dy * 40], [ex + sx * 236, ey + dy * 40]], '#c8ff2e', 3, 0.85);
+      ctx.fillStyle = '#c8ff2e';
+      ctx.fillRect(ex + sx * 236 - 5, ey + dy * 40 - 5, 10, 10);
+    }
+    glow('CYBERNETICS', w / 2, 270, w - 50, 80, '#f4ff6a', '#c8ff2e');
+    glow('NOW', w / 2, 352, w - 200, 96, '#ffffff', '#c8ff2e');
+    glow('UPGRADE YOUR CHROME', w / 2, 418, w - 90, 28, '#e8ff9a', '#9fdc00', 800, 8);
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(24, 450, w - 48, 36);
+    ctx.clip();
+    for (let x = -40; x < w; x += 36) {
+      ctx.fillStyle = '#e8ff2e';
+      ctx.beginPath();
+      ctx.moveTo(x, 486);
+      ctx.lineTo(x + 18, 486);
+      ctx.lineTo(x + 54, 450);
+      ctx.lineTo(x + 36, 450);
+      ctx.fill();
+    }
+    ctx.restore();
+    bezel(w, h, '#c8ff2e');
+  });
+
+  // 3 BELOW DECK — tall 1:3 portrait: glowing halftone face silhouette in coral / magenta / gold.
+  cell(3, (w, h) => {
+    grad(w, h, '#1c0514', '#3c0a26');
+    const inHead = (x: number, y: number): number => {
+      // Profile facing left: skull ellipse, nose / lips / chin bumps, neck.
+      const hx = (x - 270) / 170;
+      const hy = (y - 470) / 260;
+      let d = hx * hx + hy * hy;
+      if (y > 520 && y < 720 && x > 150 && x < 300) d = Math.min(d, ((x - 205) / 70) ** 2 + ((y - 640) / 110) ** 2);
+      if (y > 700 && y < 930 && x > 230 && x < 360) d = Math.min(d, 0.6);
+      return d;
+    };
+    const sp = 18;
+    for (let y = 120; y < 960; y += sp) {
+      for (let x = 40; x < w - 30; x += sp) {
+        const d = inHead(x, y);
+        if (d > 1.05) continue;
+        const shade = 1 - Math.min(1, Math.max(0, (x - 120) / 330 + (y - 250) / 1400));
+        const r = (sp * 0.5) * (0.25 + 0.75 * shade) * (d > 0.85 ? 0.6 : 1);
+        ctx.fillStyle = y < 420 ? '#ff6f8f' : y < 700 ? '#ff2bd6' : '#ffb347';
+        ctx.globalAlpha = 0.9;
+        ctx.beginPath();
+        ctx.arc(x, y, r, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+    ctx.globalAlpha = 1;
+    line([[60, 990], [w - 60, 990]], '#ffb347', 6);
+    glow('BELOW', w / 2, 1090, w - 50, 150, '#ffe0c0', '#ff6f5e');
+    glow('DECK', w / 2, 1240, w - 70, 160, '#ffffff', '#ff2bd6');
+    glow('CLUB // LEVEL -3', w / 2, 1348, w - 60, 44, '#ffd28a', '#ffa21f', 800, 12);
+    glow('OPEN TILL DAWN', w / 2, 1430, w - 90, 40, '#ffc2e4', '#ff2bd6', 800, 12);
+    bezel(w, h, '#ff6f8f');
+  });
+
+  // 4 Crimson vertical monolith (1:6): hexagon sigil + stacked bold column STRAND // RESTRICTED ZONE 09.
+  cell(4, (w, h) => {
+    grad(w, h, '#140208', '#2c0610');
+    const cx = w / 2;
+    const hex = (r: number, lw: number): void => {
+      ctx.lineWidth = lw;
+      ctx.beginPath();
+      for (let k = 0; k <= 6; k++) {
+        const a = Math.PI / 6 + (k / 6) * Math.PI * 2;
+        if (k) ctx.lineTo(cx + Math.cos(a) * r, 300 + Math.sin(a) * r);
+        else ctx.moveTo(cx + Math.cos(a) * r, 300 + Math.sin(a) * r);
+      }
+      ctx.stroke();
+    };
+    ctx.save();
+    ctx.strokeStyle = '#ff2b4a';
+    ctx.shadowColor = '#ff1f3d';
+    ctx.shadowBlur = 30;
+    hex(200, 16);
+    hex(128, 10);
+    ctx.beginPath();
+    ctx.moveTo(cx, 210);
+    ctx.lineTo(cx + 80, 350);
+    ctx.lineTo(cx - 80, 350);
+    ctx.closePath();
+    ctx.stroke();
+    ctx.restore();
+    const letters = Array.from('STRAND');
+    letters.forEach((ch, k) => glow(ch, cx, 700 + k * 300, w - 60, 300, '#ffffff', '#ff1f3d', 900, 34));
+    line([[80, 2500], [w - 80, 2500]], '#ff2b4a', 10);
+    glow('ZONE', cx, 2640, w - 60, 170, '#ffd0d6', '#ff1f3d');
+    glow('09', cx, 2860, w - 120, 230, '#ffffff', '#ff1f3d');
+    ctx.save();
+    ctx.translate(46, h / 2);
+    ctx.rotate(-Math.PI / 2);
+    glow('◆ RESTRICTED ZONE 09 ◆ RESTRICTED ZONE 09 ◆', 0, 0, h - 120, 44, '#ff8a9a', '#ff1f3d', 800, 10);
+    ctx.restore();
+    ctx.save();
+    ctx.translate(w - 46, h / 2);
+    ctx.rotate(Math.PI / 2);
+    glow('◆ STRAND // RESTRICTED ZONE 09 ◆', 0, 0, h - 120, 44, '#ff8a9a', '#ff1f3d', 800, 10);
+    ctx.restore();
+    bezel(w, h, '#ff1f3d');
+  });
+
+  // 5 KIROSHI // OPTICS — teal / cyan reticle emblem + SEE THE FUTURE.
+  cell(5, (w, h) => {
+    grad(w, h, '#011414', '#043232');
+    const cx = w / 2;
+    const cy = 132;
+    ctx.save();
+    ctx.strokeStyle = '#19e6e6';
+    ctx.shadowColor = '#19e6e6';
+    ctx.shadowBlur = 18;
+    ctx.lineWidth = 6;
+    for (const r of [92, 58]) {
+      ctx.beginPath();
+      ctx.arc(cx, cy, r, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+    for (let k = 0; k < 4; k++) {
+      const a = (k * Math.PI) / 2;
+      ctx.beginPath();
+      ctx.moveTo(cx + Math.cos(a) * 66, cy + Math.sin(a) * 66);
+      ctx.lineTo(cx + Math.cos(a) * 120, cy + Math.sin(a) * 120);
+      ctx.stroke();
+    }
+    ctx.fillStyle = '#aefcff';
+    ctx.beginPath();
+    ctx.moveTo(cx, cy - 20);
+    ctx.lineTo(cx + 20, cy);
+    ctx.lineTo(cx, cy + 20);
+    ctx.lineTo(cx - 20, cy);
+    ctx.fill();
+    ctx.restore();
+    glow('KIROSHI', w / 2, 284, w - 60, 100, '#ffffff', '#19e6e6');
+    glow('// OPTICS', w / 2, 352, w - 160, 50, '#aefcff', '#00c8c8');
+    glow('SEE THE FUTURE', w / 2, 420, w - 100, 36, '#e0ffff', '#19e6e6', 800, 10);
+    line([[60, 462], [w - 60, 462]], '#19e6e6', 3, 0.8);
+    bezel(w, h, '#19e6e6');
+  });
+
+  // 6 SYNTH NOODLES // 24H — warm amber neon ramen bowl.
+  cell(6, (w, h) => {
+    grad(w, h, '#1a0702', '#3c1404');
+    const cx = w / 2;
+    ctx.save();
+    ctx.strokeStyle = '#ffa21f';
+    ctx.shadowColor = '#ff8a00';
+    ctx.shadowBlur = 20;
+    ctx.lineWidth = 7;
+    ctx.beginPath();
+    ctx.moveTo(cx - 130, 150);
+    ctx.lineTo(cx + 130, 150);
+    ctx.arc(cx, 150, 130, 0, Math.PI);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(cx + 40, 160);
+    ctx.lineTo(cx + 170, 60);
+    ctx.moveTo(cx + 62, 166);
+    ctx.lineTo(cx + 196, 72);
+    ctx.stroke();
+    ctx.lineWidth = 4;
+    for (const dx of [-60, 0, 60]) {
+      ctx.beginPath();
+      for (let k = 0; k <= 16; k++) {
+        const y = 128 - k * 6;
+        const x = cx + dx + Math.sin(k * 0.8) * 10;
+        if (k) ctx.lineTo(x, y);
+        else ctx.moveTo(x, y);
+      }
+      ctx.stroke();
+    }
+    ctx.restore();
+    glow('SYNTH NOODLES', w / 2, 330, w - 50, 70, '#ffe2b0', '#ffa21f');
+    glow('24H', w / 2, 404, w - 200, 74, '#ffffff', '#ff7a00');
+    glow('HOT ▶ FAST ▶ CHEAP', w / 2, 462, w - 100, 30, '#ffd28a', '#ffa21f', 800, 8);
+    bezel(w, h, '#ffa21f');
+  });
+
+  // 7 SOFTSYS // CORE — deep electric-blue isometric server wireframe + telemetry.
+  cell(7, (w, h) => {
+    grad(w, h, '#020718', '#061a4c');
+    const iso = (x: number, y: number, bw: number, bh: number): void => {
+      const d = bw * 0.5;
+      line([[x, y], [x + bw, y - d * 0.5], [x + bw + d, y], [x + d, y + d * 0.5], [x, y]], '#4f9bff', 2.5, 0.9);
+      line([[x, y], [x, y + bh], [x + d, y + bh + d * 0.5], [x + bw + d, y + bh], [x + bw + d, y]], '#2f7bff', 2.5, 0.9);
+      line([[x + d, y + d * 0.5], [x + d, y + bh + d * 0.5]], '#2f7bff', 2.5, 0.9);
+      for (let k = 1; k < 4; k++) line([[x + 4, y + (bh * k) / 4], [x + d - 4, y + (bh * k) / 4 + d * 0.5 - 4]], '#9cc4ff', 1.5, 0.7);
+    };
+    iso(120, 70, 90, 120);
+    iso(250, 50, 90, 140);
+    glow('SOFTSYS', w / 2, 280, w - 60, 100, '#ffffff', '#2f7bff');
+    glow('// CORE', w / 2, 348, w - 180, 52, '#b8d4ff', '#2f7bff');
+    const pts: Array<[number, number]> = [];
+    for (let x = 48; x <= w - 48; x += 12) pts.push([x, 440 - 18 * Math.sin(x * 0.05) - rng() * 16]);
+    line(pts, '#7fb6ff', 3, 0.95);
+    glow('UPTIME 99.999%  ▲ LOAD 72%', w / 2, 480, w - 80, 22, '#cfe2ff', '#2f7bff', 700, 6);
+    bezel(w, h, '#2f7bff');
+  });
+
+  const tex = finalizeTexture(c, THREE.SRGBColorSpace, anisotropy, false);
+  return tex;
+}
+
+// ---------------------------------------------------------------------------
 // 4b. Sign atlas (5B-3): wide banners + scrolling tickers (top) and emblems (bottom), 1024²
 // ---------------------------------------------------------------------------
 const WIDE_SIGNS: ReadonlyArray<{ text: string; color: string; glow: string }> = [
-  { text: 'ラーメン 24H ◆ NEON NOODLE', color: '#ffd28a', glow: '#ffa21f' },
+  { text: 'NOODLE 24H ◆ NEON RAMEN', color: '#ffd28a', glow: '#ffa21f' },
   { text: 'OMEGA//CORP — STRAND SYSTEMS', color: '#aefcff', glow: '#00f0ff' },
-  { text: 'サイバー薬局 PHARMA+', color: '#9dffc8', glow: '#39ff88' },
-  { text: 'HOTEL 九龍 ◆ VACANCY', color: '#ff9ef0', glow: '#ff2bd6' },
-  { text: 'KARAOKE カラオケ ▶ BAR', color: '#d6a8ff', glow: '#b44bff' },
+  { text: 'CYBER PHARMA+ ◆ 24H', color: '#9dffc8', glow: '#39ff88' },
+  { text: 'HOTEL KOWLOON // VACANCY', color: '#ff9ef0', glow: '#ff2bd6' },
+  { text: 'KARAOKE // BAR ▶ OPEN', color: '#d6a8ff', glow: '#b44bff' },
   { text: 'EXPRESS 09 ▶▶ EXIT 4B', color: '#7ff8ff', glow: '#38f8ff' },
   { text: '▶ SECTOR LOCKDOWN ▶ STAY INDOORS ▶ CURFEW 23:00 ', color: '#ffc96a', glow: '#ffa21f' },
-  { text: '◆ VALKYRIE-09 SIGHTED ◆ ネオン市 警報 ◆ GRID 480 ', color: '#ff86b0', glow: '#ff2b6d' },
+  { text: '◆ VALKYRIE-09 SIGHTED ◆ NEON CITY ALERT ◆ GRID 480 ', color: '#ff86b0', glow: '#ff2b6d' },
 ];
 
 function generateSignAtlas(anisotropy: number): THREE.Texture {
@@ -1321,7 +1722,7 @@ function generateSignAtlas(anisotropy: number): THREE.Texture {
   const RH = 64;
   const [c, ctx] = makeCanvas(W, H);
   ctx.clearRect(0, 0, W, H);
-  const font = "'Hiragino Kaku Gothic ProN','Yu Gothic','Meiryo','Noto Sans CJK JP','Noto Sans JP','Arial Black',sans-serif";
+  const font = SIGN_FONT;
   const glowText = (text: string, x: number, y: number, color: string, glow: string, align: CanvasTextAlign): void => {
     ctx.textAlign = align;
     ctx.save();
@@ -1457,13 +1858,14 @@ function generateSignAtlas(anisotropy: number): THREE.Texture {
       ctx.stroke();
     }
   }, '#ff86b0', '#ff2b6d');
-  // 6 kanji seal 零
+  // 6 '09' district seal
   emblem(6, (cx, cy, r) => {
     ctx.strokeRect(cx - r, cy - r, r * 2, r * 2);
-    ctx.font = `900 ${Math.floor(r * 1.5)}px ${font}`;
+    ctx.strokeRect(cx - r * 0.82, cy - r * 0.82, r * 1.64, r * 1.64);
+    ctx.font = `900 ${Math.floor(r * 1.15)}px ${font}`;
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
-    ctx.fillText('零', cx, cy + 4);
+    ctx.fillText('09', cx, cy + 4);
   }, '#d6a8ff', '#b44bff');
   // 7 chevron arrows
   emblem(7, (cx, cy, r) => {
@@ -2181,7 +2583,7 @@ function generatePlaqueAtlas(anisotropy: number): THREE.Texture {
 // ---------------------------------------------------------------------------
 // 9B-3 Graffiti / torn-poster atlas (1024 × 512, 4 × 2 alpha-masked cells of 256²).
 //   0 STRAND wild tag · 1 NO SIGNAL glitch stencil · 2 ZERO / 09 bubble letters · 3 glitch skull stencil
-//   4 rain-stained flyer collage · 5 torn katakana promo · 6 RESTRICTED caution stencil · 7 HIGH VOLTAGE / SECTOR 04
+//   4 rain-stained flyer collage · 5 torn NEO tag promo · 6 RESTRICTED caution stencil · 7 HIGH VOLTAGE / SECTOR 04
 // ---------------------------------------------------------------------------
 function generateGraffitiAtlas(anisotropy: number): THREE.Texture {
   const W = 1024;
@@ -2191,7 +2593,6 @@ function generateGraffitiAtlas(anisotropy: number): THREE.Texture {
   ctx.clearRect(0, 0, W, H);
   const rng = createRng(0x9b3);
   const font = "'Arial Black','Impact','Helvetica Neue',sans-serif";
-  const jp = "'Hiragino Kaku Gothic ProN','Yu Gothic','Noto Sans CJK JP','Noto Sans JP',sans-serif";
   const cell = (i: number, draw: (ox: number, oy: number) => void): void => {
     const ox = (i % 4) * S;
     const oy = Math.floor(i / 4) * S;
@@ -2404,14 +2805,14 @@ function generateGraffitiAtlas(anisotropy: number): THREE.Texture {
       ctx.restore();
     }
   });
-  // 5 Torn katakana promo poster.
+  // 5 Torn 'NEO' tag promo poster.
   cell(5, (ox, oy) => {
     sheet(ox + 40, oy + 18, 176, 214, '#1a1424', -0.03, 1);
     ctx.save();
     ctx.textAlign = 'center';
     ctx.fillStyle = '#ff2bd6';
-    ctx.font = `900 46px ${jp}`;
-    ctx.fillText('ネオ', ox + 128, oy + 90);
+    ctx.font = `900 50px ${font}`;
+    ctx.fillText('NEO', ox + 128, oy + 90);
     ctx.fillStyle = '#28f4ff';
     ctx.font = `900 64px ${font}`;
     ctx.fillText('77', ox + 128, oy + 160);
@@ -2486,6 +2887,7 @@ export function getProceduralTextures(renderer: THREE.WebGLRenderer): Procedural
       manhole: pbr(),
       plaqueAtlas: new THREE.Texture(),
       graffitiAtlas: new THREE.Texture(),
+      megaBillboard: new THREE.Texture(),
       glove: pbr(),
       gun: pbr(),
     };
@@ -2505,6 +2907,7 @@ export function getProceduralTextures(renderer: THREE.WebGLRenderer): Procedural
     manhole: generateManholeSet(aniso),
     plaqueAtlas: generatePlaqueAtlas(aniso),
     graffitiAtlas: generateGraffitiAtlas(aniso),
+    megaBillboard: generateMegaBillboardAtlas(aniso),
     glove: generateGloveSet(aniso),
     gun: generateGunSet(aniso),
   };

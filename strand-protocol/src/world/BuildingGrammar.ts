@@ -15,6 +15,7 @@
  */
 import * as THREE from 'three';
 import { ARCHETYPE, FACADE } from '../config/constants';
+import type { MegaStructureKind } from '../config/skills';
 
 export type Axis = 'x' | 'z';
 export interface Rect {
@@ -24,8 +25,12 @@ export interface Rect {
   z1: number;
 }
 
-export type MassingKind = 'L_SHAPE' | 'PODIUM_OFFSET' | 'STEPPED_SETBACK' | 'GALLERY_DANCHI' | 'PENCIL_TOWER';
-export const MASSING_KINDS: readonly MassingKind[] = ['L_SHAPE', 'PODIUM_OFFSET', 'STEPPED_SETBACK', 'GALLERY_DANCHI', 'PENCIL_TOWER'];
+export type BaseMassingKind = 'L_SHAPE' | 'PODIUM_OFFSET' | 'STEPPED_SETBACK' | 'GALLERY_DANCHI' | 'PENCIL_TOWER';
+/** 9A-2 base massings + the four 10B-3 megastructures. */
+export type MassingKind = BaseMassingKind | MegaStructureKind;
+export const MASSING_KINDS: readonly BaseMassingKind[] = ['L_SHAPE', 'PODIUM_OFFSET', 'STEPPED_SETBACK', 'GALLERY_DANCHI', 'PENCIL_TOWER'];
+export const MEGA_KINDS: readonly MegaStructureKind[] = ['X_TRUSS_TOWER', 'CYLINDER_RING_TOWER', 'TWIN_ARCH_GATE', 'SLANT_CORP_TOWER'];
+export const isMegaKind = (k: MassingKind): k is MegaStructureKind => (MEGA_KINDS as readonly string[]).includes(k);
 
 export type GroundProgram = 'CYBER_EATERY' | 'TECH_APPAREL' | 'CAPSULE_HOTEL' | 'CYBER_APARTMENT' | 'ALLEY_INFRA';
 export const GROUND_PROGRAMS: readonly GroundProgram[] = ['CYBER_EATERY', 'TECH_APPAREL', 'CAPSULE_HOTEL', 'CYBER_APARTMENT', 'ALLEY_INFRA'];
@@ -114,6 +119,32 @@ export const GRAMMAR = {
   AO_RECESS: 0.42,
   AO_PIPE_BACK: 0.48,
   AO_SOFFIT_GALLERY: 0.45,
+  // 10B-3 megastructures (Type A only)
+  MEGA_PODIUM_M: 8,
+  TRUSS_MIN_ROOF_M: 44,
+  TRUSS_MAX_ROOF_M: 92,
+  /** Exoskeleton: 0.45 m beams, 12 m vertical bays, ≤ 0.28 m relief (wall-run safe, no collider). */
+  TRUSS_BEAM_M: 0.45,
+  TRUSS_BAY_M: 12,
+  TRUSS_RELIEF_M: 0.26,
+  /** Cantilevered stepped crown: two 4 m tiers stepping 0.6 m / 1.2 m out over the street faces. */
+  TRUSS_CROWN_OUT_M: [0.6, 1.2] as readonly number[],
+  CYL_SIDES: 12,
+  CYL_R_MIN_M: 6.5,
+  CYL_R_MAX_M: 9.5,
+  /** Cylinder shaft 38–84 m tall above the 8 m podium. */
+  CYL_MIN_ROOF_M: 46,
+  CYL_MAX_ROOF_M: 92,
+  ARCH_VOID_MIN_M: 6,
+  ARCH_VOID_MAX_M: 8,
+  ARCH_SLAB_MIN_M: 6,
+  ARCH_BRIDGE_M: 12,
+  ARCH_MIN_ROOF_M: 36,
+  SLANT_MIN_ROOF_M: 44,
+  SLANT_MIN_SIDE_M: 14,
+  /** Sloped crown cap: rise / run of the walkable cap ramp (≈ 35°) and its height cap. */
+  SLANT_RISE_K: 0.7,
+  SLANT_MAX_H_M: 12,
 } as const;
 
 // =============================================================================================
@@ -165,6 +196,10 @@ export interface RoofPlate extends Rect {
   y: number;
   /** The main (roof-prop) surface. */
   main: boolean;
+  /** 10B-3 round roof (CYLINDER_RING_TOWER): the rect is the inscribed prop square; parapet / cap are 12-gons. */
+  round?: { cx: number; cz: number; r: number };
+  /** 10B-3 plate edges left open (no parapet), e.g. the foot of the SLANT_CORP_TOWER cap ramp ("z:1"). */
+  open?: string[];
 }
 
 /** One exposed vertical wall span: plane coordinate, along range and height range. */
@@ -195,6 +230,16 @@ export interface MassingPlan {
   cut: Rect | null;
   /** PODIUM_OFFSET: the lot faces the tower is flush with ("x:1", "z:-1"). */
   flush: string[];
+  /** 10B-3: lot faces that are not full-height walls (TWIN_ARCH_GATE void openings) — no run / feature roles. */
+  partial?: string[];
+  /** 10B-3 CYLINDER_RING_TOWER shaft (12-gon, flats facing ±x / ±z) standing on the 8 m podium. */
+  cyl?: { cx: number; cz: number; r: number; y0: number; y1: number };
+  /** 10B-3 TWIN_ARCH_GATE: split axis, void range along it, open void height band, bridge (sky-arch) band. */
+  twin?: { axis: Axis; v0: number; v1: number; l0: number; l1: number; y0: number; y1: number; bridgeY0: number; bridgeY1: number };
+  /** 10B-3 SLANT_CORP_TOWER sloped crown cap: rises along `axis` toward side `sg` from `a0` (deck edge) to `a1`. */
+  slant?: { axis: Axis; sg: 1 | -1; a0: number; a1: number; l0: number; l1: number; y0: number; h: number };
+  /** 10B-3 X_TRUSS_TOWER exoskeleton band (lot faces, y0 → y1) and the faces whose crown cantilevers out. */
+  truss?: { y0: number; y1: number; cantilever: string[] };
 }
 
 export const faceKeyOf = (ax: Axis, sg: number): string => `${ax}:${sg > 0 ? 1 : -1}`;
@@ -206,6 +251,8 @@ export interface MassingCandidate {
   roofY: number;
   /** Lot faces that border a wall-run alley ("x:1" …). */
   alley: ReadonlySet<string>;
+  /** 10B-3 lot faces on the lockdown boundary (no cantilever / no void opening). */
+  edge?: ReadonlySet<string>;
 }
 
 const lotW = (r: Rect): number => r.x1 - r.x0;
@@ -244,6 +291,48 @@ export function isNarrow(c: MassingCandidate): boolean {
   return minSide(c.lot) <= GRAMMAR.PENCIL_MAX_SIDE_M;
 }
 
+const freeFace = (c: MassingCandidate, k: string): boolean => !c.alley.has(k) && !(c.edge?.has(k) ?? false);
+
+/** 10B-3 TWIN_ARCH_GATE split axis: slabs ≥ 6 m either side of a 6–8 m void whose two openings face streets. */
+export function twinSplitAxis(c: MassingCandidate): Axis | null {
+  const G = GRAMMAR;
+  const need = 2 * G.ARCH_SLAB_MIN_M + G.ARCH_VOID_MIN_M;
+  const opts: Axis[] = lotW(c.lot) >= lotD(c.lot) ? ['x', 'z'] : ['z', 'x'];
+  for (const ax of opts) {
+    const len = ax === 'x' ? lotW(c.lot) : lotD(c.lot);
+    // Split along x ⇒ the void opens on the z faces (and vice versa).
+    const open: Axis = ax === 'x' ? 'z' : 'x';
+    if (len >= need && minSide(c.lot) >= 12 && freeFace(c, faceKeyOf(open, 1)) && freeFace(c, faceKeyOf(open, -1))) return ax;
+  }
+  return null;
+}
+
+/** 10B-3 megastructure eligibility (Type A glass towers only: no balconies / escapes / galleries to collide with). */
+export function canMega(kind: MegaStructureKind, c: MassingCandidate): boolean {
+  const G = GRAMMAR;
+  if (c.arch !== ARCH_A) return false;
+  switch (kind) {
+    case 'X_TRUSS_TOWER':
+      return c.roofY >= G.TRUSS_MIN_ROOF_M && c.roofY <= G.TRUSS_MAX_ROOF_M && minSide(c.lot) >= 10;
+    case 'CYLINDER_RING_TOWER':
+      return c.roofY >= G.CYL_MIN_ROOF_M && c.roofY <= G.CYL_MAX_ROOF_M && minSide(c.lot) >= 2 * G.CYL_R_MIN_M + 2.4;
+    case 'TWIN_ARCH_GATE':
+      return c.roofY >= G.ARCH_MIN_ROOF_M && twinSplitAxis(c) !== null;
+    case 'SLANT_CORP_TOWER':
+      return c.roofY >= G.SLANT_MIN_ROOF_M && minSide(c.lot) >= G.SLANT_MIN_SIDE_M;
+  }
+}
+
+/** 10B-4 sector identity knobs for `assignMassings` (defaults reproduce the 9A assignment exactly). */
+export interface MassingOptions {
+  /** Minimum counts of base massings (topped up where eligible lots exist). */
+  minCounts?: Readonly<Partial<Record<BaseMassingKind, number>>>;
+  /** Megastructure quotas (converted from eligible Type A towers). */
+  mega?: Readonly<Partial<Record<MegaStructureKind, number>>>;
+  /** Sky-bridge towers: never CYLINDER / TWIN_ARCH (their alley walls must stay solid up to Layer 2). */
+  noMega?: ReadonlySet<number>;
+}
+
 /**
  * 9A-2 deterministic massing assignment. Rules in order: STEPPED_SETBACK (Type A ≥ 44 m, ~65 %), L_SHAPE (Type B / C
  * on ≥ 18 × 18 m lots with a free street corner, ~45 %), GALLERY_DANCHI (Type B on non-L lots), PODIUM_OFFSET (the
@@ -251,7 +340,7 @@ export function isNarrow(c: MassingCandidate): boolean {
  * is guaranteed every massing where an eligible lot exists (≥ 2 galleries), and any leftover building takes the
  * closest fitting massing (podium on wide lots, pencil otherwise).
  */
-export function assignMassings(cands: readonly MassingCandidate[], rng: () => number): MassingKind[] {
+export function assignMassings(cands: readonly MassingCandidate[], rng: () => number, opts: MassingOptions = {}): MassingKind[] {
   const G = GRAMMAR;
   const out: Array<MassingKind | null> = cands.map(() => null);
   cands.forEach((c, i) => {
@@ -304,6 +393,61 @@ export function assignMassings(cands: readonly MassingCandidate[], rng: () => nu
   for (let guard = 0; guard < 4 && count('GALLERY_DANCHI') < G.GALLERY_MIN_PER_SECTOR; guard++) {
     if (!steal('GALLERY_DANCHI', (c) => (c.arch === ARCH_B || c.arch === ARCH_C) && canGallery(c), (c) => (c.arch === ARCH_B ? 100 : 0) + c.roofY * 0.01)) break;
   }
+  if (!opts.minCounts && !opts.mega) return kinds;
+
+  // 10B-4 identity: top up minimum base-massing counts, then convert Type A towers into megastructures. Neither
+  // pass takes a tower whose massing would drop below its own floor (≥ 1, ≥ 2 galleries, ≥ the identity minimum).
+  const mins = opts.minCounts ?? {};
+  const floorOf = (k: MassingKind): number =>
+    isMegaKind(k) ? Infinity : Math.max(1, mins[k as BaseMassingKind] ?? 0, k === 'GALLERY_DANCHI' ? G.GALLERY_MIN_PER_SECTOR : 0);
+  const take = (k: MassingKind, ok: (c: MassingCandidate, i: number) => boolean, score: (c: MassingCandidate) => number): boolean => {
+    let best = -1;
+    let bestS = -Infinity;
+    cands.forEach((c, i) => {
+      if (kinds[i] === k || !ok(c, i) || count(kinds[i]) <= floorOf(kinds[i])) return;
+      const s = score(c) + rng() * 1e-3;
+      if (s > bestS) {
+        bestS = s;
+        best = i;
+      }
+    });
+    if (best < 0) return false;
+    kinds[best] = k;
+    return true;
+  };
+  // A gallery needs one free (non-alley, non-boundary) face long enough for its corridor + street stair.
+  const galleryFace = (c: MassingCandidate): boolean =>
+    FACES4.some(([ax, sg]) => freeFace(c, faceKeyOf(ax, sg)) && (ax === 'x' ? lotD(c.lot) : lotW(c.lot)) >= G.GALLERY_MIN_FACE_M);
+  kinds.forEach((k, i) => {
+    if (k !== 'GALLERY_DANCHI' || galleryFace(cands[i]) || count('GALLERY_DANCHI') <= floorOf('GALLERY_DANCHI')) return;
+    const c = cands[i];
+    kinds[i] = canPodium(c) && !isNarrow(c) ? 'PODIUM_OFFSET' : 'PENCIL_TOWER';
+  });
+  const baseRule: Record<BaseMassingKind, [(c: MassingCandidate) => boolean, (c: MassingCandidate) => number]> = {
+    L_SHAPE: [(c) => canLShape(c) || canLShape(c, true), (c) => (c.arch === ARCH_B || c.arch === ARCH_C ? 100 : 0) + minSide(c.lot)],
+    PODIUM_OFFSET: [(c) => canPodium(c) && !isNarrow(c), (c) => (c.arch === ARCH_A || c.arch === ARCH_D ? 100 : 0) + minSide(c.lot)],
+    STEPPED_SETBACK: [(c) => canStepped(c), (c) => (c.arch === ARCH_A ? 100 : 0) + c.roofY],
+    GALLERY_DANCHI: [(c) => (c.arch === ARCH_B || c.arch === ARCH_C) && canGallery(c) && galleryFace(c), (c) => (c.arch === ARCH_B ? 100 : 0) + c.roofY * 0.01],
+    PENCIL_TOWER: [() => true, (c) => (c.arch === ARCH_C || c.arch === ARCH_D ? 100 : 0) + (isNarrow(c) ? 50 : 0) - minSide(c.lot)],
+  };
+  for (const k of MASSING_KINDS) {
+    const want = mins[k] ?? 0;
+    const [ok, score] = baseRule[k];
+    for (let guard = 0; guard < 16 && count(k) < want; guard++) if (!take(k, ok, score)) break;
+  }
+  const megaScore: Record<MegaStructureKind, (c: MassingCandidate) => number> = {
+    X_TRUSS_TOWER: (c) => c.roofY,
+    CYLINDER_RING_TOWER: (c) => minSide(c.lot) + c.roofY * 0.1,
+    TWIN_ARCH_GATE: (c) => Math.max(lotW(c.lot), lotD(c.lot)) + c.roofY * 0.05,
+    SLANT_CORP_TOWER: (c) => c.roofY + minSide(c.lot) * 0.2,
+  };
+  // Rarest-eligibility first so a twin-arch / cylinder lot is not taken by a truss tower.
+  const megaOrder: MegaStructureKind[] = ['TWIN_ARCH_GATE', 'CYLINDER_RING_TOWER', 'SLANT_CORP_TOWER', 'X_TRUSS_TOWER'];
+  for (const k of megaOrder) {
+    const want = opts.mega?.[k] ?? 0;
+    const needsSolidWalls = k === 'CYLINDER_RING_TOWER' || k === 'TWIN_ARCH_GATE';
+    for (let n = 0; n < want; n++) if (!take(k, (c, i) => !(needsSolidWalls && (opts.noMega?.has(i) ?? false)) && canMega(k, c), megaScore[k])) break;
+  }
   return kinds;
 }
 
@@ -346,6 +490,7 @@ export function planMassing(kind: MassingKind, c: MassingCandidate, rng: () => n
     flush: [],
   });
   if (kind === 'GALLERY_DANCHI' || kind === 'PENCIL_TOWER') return single(kind);
+  if (isMegaKind(kind)) return planMega(kind, c, rng);
 
   if (kind === 'STEPPED_SETBACK') {
     const tiers = roofY >= 64 && rng() < 0.6 ? 3 : 2;
@@ -447,6 +592,158 @@ export function planMassing(kind: MassingKind, c: MassingCandidate, rng: () => n
   };
 }
 
+/**
+ * 10B-3 megastructure plans. Every solid part is still an axis-aligned MassBox (bodies + BUILDING colliders + face
+ * spans keep working); the cylinder shaft, exoskeleton, sky-arch and sloped cap are described by extra records the
+ * CityBuilder turns into geometry merged into its existing buckets (+0 draw calls).
+ */
+function planMega(kind: MegaStructureKind, c: MassingCandidate, rng: () => number): MassingPlan {
+  const G = GRAMMAR;
+  const L = c.lot;
+  const W = lotW(L);
+  const D = lotD(L);
+  const cx = (L.x0 + L.x1) / 2;
+  const cz = (L.z0 + L.z1) / 2;
+  const roofY = c.roofY;
+  const P = G.MEGA_PODIUM_M;
+
+  if (kind === 'X_TRUSS_TOWER') {
+    // Shaft to roofY − 8, then two 4 m crown tiers stepping out (0.6 / 1.2 m) over the free street faces.
+    const yC = roofY - 8;
+    const cant = FACES4.filter(([ax, sg]) => freeFace(c, faceKeyOf(ax, sg))).map(([ax, sg]) => faceKeyOf(ax, sg));
+    const grow = (e: number): Rect => ({
+      x0: L.x0 - (cant.includes('x:-1') ? e : 0),
+      x1: L.x1 + (cant.includes('x:1') ? e : 0),
+      z0: L.z0 - (cant.includes('z:-1') ? e : 0),
+      z1: L.z1 + (cant.includes('z:1') ? e : 0),
+    });
+    const shaft: MassBox = { ...L, y0: 0, y1: yC };
+    const t1: MassBox = { ...grow(G.TRUSS_CROWN_OUT_M[0]), y0: yC, y1: roofY - 4 };
+    const t2: MassBox = { ...grow(G.TRUSS_CROWN_OUT_M[1]), y0: roofY - 4, y1: roofY };
+    const faces = [...boxFaces(shaft, L), ...boxFaces(t1, L), ...boxFaces(t2, L)];
+    return {
+      kind,
+      boxes: [shaft, t1, t2],
+      plates: [{ x0: t2.x0, x1: t2.x1, z0: t2.z0, z1: t2.z1, y: roofY, main: true }],
+      roof: { cx: (t2.x0 + t2.x1) / 2, cz: (t2.z0 + t2.z1) / 2, halfW: (t2.x1 - t2.x0) / 2, halfD: (t2.z1 - t2.z0) / 2 },
+      setbackY: 0,
+      faces,
+      cut: null,
+      flush: [],
+      truss: { y0: P, y1: yC, cantilever: cant },
+    };
+  }
+
+  if (kind === 'CYLINDER_RING_TOWER') {
+    const r = Math.min(G.CYL_R_MAX_M, Math.max(G.CYL_R_MIN_M, minSide(L) / 2 - 1.2));
+    const podium: MassBox = { ...L, y0: 0, y1: P };
+    // Inscribed prop square of the 12-gon (apothem 0.966 r): 0.68 r keeps parapet + crown clear.
+    const q = r * 0.68;
+    return {
+      kind,
+      boxes: [podium],
+      plates: [
+        { ...L, y: P, main: false },
+        { x0: cx - q, x1: cx + q, z0: cz - q, z1: cz + q, y: roofY, main: true, round: { cx, cz, r } },
+      ],
+      roof: { cx, cz, halfW: q, halfD: q },
+      setbackY: P,
+      faces: boxFaces(podium, L),
+      cut: null,
+      flush: [],
+      cyl: { cx, cz, r, y0: P, y1: roofY },
+    };
+  }
+
+  if (kind === 'TWIN_ARCH_GATE') {
+    const axis = twinSplitAxis(c) ?? (W >= D ? 'x' : 'z');
+    const len = axis === 'x' ? W : D;
+    const v = Math.min(G.ARCH_VOID_MAX_M, Math.max(G.ARCH_VOID_MIN_M, Math.round(len * 0.28 * 2) / 2), len - 2 * G.ARCH_SLAB_MIN_M);
+    const mid = axis === 'x' ? cx : cz;
+    const v0 = mid - v / 2;
+    const v1 = mid + v / 2;
+    const yB = roofY - G.ARCH_BRIDGE_M;
+    const podium: MassBox = { ...L, y0: 0, y1: P };
+    const slabA: MassBox = axis === 'x' ? { ...L, x1: v0, y0: P, y1: roofY } : { ...L, z1: v0, y0: P, y1: roofY };
+    const slabB: MassBox = axis === 'x' ? { ...L, x0: v1, y0: P, y1: roofY } : { ...L, z0: v1, y0: P, y1: roofY };
+    const bridge: MassBox = axis === 'x' ? { ...L, x0: v0, x1: v1, y0: yB, y1: roofY } : { ...L, z0: v0, z1: v1, y0: yB, y1: roofY };
+    const boxes = [podium, slabA, slabB, bridge];
+    const open: Axis = axis === 'x' ? 'z' : 'x';
+    const plate = (b: MassBox, main: boolean): RoofPlate => ({ x0: b.x0, x1: b.x1, z0: b.z0, z1: b.z1, y: b.y1, main });
+    const [l0, l1] = axis === 'x' ? [L.z0, L.z1] : [L.x0, L.x1];
+    void rng;
+    return {
+      kind,
+      boxes,
+      plates: [plate(podium, false), plate(slabA, true), plate(slabB, true), plate(bridge, true)],
+      roof: { cx: (slabA.x0 + slabA.x1) / 2, cz: (slabA.z0 + slabA.z1) / 2, halfW: (slabA.x1 - slabA.x0) / 2, halfD: (slabA.z1 - slabA.z0) / 2 },
+      setbackY: P,
+      faces: exposedBoxFaces(boxes, L),
+      cut: null,
+      flush: [],
+      partial: [faceKeyOf(open, 1), faceKeyOf(open, -1)],
+      twin: { axis, v0, v1, l0, l1, y0: P, y1: yB, bridgeY0: yB, bridgeY1: roofY },
+    };
+  }
+
+  // SLANT_CORP_TOWER: one monolith box; the sloped cap covers the back half of the roof along the long axis, rising
+  // from the flat sniper deck (front half, main plate, open edge at the ramp foot) to the back edge.
+  const axis: Axis = W >= D ? 'x' : 'z';
+  const sg: 1 | -1 = rng() < 0.5 ? 1 : -1;
+  const [a0L, a1L] = axis === 'x' ? [L.x0, L.x1] : [L.z0, L.z1];
+  const [l0, l1] = axis === 'x' ? [L.z0, L.z1] : [L.x0, L.x1];
+  const midA = (a0L + a1L) / 2;
+  const back = sg > 0 ? a1L : a0L;
+  const run = Math.abs(back - midA);
+  const h = Math.min(G.SLANT_MAX_H_M, Math.round(run * G.SLANT_RISE_K * 2) / 2);
+  const whole: MassBox = { ...L, y0: 0, y1: roofY };
+  const deck: Rect = axis === 'x' ? (sg > 0 ? { ...L, x1: midA } : { ...L, x0: midA }) : sg > 0 ? { ...L, z1: midA } : { ...L, z0: midA };
+  return {
+    kind,
+    boxes: [whole],
+    plates: [{ ...deck, y: roofY, main: true, open: [faceKeyOf(axis, sg)] }],
+    roof: { cx: (deck.x0 + deck.x1) / 2, cz: (deck.z0 + deck.z1) / 2, halfW: (deck.x1 - deck.x0) / 2, halfD: (deck.z1 - deck.z0) / 2 },
+    setbackY: 0,
+    faces: boxFaces(whole, L),
+    cut: null,
+    flush: [],
+    slant: { axis, sg, a0: midA, a1: back, l0, l1, y0: roofY, h },
+  };
+}
+
+/** Exposed vertical face spans of arbitrary stacked / abutting boxes: each face minus every box abutting its plane. */
+export function exposedBoxFaces(boxes: readonly MassBox[], lot: Rect): FaceSpan[] {
+  const out: FaceSpan[] = [];
+  boxes.forEach((b, i) => {
+    for (const f of boxFaces(b, lot)) {
+      let rects: Array<[number, number, number, number]> = [[f.a0, f.a1, f.y0, f.y1]];
+      boxes.forEach((o, j) => {
+        if (i === j) return;
+        const touches = f.ax === 'x' ? Math.abs((f.sg > 0 ? o.x0 : o.x1) - f.plane) < 1e-6 : Math.abs((f.sg > 0 ? o.z0 : o.z1) - f.plane) < 1e-6;
+        if (!touches) return;
+        const c0 = f.ax === 'x' ? o.z0 : o.x0;
+        const c1 = f.ax === 'x' ? o.z1 : o.x1;
+        const next: Array<[number, number, number, number]> = [];
+        for (const [a0, a1, y0, y1] of rects) {
+          if (c1 <= a0 || c0 >= a1 || o.y1 <= y0 || o.y0 >= y1) {
+            next.push([a0, a1, y0, y1]);
+            continue;
+          }
+          if (c0 > a0) next.push([a0, c0, y0, y1]);
+          if (c1 < a1) next.push([c1, a1, y0, y1]);
+          const m0 = Math.max(a0, c0);
+          const m1 = Math.min(a1, c1);
+          if (o.y0 > y0) next.push([m0, m1, y0, o.y0]);
+          if (o.y1 < y1) next.push([m0, m1, o.y1, y1]);
+        }
+        rects = next;
+      });
+      for (const [a0, a1, y0, y1] of rects) if (a1 - a0 > 0.05 && y1 - y0 > 0.05) out.push({ ...f, a0, a1, y0, y1 });
+    }
+  });
+  return out;
+}
+
 /** Exposed face spans of ground-standing boxes of equal height (shared walls removed); courtyard walls flagged. */
 function exposedFaces(boxes: readonly MassBox[], lot: Rect, cut: Rect): FaceSpan[] {
   const out: FaceSpan[] = [];
@@ -515,6 +812,8 @@ export interface ParapetSeg {
 export function parapetSegments(plan: MassingPlan, gaps: ReadonlyArray<{ ax: Axis; sg: number; plane: number; a0: number; a1: number }> = []): ParapetSeg[] {
   const out: ParapetSeg[] = [];
   plan.plates.forEach((p) => {
+    // 10B-3: the round cylinder roof carries a 12-gon parapet built by the CityBuilder.
+    if (p.round) return;
     const own = plan.boxes.find((b) => Math.abs(b.y1 - p.y) < 1e-6 && b.x0 <= p.x0 + 1e-6 && b.x1 >= p.x1 - 1e-6 && b.z0 <= p.z0 + 1e-6 && b.z1 >= p.z1 - 1e-6);
     for (const [ax, sg] of FACES4) {
       const plane = ax === 'x' ? (sg > 0 ? p.x1 : p.x0) : sg > 0 ? p.z1 : p.z0;
@@ -530,6 +829,7 @@ export function parapetSegments(plan: MassingPlan, gaps: ReadonlyArray<{ ax: Axi
         if (g.ax !== ax || g.sg !== sg || Math.abs(g.plane - plane) > 0.05) continue;
         spans = subtract(spans, g.a0, g.a1);
       }
+      if (p.open?.includes(faceKeyOf(ax, sg))) spans = [];
       for (const [a0, a1] of spans) if (a1 - a0 > 0.2) out.push({ ax, sg, plane, a0, a1, y: p.y });
     }
   });

@@ -19,12 +19,37 @@ export interface SectorWave {
 /** District layout family: street grid (Sectors 1–4) or central scramble with a ring of supertalls (Sector 5). */
 export type DistrictLayout = 'GRID' | 'RING';
 
+/** 10B-3 skyline-defining cyber megastructures (Type A towers, merged into the existing G.* buckets). */
+export type MegaStructureKind = 'X_TRUSS_TOWER' | 'CYLINDER_RING_TOWER' | 'TWIN_ARCH_GATE' | 'SLANT_CORP_TOWER';
+export const MEGA_STRUCTURE_KINDS: readonly MegaStructureKind[] = ['X_TRUSS_TOWER', 'CYLINDER_RING_TOWER', 'TWIN_ARCH_GATE', 'SLANT_CORP_TOWER'];
+
+/**
+ * 10B-4 per-sector architectural & colour identity: district name, neon palette (lamps, vending, crowns, terraces,
+ * megastructure neon, Mega-Billboard mist), megastructure quotas, minimum massing counts, archetype shares and
+ * Mega-Billboard density / preferred ad cells.
+ */
+export interface SectorIdentity {
+  readonly name: string;
+  readonly palette: readonly number[];
+  readonly megastructures: Readonly<Partial<Record<MegaStructureKind, number>>>;
+  /** Minimum counts of the 9A base massings (topped up where eligible lots exist). */
+  readonly minMassings: Readonly<Partial<Record<'L_SHAPE' | 'PODIUM_OFFSET' | 'STEPPED_SETBACK' | 'GALLERY_DANCHI' | 'PENCIL_TOWER', number>>>;
+  /** A / B / C / D archetype shares (default ARCHETYPE.SHARES). */
+  readonly archShares?: readonly number[];
+  /** Mega-Billboard density 0..1 (avenue screens, L-corner wraps, monolith blades). */
+  readonly billboardDensity: number;
+  /** Preferred Mega-Billboard atlas cells (0–7) for this district. */
+  readonly adCells: readonly number[];
+}
+
 export interface SectorDef {
+  /** 10B-4 district identity. */
+  readonly identity: SectorIdentity;
   readonly index: number;
   readonly name: string;
   readonly subtitle: string;
   readonly layout: DistrictLayout;
-  /** Number of low-rise … supertall towers in the district (14–22). */
+  /** 10B-1: MINIMUM number of towers (every valid ≥ 10 × 10 m lot is built; at most one becomes a covered market). */
   readonly buildingCount: number;
   /** Building height band (m) inside 16 … 95 m. */
   readonly heightMin: number;
@@ -61,6 +86,11 @@ export interface SectorDef {
 
 export const SECTORS: readonly SectorDef[] = [
   {
+    identity: {
+      name: 'NEON DOWNTOWN', palette: [0x00f0ff, 0xff2bd6, 0xffa21f],
+      megastructures: { TWIN_ARCH_GATE: 1 }, minMassings: { L_SHAPE: 1, PODIUM_OFFSET: 2, GALLERY_DANCHI: 2 },
+      billboardDensity: 1.0, adCells: [0, 1, 5, 6, 3],
+    },
     index: 1, name: 'SECTOR 01', subtitle: 'MAIN AVENUE // EXPRESSWAY ENTRANCE',
     layout: 'GRID', buildingCount: 14, heightMin: 18, heightMax: 65,
     highways: 1, highwayCrossing: false, highwayRing: false, onRamps: 1,
@@ -72,6 +102,11 @@ export const SECTORS: readonly SectorDef[] = [
     reward: 'SKILL',
   },
   {
+    identity: {
+      name: 'KOWLOON CANAL', palette: [0xffb347, 0x19e6c1, 0xff6f5e],
+      megastructures: {}, minMassings: { GALLERY_DANCHI: 4, L_SHAPE: 2 },
+      archShares: [0.2, 0.4, 0.2, 0.2], billboardDensity: 0.55, adCells: [6, 3, 0, 2],
+    },
     index: 2, name: 'SECTOR 02', subtitle: 'CANAL // TRUSS BRIDGE QUARTER',
     layout: 'GRID', buildingCount: 16, heightMin: 18, heightMax: 75,
     highways: 1, highwayCrossing: false, highwayRing: false, onRamps: 1,
@@ -82,6 +117,11 @@ export const SECTORS: readonly SectorDef[] = [
     reward: 'SKILL',
   },
   {
+    identity: {
+      name: 'INDUSTRIAL INTERCHANGE', palette: [0xff1f3d, 0xff7a00, 0x9fc3dc],
+      megastructures: { X_TRUSS_TOWER: 3 }, minMassings: { PENCIL_TOWER: 5 },
+      billboardDensity: 0.6, adCells: [2, 4, 7, 1],
+    },
     index: 3, name: 'SECTOR 03', subtitle: 'EXPRESSWAY INTERCHANGE // HIGH-RISE ALLEYS',
     layout: 'GRID', buildingCount: 18, heightMin: 22, heightMax: 85,
     highways: 2, highwayCrossing: true, highwayRing: false, onRamps: 2,
@@ -92,6 +132,11 @@ export const SECTORS: readonly SectorDef[] = [
     reward: 'SKILL',
   },
   {
+    identity: {
+      name: 'MEGA-PLAZA OVERDRIVE', palette: [0x00f0ff, 0xff2bd6, 0xb6ff2e, 0xffa21f, 0xb44bff],
+      megastructures: { CYLINDER_RING_TOWER: 2, TWIN_ARCH_GATE: 1 }, minMassings: { STEPPED_SETBACK: 3 },
+      billboardDensity: 1.0, adCells: [0, 1, 2, 3, 5, 6, 7],
+    },
     index: 4, name: 'SECTOR 04', subtitle: 'NEON CANAL DISTRICT // TWIN EXPRESSWAYS',
     layout: 'GRID', buildingCount: 22, heightMin: 24, heightMax: 95,
     highways: 2, highwayCrossing: false, highwayRing: false, onRamps: 2,
@@ -103,6 +148,11 @@ export const SECTORS: readonly SectorDef[] = [
   },
   {
     // Spec gives no car count for Sector 5; 34 sits inside the 25–45 global band.
+    identity: {
+      name: 'VALKYRIE CITADEL', palette: [0xff1f3d, 0xf2f6ff, 0x5b4bff],
+      megastructures: { SLANT_CORP_TOWER: 4, X_TRUSS_TOWER: 3 }, minMassings: {},
+      archShares: [0.5, 0.2, 0.15, 0.15], billboardDensity: 0.8, adCells: [4, 7, 5, 1],
+    },
     index: 5, name: 'SECTOR 05', subtitle: 'CENTRAL SCRAMBLE // VALKYRIE-09',
     layout: 'RING', buildingCount: 16, heightMin: 30, heightMax: 95,
     highways: 1, highwayCrossing: false, highwayRing: true, onRamps: 1,

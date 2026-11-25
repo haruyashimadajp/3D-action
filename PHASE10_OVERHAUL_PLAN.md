@@ -172,6 +172,9 @@ Extend `MassingKind` with 4 skyline-defining cyber megastructures (all merged in
 
 ## PHASE 10C — Hero Close-Up Procedural Models & Dense Street-Level Cyberpunk Furniture (`src/world/CityVehicles.ts`, `ProceduralTextures.ts`, `CityBuilder.ts`)
 
+> [!IMPORTANT]
+> **Mandatory Blueprint Reference**: Follow **`HERO_3D_MODELING_SPEC.md`** (§0–§3 & §6) strictly for `loftSymHull` cross-section station coordinates, multi-spoke wheels with brake rotors/calipers, recessed vending machine cavities, detailed street lamps, lanterns, umbrellas, ramen carts, bus-stop shelters, triangle caps, and silhouette unit tests!
+
 **Goal**: Make every object the player inspects at close range (cars, vending machines, lamps, sidewalk curbs, low roofs, eatery streets) richly detailed with genuine AAA silhouette and surface complexity — at **only `+1` net draw call**!
 
 ### 10C-1. Hero 3-Variant Cyberpunk Vehicles (`src/world/CityVehicles.ts`, `+0` extra draw calls — replaces existing `cars[0..2]`)

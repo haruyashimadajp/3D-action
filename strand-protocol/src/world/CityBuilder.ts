@@ -42,7 +42,7 @@ import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js
 import { ARCHETYPE, BALCONY, CITY_FX, CITY_SHADING, COLORS, FACADE, FIRE_ESCAPE, LEVEL, LIMITS, MATERIALS, NEON_BLOOM, PHYSICS, RENDER, SILHOUETTE, createRng, clamp } from '../config/constants';
 import { ARCH_A, ARCH_B, ARCH_C, ARCH_D, GLSL_FACADE, facadeFloorY, facadeRoomState, faceKey, isMachineFloor, roomOffset, roomsPerTile, seedInt } from './FacadeLighting';
 import { SECTORS, type SectorDef } from '../config/skills';
-import { NEON_STRIP_GLOW, ROAD_ATLAS, SIGN_ATLAS, type AtlasRegion, type ProceduralTextureLibrary } from '../engine/ProceduralTextures';
+import { MEGA_ATLAS, NEON_STRIP_GLOW, ROAD_ATLAS, SIGN_ATLAS, type AtlasRegion, type ProceduralTextureLibrary } from '../engine/ProceduralTextures';
 import {
   GRAMMAR,
   PAINT,
@@ -75,6 +75,9 @@ import {
   type MassingKind,
   type MassingPlan,
   type PropSocket,
+  MASSING_KINDS,
+  MEGA_KINDS,
+  isMegaKind,
 } from './BuildingGrammar';
 import {
   PROPS,
@@ -144,6 +147,12 @@ export interface GrappleAnchor {
 export interface BuildingInfo {
   /** 9A-2 massing (optional for older consumers). */
   massing?: string;
+  /** 10B-3 CYLINDER_RING_TOWER shaft circumradius (12-gon, flats facing ±x / ±z). */
+  cylR?: number;
+  /** 10B-3 TWIN_ARCH_GATE open void (grapple-passable slot between the slabs, under the sky-arch bridge). */
+  voidBox?: { x0: number; x1: number; y0: number; y1: number; z0: number; z1: number };
+  /** 10B-3 SLANT_CORP_TOWER cap height above the flat deck. */
+  slantH?: number;
   /** 9A-1 first terrace height (0 = none). */
   setbackY?: number;
   readonly index: number;
@@ -261,6 +270,10 @@ export interface SectorLayout {
   readonly neonSignRecords: readonly NeonSignRecord[];
   readonly buildingSpans: readonly (readonly FaceSpan[])[];
   readonly farTowersInfo: readonly FarTowerInfo[];
+  /** 10B-2 Mega-Billboard records (FaceSpan-bound; L-corner halves / ring segments share a group). */
+  readonly megaBillboards: readonly MegaBillboardRecord[];
+  /** 10B-1 the open pocket(s) built as a covered cyber street-market (≤ 1 per district). */
+  readonly marketRects: readonly RectXZ[];
   readonly stats: {
     readonly towers: number;
     readonly cars: number;
@@ -330,6 +343,17 @@ export interface SectorLayout {
       readonly decals: number;
       readonly contactShadows: number;
     };
+    /** 10B-1 lot census: generated valid lots, built towers, market pockets, built share. */
+    readonly lots: { readonly generated: number; readonly built: number; readonly market: number; readonly fill: number; readonly marketStalls: number };
+    /** 10B-3 megastructure counts. */
+    readonly megastructures: Readonly<Record<string, number>>;
+    /** 10B-2 Mega-Billboard instances by format + rain-mist halos. */
+    readonly megaBillboards: { readonly total: number; readonly avenue: number; readonly perimeter: number; readonly corner: number; readonly cornerPieces: number; readonly blade: number; readonly ring: number; readonly mists: number };
+    /** 10B-2 signs rejected by the 3D AABB non-overlap guard. */
+    readonly signRejects: number;
+    /** 10B-4 district identity name + neon palette. */
+    readonly identity: string;
+    readonly palette: readonly number[];
   };
 }
 
@@ -704,6 +728,49 @@ function slopedPrism(
   return mergeOrEmpty(parts);
 }
 
+// =============================================================================================
+// 10B-3 n-gon helpers (CYLINDER_RING_TOWER): indexed quads; for n = 12 the flats face ±x / ±z
+// =============================================================================================
+function ngonCorner(cx: number, cz: number, r: number, n: number, k: number): THREE.Vector3 {
+  const a = ((k + 0.5) / n) * Math.PI * 2;
+  return new THREE.Vector3(cx + Math.cos(a) * r, 0, cz + Math.sin(a) * r);
+}
+/** Vertical n-gon wall from y0 to y1 (outward, or inward-facing); uv = (perimeter, y) / tile. */
+function ngonWall(cx: number, cz: number, r: number, y0: number, y1: number, n: number, inward = false, tile = 4): THREE.BufferGeometry {
+  const parts: THREE.BufferGeometry[] = [];
+  const side = 2 * r * Math.sin(Math.PI / n);
+  for (let k = 0; k < n; k++) {
+    const a = ngonCorner(cx, cz, r, n, k - 1);
+    const b = ngonCorner(cx, cz, r, n, k);
+    const mid = (k / n) * Math.PI * 2;
+    const nh = new THREE.Vector3(Math.cos(mid), 0, Math.sin(mid)).multiplyScalar(inward ? -1 : 1);
+    const u0 = (k * side) / tile;
+    const u1 = ((k + 1) * side) / tile;
+    parts.push(quad([a.clone().setY(y0), b.clone().setY(y0), b.clone().setY(y1), a.clone().setY(y1)], [u0, y0 / tile, u1, y0 / tile, u1, y1 / tile, u0, y1 / tile], nh));
+  }
+  return mergeOrEmpty(parts);
+}
+/** Flat n-gon annulus (r0 → r1) at height y facing up or down; world uv / tile (r0 ≈ 0 gives a disc). */
+function ngonAnnulus(cx: number, cz: number, r0: number, r1: number, y: number, n: number, up: boolean, tile = 4): THREE.BufferGeometry {
+  const parts: THREE.BufferGeometry[] = [];
+  const nh = new THREE.Vector3(0, up ? 1 : -1, 0);
+  for (let k = 0; k < n; k++) {
+    const p = [ngonCorner(cx, cz, r0, n, k - 1), ngonCorner(cx, cz, r1, n, k - 1), ngonCorner(cx, cz, r1, n, k), ngonCorner(cx, cz, r0, n, k)].map((v) => v.setY(y)) as [THREE.Vector3, THREE.Vector3, THREE.Vector3, THREE.Vector3];
+    const uv = p.flatMap((v) => [v.x / tile, v.z / tile]) as unknown as [number, number, number, number, number, number, number, number];
+    parts.push(quad(p, uv, nh));
+  }
+  return mergeOrEmpty(parts);
+}
+/** Closed n-gon ring band (outer + inner walls, top + bottom). */
+function ngonRing(cx: number, cz: number, r0: number, r1: number, y0: number, y1: number, n: number, tile = 4): THREE.BufferGeometry {
+  return mergeOrEmpty([
+    ngonWall(cx, cz, r1, y0, y1, n, false, tile),
+    ngonWall(cx, cz, r0, y0, y1, n, true, tile),
+    ngonAnnulus(cx, cz, r0, r1, y1, n, true, tile),
+    ngonAnnulus(cx, cz, r0, r1, y0, n, false, tile),
+  ]);
+}
+
 function withColor(g: THREE.BufferGeometry, hex: number, intensity: number): THREE.BufferGeometry {
   _col.setHex(hex);
   const n = g.getAttribute('position').count;
@@ -966,7 +1033,42 @@ const CAP = {
   STEAM: 200,
   /** 9A-6 cast-iron manholes. */
   MANHOLE: 55,
+  /** 10B-2 Mega-Billboards (avenue screens, L-corner wraps, monolith blades, cylinder ad rings): one draw call. */
+  MEGA: 140,
+  /** 10B-2 coloured rain-mist halos packed after the lamp halos in the same instanced draw. */
+  MIST: 90,
 } as const;
+
+/** 10B-1 inner far-tower ring pulled in for tight skyline framing (heights still blimp-corridor clamped). */
+export const FAR_INNER = { COUNT: 36, R_MIN: 115, R_MAX: 220, H_MIN: 55, H_MAX: 180, CLEAR_M: 14 } as const;
+
+/** 10B-1 proximity-only lockdown barrier: full at ≤ 3 m, invisible (alpha 0) beyond 14 m from the camera. */
+export const BARRIER_NEAR_M = 3;
+export const BARRIER_FAR_M = 14;
+
+/** 10B-2 sign non-overlap guard: AABB padding per sign and the plane thickness used for its box. */
+export const SIGN_MARGIN_M = 0.35;
+export const SIGN_THICK_M = 0.1;
+/** 10B-2 dominant hue of each Mega-Billboard atlas cell (street light + mist tint). */
+export const AD_HUES: readonly number[] = [0x38f8ff, 0xd040ff, 0xc8ff2e, 0xff5a8a, 0xff1f3d, 0x19e6e6, 0xffa21f, 0x2f7bff];
+
+/** 10B-2 Mega-Billboard placement record (tests: zero floating, zero overlap). */
+export interface MegaBillboardRecord {
+  readonly kind: 'AVENUE' | 'PERIMETER' | 'CORNER' | 'BLADE' | 'RING';
+  readonly x: number;
+  readonly y: number;
+  readonly z: number;
+  /** Plane normal (flat screens: outward from the wall; blades: perpendicular to the wall). */
+  readonly nx: number;
+  readonly nz: number;
+  readonly w: number;
+  readonly h: number;
+  readonly building: number;
+  readonly cell: number;
+  /** Pieces sharing a group (L-corner halves, ring segments) are one screen: exempt from each other's guard. */
+  readonly group: number;
+  readonly standoff: number;
+}
 
 /**
  * `halfW` / `halfD` / `roofY` describe the ROOF (upper tier on setback towers) — roof props, corner anchors,
@@ -1062,6 +1164,8 @@ export class CityBuilder {
   private readonly halos: THREE.InstancedMesh;
   /** 5B-1: soft rain-haze glow around every street-lamp head (one instanced draw). */
   private readonly lampHalos: THREE.InstancedMesh;
+  /** 10B-2 giant English ad screens (one draw call). */
+  private readonly megaBillboards: THREE.InstancedMesh;
   /** 7B-3 / 7B-4 / 7B-5 set pieces (one draw each). */
   private readonly lampCones: THREE.InstancedMesh;
   /** 7B-1 / 7B-2 A/B switches (1 = on; verification only). */
@@ -1153,6 +1257,7 @@ export class CityBuilder {
     this.beacons = this.makeInstanced(this.createBeaconGeometry(), this.beaconMat, CAP.BEACON, 'GoldAnchors');
     this.halos = this.createAnchorHalos();
     this.lampHalos = this.createLampHalos();
+    this.megaBillboards = this.createMegaBillboards();
     this.lampCones = this.createLampCones();
     this.signals = this.createSignals();
     this.carPools = this.createCarPools();
@@ -1168,7 +1273,7 @@ export class CityBuilder {
     );
     this.persistent.add(
       ...this.cars, this.lamps, this.vending, this.steelFixtures, this.acUnits, this.ducts,
-      this.machineRooms, this.aviation, this.neonSigns, this.searchlights, this.beacons, this.halos, this.lampHalos, this.steam, this.gatePillar,
+      this.machineRooms, this.aviation, this.neonSigns, this.megaBillboards, this.searchlights, this.beacons, this.halos, this.lampHalos, this.steam, this.gatePillar,
       this.lampCones, this.signals, this.carPools, this.blimpHull, this.blimpBanner, this.manholes,
       ...this.propMeshes.meshes,
     );
@@ -1964,9 +2069,11 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
           float scan = 0.65 + 0.35 * sin(vWorld.y * 1.4 - uTime * 3.0);
           float k = floor(vKind + 0.5);
           vec3 c;
+          // 10B-1: the lockdown wall is invisible (alpha 0) beyond 14 m and fades in only from 14 m → 3 m.
+          float prox = 1.0 - smoothstep(${BARRIER_NEAR_M.toFixed(1)}, ${BARRIER_FAR_M.toFixed(1)}, dist);
           if (k < 0.5) {
             // Faint wall: only reveals itself near the player.
-            float near = 1.0 - smoothstep(10.0, 34.0, dist);
+            float near = prox;
             c = uCyan * (hex * 0.55 + 0.03) * near * scan * (1.0 - smoothstep(6.0, 40.0, vWorld.y - cameraPosition.y));
           } else {
             float frame = max(smoothstep(0.03, 0.0, min(vUv.x, 1.0 - vUv.x)), smoothstep(0.04, 0.0, 1.0 - vUv.y));
@@ -1974,11 +2081,12 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
             float topFade = 1.0 - smoothstep(0.55, 1.0, vUv.y);
             vec3 locked = uRed * (hex * 0.9 + 0.12 + frame * 1.6) * scan + uAmber * stripes * 0.18 * topFade;
             if (k > 1.5) {
+              // The open emerald next-sector gate stays visible from anywhere.
               float chev = step(0.5, fract(vWorld.y * 0.25 - abs(vUv.x - 0.5) * 2.0 - uTime * 1.2));
               vec3 open = uJade * (frame * uJadeI + hex * 0.35 + chev * 0.25 * topFade);
-              c = mix(locked, open, uGateOpen);
+              c = mix(locked * prox, open, uGateOpen);
             } else {
-              c = locked;
+              c = locked * prox;
             }
             c *= strandFogFade(dist, uFogDensity * 0.6);
           }
@@ -2923,43 +3031,135 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
    */
   private createLampHalos(): THREE.InstancedMesh {
     const geo = new THREE.PlaneGeometry(1, 1);
+    // 10B-2: per-instance colour (premultiplied by its opacity ratio) + radius: lamp halos and the coloured rain-mist
+    // halos around Mega-Billboards share this one draw.
+    geo.setAttribute('aHalo', new THREE.InstancedBufferAttribute(new Float32Array((CAP.LAMP + CAP.MIST) * 4), 4));
     const mat = new THREE.ShaderMaterial({
       transparent: true,
       depthWrite: false,
       blending: THREE.AdditiveBlending,
-      uniforms: { uColor: { value: new THREE.Color(COLORS.STREET_LAMP) }, uFogDensity: this.uFogDensity },
+      uniforms: { uFogDensity: this.uFogDensity },
       vertexShader: /* glsl */ `
-        varying vec2 vUv; varying float vDist;
+        attribute vec4 aHalo;
+        varying vec2 vUv; varying float vDist; varying vec3 vCol; varying float vR;
         void main() {
           vUv = uv;
+          vCol = aHalo.rgb;
+          vR = aHalo.w;
           vec3 center = (modelMatrix * instanceMatrix * vec4(0.0, 0.0, 0.0, 1.0)).xyz;
+          vec3 toCam = cameraPosition - center;
+          float dc = length(toCam);
+          // Big mist sprites slide toward the camera so the facade behind never slices them.
+          center += toCam / max(dc, 1e-3) * (vR > 4.0 ? min(vR * 0.8, dc * 0.5) : 0.0);
           vec3 right = vec3(viewMatrix[0][0], viewMatrix[1][0], viewMatrix[2][0]);
           vec3 up = vec3(viewMatrix[0][1], viewMatrix[1][1], viewMatrix[2][1]);
-          vec3 wp = center + (right * position.x + up * position.y) * ${(NEON_BLOOM.LAMP_HALO_RADIUS_M * 2).toFixed(2)};
-          vDist = length(center - cameraPosition);
+          vec3 wp = center + (right * position.x + up * position.y) * vR * 2.0;
+          vDist = dc;
           gl_Position = projectionMatrix * viewMatrix * vec4(wp, 1.0);
         }
       `,
       fragmentShader: /* glsl */ `
-        uniform vec3 uColor; uniform float uFogDensity;
-        varying vec2 vUv; varying float vDist;
+        uniform float uFogDensity;
+        varying vec2 vUv; varying float vDist; varying vec3 vCol; varying float vR;
         ${GLSL_FOG_FADE}
         void main() {
           float r = length(vUv - 0.5) * 2.0;
-          float a = ${NEON_BLOOM.LAMP_HALO_OPACITY.toFixed(2)} * exp(-r * r * ${NEON_BLOOM.LAMP_HALO_FALLOFF.toFixed(2)}) * (1.0 - smoothstep(0.85, 1.0, r));
+          float mist = step(4.0, vR);
+          // Lamps: tight 2.2 m glow; mist: ultra-soft wide falloff.
+          float fall = mix(${NEON_BLOOM.LAMP_HALO_FALLOFF.toFixed(2)}, 2.2, mist);
+          float a = ${NEON_BLOOM.LAMP_HALO_OPACITY.toFixed(2)} * exp(-r * r * fall) * (1.0 - smoothstep(0.85, 1.0, r));
           // Close-up: fade so the halo never washes the screen when the camera passes through it.
-          a *= smoothstep(0.6, 2.4, vDist) * strandFogFade(vDist, uFogDensity * 0.6);
-          gl_FragColor = vec4(uColor * a, 1.0);
+          a *= mix(smoothstep(0.6, 2.4, vDist), smoothstep(vR * 0.35, vR * 1.1, vDist), mist) * strandFogFade(vDist, uFogDensity * 0.6);
+          gl_FragColor = vec4(vCol * a, 1.0);
           #include <tonemapping_fragment>
           #include <colorspace_fragment>
         }
       `,
     });
-    const m = new THREE.InstancedMesh(geo, mat, CAP.LAMP);
+    const m = new THREE.InstancedMesh(geo, mat, CAP.LAMP + CAP.MIST);
     m.count = 0;
     m.frustumCulled = false;
     m.name = 'LampHalos';
     m.renderOrder = 6;
+    return m;
+  }
+
+  /**
+   * 10B-2 Mega-Billboards: one InstancedMesh (cap 140) of unit quads sampling the 2048 × 1024 English ad atlas
+   * (4 × 2 cells). Per instance: `aUvRect` (atlas sub-rect, so every screen / L-corner half / ring segment shows an
+   * undistorted crop) and `aMega` (HDR 1.15–1.55, shimmer phase, data-scroll flag, blade flag). Subtle LCD
+   * scanlines, a slow diagonal scroll shimmer, scrolling data panels, blades readable from both sides, scene fog.
+   */
+  private createMegaBillboards(): THREE.InstancedMesh {
+    const geo = new THREE.PlaneGeometry(1, 1);
+    geo.setAttribute('aUvRect', new THREE.InstancedBufferAttribute(new Float32Array(CAP.MEGA * 4), 4));
+    geo.setAttribute('aMega', new THREE.InstancedBufferAttribute(new Float32Array(CAP.MEGA * 4), 4));
+    const mat = new THREE.ShaderMaterial({
+      side: THREE.DoubleSide,
+      fog: true,
+      uniforms: {
+        ...THREE.UniformsUtils.clone(THREE.UniformsLib.fog),
+        uTime: this.uTime,
+        uAtlas: { value: this.tex.megaBillboard ?? null },
+        uBoost: this.uNeonBoost,
+        uFogDensity: this.uFogDensity,
+      },
+      vertexShader: /* glsl */ `
+        attribute vec4 aUvRect;
+        attribute vec4 aMega;
+        varying vec2 vLocal; varying vec4 vRect; varying vec4 vMega; varying float vDist; varying vec3 vWorld;
+        #include <fog_pars_vertex>
+        void main() {
+          vLocal = uv;
+          vRect = aUvRect;
+          vMega = aMega;
+          vec4 wp = modelMatrix * instanceMatrix * vec4(position, 1.0);
+          vWorld = wp.xyz;
+          vDist = length(wp.xyz - cameraPosition);
+          vec4 mvPosition = viewMatrix * wp;
+          gl_Position = projectionMatrix * mvPosition;
+          #include <fog_vertex>
+        }
+      `,
+      fragmentShader: /* glsl */ `
+        uniform float uTime; uniform sampler2D uAtlas; uniform float uBoost; uniform float uFogDensity;
+        varying vec2 vLocal; varying vec4 vRect; varying vec4 vMega; varying float vDist; varying vec3 vWorld;
+        #include <fog_pars_fragment>
+        void main() {
+          vec2 l = vLocal;
+          // Blades read correctly from both sides; flat screens / ring segments are front-only (backs face the wall).
+          if (!gl_FrontFacing) {
+            if (vMega.w < 0.5) discard;
+            l.x = 1.0 - l.x;
+          }
+
+          vec2 uv = vRect.xy + clamp(l, 0.004, 0.996) * vRect.zw;
+          vec3 t = texture2D(uAtlas, uv).rgb;
+          // DATA FLOW panels: cascading code columns pulse downward (title glyphs stay steady).
+          float rain = 1.0;
+          if (vMega.z > 0.5) {
+            float col = floor(vLocal.x * 22.0);
+            float sp = 0.25 + fract(sin(col * 12.9898) * 43758.5453) * 0.5;
+            float f = fract(vLocal.y * 1.3 + uTime * sp + col * 0.37);
+            rain = mix(0.5 + 0.95 * pow(f, 5.0), 1.0, smoothstep(0.45, 0.8, max(t.r, max(t.g, t.b))));
+          }
+          // LCD scanlines (fade with distance to avoid moire) + a slow diagonal refresh shimmer.
+          float scanAmp = 0.14 * (1.0 - smoothstep(18.0, 70.0, vDist));
+          float scan = 1.0 - scanAmp + scanAmp * sin(vWorld.y * 38.0);
+          float sweep = fract(vLocal.y * 0.55 + vLocal.x * 0.25 - uTime * 0.09 + vMega.y);
+          float shimmer = smoothstep(0.0, 0.05, sweep) * (1.0 - smoothstep(0.05, 0.12, sweep)) * 0.22;
+          vec3 c = t * vMega.x * uBoost * scan * rain + t * shimmer;
+          gl_FragColor = vec4(c, 1.0);
+          #include <tonemapping_fragment>
+          #include <colorspace_fragment>
+          #include <fog_fragment>
+        }
+      `,
+    });
+    const m = new THREE.InstancedMesh(geo, mat, CAP.MEGA);
+    m.count = 0;
+    m.frustumCulled = false;
+    m.name = 'MegaBillboards';
     return m;
   }
 
@@ -3116,7 +3316,40 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
     };
 
     // Instance counters & attributes
-    const counts = { ac: 0, duct: 0, fence: 0, ant: 0, room: 0, avi: 0, neon: 0, search: 0, beacon: 0, lamp: 0, vend: 0, rail: 0, steelFix: 0 };
+    const counts = { ac: 0, duct: 0, fence: 0, ant: 0, room: 0, avi: 0, neon: 0, search: 0, beacon: 0, lamp: 0, vend: 0, rail: 0, steelFix: 0, mega: 0 };
+    // 10B-2 sign registry: padded world AABBs of every neon sign + Mega-Billboard (strict non-overlap guard).
+    const signBoxes: Array<{ x0: number; y0: number; z0: number; x1: number; y1: number; z1: number; group: number }> = [];
+    let signRejects = 0;
+    const claimSignBox = (x: number, y: number, z: number, nx: number, nz: number, w: number, h: number, group: number): boolean => {
+      const m = SIGN_MARGIN_M;
+      const len = Math.hypot(nx, nz) || 1;
+      const ux = Math.abs(nx / len);
+      const uz = Math.abs(nz / len);
+      // Plane of width w along the tangent (nz, −nx), thickness SIGN_THICK_M along the normal.
+      const hx = (uz * w + ux * SIGN_THICK_M) / 2 + m;
+      const hz = (ux * w + uz * SIGN_THICK_M) / 2 + m;
+      const hy = h / 2 + m;
+      const box = { x0: x - hx, x1: x + hx, y0: y - hy, y1: y + hy, z0: z - hz, z1: z + hz, group };
+      for (const o of signBoxes) {
+        if (group >= 0 && o.group === group) continue;
+        if (box.x0 < o.x1 && box.x1 > o.x0 && box.y0 < o.y1 && box.y1 > o.y0 && box.z0 < o.z1 && box.z1 > o.z0) return false;
+      }
+      signBoxes.push(box);
+      return true;
+    };
+    /** Dry-run of claimSignBox (multi-piece screens are only placed when every piece fits). */
+    const signFits = (x: number, y: number, z: number, nx: number, nz: number, w: number, h: number, group: number): boolean => {
+      const n0 = signBoxes.length;
+      const ok = claimSignBox(x, y, z, nx, nz, w, h, group);
+      signBoxes.length = n0;
+      return ok;
+    };
+    const megaRecords: MegaBillboardRecord[] = [];
+    const mists: Array<{ x: number; y: number; z: number; hex: number; radius: number; opacity: number }> = [];
+    /** 10B-3 buildings whose facades belong to a megastructure (signs stay on the podium band). */
+    const megaBuilding = new Set<number>();
+    /** 10B-4 district neon palette. */
+    const PAL: readonly number[] = sector.identity?.palette ?? [COLORS.WALLRUN_CYAN, COLORS.NEON_MAGENTA, COLORS.NEON_AMBER];
     const carCounts = [0, 0, 0];
     const neonSignRecords: NeonSignRecord[] = [];
     const extraShadows: ContactShadowDesc[] = [];
@@ -3140,6 +3373,7 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
     let cableBundles = 0;
     const paintCounts = [0, 0, 0, 0, 0, 0];
     const vendTint = this.vending.geometry.getAttribute('aTint') as THREE.InstancedBufferAttribute;
+    const haloAttr = this.lampHalos.geometry.getAttribute('aHalo') as THREE.InstancedBufferAttribute;
 
     const inArea = (x: number, z: number, m = 0): boolean => Math.abs(x) <= H - m && Math.abs(z) <= H - m;
 
@@ -3196,8 +3430,15 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
       strip: number,
       format: 0 | 1 | 2 = 0,
       meta: { kind: NeonSignRecord['kind']; building?: number; buildingB?: number; farIndex?: number } = { kind: 'HIGHWAY' },
-    ): void => {
-      if (counts.neon >= CAP.NEON) return;
+    ): boolean => {
+      if (counts.neon >= CAP.NEON) return false;
+      // 10B-3: megastructure facades (exoskeleton, slant ribs, twin-arch slabs) keep signs on the podium band only.
+      if (meta.building !== undefined && meta.building >= 0 && megaBuilding.has(meta.building) && y + h / 2 > GRAMMAR.MEGA_PODIUM_M) return false;
+      // 10B-2 strict 3D AABB non-overlap guard (0.35 m padding) against every placed neon sign and Mega-Billboard.
+      if (!claimSignBox(x, y, z, nx, nz, w, h, -1)) {
+        signRejects++;
+        return false;
+      }
       // 7B-1: low / mid-rise signs light the wet street (sign colour), one light per ~3.5 m.
       if (y < 30) {
         const hex = format === 0 ? NEON_STRIP_GLOW[strip % NEON_STRIP_GLOW.length] : NEON_TINTS[strip % NEON_TINTS.length];
@@ -3227,6 +3468,64 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
         farIndex: meta.farIndex,
       });
       counts.neon++;
+      return true;
+    };
+    /** 10B-2 Mega-Billboard (2048 × 1024 English ad atlas, 4 × 2 cells): flat screen, L-corner piece, blade or ring segment. */
+    const megaAttrRect = this.megaBillboards.geometry.getAttribute('aUvRect') as THREE.InstancedBufferAttribute;
+    const megaAttrParams = this.megaBillboards.geometry.getAttribute('aMega') as THREE.InstancedBufferAttribute;
+    const addMegaBillboard = (o: {
+      kind: MegaBillboardRecord['kind'];
+      x: number;
+      y: number;
+      z: number;
+      nx: number;
+      nz: number;
+      w: number;
+      h: number;
+      building: number;
+      cell: number;
+      /** Sub-rect of the cell (0..1) this quad shows: u0, v0, su, sv. */
+      rect: readonly [number, number, number, number];
+      /** Mounting depth: screen-plane distance from the wall (flat) or inner-edge gap (blade). */
+      standoff: number;
+      group?: number;
+      hdr?: number;
+      skipGuard?: boolean;
+    }): boolean => {
+      if (counts.mega >= CAP.MEGA) return false;
+      const group = o.group ?? -1;
+      if (!o.skipGuard && !claimSignBox(o.x, o.y, o.z, o.nx, o.nz, o.w, o.h, group)) {
+        signRejects++;
+        return false;
+      }
+      _pos.set(o.x, o.y, o.z);
+      _euler.set(0, Math.atan2(o.nx, o.nz), 0);
+      _quat.setFromEuler(_euler);
+      _scl.set(o.w, o.h, 1);
+      _m4.compose(_pos, _quat, _scl);
+      this.megaBillboards.setMatrixAt(counts.mega, _m4);
+      const cx = o.cell % 4;
+      const cy = Math.floor(o.cell / 4);
+      // Atlas v runs bottom-up: row 0 is the top half.
+      // Atlas uv (flipY): cell row 0 is the top half (v 0.5 … 1); rect v is measured up from the cell bottom.
+      megaAttrRect.setXYZW(counts.mega, (cx + o.rect[0]) / 4, (1 - cy) / 2 + o.rect[1] / 2, o.rect[2] / 4, o.rect[3] / 2);
+      megaAttrParams.setXYZW(counts.mega, o.hdr ?? 1.15 + srng() * 0.4, srng(), o.cell === 1 ? 1 : 0, o.kind === 'BLADE' ? 1 : 0);
+      megaRecords.push({ kind: o.kind, x: o.x, y: o.y, z: o.z, nx: o.nx, nz: o.nz, w: o.w, h: o.h, building: o.building, cell: o.cell, group, standoff: o.standoff });
+      counts.mega++;
+      // Mega screens light the wet street below like the neon signs (one light per ~6 m).
+      if (o.y - o.h / 2 < 30) {
+        const hex = AD_HUES[o.cell];
+        const lx = o.x + o.nx * 2;
+        const lz = o.z + o.nz * 2;
+        const ly = Math.max(3, o.y - o.h / 2);
+        if (!lightNear(lx, ly, lz, 6)) addLight(lx, ly, lz, hex, Math.min(3.2, 1.2 + 0.02 * o.w * o.h));
+      }
+      return true;
+    };
+    /** 10B-2 coloured rain-mist halo (packed into the lampHalos instancing, +0 calls). */
+    const addMist = (x: number, y: number, z: number, hex: number, radius: number, opacity: number): void => {
+      if (mists.length >= CAP.MIST) return;
+      mists.push({ x, y, z, hex, radius, opacity });
     };
     const addSearch = (x: number, y: number, z: number): void => {
       if (counts.search >= CAP.SEARCH) return;
@@ -3254,19 +3553,23 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
       addSteelFixture(0, x, 0, z, alongX ? 0 : Math.PI / 2);
     };
     const NEON_TINTS = [0xff2bd6, 0x00f0ff, 0xffa21f, 0x39ff88, 0xb44bff];
+    /** 10B-4: lamp-arm and vending tints follow the district palette. */
+    const LAMP_TINTS: readonly number[] = [...PAL, ...PAL, 0xf2f6ff];
     /** 9B: lamp poles carry no collider; clutter keeps clear of them. */
     const lampPoles: Array<readonly [number, number]> = [];
     const addLamp = (x: number, z: number, yaw: number): void => {
       if (counts.lamp >= CAP.LAMP) return;
       lampPoles.push([x, z]);
       placeInstance(this.lamps, counts.lamp, x, 0, z, yaw);
-      _col.setHex(NEON_TINTS[Math.floor(rng() * NEON_TINTS.length)]);
+      _col.setHex(LAMP_TINTS[Math.floor(rng() * LAMP_TINTS.length)]);
       lampTint.setXYZ(counts.lamp, _col.r, _col.g, _col.b);
       counts.lamp++;
       // Lamp head sits 2.05 m out along the arm (+Z rotated by yaw).
       addLight(x + Math.sin(yaw) * 2.05, 6.2, z + Math.cos(yaw) * 2.05, COLORS.STREET_LAMP, 4.0);
       _m4.makeTranslation(x + Math.sin(yaw) * 2.05, 6.22, z + Math.cos(yaw) * 2.05);
       this.lampHalos.setMatrixAt(counts.lamp - 1, _m4);
+      _colB.setHex(COLORS.STREET_LAMP);
+      haloAttr.setXYZW(counts.lamp - 1, _colB.r, _colB.g, _colB.b, NEON_BLOOM.LAMP_HALO_RADIUS_M);
       // 7B-3: volumetric cone under the head.
       _m4.makeTranslation(x + Math.sin(yaw) * 2.05, CITY_FX.CONE_TOP_Y, z + Math.cos(yaw) * 2.05);
       this.lampCones.setMatrixAt(counts.lamp - 1, _m4);
@@ -3275,7 +3578,7 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
     const addVending = (x: number, z: number, yaw: number, scale = 1): void => {
       if (counts.vend >= CAP.VENDING) return;
       placeInstance(this.vending, counts.vend, x, 0, z, yaw, scale, scale, scale);
-      const vHex = NEON_TINTS[Math.floor(rng() * NEON_TINTS.length)];
+      const vHex = LAMP_TINTS[Math.floor(rng() * LAMP_TINTS.length)];
       _col.setHex(vHex);
       vendTint.setXYZ(counts.vend, _col.r, _col.g, _col.b);
       counts.vend++;
@@ -3523,7 +3826,6 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
     }
 
     // ------------------------------------------------------------------ 4. neon truss bridges
-    const BRIDGE_NEON = [COLORS.NEON_MAGENTA, COLORS.WALLRUN_CYAN, COLORS.NEON_AMBER];
     bridgeSpans.forEach((b, bi) => {
       const c = canals[b.canal];
       const s = streets[b.street];
@@ -3535,7 +3837,8 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
         bridgeSpawns.push({ position: pt(axis, c.coord + k * (c.width / 2), LEVEL.BRIDGE_DECK_Y, (b.lat0 + b.lat1) / 2), layer: 0, building: -1 });
       }
       colliders.push(colliderAL(axis, c.coord - c.width / 2, c.coord + c.width / 2, b.lat0, b.lat1, -LEVEL.BRIDGE_DECK_THICKNESS_M, LEVEL.BRIDGE_DECK_Y, 'BRIDGE'));
-      const neon = BRIDGE_NEON[bi % BRIDGE_NEON.length];
+      // 10B-4: truss-bridge neon glows in the district palette (Kowloon canal amber / jade / coral …).
+      const neon = PAL[bi % PAL.length];
       const tops = [3.5, 5.6, 6.5, 5.6, 3.5];
       for (const side of [-1, 1]) {
         const lat = side < 0 ? b.lat0 - 0.25 : b.lat1 + 0.25;
@@ -3801,29 +4104,21 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
 
     // ------------------------------------------------------------------ 6. building lots, alleys & heights
     const lotList = plan.explicitLots ? plan.explicitLots.map((r) => ({ r, pair: -1 })) : this.computeLots(plan, sector, rng);
-    const N = sector.buildingCount;
     const isPerimeter = (r: RectXZ): boolean => Math.max(Math.abs(r.x0), Math.abs(r.x1), Math.abs(r.z0), Math.abs(r.z1)) > H - 6;
-    // Whole alley-split groups first (keeps both sides of each wall-run alley), perimeter wall preferred,
-    // then single lots; spare lots become plazas.
-    const groups = new Map<number, RectXZ[]>();
-    const singles: RectXZ[] = [];
-    for (const l of lotList) {
-      if (l.pair < 0) singles.push(l.r);
-      else groups.set(l.pair, [...(groups.get(l.pair) ?? []), l.r]);
-    }
-    const groupOrder = [...groups.values()]
-      .map((g) => ({ g, perim: g.some(isPerimeter) ? 1 : 0, roll: rng() }))
-      .sort((p, o) => o.perim - p.perim || p.roll - o.roll);
-    const chosen: RectXZ[] = [];
-    const rest: RectXZ[] = [...singles];
-    for (const { g } of groupOrder) {
-      if (chosen.length + g.length <= N) chosen.push(...g);
-      else rest.push(...g);
-    }
-    const restOrder = rest.map((r) => ({ r, perim: isPerimeter(r) ? 1 : 0, roll: rng() })).sort((p, o) => o.perim - p.perim || p.roll - o.roll);
-    while (chosen.length < N && restOrder.length) chosen.push((restOrder.shift() as { r: RectXZ }).r);
-    const plazas = restOrder.map((o) => o.r);
-    if (chosen.length !== N) throw new Error(`Sector ${sector.index}: only ${chosen.length}/${N} building lots`);
+    // 10B-1: every valid lot (≥ 10 × 10 m) is built — `buildingCount` is now a minimum. At most ONE small interior
+    // single lot (never an alley-split piece, never on the perimeter) stays open and becomes a dense covered cyber
+    // street-market, and only while the district still builds ≥ 92 % of its lots.
+    const lotArea = (r: RectXZ): number => (r.x1 - r.x0) * (r.z1 - r.z0);
+    const marketCands = lotList
+      .filter((l) => l.pair < 0 && !isPerimeter(l.r) && lotArea(l.r) <= 560)
+      .map((l) => ({ r: l.r, a: lotArea(l.r), roll: rng() }))
+      .sort((p, o) => p.a - o.a || p.roll - o.roll);
+    const marketLot = !plan.explicitLots && marketCands.length && (lotList.length - 1) / lotList.length >= 0.92 ? marketCands[0].r : null;
+    const chosen: RectXZ[] = lotList.filter((l) => l.r !== marketLot).map((l) => l.r);
+    const plazas: RectXZ[] = marketLot ? [marketLot] : [];
+    const N = chosen.length;
+    if (N < sector.buildingCount) throw new Error(`Sector ${sector.index}: only ${N}/${sector.buildingCount} building lots`);
+    const lotsGenerated = lotList.length;
 
     // Alley detection: footprints facing each other across a 4–10 m gap with ≥ 5 m overlap.
     type AlleyRec = { a: number; b: number; axis: Axis; gap0: number; gap1: number; ov0: number; ov1: number };
@@ -3871,9 +4166,12 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
 
     // Heights inside the sector band; perimeter towers lean tall; sky-bridge towers tall enough for Layer 2.
     const q2 = (v: number): number => Math.round(v * 2) / 2;
+    /** 10B-1 perimeter skyline framing: lots on the ±H wall always rise ≥ 36 m. */
+    const PERIM_MIN_H = 36;
     const heights = chosen.map((r) => {
       const t = isPerimeter(r) ? 0.45 + rng() * 0.55 : rng();
-      return q2(sector.heightMin + t * (sector.heightMax - sector.heightMin));
+      const hgt = q2(sector.heightMin + t * (sector.heightMax - sector.heightMin));
+      return isPerimeter(r) ? Math.max(PERIM_MIN_H, hgt) : hgt;
     });
     for (const i of bridged) heights[i] = Math.min(sector.heightMax, Math.max(heights[i], q2(LEVEL.SKYBRIDGE_Y_MIN + 12 + rng() * 14)));
     let iMax = 0;
@@ -3906,7 +4204,7 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
     const escapeNeed = 2 * FE.LANDING_WIDTH_M + FE.RUN_MIN_M + 1.2;
     const lotFaceLen = (r: RectXZ, ax: Axis): number => (ax === 'x' ? r.z1 - r.z0 : r.x1 - r.x0);
     const hasEscapeFace = (i: number): boolean => FACES.some(([ax, sg]) => !alleyFaces.has(`${i}:${ax}:${sg}`) && lotFaceLen(chosen[i], ax) >= escapeNeed);
-    const quota = AR.SHARES.map((sh) => sh * N);
+    const quota = (sector.identity?.archShares ?? AR.SHARES).map((sh) => sh * N);
     const archCount = quota.map((q) => Math.floor(q));
     const remOrder = quota.map((q, i) => ({ i, r: q - archCount[i] })).sort((p, o) => o.r - p.r || p.i - o.i);
     for (let k = 0; archCount.reduce((s, v) => s + v, 0) < N; k++) archCount[remOrder[k % 4].i]++;
@@ -3926,8 +4224,9 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
     // so its fire escapes still land flush on whole 4 m storeys.)
     heights.forEach((h, i) => {
       const a = archOf[i];
-      const [lo, hi] = heightBand(a, sector.heightMin, sector.heightMax);
-      heights[i] = quantizeToFloors(a, clamp(h, lo, hi), lo, hi, bridged.has(i) ? 'ceil' : 'round');
+      const [lo0, hi] = heightBand(a, sector.heightMin, sector.heightMax);
+      const lo = isPerimeter(chosen[i]) ? Math.min(hi, Math.max(lo0, PERIM_MIN_H)) : lo0;
+      heights[i] = quantizeToFloors(a, clamp(h, lo, hi), lo, hi, bridged.has(i) || isPerimeter(chosen[i]) ? 'ceil' : 'round');
     });
 
     // 9A-2: five massings (own rng stream, so streets / cars / lamps stay where they were).
@@ -3936,9 +4235,16 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
     const candidates: MassingCandidate[] = chosen.map((r, i) => {
       const alley = new Set<string>();
       for (const [ax, sg] of FACES) if (alleyFaces.has(`${i}:${ax}:${sg}`)) alley.add(faceKeyOf(ax, sg));
-      return { arch: archOf[i], lot: r, roofY: heights[i], alley };
+      // 10B-3: faces within 4 m of the lockdown wall never cantilever / open a void toward it.
+      const edge = new Set<string>();
+      if (r.x1 > H - 4) edge.add('x:1');
+      if (r.x0 < -H + 4) edge.add('x:-1');
+      if (r.z1 > H - 4) edge.add('z:1');
+      if (r.z0 < -H + 4) edge.add('z:-1');
+      return { arch: archOf[i], lot: r, roofY: heights[i], alley, edge };
     });
-    const massings = assignMassings(candidates, mrng);
+    const ident = sector.identity;
+    const massings = assignMassings(candidates, mrng, ident ? { minCounts: ident.minMassings, mega: ident.megastructures, noMega: bridged } : {});
     const buildings: Building[] = chosen.map((r, i) => {
       const plan = planMassing(massings[i], candidates[i], mrng);
       return {
@@ -3958,6 +4264,13 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
         setbackY: plan.setbackY,
         massing: massings[i],
         plan,
+        cylR: plan.cyl?.r,
+        voidBox: plan.twin
+          ? plan.twin.axis === 'x'
+            ? { x0: plan.twin.v0, x1: plan.twin.v1, y0: plan.twin.y0, y1: plan.twin.y1, z0: plan.twin.l0, z1: plan.twin.l1 }
+            : { x0: plan.twin.l0, x1: plan.twin.l1, y0: plan.twin.y0, y1: plan.twin.y1, z0: plan.twin.v0, z1: plan.twin.v1 }
+          : undefined,
+        slantH: plan.slant?.h,
       };
     });
     const lowTopOf = (b: Building): number => (b.setbackY > 0 ? b.setbackY : b.roofY);
@@ -3986,6 +4299,8 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
     const spineFaces = new Set<string>();
     const partialFaces = new Set<string>();
     buildings.forEach((b) => {
+      // 10B-3: TWIN_ARCH_GATE void openings are not full-height walls (no run / feature roles).
+      for (const k of b.plan.partial ?? []) partialFaces.add(`${b.index}:${k}`);
       const cut = b.plan.cut;
       if (cut) {
         if (Math.abs(cut.x1 - b.rect.x1) < 1e-6) partialFaces.add(fkey(b, 'x', 1));
@@ -4094,12 +4409,309 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
     }
     const runFaceCount = buildings.map((b) => FACES.filter(([ax, sg]) => runFaces.has(fkey(b, ax, sg))).length);
 
+    /** Face frame on an arbitrary wall plane (9A helpers, shared by 10B megastructures / Mega-Billboards). */
+    const sf = (ax: Axis, sg: number, plane: number) => {
+      const P3 = (al: number, y: number, d: number): THREE.Vector3 => (ax === 'x' ? new THREE.Vector3(plane + sg * d, y, al) : new THREE.Vector3(al, y, plane + sg * d));
+      const ext = (a0: number, a1: number, y0: number, y1: number, d0: number, d1: number) => {
+        const lo = P3(a0, y0, d0);
+        const hi = P3(a1, y1, d1);
+        return { w: Math.abs(hi.x - lo.x), h: y1 - y0, d: Math.abs(hi.z - lo.z), x: (lo.x + hi.x) / 2, y: (y0 + y1) / 2, z: (lo.z + hi.z) / 2, lo, hi };
+      };
+      const bx = (a0: number, a1: number, y0: number, y1: number, d0: number, d1: number, ao: Parameters<typeof aoBox>[6] = {}): THREE.BufferGeometry[] => {
+        const e = ext(a0, a1, y0, y1, d0, d1);
+        return aoBox(Math.max(e.w, 0.005), Math.max(e.h, 0.005), Math.max(e.d, 0.005), e.x, e.y, e.z, ao);
+      };
+      const paint = (hex: number, a0: number, a1: number, y0: number, y1: number, d0: number, d1: number, ao: Parameters<typeof aoBox>[6] = {}): THREE.BufferGeometry[] =>
+        bx(a0, a1, y0, y1, d0, d1, { tile: 1.6, ...ao }).map((g) => withTint(g, hex));
+      const glow = (hex: number, k: number, a0: number, a1: number, y0: number, y1: number, d0: number, d1: number): THREE.BufferGeometry => {
+        const e = ext(a0, a1, y0, y1, d0, d1);
+        return withColor(boxAt(Math.max(e.w, 0.005), Math.max(e.h, 0.005), Math.max(e.d, 0.005), e.x, e.y, e.z), hex, k);
+      };
+      const coll = (a0: number, a1: number, y0: number, y1: number, d0: number, d1: number, building: number, kind: ColliderKind = 'PROP'): void => {
+        const e = ext(a0, a1, y0, y1, d0, d1);
+        colliders.push({ min: new THREE.Vector3(Math.min(e.lo.x, e.hi.x), y0, Math.min(e.lo.z, e.hi.z)), max: new THREE.Vector3(Math.max(e.lo.x, e.hi.x), y1, Math.max(e.lo.z, e.hi.z)), kind, building });
+      };
+      /** Slanted slab from the wall (yIn at d0) out to yOut at d1 across [a0, a1] (awnings). */
+      const slant = (a0: number, a1: number, yIn: number, yOut: number, d0: number, d1: number, th: number): THREE.BufferGeometry => {
+        const run = d1 - d0;
+        const len = Math.hypot(run, yIn - yOut);
+        const ang = Math.atan2(yIn - yOut, run);
+        const g = ax === 'x' ? new THREE.BoxGeometry(len, th, a1 - a0) : new THREE.BoxGeometry(a1 - a0, th, len);
+        if (ax === 'x') g.rotateZ(-ang * sg);
+        else g.rotateX(ang * sg);
+        const c = P3((a0 + a1) / 2, (yIn + yOut) / 2, (d0 + d1) / 2);
+        g.translate(c.x, c.y, c.z);
+        return applyAo(g, { bottom: GRAMMAR.AO_UNDERSIDE });
+      };
+      return { P3, bx, paint, glow, coll, slant, ref: { ax, sg, plane }, nx: ax === 'x' ? sg : 0, nz: ax === 'z' ? sg : 0 };
+    };
+    type SF = ReturnType<typeof sf>;
+
+
+    // ------------------------------------------------------------------ 7c. 10B-3 cyber megastructures (+0 calls)
+    // Merged into the existing buckets: G.bodies (glass shafts), G.steel (exoskeleton, arch ribs, spire, frames),
+    // G.strips (neon pillars / rings / ribs), G.concrete (round roof + parapet); cylinder ad rings are Mega-Billboards.
+    const megaCounts: Record<string, number> = Object.fromEntries(MEGA_KINDS.map((k) => [k, 0]));
+    let signGroup = 0;
+    const palOf = (b: Building, k: number): number => PAL[(Math.floor(b.seed * 977) + k) % PAL.length];
+    /** Beam lying in a wall plane: `inPlane` section width, `relief` depth along the wall normal. */
+    const faceBeam = (ax: Axis, p0: THREE.Vector3, p1: THREE.Vector3, inPlane: number, relief: number): THREE.BufferGeometry =>
+      ax === 'x' ? beam(p0, p1, relief, inPlane) : beam(p0, p1, inPlane, relief);
+    const lotPlane = (b: Building, ax: Axis, sg: number): number => (ax === 'x' ? (sg > 0 ? b.rect.x1 : b.rect.x0) : sg > 0 ? b.rect.z1 : b.rect.z0);
+    const lotRange = (b: Building, ax: Axis): [number, number] => (ax === 'x' ? [b.rect.z0, b.rect.z1] : [b.rect.x0, b.rect.x1]);
+    /** Undistorted crop of an ad cell for a screen of aspect `a` (≤ 25 % stretch), centred on the cell's title band. */
+    const adCrop = (cell: number, a: number): [number, number, number, number] => {
+      const ac = MEGA_ATLAS.ASPECT[cell];
+      const r = a / ac;
+      let su = 1;
+      let sv = 1;
+      if (r > 1.25) sv = Math.max(0.12, 1.25 / r);
+      else if (r < 0.8) su = Math.max(0.12, r / 0.8);
+      const v0 = Math.min(1 - sv, Math.max(0, MEGA_ATLAS.TITLE_V[cell] - sv / 2));
+      return [(1 - su) / 2, v0, su, sv];
+    };
+    const megaStructure = (b: Building): void => {
+      const plan = b.plan;
+      const GM = GRAMMAR;
+      megaBuilding.add(b.index);
+      megaCounts[b.massing]++;
+      const neonA = palOf(b, 0);
+      const neonB = palOf(b, 1);
+      const V = (x: number, y: number, z: number): THREE.Vector3 => new THREE.Vector3(x, y, z);
+
+      if (plan.truss) {
+        // X_TRUSS_TOWER: bold diagonal X-brace exoskeleton (0.45 m beams, 12 m bays, 0.26 m relief: wall-run safe),
+        // ring beams on every bay line, heavy corner columns, glowing node plates, lit cantilevered crown soffits.
+        const { y0, y1 } = plan.truss;
+        const R = GM.TRUSS_RELIEF_M;
+        const BW = GM.TRUSS_BEAM_M;
+        const nb = Math.max(1, Math.round((y1 - y0) / GM.TRUSS_BAY_M));
+        const bh = (y1 - y0) / nb;
+        for (const [ax, sg] of FACES) {
+          const f = sf(ax, sg, lotPlane(b, ax, sg));
+          const [a0, a1] = lotRange(b, ax);
+          const np = a1 - a0 > 22 ? 2 : 1;
+          const pw = (a1 - a0) / np;
+          for (let i = 0; i < nb; i++) {
+            const ya = y0 + i * bh;
+            const yb = ya + bh;
+            for (let j = 0; j < np; j++) {
+              const pa = a0 + j * pw;
+              const pb = pa + pw;
+              G.steel.push(
+                faceBeam(ax, f.P3(pa + BW, ya + BW / 2, R / 2), f.P3(pb - BW, yb - BW / 2, R / 2), BW, R),
+                faceBeam(ax, f.P3(pb - BW, ya + BW / 2, R / 2), f.P3(pa + BW, yb - BW / 2, R / 2), BW, R),
+              );
+              const ma = (pa + pb) / 2;
+              const my = (ya + yb) / 2;
+              G.strips.push(f.glow(neonA, 1.7, ma - 0.28, ma + 0.28, my - 0.28, my + 0.28, R - 0.04, R + 0.05));
+              if (i % 2 === 0 && my < 40) {
+                const lp = f.P3(ma, my, 1.2);
+                if (!lightNear(lp.x, lp.y, lp.z, 8)) addLight(lp.x, lp.y, lp.z, neonA, 1.2);
+              }
+            }
+            for (let j = 1; j < np; j++) G.steel.push(...f.bx(a0 + j * pw - BW / 2, a0 + j * pw + BW / 2, ya, yb, 0, R));
+          }
+          for (let i = 0; i <= nb; i++) G.steel.push(...f.bx(a0, a1, y0 + i * bh - BW / 2, y0 + i * bh + BW / 2, 0, R, { bottom: GM.AO_UNDERSIDE }));
+        }
+        for (const [sx, sz] of CORNERS_4) {
+          const x = sx > 0 ? b.rect.x1 : b.rect.x0;
+          const z = sz > 0 ? b.rect.z1 : b.rect.z0;
+          G.steel.push(boxAt(0.62, y1 - y0 + BW, 0.62, x + sx * 0.09, (y0 + y1) / 2, z + sz * 0.09));
+        }
+        // Cantilevered crown: neon line under each overhanging tier edge + a lit top edge.
+        for (const bx of plan.boxes.slice(1)) {
+          for (const [ax, sg] of FACES) {
+            if (!plan.truss.cantilever.includes(faceKeyOf(ax, sg))) continue;
+            const plane = ax === 'x' ? (sg > 0 ? bx.x1 : bx.x0) : sg > 0 ? bx.z1 : bx.z0;
+            const [a0, a1] = ax === 'x' ? [bx.z0, bx.z1] : [bx.x0, bx.x1];
+            const f = sf(ax, sg, plane);
+            G.strips.push(f.glow(neonB, 1.6, a0 + 0.1, a1 - 0.1, bx.y0 + 0.02, bx.y0 + 0.12, -0.05, 0.04));
+          }
+        }
+        addLight(b.cx, b.roofY + 2, b.cz, neonB, 2.4);
+        return;
+      }
+
+      if (plan.cyl) {
+        // CYLINDER_RING_TOWER: 12-sided glass shaft on the 8 m podium, vertical fins, 3 tiered ad rings (Mega-Billboard
+        // segments + steel frames + neon edges), round roof + parapet, blazing crown halo and an 18 m radio spire.
+        const { cx, cz, r, y0, y1 } = plan.cyl;
+        const n = GM.CYL_SIDES;
+        G.bodies.push(withAttr1(withAttr1(ngonWall(cx, cz, r, y0 - 0.05, y1 - 0.45, n), 'aSeed', b.seed), 'aArch', b.arch));
+        // Circumscribed collider cross (≤ 0.18 r outside the facets, never inside).
+        for (const [hx, hz] of [[0.966, 0.5], [0.5, 0.966], [0.837, 0.837]] as const) {
+          colliders.push({ min: V(cx - hx * r, y0, cz - hz * r), max: V(cx + hx * r, y1, cz + hz * r), kind: 'BUILDING', building: b.index });
+        }
+        for (let k = 0; k < n; k++) {
+          const c = ngonCorner(cx, cz, r + 0.03, n, k);
+          G.steel.push(boxAt(0.16, y1 - y0 - 0.5, 0.16, c.x, (y0 + y1 - 0.5) / 2, c.z));
+        }
+        const T = RENDER.ROOF_TILE_M;
+        G.concrete.push(ngonWall(cx, cz, r + 0.15, y1 - 0.5, y1, n, false, T), ngonAnnulus(cx, cz, 0.02, r + 0.15, y1, n, true, T), ngonAnnulus(cx, cz, r - 0.3, r + 0.15, y1 - 0.5, n, false, T));
+        const pr1 = r + 0.12;
+        const pr0 = pr1 - GM.PARAPET_T;
+        G.concrete.push(ngonRing(cx, cz, pr0, pr1, y1, y1 + GM.PARAPET_H, n, T));
+        G.steel.push(ngonRing(cx, cz, pr1 - GM.COPING_W, pr1 + 0.03, y1 + GM.PARAPET_H, y1 + GM.PARAPET_H + GM.COPING_H, n));
+        for (let k = 0; k < n; k++) {
+          const pa = ngonCorner(cx, cz, (pr0 + pr1) / 2, n, k - 1);
+          const pb = ngonCorner(cx, cz, (pr0 + pr1) / 2, n, k);
+          for (let q = 0; q < 3; q++) {
+            const p0 = pa.clone().lerp(pb, q / 3);
+            const p1 = pa.clone().lerp(pb, (q + 1) / 3);
+            const t = GM.PARAPET_T / 2;
+            colliders.push({
+              min: V(Math.min(p0.x, p1.x) - t, y1, Math.min(p0.z, p1.z) - t),
+              max: V(Math.max(p0.x, p1.x) + t, y1 + GM.PARAPET_H, Math.max(p0.z, p1.z) + t),
+              kind: 'PROP',
+              building: b.index,
+            });
+          }
+        }
+        // Tiered ad rings: 12 flush segments each, the ad repeating 4× around (3 segments per repeat).
+        const ap = r * Math.cos(Math.PI / n);
+        const ra = ap + 0.36;
+        const ws = 2 * ra * Math.tan(Math.PI / n);
+        const hr = 3.2;
+        const rings = 3;
+        const cells = sector.identity?.adCells.filter((c) => MEGA_ATLAS.ASPECT[c] >= 1) ?? [0, 1, 2, 5, 6, 7];
+        for (let i = 0; i < rings; i++) {
+          const yk = y0 + 7 + ((i + 0.5) / rings) * (y1 - y0 - 12);
+          const cell = cells[(Math.floor(b.seed * 31) + i) % cells.length];
+          const crop = adCrop(cell, (3 * ws) / hr);
+          const g = ++signGroup;
+          for (let k = 0; k < n; k++) {
+            const th = (k / n) * Math.PI * 2;
+            const seg = 2 - (k % 3);
+            addMegaBillboard({
+              kind: 'RING',
+              x: cx + Math.cos(th) * ra,
+              y: yk,
+              z: cz + Math.sin(th) * ra,
+              nx: Math.cos(th),
+              nz: Math.sin(th),
+              w: ws,
+              h: hr,
+              building: b.index,
+              cell,
+              rect: [crop[0] + (seg / 3) * crop[2], crop[1], crop[2] / 3, crop[3]],
+              standoff: 0.36,
+              group: g,
+            });
+          }
+          const rf = (ap + 0.5) / Math.cos(Math.PI / n);
+          for (const yy of [yk + hr / 2 + 0.02, yk - hr / 2 - 0.2]) G.steel.push(ngonRing(cx, cz, r - 0.05, rf, yy, yy + 0.18, n));
+          for (const yy of [yk + hr / 2 + 0.2, yk - hr / 2 - 0.26]) G.strips.push(withColor(ngonWall(cx, cz, rf + 0.02, yy, yy + 0.06, n), neonA, 1.7));
+          addMist(cx, yk, cz, AD_HUES[cell], r + 4, 0.12);
+        }
+        // Crown halo + posts, radio spire with aviation light.
+        for (let k = 0; k < n; k += 2) {
+          const c = ngonCorner(cx, cz, r + 0.3, n, k);
+          G.steel.push(boxAt(0.14, 2.5, 0.14, c.x, y1 + 1.25, c.z));
+        }
+        G.strips.push(withColor(ngonWall(cx, cz, r + 0.34, y1 + 1.9, y1 + 2.4, n), neonA, 2.0), withColor(ngonWall(cx, cz, r + 0.3, y1 + 1.9, y1 + 2.4, n, true), neonA, 2.0));
+        addLight(cx, y1 + 3, cz, neonA, 3.4);
+        const SP = 18;
+        G.steel.push(boxAt(0.4, SP, 0.4, cx, y1 + SP / 2, cz), boxAt(3.2, 0.14, 0.14, cx, y1 + 7, cz), boxAt(0.14, 0.14, 2.4, cx, y1 + 11.5, cz));
+        colliders.push({ min: V(cx - 0.2, y1, cz - 0.2), max: V(cx + 0.2, y1 + SP, cz + 0.2), kind: 'STEEL', building: b.index });
+        roofRects[b.index].push(rectFrom(cx - 1.8, cz - 1.8, cx + 1.8, cz + 1.8));
+        addAviation(cx, y1 + SP + 0.3, cz);
+        return;
+      }
+
+      if (plan.twin) {
+        // TWIN_ARCH_GATE: twin slabs over a 6–8 m void (grapple-passable), bridged by a neon-framed sky-arch truss
+        // with glowing vertical edge pillars; anchors under the soffit on both openings.
+        const t = plan.twin;
+        const openAx: Axis = t.axis === 'x' ? 'z' : 'x';
+        const span = t.v1 - t.v0;
+        const midA = (t.v0 + t.v1) / 2;
+        const rise = Math.min(span * 0.62, (t.y1 - t.y0) * 0.4);
+        const R = GM.TRUSS_RELIEF_M;
+        for (const sgO of [-1, 1] as const) {
+          const f = sf(openAx, sgO, sgO > 0 ? t.l1 : t.l0);
+          for (const a of [t.v0, t.v1]) {
+            G.strips.push(f.glow(neonA, 2.0, a - 0.22, a + 0.22, t.y0, t.bridgeY1 - 0.4, 0.02, 0.34));
+            G.steel.push(...f.bx(a - 0.34, a + 0.34, t.y0, t.bridgeY1 - 0.4, -0.02, 0.24));
+          }
+          G.strips.push(f.glow(neonB, 1.8, t.v0, t.v1, t.bridgeY0 - 0.14, t.bridgeY0 + 0.04, 0.0, 0.26));
+          G.strips.push(f.glow(neonB, 1.4, t.v0, t.v1, t.y0 + GM.PARAPET_H + 0.1, t.y0 + GM.PARAPET_H + 0.2, 0.0, 0.2));
+          // Sky-arch: steel rib + neon face along a sine arch under the bridge soffit.
+          const segs = 14;
+          for (let i = 0; i < segs; i++) {
+            const q0 = i / segs;
+            const q1 = (i + 1) / segs;
+            const p0 = f.P3(t.v0 + q0 * span, t.bridgeY0 - rise * (1 - Math.sin(Math.PI * q0)), 0.2);
+            const p1 = f.P3(t.v0 + q1 * span, t.bridgeY0 - rise * (1 - Math.sin(Math.PI * q1)), 0.2);
+            G.steel.push(faceBeam(openAx, p0, p1, 0.42, 0.3));
+            G.strips.push(withColor(faceBeam(openAx, f.P3(t.v0 + q0 * span, t.bridgeY0 - rise * (1 - Math.sin(Math.PI * q0)), 0.38), f.P3(t.v0 + q1 * span, t.bridgeY0 - rise * (1 - Math.sin(Math.PI * q1)), 0.38), 0.16, 0.05), neonA, 2.0));
+          }
+          // Truss X on the bridge face + hanger rods from the arch crown.
+          const yb0 = t.bridgeY0 + 0.4;
+          const yb1 = t.bridgeY1 - 0.6;
+          G.steel.push(
+            faceBeam(openAx, f.P3(t.v0 + 0.3, yb0, R / 2), f.P3(t.v1 - 0.3, yb1, R / 2), 0.4, R),
+            faceBeam(openAx, f.P3(t.v1 - 0.3, yb0, R / 2), f.P3(t.v0 + 0.3, yb1, R / 2), 0.4, R),
+          );
+          for (const q of [0.25, 0.5, 0.75]) {
+            const a = t.v0 + q * span;
+            const ya = t.bridgeY0 - rise * (1 - Math.sin(Math.PI * q));
+            G.steel.push(...f.bx(a - 0.05, a + 0.05, ya, t.bridgeY0, 0.15, 0.25));
+          }
+          // Grapple anchor 1.2 m inside the opening, hung from the soffit.
+          const an = f.P3(midA, t.bridgeY0 - 1.0, -1.2);
+          G.steel.push(beam(an, an.clone().setY(t.bridgeY0), 0.16));
+          addBeacon(an, 'BUILDING_CORNER');
+        }
+        const vc = openAx === 'x' ? V((t.l0 + t.l1) / 2, (t.y0 + t.y1) / 2, midA) : V(midA, (t.y0 + t.y1) / 2, (t.l0 + t.l1) / 2);
+        addLight(vc.x, vc.y, vc.z, neonA, 2.6);
+        addMist(vc.x, vc.y, vc.z, neonA, 9, 0.11);
+        return;
+      }
+
+      if (plan.slant) {
+        // SLANT_CORP_TOWER: sloped crown cap (walkable 35° ramp over the back half; the flat sniper deck stays in
+        // front), vertical glowing spine ribs and an upward searchlight from the cap's crest.
+        const sl = plan.slant;
+        const yT = sl.y0 + sl.h;
+        G.steel.push(slopedPrism(sl.axis, sl.a0, sl.a1, sl.l0, sl.l1, sl.y0 - 0.5, sl.y0 + 0.02, sl.y0 - 0.5, yT, { side: 0.9 }));
+        for (const l of [sl.l0 + 0.08, sl.l1 - 0.08]) {
+          G.strips.push(withColor(beam(pt(sl.axis, sl.a0, sl.y0 + 0.08, l), pt(sl.axis, sl.a1, yT + 0.06, l), 0.12), neonA, 2.0));
+        }
+        G.strips.push(withColor(boxGeoWorld(sl.axis, sl.a1 - sl.sg * 0.12, sl.a1, sl.l0, sl.l1, yT - 0.06, yT + 0.06), neonB, 1.8));
+        rampColliders.push({ axis: sl.axis, lateralMin: sl.l0, lateralMax: sl.l1, alongStart: sl.a1, alongEnd: sl.a0, yStart: yT, yEnd: sl.y0, thickness: 0.5 });
+        const wall = pt(sl.axis, sl.a1 - sl.sg * 0.2, 0, (sl.l0 + sl.l1) / 2);
+        const half = (sl.l1 - sl.l0) / 2;
+        colliders.push(
+          sl.axis === 'x'
+            ? { min: V(Math.min(sl.a1, sl.a1 - sl.sg * 0.4), sl.y0, sl.l0), max: V(Math.max(sl.a1, sl.a1 - sl.sg * 0.4), yT, sl.l1), kind: 'BUILDING', building: b.index }
+            : { min: V(sl.l0, sl.y0, Math.min(sl.a1, sl.a1 - sl.sg * 0.4)), max: V(sl.l1, yT, Math.max(sl.a1, sl.a1 - sl.sg * 0.4)), kind: 'BUILDING', building: b.index },
+        );
+        void wall;
+        void half;
+        // Spine ribs: 3 per face (0.24 m wide, 0.14 m relief), the back face's ribs continue up the cap wall.
+        for (const [ax, sg] of FACES) {
+          const f = sf(ax, sg, lotPlane(b, ax, sg));
+          const [a0, a1] = lotRange(b, ax);
+          const back = ax === sl.axis && sg === sl.sg;
+          for (const q of [0.2, 0.5, 0.8]) {
+            const a = a0 + q * (a1 - a0);
+            G.strips.push(f.glow(q === 0.5 ? neonB : neonA, 1.7, a - 0.12, a + 0.12, GM.MEGA_PODIUM_M, (back ? yT : sl.y0) - 0.3, 0, 0.14));
+          }
+        }
+        const crest = pt(sl.axis, sl.a1 - sl.sg * 1.2, yT + 0.4, (sl.l0 + sl.l1) / 2);
+        addSearch(crest.x, crest.y, crest.z);
+        addLight(crest.x, crest.y + 1, crest.z, neonA, 2.6);
+        addAviation(crest.x, yT + 0.6, crest.z);
+      }
+    };
+
     // ------------------------------------------------------------------ 7b. tower bodies, roofs, crowns
     const roofRects: RectXZ[][] = buildings.map(() => []);
     /** Tower body box: aSeed + aArch. */
     const bodyBox = (w: number, h: number, d: number, x: number, y: number, z: number, seed: number, arch: number): THREE.BufferGeometry =>
       withAttr1(withAttr1(boxAt(w, h, d, x, y, z), 'aSeed', seed), 'aArch', arch);
-    const TERRACE_NEON = [COLORS.WALLRUN_CYAN, COLORS.NEON_MAGENTA, COLORS.NEON_AMBER];
+    const TERRACE_NEON = PAL;
     buildings.forEach((b) => {
       // 9A-2: one tower-material body + one BUILDING collider per massing box (L wings, podium + offset tower,
       // stepped tiers); every box top is a floor-grid roof / terrace with a wet concrete cap.
@@ -4110,8 +4722,10 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
         colliders.push({ min: new THREE.Vector3(bx.x0, bx.y0, bx.z0), max: new THREE.Vector3(bx.x1, bx.y1, bx.z1), kind: 'BUILDING', building: b.index });
       }
       for (const pl of b.plan.plates) {
+        if (pl.round) continue;
         G.concrete.push(worldUvBox(pl.x1 - pl.x0 + 0.3, 0.5, pl.z1 - pl.z0 + 0.3, (pl.x0 + pl.x1) / 2, pl.y - 0.25, (pl.z0 + pl.z1) / 2, RENDER.ROOF_TILE_M));
       }
+      if (isMegaKind(b.massing)) megaStructure(b);
       // Terraces (stepped tiers, podium): a thin neon edge line under the parapet where the edge is open.
       if (b.plan.plates.some((pl) => !pl.main)) {
         const tn = TERRACE_NEON[Math.floor(srng() * TERRACE_NEON.length)];
@@ -4121,8 +4735,9 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
           G.strips.push(withColor(seg.ax === 'x' ? boxAt(0.06, 0.06, seg.a1 - seg.a0, out, seg.y - 0.6, (seg.a0 + seg.a1) / 2) : boxAt(seg.a1 - seg.a0, 0.06, 0.06, (seg.a0 + seg.a1) / 2, seg.y - 0.6, out), tn, 1.3));
         }
       }
-      // Type A roof crown: steel corner posts + two horizontal neon rings — a sharp, lit skyline.
-      if (b.arch === ARCH_A) {
+      // Type A roof crown: steel corner posts + two horizontal neon rings — a sharp, lit skyline (the cylinder and
+      // slant-cap megastructures carry their own crowns).
+      if (b.arch === ARCH_A && b.massing !== 'CYLINDER_RING_TOWER' && b.massing !== 'SLANT_CORP_TOWER') {
         const cn = TERRACE_NEON[Math.floor(srng() * TERRACE_NEON.length)];
         // Inset clear of the 0.32 m parapet.
         const ix = b.halfW - 0.55;
@@ -4161,6 +4776,301 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
         roofRects[b.index].push(rectFrom(base.x - 1, base.z - 1, base.x + 1, base.z + 1));
       }
     });
+
+
+    // ------------------------------------------------------------------ 7c-2. 10B-2 Mega-Billboards (+1 call)
+    // Strictly bound to solid lot FaceSpans: giant avenue screens (10–20 × 10–34 m), synchronized 90° L-corner
+    // wrap-around screens (2–4 stacked tiers), towering monolith blades (3.2–4.5 × 18–38 m) and inward-facing
+    // perimeter screens. Flat screens sit 0.30 m proud (0.47 m over Type A mullions; never on an A run face) with
+    // steel frames and no collider; feature faces (balconies, escapes, galleries, spines, ducts, shutters) stay clear.
+    const ident10 = sector.identity;
+    const density = ident10?.billboardDensity ?? 0.6;
+    const adCells = ident10?.adCells ?? [0, 1, 2, 5, 6, 7];
+    const brng = createRng(0x10b2 + sector.index * 71 + loop * 307);
+    /** Faces carrying a flat Mega-Billboard (Type B fins and riser bundles keep off them). */
+    const megaFaces = new Set<string>();
+    const megaRects: Array<{ b: number; ax: Axis; sg: number; a0: number; a1: number; y0: number; y1: number }> = [];
+    const megaStats = { avenue: 0, perimeter: 0, corner: 0, cornerPieces: 0, blade: 0, ring: 0 };
+    const pickCell = (pred: (c: number) => boolean): number => {
+      const pool = adCells.filter(pred);
+      const all = pool.length ? pool : [0, 1, 2, 3, 4, 5, 6, 7].filter(pred);
+      return all[Math.floor(brng() * all.length)];
+    };
+    /** Named rejection (documents why a face / screen was skipped). */
+    const why = (_reason: string): false => false;
+    const screenFace = (b: Building, ax: Axis, sg: number, blade = false): boolean => {
+      const k = fkey(b, ax, sg);
+      // Slant monoliths take blades between their spine ribs; every other megastructure facade stays clean.
+      if (isMegaKind(b.massing) && !(blade && b.massing === 'SLANT_CORP_TOWER')) return why('mega');
+      if (megaFaces.has(k)) return why('used');
+      if (alleyFaces.has(k)) return why('alley');
+      if (partialFaces.has(k)) return why('partial');
+      if (balconyFaces.has(k)) return why('balc');
+      if (escapeFaces.has(k)) return why('esc');
+      if (galleryFaces.has(k)) return why('gal');
+      if (spineFaces.has(k)) return why('spine');
+      if (ductFaces.has(k)) return why('duct');
+      if (shutterFaces.has(k)) return why('shutter');
+      if (blade && runFaces.has(k)) return why('run');
+      return faceInPlay(b, ax, sg, blade ? 5.5 : 2) || why('play');
+    };
+    /** Screens sit 0.30 m proud (inside the 0.38 m wall-run capsule radius); Type A mullions are cut behind them. */
+    const standoffOf = (_b: Building): number => 0.3;
+    /** Tallest solid lot span of a face with its usable screen band (≥ 10 m up, 1 m under the span top). */
+    const screenSpan = (b: Building, ax: Axis, sg: number): { sp: FaceSpan; yLo: number; yHi: number } | null => {
+      let best: { sp: FaceSpan; yLo: number; yHi: number } | null = null;
+      for (const sp of b.plan.faces) {
+        if (sp.ax !== ax || sp.sg !== sg || !sp.lot || sp.court) continue;
+        const yLo = Math.max(sp.y0 + 0.4, 10);
+        const yHi = sp.y1 - 1.0;
+        if (yHi - yLo < 8) continue;
+        if (!best || (yHi - yLo) * (sp.a1 - sp.a0) > (best.yHi - best.yLo) * (best.sp.a1 - best.sp.a0)) best = { sp, yLo, yHi };
+      }
+      return best;
+    };
+    const frame = (f: SF, a0: number, a1: number, y0: number, y1: number, d: number): void => {
+      // Steel mounting truss: top + bottom chords, side posts and two stand-off stiffeners behind the panel.
+      G.steel.push(...f.bx(a0 - 0.12, a1 + 0.12, y1, y1 + 0.26, 0, d + 0.04, { bottom: GRAMMAR.AO_UNDERSIDE }));
+      G.steel.push(...f.bx(a0 - 0.12, a1 + 0.12, y0 - 0.26, y0, 0, d + 0.04, { bottom: GRAMMAR.AO_UNDERSIDE }));
+      G.steel.push(...f.bx(a0 - 0.12, a0, y0, y1, 0, d + 0.04), ...f.bx(a1, a1 + 0.12, y0, y1, 0, d + 0.04));
+      for (const q of [0.33, 0.67]) {
+        const a = a0 + q * (a1 - a0);
+        G.steel.push(...f.bx(a - 0.06, a + 0.06, y0, y1, 0, Math.max(0.05, d - 0.03)));
+      }
+    };
+    const flatScreen = (b: Building, ax: Axis, sg: number, kind: 'AVENUE' | 'PERIMETER'): boolean => {
+      if (!screenFace(b, ax, sg)) return false;
+      const ss = screenSpan(b, ax, sg);
+      if (!ss) return why('nospan');
+      const { sp, yLo, yHi } = ss;
+      // 0.8 m end margins clear Type B corner pilasters and the frame posts.
+      const aw = sp.a1 - sp.a0 - 1.6;
+      const w = Math.min(20, aw, 10 + brng() * 10);
+      const h = Math.min(34, yHi - yLo, w * (0.8 + brng() * 1.1));
+      if (w < 10) return why('narrow');
+      if (h < 10) return why('short');
+      const cell = h / w >= 1.8 ? 3 : pickCell((c) => MEGA_ATLAS.ASPECT[c] >= 1);
+      const d = standoffOf(b);
+      const a = sp.a0 + 0.8 + w / 2 + brng() * Math.max(0, aw - w);
+      const y = yLo + 0.3 + h / 2 + brng() * Math.max(0, Math.min(3, yHi - yLo - h - 0.3));
+      if (y + h / 2 > yHi) return false;
+      const f = sf(ax, sg, sp.plane);
+      const p = f.P3(a, y, d);
+      const ok = addMegaBillboard({ kind, x: p.x, y: p.y, z: p.z, nx: f.nx, nz: f.nz, w, h, building: b.index, cell, rect: adCrop(cell, w / h), standoff: d });
+      if (!ok) return why('guard');
+      frame(f, a - w / 2, a + w / 2, y - h / 2, y + h / 2, d);
+      megaFaces.add(fkey(b, ax, sg));
+      megaRects.push({ b: b.index, ax, sg, a0: a - w / 2 - 0.2, a1: a + w / 2 + 0.2, y0: y - h / 2 - 0.3, y1: y + h / 2 + 0.3 });
+      const m = f.P3(a, y, d + 3);
+      addMist(m.x, m.y, m.z, AD_HUES[cell], Math.min(16, Math.max(8, Math.sqrt(w * h) * 0.6)), 0.1 + brng() * 0.06);
+      return true;
+    };
+
+    // (1) Synchronized 90° L-corner wrap-around screens on prominent street corners.
+    {
+      const want = Math.round(density * (sector.denseNeon ? 6 : 4));
+      const cands: Array<{ b: Building; sx: 1 | -1; sz: 1 | -1; score: number }> = [];
+      for (const b of buildings) {
+        if (b.arch === ARCH_B) continue;
+        for (const [sx, sz] of CORNERS_4 as ReadonlyArray<readonly [1 | -1, 1 | -1]>) {
+          if (!screenFace(b, 'x', sx) || !screenFace(b, 'z', sz)) continue;
+          const cxp = sx > 0 ? b.rect.x1 : b.rect.x0;
+          const czp = sz > 0 ? b.rect.z1 : b.rect.z0;
+          const near = Math.min(...intersectionSquares.map((r) => Math.hypot((r.x0 + r.x1) / 2 - cxp, (r.z0 + r.z1) / 2 - czp)), 99);
+          cands.push({ b, sx, sz, score: -near + b.roofY * 0.2 + brng() * 6 });
+        }
+      }
+      cands.sort((p, o) => o.score - p.score);
+      const used = new Set<number>();
+      for (const { b, sx, sz } of cands) {
+        if (megaStats.corner >= want) break;
+        if (used.has(b.index) || isMegaKind(b.massing) || !screenFace(b, 'x', sx) || !screenFace(b, 'z', sz)) continue;
+        const cxp = sx > 0 ? b.rect.x1 : b.rect.x0;
+        const czp = sz > 0 ? b.rect.z1 : b.rect.z0;
+        // Spans of both faces that reach the corner.
+        const reach = (ax: Axis, sg: number, cornerA: number): FaceSpan | undefined =>
+          b.plan.faces.find((sp) => sp.ax === ax && sp.sg === sg && sp.lot && !sp.court && (Math.abs(sp.a0 - cornerA) < 1e-6 || Math.abs(sp.a1 - cornerA) < 1e-6) && sp.y1 - sp.y0 > 12);
+        const spX = reach('x', sx, czp);
+        const spZ = reach('z', sz, cxp);
+        if (!spX || !spZ) continue;
+        const yLo = Math.max(spX.y0 + 0.4, spZ.y0 + 0.4, 10);
+        const yHi = Math.min(spX.y1, spZ.y1) - 1.0;
+        if (yHi - yLo < 8) continue;
+        const d = standoffOf(b);
+        const lenX = Math.min(12, spX.a1 - spX.a0 - 0.6);
+        const lenZ = Math.min(12, spZ.a1 - spZ.a0 - 0.6);
+        if (lenX < 5 || lenZ < 5) continue;
+        const Wt = lenX + lenZ + 2 * d;
+        let n = Math.max(2, Math.min(4, Math.floor((yHi - yLo) / 6)));
+        const gap = 1.0;
+        let ht = Math.min(5.5, (Math.min(yHi - yLo, Wt * 1.1) - (n - 1) * gap) / n);
+        while (ht < 2.6 && n > 2) {
+          n--;
+          ht = Math.min(5.5, (Math.min(yHi - yLo, Wt * 1.1) - (n - 1) * gap) / n);
+        }
+        if (ht < 2.6) continue;
+        const Hs = n * ht + (n - 1) * gap;
+        const ys = yLo + 0.3 + brng() * Math.max(0, yHi - yLo - Hs - 0.3);
+        const cell = pickCell((c) => MEGA_ATLAS.ASPECT[c] >= 1);
+        const crop = adCrop(cell, Wt / Hs);
+        const g = ++signGroup;
+        // Pieces: face x (along z) ends at the outer corner (czp + sz·d); face z (along x) ends at (cxp + sx·d).
+        const fX = sf('x', sx, cxp);
+        const fZ = sf('z', sz, czp);
+        const pieces = [
+          { f: fX, ax: 'x' as Axis, sg: sx, len: lenX, a0: czp - sz * lenX, a1: czp + sz * d, nx: sx, nz: 0 },
+          { f: fZ, ax: 'z' as Axis, sg: sz, len: lenZ, a0: cxp - sx * lenZ, a1: cxp + sx * d, nx: 0, nz: sz },
+        ];
+        const geo = pieces.map((pc) => {
+          const am = (pc.a0 + pc.a1) / 2;
+          const w = Math.abs(pc.a1 - pc.a0);
+          const c = pc.f.P3(am, 0, d);
+          // Tangent of the quad's +u axis is (nz, −nx): the piece whose +u runs toward the corner is the LEFT half.
+          const corner = pc.f.P3(pc.a1, 0, d);
+          const left = (corner.x - c.x) * pc.nz + (corner.z - c.z) * -pc.nx > 0;
+          return { ...pc, am, w, c, left };
+        });
+        if (geo[0].left === geo[1].left) continue;
+        const wL = geo.find((q) => q.left)!.w;
+        let fits = true;
+        for (let k = 0; k < n && fits; k++) {
+          const yc = ys + k * (ht + gap) + ht / 2;
+          for (const q of geo) if (!signFits(q.c.x, yc, q.c.z, q.nx, q.nz, q.w, ht, g)) fits = false;
+        }
+        if (!fits || counts.mega + 2 * n > CAP.MEGA) continue;
+        for (let k = 0; k < n; k++) {
+          const yk0 = ys + k * (ht + gap);
+          const vs0 = crop[1] + crop[3] * ((yk0 - ys) / Hs);
+          const vsh = crop[3] * (ht / Hs);
+          for (const q of geo) {
+            const u0 = q.left ? crop[0] : crop[0] + crop[2] * (wL / Wt);
+            const su = crop[2] * (q.w / Wt);
+            addMegaBillboard({ kind: 'CORNER', x: q.c.x, y: yk0 + ht / 2, z: q.c.z, nx: q.nx, nz: q.nz, w: q.w, h: ht, building: b.index, cell, rect: [u0, vs0, su, vsh], standoff: d, group: g });
+            megaStats.cornerPieces++;
+            const lo = Math.min(q.a0, q.a1);
+            const hi = Math.max(q.a0, q.a1);
+            G.steel.push(...q.f.bx(lo, hi, yk0 + ht, yk0 + ht + 0.2, 0, d + 0.04, { bottom: GRAMMAR.AO_UNDERSIDE }), ...q.f.bx(lo, hi, yk0 - 0.2, yk0, 0, d + 0.04));
+            G.strips.push(q.f.glow(AD_HUES[cell], 1.6, lo, hi, yk0 + ht + 0.2, yk0 + ht + 0.27, d - 0.02, d + 0.05));
+          }
+        }
+        for (const q of geo) {
+          const lo = Math.min(q.a0, q.a1);
+          const hi = Math.max(q.a0, q.a1);
+          megaFaces.add(fkey(b, q.ax, q.sg));
+          megaRects.push({ b: b.index, ax: q.ax, sg: q.sg, a0: lo - 0.2, a1: hi + 0.2, y0: ys - 0.3, y1: ys + Hs + 0.3 });
+          const fEnd = q.f.P3(q.a0, ys + Hs / 2, d / 2);
+          G.steel.push(boxAt(0.16, Hs + 0.4, 0.16, fEnd.x, fEnd.y, fEnd.z));
+        }
+        const oc = fX.P3(czp + sz * d, ys + Hs / 2, d);
+        G.steel.push(boxAt(0.2, Hs + 0.5, 0.2, oc.x, oc.y, oc.z));
+        addMist(oc.x + sx * 2.5, oc.y, oc.z + sz * 2.5, AD_HUES[cell], Math.min(16, 8 + Hs * 0.35), 0.13);
+        megaStats.corner++;
+        used.add(b.index);
+      }
+    }
+
+    // (2) Towering vertical monolith blades (cell 4) on solid spans: street lot faces without a run / feature role,
+    // or set-back upper tower faces (podium towers, stepped tiers); Sector 5 frames its scramble arena with them.
+    {
+      const want = Math.round(density * 4) + (plan.plaza ? 4 : 0);
+      const cands: Array<{ b: Building; sp: FaceSpan; score: number }> = [];
+      for (const b of buildings) {
+        if (isMegaKind(b.massing) && b.massing !== 'SLANT_CORP_TOWER') continue;
+        for (const sp of b.plan.faces) {
+          if (sp.court || sp.a1 - sp.a0 < 1.6 || sp.y1 - 0.45 - Math.max(sp.y0 + 0.4, 10) < 18) continue;
+          const k = fkey(b, sp.ax, sp.sg);
+          if (sp.lot && !screenFace(b, sp.ax, sp.sg, true)) continue;
+          if (!sp.lot && (alleyFaces.has(k) || partialFaces.has(k))) continue;
+          const toPlaza = plan.plaza ? (Math.sign(-sp.plane) === sp.sg && Math.abs(sp.plane) < 46 ? 60 : 0) : 0;
+          cands.push({ b, sp, score: toPlaza + sp.y1 * 0.5 + brng() * 25 });
+        }
+      }
+      cands.sort((p, o) => o.score - p.score);
+      const used = new Set<number>();
+      for (const { b, sp } of cands) {
+        if (megaStats.blade >= want) break;
+        if (used.has(b.index) || (sp.lot && megaFaces.has(fkey(b, sp.ax, sp.sg)))) continue;
+        const ax = sp.ax;
+        const bw = 3.2 + brng() * 1.3;
+        let yLo = Math.max(sp.y0 + 0.4, 10);
+        const yHi = sp.y1 - 0.45;
+        const f = sf(ax, sp.sg, sp.plane);
+        const a = b.massing === 'SLANT_CORP_TOWER' ? sp.a0 + (brng() < 0.5 ? 0.35 : 0.65) * (sp.a1 - sp.a0) : sp.a0 + 0.6 + brng() * Math.max(0, sp.a1 - sp.a0 - 1.2);
+        // Clear the expressway decks (Y 7.9–10.6) wherever the blade's footprint overhangs one.
+        const pIn = f.P3(a, 0, 0.3);
+        const pOut = f.P3(a, 0, 0.3 + bw);
+        const foot = rectFrom(Math.min(pIn.x, pOut.x) - 0.2, Math.min(pIn.z, pOut.z) - 0.2, Math.max(pIn.x, pOut.x) + 0.2, Math.max(pIn.z, pOut.z) + 0.2);
+        if (highwayRects.some((r) => rectsOverlap(r, foot, 1))) yLo = Math.max(yLo, 12.5);
+        if (!inArea(pOut.x, pOut.z, 0.5)) continue;
+        // Never through a neighbouring tower (set-back faces look over a podium roof first).
+        if (buildings.some((o) => o !== b && rectsOverlap(o.rect, foot, 0.4))) continue;
+        const bh = Math.min(38, yHi - yLo, 18 + brng() * 20);
+        if (bh < 18) continue;
+        const y = yLo + bh / 2 + brng() * Math.max(0, Math.min(4, yHi - yLo - bh));
+        const c = f.P3(a, y, 0.3 + bw / 2);
+        const nx = ax === 'x' ? 0 : 1;
+        const nz = ax === 'x' ? 1 : 0;
+        const cell = 4;
+        if (!addMegaBillboard({ kind: 'BLADE', x: c.x, y: c.y, z: c.z, nx, nz, w: bw, h: bh, building: b.index, cell, rect: adCrop(cell, bw / bh), standoff: 0.3 })) continue;
+        // Steel spine along the inner edge + three cantilever arms, neon edge on the outer edge.
+        G.steel.push(...f.bx(a - 0.12, a + 0.12, y - bh / 2 - 0.3, y + bh / 2 + 0.3, 0.06, 0.3));
+        for (const q of [-0.45, 0, 0.45]) G.steel.push(...f.bx(a - 0.08, a + 0.08, y + q * bh - 0.12, y + q * bh + 0.12, 0, 0.3 + bw));
+        G.strips.push(f.glow(0xff2b4a, 1.8, a - 0.06, a + 0.06, y - bh / 2, y + bh / 2, 0.3 + bw, 0.3 + bw + 0.08));
+        const m = f.P3(a, y, 0.3 + bw / 2);
+        addMist(m.x, m.y, m.z, AD_HUES[cell], Math.min(16, 8 + bh * 0.2), 0.12);
+        used.add(b.index);
+        megaStats.blade++;
+      }
+    }
+
+    // (3) Giant avenue wall screens facing the district's avenues.
+    {
+      const want = Math.round(density * 6);
+      const faces: Array<{ b: Building; ax: Axis; sg: number; score: number }> = [];
+      for (const s0 of plan.streets) {
+        if (s0.kind !== 'AVENUE') continue;
+        const ch = corridorHalf(s0) + 4;
+        for (const b of buildings) {
+          const ax: Axis = s0.axis === 'z' ? 'x' : 'z';
+          for (const sg of [1, -1] as const) {
+            const plane = ax === 'x' ? (sg > 0 ? b.rect.x1 : b.rect.x0) : sg > 0 ? b.rect.z1 : b.rect.z0;
+            const along = ax === 'x' ? (b.rect.z0 + b.rect.z1) / 2 : (b.rect.x0 + b.rect.x1) / 2;
+            if (Math.sign(s0.coord - plane) !== sg || Math.abs(s0.coord - plane) > ch || along < s0.from - 15 || along > s0.to + 15) continue;
+            faces.push({ b, ax, sg, score: b.roofY + brng() * 20 });
+          }
+        }
+      }
+      faces.sort((p, o) => o.score - p.score);
+      for (const fc of faces) {
+        if (megaStats.avenue >= want) break;
+        if (flatScreen(fc.b, fc.ax, fc.sg, 'AVENUE')) megaStats.avenue++;
+      }
+    }
+
+    // (4) Perimeter skyline: tall lots on the ±H wall face the district with inward screens.
+    {
+      const want = Math.round(density * 6);
+      const cands: Array<{ b: Building; ax: Axis; sg: number; score: number }> = [];
+      for (const b of buildings) {
+        if (!isPerimeter(b.rect)) continue;
+        for (const [ax, sg] of FACES) {
+          const c = ax === 'x' ? b.lcx : b.lcz;
+          if (sg * c >= 0) continue;
+          cands.push({ b, ax, sg, score: Math.abs(c) + b.roofY * 0.3 + brng() * 10 });
+        }
+      }
+      cands.sort((p, o) => o.score - p.score);
+      const used = new Set<number>();
+      for (const { b, ax, sg } of cands) {
+        if (megaStats.perimeter >= want) break;
+        if (used.has(b.index)) continue;
+        if (flatScreen(b, ax, sg, 'PERIMETER')) {
+          megaStats.perimeter++;
+          used.add(b.index);
+        }
+      }
+    }
+    megaStats.ring = megaRecords.filter((r) => r.kind === 'RING').length;
 
     // ------------------------------------------------------------------ 7d. archetype 3D details
     /** Structural add-on drawn with the tower material in its archetype's plain cladding band (one draw). */
@@ -4219,9 +5129,21 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
       const hd = (bx.z1 - bx.z0) / 2;
       for (const [ax, sg] of FACES) {
         const lines = ax === 'x' ? roomLines(b, ax, sg, bx.z0, bx.z1, 1, 0.6) : roomLines(b, ax, sg, bx.x0, bx.x1, 1, 0.6);
+        const plane = ax === 'x' ? cx + sg * hw : cz + sg * hd;
         for (const a of lines) {
-          if (ax === 'x') G.steel.push(boxAt(AR.MULLION_D, h, AR.MULLION_W, cx + sg * (hw + AR.MULLION_D / 2), cy, a));
-          else G.steel.push(boxAt(AR.MULLION_W, h, AR.MULLION_D, a, cy, cz + sg * (hd + AR.MULLION_D / 2)));
+          // 10B-2: mullions stop behind Mega-Billboards (screens sit 0.30 m proud of the glass).
+          let segs: Array<[number, number]> = [[y0, y1]];
+          for (const mr of megaRects) {
+            if (mr.b !== b.index || mr.ax !== ax || mr.sg !== sg || a < mr.a0 - 0.2 || a > mr.a1 + 0.2) continue;
+            const mPlane = ax === 'x' ? (sg > 0 ? b.rect.x1 : b.rect.x0) : sg > 0 ? b.rect.z1 : b.rect.z0;
+            if (Math.abs(mPlane - plane) > 1e-3) continue;
+            segs = segs.flatMap(([s0, s1]): Array<[number, number]> => (mr.y1 <= s0 || mr.y0 >= s1 ? [[s0, s1]] : [[s0, Math.min(s1, mr.y0)], [Math.max(s0, mr.y1), s1]]));
+          }
+          for (const [s0, s1] of segs) {
+            if (s1 - s0 < 0.3) continue;
+            if (ax === 'x') G.steel.push(boxAt(AR.MULLION_D, s1 - s0, AR.MULLION_W, cx + sg * (hw + AR.MULLION_D / 2), (s0 + s1) / 2, a));
+            else G.steel.push(boxAt(AR.MULLION_W, s1 - s0, AR.MULLION_D, a, (s0 + s1) / 2, cz + sg * (hd + AR.MULLION_D / 2)));
+          }
         }
       }
       for (const [sx, sz] of CORNERS_4) G.steel.push(boxAt(AR.MULLION_D + 0.1, h, AR.MULLION_D + 0.1, cx + sx * (hw + 0.02), cy, cz + sz * (hd + 0.02)));
@@ -4491,7 +5413,11 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
     buildings.forEach((b) => {
       const lowTop = lowTopOf(b);
       void lowTop;
-      if (b.arch === ARCH_A) for (const bx of b.plan.boxes) mullions(b, bx, Math.max(4.0, bx.y0 + 0.05), bx.y1 - 0.45);
+      if (b.arch === ARCH_A) {
+        // 10B-3: exoskeleton / spine-rib megastructures keep mullions on the podium band only.
+        const ribbed = b.massing === 'X_TRUSS_TOWER' || b.massing === 'SLANT_CORP_TOWER';
+        for (const bx of b.plan.boxes) mullions(b, bx, Math.max(4.0, bx.y0 + 0.05), ribbed ? Math.min(bx.y1 - 0.45, GRAMMAR.MEGA_PODIUM_M) : bx.y1 - 0.45);
+      }
       else if (b.arch === ARCH_B) pilasters(b);
       for (const [ax, sg] of FACES) {
         const key = fkey(b, ax, sg);
@@ -4529,42 +5455,6 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
     let parapetGapCount = 0;
     let pipeBundles = 0;
     /** Span-local frame: `a` along the wall, `y` up, `d` metres out from the wall plane. */
-    const sf = (ax: Axis, sg: number, plane: number) => {
-      const P3 = (al: number, y: number, d: number): THREE.Vector3 => (ax === 'x' ? new THREE.Vector3(plane + sg * d, y, al) : new THREE.Vector3(al, y, plane + sg * d));
-      const ext = (a0: number, a1: number, y0: number, y1: number, d0: number, d1: number) => {
-        const lo = P3(a0, y0, d0);
-        const hi = P3(a1, y1, d1);
-        return { w: Math.abs(hi.x - lo.x), h: y1 - y0, d: Math.abs(hi.z - lo.z), x: (lo.x + hi.x) / 2, y: (y0 + y1) / 2, z: (lo.z + hi.z) / 2, lo, hi };
-      };
-      const bx = (a0: number, a1: number, y0: number, y1: number, d0: number, d1: number, ao: Parameters<typeof aoBox>[6] = {}): THREE.BufferGeometry[] => {
-        const e = ext(a0, a1, y0, y1, d0, d1);
-        return aoBox(Math.max(e.w, 0.005), Math.max(e.h, 0.005), Math.max(e.d, 0.005), e.x, e.y, e.z, ao);
-      };
-      const paint = (hex: number, a0: number, a1: number, y0: number, y1: number, d0: number, d1: number, ao: Parameters<typeof aoBox>[6] = {}): THREE.BufferGeometry[] =>
-        bx(a0, a1, y0, y1, d0, d1, { tile: 1.6, ...ao }).map((g) => withTint(g, hex));
-      const glow = (hex: number, k: number, a0: number, a1: number, y0: number, y1: number, d0: number, d1: number): THREE.BufferGeometry => {
-        const e = ext(a0, a1, y0, y1, d0, d1);
-        return withColor(boxAt(Math.max(e.w, 0.005), Math.max(e.h, 0.005), Math.max(e.d, 0.005), e.x, e.y, e.z), hex, k);
-      };
-      const coll = (a0: number, a1: number, y0: number, y1: number, d0: number, d1: number, building: number, kind: ColliderKind = 'PROP'): void => {
-        const e = ext(a0, a1, y0, y1, d0, d1);
-        colliders.push({ min: new THREE.Vector3(Math.min(e.lo.x, e.hi.x), y0, Math.min(e.lo.z, e.hi.z)), max: new THREE.Vector3(Math.max(e.lo.x, e.hi.x), y1, Math.max(e.lo.z, e.hi.z)), kind, building });
-      };
-      /** Slanted slab from the wall (yIn at d0) out to yOut at d1 across [a0, a1] (awnings). */
-      const slant = (a0: number, a1: number, yIn: number, yOut: number, d0: number, d1: number, th: number): THREE.BufferGeometry => {
-        const run = d1 - d0;
-        const len = Math.hypot(run, yIn - yOut);
-        const ang = Math.atan2(yIn - yOut, run);
-        const g = ax === 'x' ? new THREE.BoxGeometry(len, th, a1 - a0) : new THREE.BoxGeometry(a1 - a0, th, len);
-        if (ax === 'x') g.rotateZ(-ang * sg);
-        else g.rotateX(ang * sg);
-        const c = P3((a0 + a1) / 2, (yIn + yOut) / 2, (d0 + d1) / 2);
-        g.translate(c.x, c.y, c.z);
-        return applyAo(g, { bottom: GR.AO_UNDERSIDE });
-      };
-      return { P3, bx, paint, glow, coll, slant, ref: { ax, sg, plane }, nx: ax === 'x' ? sg : 0, nz: ax === 'z' ? sg : 0 };
-    };
-    type SF = ReturnType<typeof sf>;
 
     // ---------------------------------------------------------------- GALLERY_DANCHI corridors
     const galleryDoorPaint = (b: Building): number => PAINT.DOORS[Math.floor(b.seed * 97) % PAINT.DOORS.length];
@@ -4724,8 +5614,8 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
           if (along < spineSpan.a0 + 0.3 || along > spineSpan.a1 - 0.3) continue;
           if (y - hgt / 2 < spineSpan.y0 + 0.4 || y + hgt / 2 > spineSpan.y1 - 0.4) continue;
           const p = fs.P3(along, y, w / 2 + 0.14);
-          addNeon(p.x, p.y, p.z, ax === 'x' ? 0 : 1, ax === 'x' ? 1 : 0, w, hgt, Math.floor(grng() * 8), 0, { kind: 'BUILDING_BLADE', building: b.index });
-          for (const yy of [y + hgt / 2 - 0.18, y - hgt / 2 + 0.18]) G.steel.push(...fs.bx(along - 0.03, along + 0.03, yy - 0.03, yy + 0.03, 0, w + 0.14));
+          if (addNeon(p.x, p.y, p.z, ax === 'x' ? 0 : 1, ax === 'x' ? 1 : 0, w, hgt, Math.floor(grng() * 8), 0, { kind: 'BUILDING_BLADE', building: b.index }))
+            for (const yy of [y + hgt / 2 - 0.18, y - hgt / 2 + 0.18]) G.steel.push(...fs.bx(along - 0.03, along + 0.03, yy - 0.03, yy + 0.03, 0, w + 0.14));
         }
       }
       blockRange(fkey(b, ax, sg), a - W2 - 0.3, a + W2 + 0.3);
@@ -4954,8 +5844,8 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
             const y = Math.min(yHi, Math.max(yLo, 5.6 + grng()));
             const w = 1.2;
             const sp = f.P3(ba, y, w / 2 + 0.14);
-            addNeon(sp.x, sp.y, sp.z, span.ax === 'x' ? 0 : 1, span.ax === 'x' ? 1 : 0, w, hgt, Math.floor(grng() * 8), 0, { kind: 'BUILDING_BLADE', building: b.index });
-            for (const yy of [y + hgt / 2 - 0.16, y - hgt / 2 + 0.16]) G.steel.push(...f.bx(ba - 0.03, ba + 0.03, yy - 0.03, yy + 0.03, 0, w + 0.14));
+            if (addNeon(sp.x, sp.y, sp.z, span.ax === 'x' ? 0 : 1, span.ax === 'x' ? 1 : 0, w, hgt, Math.floor(grng() * 8), 0, { kind: 'BUILDING_BLADE', building: b.index }))
+              for (const yy of [y + hgt / 2 - 0.16, y - hgt / 2 + 0.16]) G.steel.push(...f.bx(ba - 0.03, ba + 0.03, yy - 0.03, yy + 0.03, 0, w + 0.14));
           }
         } else if (program === 'CAPSULE_HOTEL' && door0) {
           const half = Math.min((ca1 - ca0) / 2, 3 + grng());
@@ -4977,8 +5867,8 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
             const vy = Math.min(span.y1 - 0.4 - mh / 2, Math.max(span.y0 + 0.4 + mh / 2, 4.4 + mh / 2));
             const w = 1.4;
             const vp = f.P3(vAlong, vy, w / 2 + 0.14);
-            addNeon(vp.x, vp.y, vp.z, span.ax === 'x' ? 0 : 1, span.ax === 'x' ? 1 : 0, w, mh, Math.floor(grng() * 8), 0, { kind: 'BUILDING_BLADE', building: b.index });
-            for (const yy of [vy + mh / 2 - 0.2, vy - mh / 2 + 0.2]) G.steel.push(...f.bx(vAlong - 0.035, vAlong + 0.035, yy - 0.035, yy + 0.035, 0, w + 0.14));
+            if (addNeon(vp.x, vp.y, vp.z, span.ax === 'x' ? 0 : 1, span.ax === 'x' ? 1 : 0, w, mh, Math.floor(grng() * 8), 0, { kind: 'BUILDING_BLADE', building: b.index }))
+              for (const yy of [vy + mh / 2 - 0.2, vy - mh / 2 + 0.2]) G.steel.push(...f.bx(vAlong - 0.035, vAlong + 0.035, yy - 0.035, yy + 0.035, 0, w + 0.14));
           }
           const lp = f.P3(ma, 2.8, 1.2);
           addLight(lp.x, lp.y, lp.z, 0xffc070, 1.0);
@@ -5030,8 +5920,8 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
         const y = Math.min(yHi, Math.max(yLo, 4.6 + hgt / 2 + grng() * 13));
         const f = sf(span.ax, span.sg, span.plane);
         const p = f.P3(a, y, reach / 2 + 0.1);
-        addNeon(p.x, p.y, p.z, span.ax === 'x' ? 0 : 1, span.ax === 'x' ? 1 : 0, reach, hgt, Math.floor(grng() * 8), 0, { kind: 'BUILDING_BLADE', building: b.index });
-        for (const yy of [y + hgt / 2 - 0.15, y - hgt / 2 + 0.15]) G.steel.push(...f.bx(a - 0.03, a + 0.03, yy - 0.03, yy + 0.03, 0, reach + 0.1));
+        if (addNeon(p.x, p.y, p.z, span.ax === 'x' ? 0 : 1, span.ax === 'x' ? 1 : 0, reach, hgt, Math.floor(grng() * 8), 0, { kind: 'BUILDING_BLADE', building: b.index }))
+          for (const yy of [y + hgt / 2 - 0.15, y - hgt / 2 + 0.15]) G.steel.push(...f.bx(a - 0.03, a + 0.03, yy - 0.03, yy + 0.03, 0, reach + 0.1));
       }
     });
 
@@ -5047,6 +5937,8 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
         for (let n = 1; floorTopY(b.arch, n) <= yMax; n++) {
           const y = floorTopY(b.arch, n);
           if (y < span.y0 + 3.9) continue;
+          // 10B-3: megastructure shafts carry their own exoskeleton / ribs / screens above the podium.
+          if (isMegaKind(b.massing) && y > GR.MEGA_PODIUM_M + 0.1) continue;
           if (isGallery && y <= floorTopY(b.arch, GR.GALLERY_LEVELS + 1) + 0.1) continue;
           G.concrete.push(...f.bx(span.a0, span.a1, y - GR.BAND_H_M, y, 0, out, { bottom: GR.AO_BAND_UNDERSIDE, tile: RENDER.ROOF_TILE_M }));
           bandCount++;
@@ -5076,6 +5968,8 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
     buildings.forEach((b) => {
       const gaps = escapeGaps.filter((gp) => gp.building === b.index);
       parapetGapCount += gaps.length;
+      // 10B-3 round cylinder roof: 12-gon parapet built with the megastructure.
+      if (b.plan.cyl) parapetLen += GRAMMAR.CYL_SIDES * 2 * (b.plan.cyl.r + 0.12) * Math.sin(Math.PI / GRAMMAR.CYL_SIDES);
       for (const seg of parapetSegments(b.plan, gaps)) {
         const f = sf(seg.ax, seg.sg, seg.plane);
         const H2 = GR.PARAPET_H;
@@ -5097,7 +5991,14 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
       const r = run || g.alley ? 0.075 : 0.1 + grng() * 0.04;
       const gap = r * 2.4;
       const base = (grng() < 0.5 ? piers[0] + 0.55 : piers[piers.length - 1] - 0.55 - gap * (n - 1));
-      const top = Math.min(span.y1 - 1.0, 12 + grng() * 16);
+      let top = Math.min(span.y1 - 1.0, 12 + grng() * 16);
+      // 10B-2: risers stop 0.6 m under any Mega-Billboard mounted over their run.
+      for (const mr of megaRects) {
+        if (mr.b !== b.index || mr.ax !== span.ax || mr.sg !== span.sg) continue;
+        if (mr.a1 < Math.min(base, base + gap * (n - 1)) - r - 0.2 || mr.a0 > Math.max(base, base + gap * (n - 1)) + r + 0.2) continue;
+        top = Math.min(top, mr.y0 - 0.6);
+      }
+      if (top < 4) continue;
       const d = r + 0.04;
       for (let k = 0; k < n; k++) {
         const a = base + k * gap;
@@ -5198,8 +6099,11 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
             const hgt = Math.min(2.4 + srng() * 3.2, yHiLim - yLoLim);
             const y = yLoLim + hgt / 2 + srng() * Math.max(0, yHiLim - yLoLim - hgt);
             const c = wall + out * (reach / 2 + 0.1);
-            if (al.axis === 'x') addNeon(c, y, o, 0, 1, reach, hgt, Math.floor(srng() * 8), 0, { kind: 'ALLEY_BLADE', building: bld.index });
-            else addNeon(o, y, c, 1, 0, reach, hgt, Math.floor(srng() * 8), 0, { kind: 'ALLEY_BLADE', building: bld.index });
+            const bladeStrip = Math.floor(srng() * 8);
+            const placed = al.axis === 'x'
+              ? addNeon(c, y, o, 0, 1, reach, hgt, bladeStrip, 0, { kind: 'ALLEY_BLADE', building: bld.index })
+              : addNeon(o, y, c, 1, 0, reach, hgt, bladeStrip, 0, { kind: 'ALLEY_BLADE', building: bld.index });
+            if (!placed) continue;
             for (const yy of [y + hgt / 2 - 0.15, y - hgt / 2 + 0.15]) {
               G.steel.push(al.axis === 'x' ? boxAt(reach + 0.1, 0.06, 0.06, wall + out * (reach / 2 + 0.05), yy, o) : boxAt(0.06, 0.06, reach + 0.1, o, yy, wall + out * (reach / 2 + 0.05)));
             }
@@ -5222,8 +6126,11 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
             const y = y0 + barH / 2 + srng() * Math.max(0, y1 - y0 - barH);
             const w = al.gap1 - al.gap0 - 0.6;
             const c = (al.gap0 + al.gap1) / 2;
-            if (al.axis === 'x') addNeon(c, y, o, 0, 1, w, barH, Math.floor(srng() * SIGN_ATLAS.WIDE_ROWS), 1, { kind: 'ALLEY_BAR', building: A.index, buildingB: B.index });
-            else addNeon(o, y, c, 1, 0, w, barH, Math.floor(srng() * SIGN_ATLAS.WIDE_ROWS), 1, { kind: 'ALLEY_BAR', building: A.index, buildingB: B.index });
+            const barRow = Math.floor(srng() * SIGN_ATLAS.WIDE_ROWS);
+            const placed = al.axis === 'x'
+              ? addNeon(c, y, o, 0, 1, w, barH, barRow, 1, { kind: 'ALLEY_BAR', building: A.index, buildingB: B.index })
+              : addNeon(o, y, c, 1, 0, w, barH, barRow, 1, { kind: 'ALLEY_BAR', building: A.index, buildingB: B.index });
+            if (!placed) continue;
             // Mounting steel cross-bar touching both solid alley walls.
             G.steel.push(al.axis === 'x' ? boxAt(al.gap1 - al.gap0, 0.06, 0.06, c, y + barH / 2 + 0.03, o) : boxAt(0.06, 0.06, al.gap1 - al.gap0, o, y + barH / 2 + 0.03, c));
             alleyNeon++;
@@ -5384,7 +6291,8 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
         const along = span.a0 + 0.3 + rng() * (span.a1 - span.a0 - 0.6);
         const fSpan = sf(span.ax, span.sg, span.plane);
         const p = fSpan.P3(along, y, w / 2 + 0.3);
-        addNeon(p.x, p.y, p.z, span.ax === 'x' ? 0 : 1, span.ax === 'x' ? 1 : 0, w, hgt, Math.floor(rng() * 8), 0, { kind: 'BUILDING_BLADE', building: b.index });
+        const shopStrip = Math.floor(rng() * 8);
+        if (!addNeon(p.x, p.y, p.z, span.ax === 'x' ? 0 : 1, span.ax === 'x' ? 1 : 0, w, hgt, shopStrip, 0, { kind: 'BUILDING_BLADE', building: b.index })) continue;
         for (const yy of [y + hgt / 2 - 0.2, y - hgt / 2 + 0.2]) {
           G.steel.push(...fSpan.bx(along - 0.04, along + 0.04, yy - 0.04, yy + 0.04, 0, w + 0.3));
         }
@@ -5408,11 +6316,14 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
           const along = span.a0 + 0.3 + (0.15 + rng() * 0.7) * (span.a1 - span.a0 - 0.6);
           const fSpan = sf(span.ax, span.sg, span.plane);
           const p = fSpan.P3(along, y, w / 2 + 0.4);
-          addNeon(p.x, p.y, p.z, span.ax === 'x' ? 0 : 1, span.ax === 'x' ? 1 : 0, w, hgt, Math.floor(rng() * 8), 0, { kind: 'BUILDING_BLADE', building: b.index });
-          for (const yy of [y + hgt / 2 - 0.25, y - hgt / 2 + 0.25]) {
-            G.steel.push(...fSpan.bx(along - 0.06, along + 0.06, yy - 0.06, yy + 0.06, 0, w + 0.4));
+          const l2Strip = Math.floor(rng() * 8);
+          const beaconRoll = rng();
+          if (addNeon(p.x, p.y, p.z, span.ax === 'x' ? 0 : 1, span.ax === 'x' ? 1 : 0, w, hgt, l2Strip, 0, { kind: 'BUILDING_BLADE', building: b.index })) {
+            for (const yy of [y + hgt / 2 - 0.25, y - hgt / 2 + 0.25]) {
+              G.steel.push(...fSpan.bx(along - 0.06, along + 0.06, yy - 0.06, yy + 0.06, 0, w + 0.4));
+            }
+            if (beaconRoll < 0.6) addBeacon(new THREE.Vector3(p.x, y + hgt / 2 + 0.9, p.z), 'SIGN');
           }
-          if (rng() < 0.6) addBeacon(new THREE.Vector3(p.x, y + hgt / 2 + 0.9, p.z), 'SIGN');
         }
       }
       // 5B-3 emblem / geometric hologram on the mid floors (14 m … below the top / 42 m), strictly inside a solid FaceSpan.
@@ -5443,7 +6354,7 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
       if (b.arch === ARCH_B && lowTop >= 16) {
         for (const [ax, sg] of streetFaces) {
           const key = fkey(b, ax, sg);
-          if (runFaces.has(key) || balconyFaces.has(key) || busyFaces.has(key) || galleryFaces.has(key) || srng() < 0.45) continue;
+          if (runFaces.has(key) || balconyFaces.has(key) || busyFaces.has(key) || galleryFaces.has(key) || megaFaces.has(key) || srng() < 0.45) continue;
           const len = (ax === 'x' ? b.lotHalfD : b.lotHalfW) * 2;
           const n = 3 + Math.floor(srng() * 3);
           const y0 = SB.CANOPY_Y + 0.9;
@@ -5495,14 +6406,73 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
       }
     });
 
-    // Plazas (unbuilt lots): kiosk + parking rows.
+    // 10B-1 the single open pocket becomes a dense covered cyber street-market (never bare concrete): two stall
+    // rows (back cabinets, lit counters, stall signs) under overhanging lit awnings along a 3.2 m central aisle, a
+    // steel ridge with lantern strings and cables, vending at the aisle mouth, a two-car parking bay, crates (9B).
     const parkingSlots: CarSlot[] = [];
+    let marketStalls = 0;
+    const STALL_PAINT = [0x3a2a20, 0x2f3a2c, 0x4a3226, 0x272e38, 0x432d26];
     plazas.forEach((r) => {
-      const cx = (r.x0 + r.x1) / 2;
-      const cz = (r.z0 + r.z1) / 2;
-      if (inArea(cx, cz, 4)) addVending(cx + (r.x1 - r.x0) * 0.25, cz, 0, 1.6);
-      for (let x = r.x0 + 3; x < r.x1 - 3; x += 2.8) {
-        for (const z of [r.z0 + 3.2, r.z1 - 3.2]) parkingSlots.push({ x, z, y: 0, yaw: z < cz ? 0 : Math.PI, onHighway: false });
+      const alongX = r.x1 - r.x0 >= r.z1 - r.z0;
+      const ax: Axis = alongX ? 'z' : 'x';
+      const [a0, a1] = alongX ? [r.x0, r.x1] : [r.z0, r.z1];
+      const [l0, l1] = alongX ? [r.z0, r.z1] : [r.x0, r.x1];
+      const S = l1 - l0;
+      const L = a1 - a0;
+      const aisle = 3.2;
+      const rowD = Math.min(3.4, (S - aisle) / 2 - 0.3);
+      if (rowD < 1.8 || L < 12) return;
+      const park = L >= 24 ? 5.5 : 0;
+      const sA0 = a0 + 1.0 + park;
+      const sA1 = a1 - 1.0;
+      const bay = 3.0;
+      const nB = Math.floor((sA1 - sA0) / bay);
+      const back0 = 0.3;
+      const back1 = back0 + Math.max(0.9, rowD * 0.45);
+      const front = back0 + rowD;
+      for (const sg of [1, -1] as const) {
+        const f = sf(ax, sg, sg > 0 ? l0 : l1);
+        for (let k = 0; k < nB; k++) {
+          const b0 = sA0 + k * bay + 0.08;
+          const b1 = b0 + bay - 0.16;
+          const cab = STALL_PAINT[(k * 3 + (sg > 0 ? 0 : 2)) % STALL_PAINT.length];
+          G.archPaint.push(...f.paint(cab, b0, b1, 0, 2.3, back0, back1, { ground: true }));
+          G.archPaint.push(...f.paint(PAINT.FRAME_DARK, b0 + 0.15, b1 - 0.15, 0, 0.95, front - 0.6, front, { ground: true }));
+          f.coll(b0, b1, 0, 2.3, back0, back1, -1);
+          f.coll(b0 + 0.15, b1 - 0.15, 0, 0.95, front - 0.6, front, -1);
+          G.strips.push(f.glow(PAL[(k + (sg > 0 ? 0 : 1)) % PAL.length], 1.6, b0 + 0.3, b1 - 0.3, 2.45, 2.75, back1 - 0.02, back1 + 0.04));
+          G.strips.push(f.glow(0xffd8a0, 0.9, b0 + 0.4, b1 - 0.4, 0.95, 1.0, front - 0.55, front - 0.05));
+          marketStalls++;
+        }
+        // Overhanging awning (walkable slab) over the row with a lit lip over the aisle, steel posts at the aisle edge.
+        const yIn = 3.45;
+        const yOut = 3.05;
+        G.archPaint.push(withTint(f.slant(sA0 - 0.2, sA1 + 0.2, yIn, yOut, back0 - 0.1, front + 0.7, 0.1), PAINT.AWNINGS[sg > 0 ? 0 : 1]));
+        G.strips.push(f.glow(PAL[sg > 0 ? 0 : 1 % PAL.length], 1.8, sA0 - 0.2, sA1 + 0.2, yOut - 0.14, yOut - 0.06, front + 0.62, front + 0.72));
+        f.coll(sA0 - 0.2, sA1 + 0.2, yOut - 0.1, yIn, back0 - 0.1, front + 0.7, -1);
+        for (let a = sA0; a <= sA1 + 0.01; a += 6) {
+          G.steel.push(...f.bx(a - 0.06, a + 0.06, 0, yOut, front + 0.45, front + 0.57, { ground: true }));
+          f.coll(a - 0.06, a + 0.06, 0, yOut, front + 0.45, front + 0.57, -1, 'STEEL');
+        }
+      }
+      // Covered ridge over the aisle: steel spine on two trestles, lantern strings + cables across every 3 m.
+      const fC = sf(ax, 1, l0);
+      const mid = S / 2;
+      G.steel.push(...fC.bx(sA0, sA1, 4.25, 4.4, mid - 0.08, mid + 0.08));
+      for (const a of [sA0 + 0.2, sA1 - 0.2]) G.steel.push(...fC.bx(a - 0.07, a + 0.07, 3.05, 4.25, mid - 0.07, mid + 0.07));
+      for (let a = sA0 + 1.5; a < sA1; a += 3) {
+        G.steel.push(...fC.bx(a - 0.015, a + 0.015, 3.86, 3.89, front + 0.6, S - front - 0.6));
+        for (const q of [0.38, 0.5, 0.62]) G.strips.push(fC.glow(PAL[Math.floor(a + q * 7) % PAL.length], 1.5, a - 0.13, a + 0.13, 3.45, 3.78, q * S - 0.13, q * S + 0.13));
+      }
+      for (let a = sA0 + 2; a < sA1; a += 6) {
+        const p = fC.P3(a, 3.1, mid);
+        if (!lightNear(p.x, p.y, p.z, 4)) addLight(p.x, p.y, p.z, PAL[Math.floor(a) % PAL.length], 1.7);
+      }
+      const v = fC.P3(sA1 + 0.55, 0, mid + aisle / 2 - 0.6);
+      if (inArea(v.x, v.z, 2)) addVending(v.x, v.z, alongX ? -Math.PI / 2 : Math.PI, 1.0);
+      if (park) for (const q of [0.3, 0.7]) {
+        const c = fC.P3(a0 + park / 2 + 0.3, 0, q * S);
+        parkingSlots.push({ x: c.x, z: c.z, y: 0, yaw: alongX ? Math.PI / 2 : 0, onHighway: false });
       }
     });
 
@@ -6058,7 +7028,19 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
     steamAttr.needsUpdate = true;
 
     commit(this.lamps, counts.lamp);
-    commit(this.lampHalos, counts.lamp, false);
+    // 10B-2: rain-mist halos ride behind the lamp halos in the same instanced draw.
+    mists.forEach((mi, k) => {
+      const i = counts.lamp + k;
+      _m4.makeTranslation(mi.x, mi.y, mi.z);
+      this.lampHalos.setMatrixAt(i, _m4);
+      _colB.setHex(mi.hex).multiplyScalar(mi.opacity / NEON_BLOOM.LAMP_HALO_OPACITY);
+      haloAttr.setXYZW(i, _colB.r, _colB.g, _colB.b, mi.radius);
+    });
+    haloAttr.needsUpdate = true;
+    commit(this.lampHalos, counts.lamp + mists.length, false);
+    commit(this.megaBillboards, counts.mega);
+    megaAttrRect.needsUpdate = true;
+    megaAttrParams.needsUpdate = true;
     commit(this.lampCones, counts.lamp, false);
     coneTint.needsUpdate = true;
     lampTint.needsUpdate = true;
@@ -6089,7 +7071,7 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
     this.layout = {
       sector,
       loop,
-      buildings: buildings.map(({ index, cx, cz, halfW, halfD, roofY, arch, massing, setbackY }) => ({ index, cx, cz, halfW, halfD, roofY, arch, massing, setbackY })),
+      buildings: buildings.map(({ index, cx, cz, halfW, halfD, roofY, arch, massing, setbackY, cylR, voidBox, slantH }) => ({ index, cx, cz, halfW, halfD, roofY, arch, massing, setbackY, cylR, voidBox, slantH })),
       colliders,
       ramps: rampColliders,
       anchors,
@@ -6115,6 +7097,8 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
       neonSignRecords,
       buildingSpans: buildings.map((b) => b.plan.faces),
       farTowersInfo: this.farInfo.map((t) => ({ ...t })),
+      megaBillboards: megaRecords,
+      marketRects: plazas,
       stats: {
         towers: buildings.length,
         cars: pick.length,
@@ -6135,7 +7119,13 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
         carPaints: paintCounts,
         carPools: poolCount,
         facadeRooms,
-        massings: Object.fromEntries((['L_SHAPE', 'PODIUM_OFFSET', 'STEPPED_SETBACK', 'GALLERY_DANCHI', 'PENCIL_TOWER'] as const).map((k) => [k, buildings.filter((b) => b.massing === k).length])),
+        massings: Object.fromEntries(([...MASSING_KINDS, ...MEGA_KINDS] as const).map((k) => [k, buildings.filter((b) => b.massing === k).length])),
+        lots: { generated: lotsGenerated, built: buildings.length, market: plazas.length, fill: buildings.length / Math.max(1, lotsGenerated), marketStalls },
+        megastructures: { ...megaCounts },
+        megaBillboards: { total: counts.mega, ...megaStats, mists: mists.length },
+        signRejects,
+        identity: sector.identity?.name ?? '',
+        palette: [...PAL],
         programs: { ...programCounts },
         roofsOnGrid: buildings.filter((b) => b.plan.plates.every((pl) => isOnFloorGrid(b.arch, pl.y))).length,
         setbacksOnGrid: buildings.filter((b) => b.setbackY === 0 || isOnFloorGrid(b.arch, b.setbackY)).length,
@@ -6204,6 +7194,8 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
     const zs = subtractIntervals(-H, H, cutsZ).filter(([a, b]) => b - a >= 12);
     const setback = 1.2;
     const alley = LEVEL.ALLEY_WIDTH_M;
+    /** 10B-1: lots stretch to 44 m (was 34 m) so no block leaves a barren concrete strip behind its tower. */
+    const LOT_MAX_M = 44;
     const minSplitLong = 20 + alley;
     const blocks: Array<{ r: RectXZ; long: number; split: boolean }> = [];
     for (const [x0, x1] of xs) {
@@ -6227,7 +7219,7 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
       const w = r.x1 - r.x0;
       const d = r.z1 - r.z0;
       if (!b.split) {
-        lots.push({ r: rectFrom(r.x0, r.z0, Math.min(r.x1, r.x0 + 34), Math.min(r.z1, r.z0 + 34)), pair: -1 });
+        lots.push({ r: rectFrom(r.x0, r.z0, Math.min(r.x1, r.x0 + LOT_MAX_M), Math.min(r.z1, r.z0 + LOT_MAX_M)), pair: -1 });
         return;
       }
       const pieces = b.long >= 54 ? 3 : 2;
@@ -6235,7 +7227,7 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
       for (let i = 0; i < pieces; i++) {
         const o = i * (each + alley);
         const piece = w >= d ? rectFrom(r.x0 + o, r.z0, r.x0 + o + each, r.z1) : rectFrom(r.x0, r.z0 + o, r.x1, r.z0 + o + each);
-        lots.push({ r: rectFrom(piece.x0, piece.z0, Math.min(piece.x1, piece.x0 + 34), Math.min(piece.z1, piece.z0 + 34)), pair: bi });
+        lots.push({ r: rectFrom(piece.x0, piece.z0, Math.min(piece.x1, piece.x0 + LOT_MAX_M), Math.min(piece.z1, piece.z0 + LOT_MAX_M)), pair: bi });
       }
     });
     // Ensure enough lots by splitting the largest remaining ones.
@@ -6302,6 +7294,26 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
         const p = pt(c.axis, end * (VIS + 16), 0, (c.l0 + c.l1) / 2);
         place(p.x, p.z, c.axis === 'z' ? w : 30, c.axis === 'z' ? 30 : w, 90 + rng() * 140);
       }
+    }
+    // 10B-1 tight skyline framing: an inner ring 115–220 m out (55–180 m tall, blimp-corridor clamped in place()),
+    // every footprint kept ≥ 14 m outside the lockdown square, then the classic outer ring.
+    const hitsCorridorAt = (x: number, z: number, w: number): boolean =>
+      corridors.some((c) => {
+        const lat = c.axis === 'z' ? x : z;
+        const along = c.axis === 'z' ? z : x;
+        return Math.abs(along) < VIS + 4 && lat + w / 2 > c.l0 - 2 && lat - w / 2 < c.l1 + 2;
+      });
+    const innerWant = this.farInfo.length + FAR_INNER.COUNT;
+    for (let g = 0; this.farInfo.length < Math.min(innerWant, LIMITS.FAR_BUILDINGS) && g < 3000; g++) {
+      const ang = rng() * Math.PI * 2;
+      const dist = FAR_INNER.R_MIN + rng() * (FAR_INNER.R_MAX - FAR_INNER.R_MIN);
+      const x = Math.cos(ang) * dist;
+      const z = Math.sin(ang) * dist;
+      const w = 18 + rng() * 24;
+      const d = 18 + rng() * 24;
+      if (Math.max(Math.abs(x) - w / 2, Math.abs(z) - d / 2) < H + FAR_INNER.CLEAR_M) continue;
+      if (hitsCorridorAt(x, z, Math.max(w, d))) continue;
+      place(x, z, w, d, FAR_INNER.H_MIN + rng() * (FAR_INNER.H_MAX - FAR_INNER.H_MIN));
     }
     let guard = 0;
     while (this.farInfo.length < LIMITS.FAR_BUILDINGS && guard++ < 6000) {
