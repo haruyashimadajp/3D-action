@@ -64,6 +64,8 @@ export interface ProceduralTextureLibrary {
   graffitiAtlas: THREE.Texture;
   /** 10B-2 Mega-Billboard hero-ad atlas (2048 × 1024, 4 × 2 cells, 100 % English) — see MEGA_ATLAS. */
   megaBillboard: THREE.Texture;
+  /** 10C-2 vending display atlas (512², 2 × 2 brand quadrants of 256², 100 % English) — see VENDING_ATLAS. */
+  vendingAtlas: THREE.Texture;
   /** 6B-1 tactical glove & wear set (512², four zones; roughnessMap packs G roughness · B metalness). */
   glove: PbrTextureSet;
   /** 6B-1 gun micro hard-surface set (512², four zones; roughnessMap packs G roughness · B metalness). */
@@ -71,7 +73,13 @@ export interface ProceduralTextureLibrary {
 }
 
 /** Rows in the wide-banner half of the sign atlas and emblem cells (4 × 2). */
-export const SIGN_ATLAS = { WIDE_ROWS: 8, SCROLL_ROWS: [6, 7] as readonly number[], EMBLEMS: 8 } as const;
+export const SIGN_ATLAS = {
+  WIDE_ROWS: 8,
+  SCROLL_ROWS: [6, 7] as readonly number[],
+  EMBLEMS: 8,
+  /** 10C-3 wide-banner rows carrying the open-frame scaffold neon words (English tube lettering). */
+  WORD_ROWS: { CYBER_RAMEN: 0, MOTEL_09: 2, NIGHT_BAR: 4, OPEN_24H: 5 } as const,
+} as const;
 
 /** 10B-2: crisp uppercase geometric Latin typography for every in-world sign (zero CJK font fallbacks). */
 export const SIGN_FONT = "'Arial Black','Helvetica Neue','Arial Narrow',Impact,Arial,sans-serif";
@@ -1169,6 +1177,190 @@ function generateNeonAtlas(anisotropy: number): THREE.Texture {
 // ---------------------------------------------------------------------------
 // 4c. Mega-Billboard hero-ad atlas (10B-2): 2048 × 1024, 4 × 2 cells, 100 % English
 // ---------------------------------------------------------------------------
+
+/**
+ * 10C-2 vending atlas layout (512², origin top-left, 2 × 2 brand quadrants of 256²). Each quadrant holds a display
+ * window (4 product rows between 3 shelf rails), the right-side control bezel (touchscreen · NFC ring · card slot)
+ * and the top marquee. `*_UV` rects are quadrant-local (u, v from the quadrant's bottom-left, 0…0.5 scale).
+ */
+export const VENDING_ATLAS = {
+  SIZE: 512,
+  BRANDS: ['NI-COLA', 'SYNTH-CAF', 'K-BOOST', 'ZERO-H2O'] as readonly string[],
+  /** Pixel regions inside a 256² quadrant: x, y (from the top), w, h. */
+  DISPLAY: [0, 0, 176, 228] as readonly number[],
+  CONTROL: [180, 0, 76, 228] as readonly number[],
+  MARQUEE: [0, 232, 256, 24] as readonly number[],
+} as const;
+
+function generateVendingAtlas(anisotropy: number): THREE.Texture {
+  const S = VENDING_ATLAS.SIZE;
+  const Q = S / 2;
+  const [c, ctx] = makeCanvas(S, S);
+  const rng = createRng(0x10c2);
+  const font = SIGN_FONT;
+  ctx.fillStyle = '#05070b';
+  ctx.fillRect(0, 0, S, S);
+  /** Draws in a logical `lw × lh` space stretched into pixel region `r` of quadrant `q`. */
+  const region = (q: number, r: readonly number[], lw: number, lh: number, draw: () => void): void => {
+    const ox = (q % 2) * Q + r[0];
+    const oy = Math.floor(q / 2) * Q + r[1];
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(ox, oy, r[2], r[3]);
+    ctx.clip();
+    ctx.translate(ox, oy);
+    ctx.scale(r[2] / lw, r[3] / lh);
+    draw();
+    ctx.restore();
+  };
+  const PAL: ReadonlyArray<{ bg: string; cans: string[]; accent: string; text: string; glow: string }> = [
+    { bg: '#2a0a0e', cans: ['#d8202c', '#f2f2f2', '#9c1420', '#ff5a4a'], accent: '#ff3040', text: '#fff0f0', glow: '#ff2b3d' },
+    { bg: '#1c1208', cans: ['#e09a22', '#2ab6d6', '#6a4a22', '#ffd070'], accent: '#ffb030', text: '#ffe8b8', glow: '#ffa21f' },
+    { bg: '#0c1c0a', cans: ['#7bd62c', '#e8e22a', '#2a9a2a', '#c8ff60'], accent: '#a6ff3a', text: '#f0ffd0', glow: '#7cff2b' },
+    { bg: '#071a24', cans: ['#2a8ae0', '#8ae8ff', '#e8f6ff', '#1a5aa8'], accent: '#38f8ff', text: '#e0fbff', glow: '#00f0ff' },
+  ];
+  const roundRect = (x: number, y: number, w: number, h: number, r: number): void => {
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+  };
+  const PRICES = ['$1.50', '$2.20', '$2.50', '$3.20', '$1.80', '$2.80', '$3.50', '$1.20'];
+  for (let q = 0; q < 4; q++) {
+    const pal = PAL[q];
+    // ---- Display window: backlit back plane, 4 product rows between shelf rails, price LEDs, condensation.
+    region(q, VENDING_ATLAS.DISPLAY, 176, 283, () => {
+      const g = ctx.createLinearGradient(0, 0, 0, 283);
+      g.addColorStop(0, '#3a424e');
+      g.addColorStop(1, '#232a34');
+      ctx.fillStyle = g;
+      ctx.fillRect(0, 0, 176, 283);
+      const rows = [[6, 79], [79, 149], [149, 218], [218, 281]];
+      rows.forEach(([y0, y1], r) => {
+        const h = y1 - y0;
+        // Shelf glow strip + rail.
+        ctx.fillStyle = 'rgba(255,255,255,0.1)';
+        ctx.fillRect(0, y0, 176, h - 16);
+        for (let k = 0; k < 4; k++) {
+          const x = 8 + k * 42;
+          const col = pal.cans[Math.floor(rng() * pal.cans.length)];
+          const bottle = (k + r) % 3 === 1;
+          const bh = h - 30;
+          const top = y1 - 15 - bh;
+          for (let n = 0; n < 2; n++) {
+            const xx = x + n * 17;
+            ctx.fillStyle = col;
+            if (bottle) {
+              roundRect(xx + 2, top + 12, 12, bh - 12, 4);
+              ctx.fill();
+              ctx.fillRect(xx + 5, top, 6, 14);
+              ctx.fillStyle = pal.accent;
+              ctx.fillRect(xx + 5, top - 2, 6, 3);
+            } else {
+              roundRect(xx, top + 6, 15, bh - 6, 3);
+              ctx.fill();
+              ctx.fillStyle = '#c8ccd2';
+              ctx.fillRect(xx + 1, top + 3, 13, 4);
+            }
+            // Label band + specular highlight + condensation beads.
+            ctx.fillStyle = 'rgba(255,255,255,0.78)';
+            ctx.fillRect(xx + 1, top + bh * 0.45, 13, bh * 0.18);
+            ctx.fillStyle = 'rgba(255,255,255,0.32)';
+            ctx.fillRect(xx + 2, top + 8, 2, bh - 12);
+            ctx.fillStyle = 'rgba(210,235,255,0.5)';
+            for (let d = 0; d < 4; d++) ctx.fillRect(xx + 3 + rng() * 9, top + 10 + rng() * (bh - 16), 1.4, 1.4);
+          }
+          // Price-tag LED under each pair.
+          ctx.fillStyle = '#05070a';
+          ctx.fillRect(x - 1, y1 - 13, 36, 11);
+          ctx.fillStyle = '#ff3a2a';
+          ctx.font = `900 9px ${font}`;
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'middle';
+          ctx.fillText(PRICES[(q * 3 + r * 2 + k) % PRICES.length], x + 17, y1 - 7);
+        }
+        ctx.fillStyle = '#aeb6c2';
+        ctx.fillRect(0, y1 - 2, 176, 3);
+      });
+    });
+    // ---- Control bezel: touchscreen selection pad, NFC tap ring, card slot, status LEDs.
+    region(q, VENDING_ATLAS.CONTROL, 76, 253, () => {
+      ctx.fillStyle = '#10151c';
+      ctx.fillRect(0, 0, 76, 253);
+      // Touchscreen (glowing blue-cyan).
+      ctx.fillStyle = '#05141c';
+      ctx.fillRect(4, 6, 68, 104);
+      ctx.fillStyle = pal.glow;
+      ctx.globalAlpha = 0.55;
+      ctx.fillRect(7, 9, 62, 98);
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = '#e8fbff';
+      ctx.font = `900 9px ${font}`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('SELECT', 38, 18);
+      for (let r = 0; r < 4; r++) {
+        for (let k = 0; k < 2; k++) {
+          ctx.fillStyle = 'rgba(5,20,28,0.8)';
+          ctx.fillRect(10 + k * 30, 28 + r * 19, 26, 15);
+          ctx.fillStyle = '#e8fbff';
+          ctx.font = `800 8px ${font}`;
+          ctx.fillText(`${'ABCD'[r]}${k + 1}`, 23 + k * 30, 36 + r * 19);
+        }
+      }
+      // NFC tap ring.
+      ctx.strokeStyle = '#38f8ff';
+      ctx.shadowColor = '#00f0ff';
+      ctx.shadowBlur = 5;
+      ctx.lineWidth = 3;
+      for (const rr of [9, 16]) {
+        ctx.beginPath();
+        ctx.arc(38, 152, rr, -2.4, -0.74);
+        ctx.stroke();
+      }
+      ctx.shadowBlur = 0;
+      ctx.fillStyle = '#e8fbff';
+      ctx.font = `900 8px ${font}`;
+      ctx.fillText('TAP', 38, 152);
+      ctx.fillText('NFC PAY', 38, 178);
+      // Card slot + status LEDs.
+      ctx.fillStyle = '#020305';
+      ctx.fillRect(14, 218, 48, 7);
+      ctx.fillStyle = '#39ff88';
+      ctx.fillRect(10, 236, 6, 6);
+      ctx.fillStyle = '#ffb030';
+      ctx.fillRect(22, 236, 6, 6);
+      ctx.fillStyle = '#ff3040';
+      ctx.fillRect(34, 236, 6, 6);
+    });
+    // ---- Marquee: brand header banner.
+    region(q, VENDING_ATLAS.MARQUEE, 256, 43, () => {
+      const g = ctx.createLinearGradient(0, 0, 0, 43);
+      g.addColorStop(0, pal.bg);
+      g.addColorStop(1, '#000');
+      ctx.fillStyle = g;
+      ctx.fillRect(0, 0, 256, 43);
+      ctx.strokeStyle = pal.accent;
+      ctx.lineWidth = 3;
+      ctx.strokeRect(3, 3, 250, 37);
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.font = `900 24px ${font}`;
+      ctx.shadowColor = pal.glow;
+      ctx.shadowBlur = 10;
+      ctx.fillStyle = pal.text;
+      ctx.fillText(VENDING_ATLAS.BRANDS[q], 128, 23);
+      ctx.shadowBlur = 0;
+    });
+  }
+  const tex = finalizeTexture(c, THREE.SRGBColorSpace, anisotropy, false);
+  tex.premultiplyAlpha = false;
+  return tex;
+}
+
 function generateMegaBillboardAtlas(anisotropy: number): THREE.Texture {
   const { W, H } = MEGA_ATLAS;
   const C = 512;
@@ -1543,12 +1735,12 @@ function generateMegaBillboardAtlas(anisotropy: number): THREE.Texture {
 // 4b. Sign atlas (5B-3): wide banners + scrolling tickers (top) and emblems (bottom), 1024²
 // ---------------------------------------------------------------------------
 const WIDE_SIGNS: ReadonlyArray<{ text: string; color: string; glow: string }> = [
-  { text: 'NOODLE 24H ◆ NEON RAMEN', color: '#ffd28a', glow: '#ffa21f' },
+  { text: 'CYBER RAMEN', color: '#ffd28a', glow: '#ffa21f' },
   { text: 'OMEGA//CORP — STRAND SYSTEMS', color: '#aefcff', glow: '#00f0ff' },
-  { text: 'CYBER PHARMA+ ◆ 24H', color: '#9dffc8', glow: '#39ff88' },
+  { text: 'MOTEL 09', color: '#9dffc8', glow: '#39ff88' },
   { text: 'HOTEL KOWLOON // VACANCY', color: '#ff9ef0', glow: '#ff2bd6' },
-  { text: 'KARAOKE // BAR ▶ OPEN', color: '#d6a8ff', glow: '#b44bff' },
-  { text: 'EXPRESS 09 ▶▶ EXIT 4B', color: '#7ff8ff', glow: '#38f8ff' },
+  { text: 'NIGHT BAR', color: '#d6a8ff', glow: '#b44bff' },
+  { text: 'OPEN 24H', color: '#7ff8ff', glow: '#38f8ff' },
   { text: '▶ SECTOR LOCKDOWN ▶ STAY INDOORS ▶ CURFEW 23:00 ', color: '#ffc96a', glow: '#ffa21f' },
   { text: '◆ VALKYRIE-09 SIGHTED ◆ NEON CITY ALERT ◆ GRID 480 ', color: '#ff86b0', glow: '#ff2b6d' },
 ];
@@ -1576,10 +1768,22 @@ function generateSignAtlas(anisotropy: number): THREE.Texture {
   WIDE_SIGNS.forEach((def, r) => {
     const y0 = r * RH;
     const scroll = SIGN_ATLAS.SCROLL_ROWS.includes(r);
-    ctx.fillStyle = scroll ? 'rgba(4,6,12,0.82)' : 'rgba(8,10,18,0.6)';
-    ctx.fillRect(2, y0 + 3, W - 4, RH - 6);
+    // 10C-3: scaffold words are free-standing tube letters (no panel, no frame), spaced across the whole banner.
+    const word = (Object.values(SIGN_ATLAS.WORD_ROWS) as number[]).includes(r);
+    if (!word) {
+      ctx.fillStyle = scroll ? 'rgba(4,6,12,0.82)' : 'rgba(8,10,18,0.6)';
+      ctx.fillRect(2, y0 + 3, W - 4, RH - 6);
+    }
     ctx.textBaseline = 'middle';
-    if (scroll) {
+    if (word) {
+      const chars = Array.from(def.text);
+      const step = Math.min((W * 0.92) / chars.length, RH * 2.2);
+      const x0 = W / 2 - (step * (chars.length - 1)) / 2;
+      ctx.font = `900 ${RH * 0.8}px ${font}`;
+      chars.forEach((ch, k) => {
+        if (ch !== ' ') glowText(ch, x0 + k * step, y0 + RH / 2 + 2, def.color, def.glow, 'center');
+      });
+    } else if (scroll) {
       // LED dot-matrix ticker: the text tiles every W px so a fract(u + t) scroll never shows a seam.
       ctx.font = `800 ${RH * 0.56}px ${font}`;
       const tw = ctx.measureText(def.text).width;
@@ -2725,6 +2929,7 @@ export function getProceduralTextures(renderer: THREE.WebGLRenderer): Procedural
       plaqueAtlas: new THREE.Texture(),
       graffitiAtlas: new THREE.Texture(),
       megaBillboard: new THREE.Texture(),
+      vendingAtlas: new THREE.Texture(),
       glove: pbr(),
       gun: pbr(),
     };
@@ -2745,6 +2950,7 @@ export function getProceduralTextures(renderer: THREE.WebGLRenderer): Procedural
     plaqueAtlas: generatePlaqueAtlas(aniso),
     graffitiAtlas: generateGraffitiAtlas(aniso),
     megaBillboard: generateMegaBillboardAtlas(aniso),
+    vendingAtlas: generateVendingAtlas(aniso),
     glove: generateGloveSet(aniso),
     gun: generateGunSet(aniso),
   };

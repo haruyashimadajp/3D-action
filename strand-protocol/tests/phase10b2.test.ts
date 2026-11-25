@@ -32,6 +32,7 @@ function mockTextures(): ProceduralTextureLibrary {
     plaqueAtlas: new THREE.Texture(),
     graffitiAtlas: new THREE.Texture(),
     megaBillboard: new THREE.Texture(),
+    vendingAtlas: new THREE.Texture(),
     glove: mockPbr(),
     gun: mockPbr(),
   };
