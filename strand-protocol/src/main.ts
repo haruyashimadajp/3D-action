@@ -18,8 +18,10 @@ import {
   FLOW_POINTS,
   FLOW_RANKS,
   INPUT,
+  LEVEL,
   PLAYER,
   RENDER,
+  SHAKE,
   DEG2RAD,
   type HitstopDef,
   type QualityPreset,
@@ -62,7 +64,8 @@ import { AudioEngine } from './engine/AudioEngine';
 import { Renderer } from './engine/Renderer';
 import { getProceduralTextures } from './engine/ProceduralTextures';
 import { InputManager } from './engine/InputManager';
-import { CityBuilder, type SectorLayout, blimpPose, lightningAt } from './world/CityBuilder';
+import { CityBuilder, type LightningSample, type SectorLayout, blimpPose, lightningAt } from './world/CityBuilder';
+import { ThunderScheduler } from './world/CityAtmosphere';
 import { PhysicsWorld, createRayHit, createTargetHit, type HitboxTarget } from './world/PhysicsWorld';
 import { EffectsPool, BURST, type ProjectileImpact, type ProjectileOwner, type ProjectileSpec } from './entities/EffectsPool';
 import { EnemyManager, RICOCHET_TAG, type HitMarkerKind, type KillInfo, type RadarEnemySample } from './entities/EnemyManager';
@@ -290,6 +293,13 @@ class AttractCamera {
 type AppState = 'TITLE' | 'PLAYING' | 'PAUSED' | 'SKILL' | 'TRANSITION' | 'RESULT';
 
 const _lookDelta = { yaw: 0, pitch: 0 };
+/** 10D-1 non-lethal traffic bump impulse (scratch). */
+const _bumpImpulse = new THREE.Vector3();
+/** 10D-4 zero-allocation scratch: lightning sample, spark direction, drip point. */
+const _lightning: LightningSample = { k: 0, start: 0, azimuth: 0, intensity: 0 };
+const _sparkDir = new THREE.Vector3();
+const _dripPos = new THREE.Vector3();
+const DOWN = new THREE.Vector3(0, -1, 0);
 const _lateLookDelta = { yaw: 0, pitch: 0 };
 const _camRight = new THREE.Vector3();
 const _camUp = new THREE.Vector3();
@@ -380,6 +390,12 @@ class App {
   private lastFrame = performance.now();
   private readonly camVel = new THREE.Vector3();
   private readonly prevCamPos = new THREE.Vector3();
+  /** 10D-5: the camera teleported (sector build / spawn / title / fixed view) — skip one frame of rain-smear velocity. */
+  private camSnapped = true;
+  /** 10D-4 breaker spark cadence (sim time of each node's next burst), canopy-drip cursor, thunder scheduler. */
+  private readonly sparkNext = new Float32Array(16);
+  private dripCursor = 0;
+  private readonly thunder = new ThunderScheduler();
   /** 7B-8: sim time of the last enemy telegraph lock. */
   private lastLockAt = -1e9;
   private readonly hudFrame: HudFrame;
@@ -523,9 +539,14 @@ class App {
       },
       onSectorClear: () => this.onSectorCleared(),
       onExplosion: (pos) => audio.explosion(pos),
-      onAlertState: (kind) => {
+      onEnemyStep: (pos) => {
+        if (this.state === 'PLAYING') audio.enemyWetStep(pos);
+      },
+      onAlertState: (kind, pos) => {
         // 8A-5 awareness cues: suspicion hum, spotted sting, radio alarm, all-clear.
         if (this.state !== 'PLAYING') return;
+        // 10D-4: the spotting enemy keys its radio (GLOBAL_COMBAT / DEESCALATE carry no position).
+        if (pos && (kind === 'DETECTED' || kind === 'COMBAT')) audio.enemyRadioSquelch(pos, kind === 'COMBAT');
         if (kind === 'ALERT' || kind === 'DETECTED' || kind === 'GLOBAL_COMBAT' || kind === 'DEESCALATE') audio.awareness(kind);
         if (kind === 'GLOBAL_COMBAT') this.hud.flowLog('DISTRICT ALERT — COMBAT', 0, 'skill');
         else if (kind === 'DEESCALATE') this.hud.flowLog('SEARCH ABANDONED — ALERT', 0, 'skill');
@@ -802,6 +823,11 @@ class App {
     this.physics.setLayout(layout);
     this.attract.rebuild(layout);
     this.layout = layout;
+    // 10D-4: re-arm breaker sparks (staggered), forget pending thunder; 10D-5: no rain smear on the jump.
+    for (let i = 0; i < this.sparkNext.length; i++) this.sparkNext[i] = this.clock.simTime + 1.5 + ((i * 2.618) % 1) * 4;
+    this.dripCursor = 0;
+    this.thunder.reset();
+    this.camSnapped = true;
     this.sectorIndex = index;
     this.sectorLabel = this.loop > 0 ? `${layout.sector.name} · LOOP ${this.loop + 1}` : layout.sector.name;
     return layout;
@@ -827,6 +853,7 @@ class App {
     this.input.setUnloadGuard(s !== 'TITLE');
     // 5A-2: rain, wind, BGM and every world SE are fully silent while paused, on the result screen and title.
     this.audio.setPaused(s === 'PAUSED' || s === 'RESULT' || s === 'TITLE');
+    if (!playing) this.thunder.reset();
     const pause = document.getElementById('pause');
     pause?.classList.toggle('visible', s === 'PAUSED');
     pause?.classList.toggle('mini', s === 'PAUSED' && this.pauseMini);
@@ -875,6 +902,7 @@ class App {
    */
   private spawnPlayer(restartSector = true): void {
     this.player.spawn(this.layout.playerSpawn, this.layout.playerSpawnYaw);
+    this.camSnapped = true;
     this.equipment.reset();
     this.effects.clearProjectiles();
     this.accumulator = 0;
@@ -1032,6 +1060,7 @@ class App {
   }
 
   private returnToTitle(): void {
+    this.camSnapped = true;
     this.hud.hideResult();
     this.hud.closeSkillModal();
     this.hud.eliminated(null);
@@ -1246,6 +1275,13 @@ class App {
     const cam = this.renderer.camera;
     this.equipment.fixedUpdate(dt, cam, this.clock.bulletTimeScale);
     this.player.fixedUpdate(dt, this.equipment.stepContext());
+    // 10D-1: expressway traffic never damages — a car brushing the player shoves them inward (0 HP, 0.6 s cooldown).
+    const pp = this.player.position;
+    if (this.deathTimer < 0 && Math.abs(pp.y - LEVEL.HIGHWAY_DECK_Y) < 2.2 && this.city.traffic.checkPlayerBump(pp, _bumpImpulse)) {
+      this.player.addImpulse(_bumpImpulse);
+      this.player.addTrauma(SHAKE.GRAZE);
+      this.audio.trafficWhoosh(pp);
+    }
     this.enemies.fixedUpdate(dt);
     this.effects.updateProjectiles(dt, this.physics, this.targetsFor, this.onImpact, this.enemies.graze);
     this.flow.update(dt);
@@ -1328,6 +1364,12 @@ class App {
         this.attract.apply(cam, alpha, realDt);
       }
       this.renderer.setFov(this.player.settings.baseFov);
+      // 10D-5: a teleport (or > 5 m jump in one frame) never becomes a one-frame horizontal rain smear.
+      if (this.camSnapped || cam.position.distanceToSquared(this.prevCamPos) > 25) {
+        this.prevCamPos.copy(cam.position);
+        this.camVel.set(0, 0, 0);
+        this.camSnapped = false;
+      }
       if (simDt > 0) this.camVel.subVectors(cam.position, this.prevCamPos).divideScalar(simDt);
       fx.speed = this.camVel.length();
       fx.bulletTime = 0;
@@ -1353,6 +1395,11 @@ class App {
       this.equipment.frameUpdate(frozen ? 0 : realDt, cam, _lookDelta.yaw, _lookDelta.pitch);
       this.enemies.frameUpdate(realDt, simDt, alpha);
       this.camVel.copy(this.player.velocity);
+      if (this.camSnapped || cam.position.distanceToSquared(this.prevCamPos) > 25) {
+        this.prevCamPos.copy(cam.position);
+        this.camVel.set(0, 0, 0);
+        this.camSnapped = false;
+      }
       fx.speed = this.player.speed;
       fx.bulletTime += ((this.player.btActive ? 1 : 0) - fx.bulletTime) * lerpFactor(14, realDt);
       fx.critical += ((this.player.isCritical && this.player.isAlive ? 1 : 0) - fx.critical) * lerpFactor(6, realDt);
@@ -1406,6 +1453,7 @@ class App {
 
     // --- World & effects ---
     this.city.update(this.clock.simTime, cam.position);
+    this.updateAmbientFx(playing, simDt, cam.position);
     this.effects.update(simDt, realDt, cam.position, this.camVel, this.clock.realTime, this.renderer.viewportHeight);
     this.renderer.update(realDt);
     this.renderer.updateShadowFocus(cam.position);
@@ -1413,6 +1461,47 @@ class App {
 
     if (this.store.data.settings.showPerf) this.updatePerfOverlay();
     if (this.debugEl) this.updateDebug();
+  }
+
+  /**
+   * 10D-4 ambient world FX (allocation-free): faulty breaker sparks (4–9 s cadence within 52 m, flash < 18 m,
+   * crackle ≤ 14 m), canopy rain drips (≤ 2 lips within 16 m, ~4.5 drips/s each) and speed-of-sound thunder.
+   */
+  private updateAmbientFx(playing: boolean, simDt: number, camPos: THREE.Vector3): void {
+    const L = this.layout;
+    const t = this.clock.simTime;
+    if (playing && simDt > 0) {
+      const nodes = L.sparkNodes;
+      for (let i = 0; i < nodes.length && i < this.sparkNext.length; i++) {
+        if (t < this.sparkNext[i]) continue;
+        const h = Math.sin((i + 1) * 91.7 + Math.floor(t) * 12.9898) * 43758.5453;
+        this.sparkNext[i] = t + 4 + (h - Math.floor(h)) * 5;
+        const n = nodes[i];
+        const d2 = n.pos.distanceToSquared(camPos);
+        if (d2 > 52 * 52) continue;
+        _sparkDir.set(n.nx, 0.25, n.nz).normalize();
+        this.effects.burst(n.pos, _sparkDir, BURST.BREAKER_SPARK);
+        if (d2 < 18 * 18) this.renderer.flashLight(n.pos, 0x70d8ff, 3.0, 10, 0.09);
+        if (d2 <= 14 * 14) this.audio.breakerCrackle(n.pos);
+      }
+      const edges = L.canopyDripEdges;
+      let sampled = 0;
+      for (let k = 0; k < edges.length && sampled < 2; k++) {
+        const e = edges[(this.dripCursor + k) % edges.length];
+        const mx = (e.x0 + e.x1) / 2;
+        const mz = (e.z0 + e.z1) / 2;
+        const half = Math.hypot(e.x1 - e.x0, e.z1 - e.z0) / 2;
+        if (Math.hypot(mx - camPos.x, mz - camPos.z) > 16 + half) continue;
+        sampled++;
+        if (Math.random() > 4.5 * simDt) continue;
+        const u = Math.random();
+        _dripPos.set(e.x0 + (e.x1 - e.x0) * u, e.y - 0.02, e.z0 + (e.z1 - e.z0) * u);
+        this.effects.burst(_dripPos, DOWN, BURST.CANOPY_DRIP);
+      }
+      if (edges.length) this.dripCursor = (this.dripCursor + 1) % edges.length;
+    }
+    lightningAt(t, _lightning);
+    if (this.thunder.step(t, _lightning, playing, this.player.yaw)) this.audio.thunderRumble(this.thunder.pan, this.thunder.intensity);
   }
 
   /** Opened gate (after the skill pick) crossed toward the next district. */

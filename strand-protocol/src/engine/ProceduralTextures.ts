@@ -66,6 +66,8 @@ export interface ProceduralTextureLibrary {
   megaBillboard: THREE.Texture;
   /** 10C-2 vending display atlas (512², 2 × 2 brand quadrants of 256², 100 % English) — see VENDING_ATLAS. */
   vendingAtlas: THREE.Texture;
+  /** 10D-3 street-landmark atlas (512 × 256, 100 % English): top half ramen-cart marquee, bottom half transit map. */
+  furnishingsAtlas?: THREE.Texture;
   /** 6B-1 tactical glove & wear set (512², four zones; roughnessMap packs G roughness · B metalness). */
   glove: PbrTextureSet;
   /** 6B-1 gun micro hard-surface set (512², four zones; roughnessMap packs G roughness · B metalness). */
@@ -1191,6 +1193,140 @@ export const VENDING_ATLAS = {
   CONTROL: [180, 0, 76, 228] as readonly number[],
   MARQUEE: [0, 232, 256, 24] as readonly number[],
 } as const;
+
+/**
+ * 10D-3 street-landmark atlas (512 × 256, origin top-left, 100 % English). Top half (v 0.5…1): ramen-cart marquee
+ * `SYNTH RAMEN // HOT NOODLES 24H` with a bowl emblem and `$6 · $9`. Bottom half (v 0…0.5): two 2:1 bus-shelter
+ * lightbox cells — `NEO-KOWLOON METRO` map with glowing cyan / magenta / amber lines (u 0…0.5) and the `SECTOR
+ * TRANSIT` departure board with `NEXT SHUTTLE: 02 MIN` (u 0.5…1).
+ */
+export const FURNISHINGS_ATLAS = {
+  W: 512,
+  H: 256,
+  LABELS: ['SYNTH RAMEN', 'HOT NOODLES 24H', '$6 · $9', 'NEO-KOWLOON METRO', 'SECTOR TRANSIT', 'NEXT SHUTTLE: 02 MIN', 'S1', 'S2', 'S3', 'S4', 'S5', 'S2 CANAL', 'S3 CROSSING', 'S5 PLAZA', '06 MIN', '11 MIN', '18 MIN'] as readonly string[],
+} as const;
+
+function generateFurnishingsAtlas(anisotropy: number): THREE.Texture {
+  const W = FURNISHINGS_ATLAS.W;
+  const H = FURNISHINGS_ATLAS.H;
+  const [c, ctx] = makeCanvas(W, H);
+  const font = SIGN_FONT;
+  // ---- Top half: ramen marquee (black = unlit).
+  ctx.fillStyle = '#1a0604';
+  ctx.fillRect(0, 0, W, H / 2);
+  const g = ctx.createLinearGradient(0, 0, 0, H / 2);
+  g.addColorStop(0, 'rgba(255,90,30,0.28)');
+  g.addColorStop(1, 'rgba(120,10,0,0.05)');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H / 2);
+  ctx.strokeStyle = '#ffb040';
+  ctx.lineWidth = 4;
+  ctx.strokeRect(6, 6, W - 12, H / 2 - 12);
+  // Bowl emblem: steaming bowl, chopsticks.
+  ctx.save();
+  ctx.translate(64, 66);
+  ctx.fillStyle = '#ff5a28';
+  ctx.beginPath();
+  ctx.arc(0, 0, 34, 0, Math.PI);
+  ctx.closePath();
+  ctx.fill();
+  ctx.fillStyle = '#ffd890';
+  ctx.fillRect(-40, -4, 80, 6);
+  ctx.strokeStyle = '#fff0d0';
+  ctx.lineWidth = 3;
+  for (const dx of [-12, 0, 12]) {
+    ctx.beginPath();
+    ctx.moveTo(dx, -12);
+    ctx.bezierCurveTo(dx + 8, -22, dx - 8, -30, dx, -42);
+    ctx.stroke();
+  }
+  ctx.strokeStyle = '#c87a3a';
+  ctx.lineWidth = 4;
+  ctx.beginPath();
+  ctx.moveTo(18, -6);
+  ctx.lineTo(44, -40);
+  ctx.moveTo(26, -4);
+  ctx.lineTo(50, -34);
+  ctx.stroke();
+  ctx.restore();
+  ctx.textBaseline = 'middle';
+  ctx.shadowColor = '#ff6a20';
+  ctx.shadowBlur = 14;
+  ctx.fillStyle = '#ffe8c0';
+  ctx.font = `900 46px ${font}`;
+  ctx.fillText('SYNTH RAMEN', 120, 44);
+  ctx.shadowBlur = 8;
+  ctx.fillStyle = '#ffb040';
+  ctx.font = `700 22px ${font}`;
+  ctx.fillText('// HOT NOODLES 24H', 122, 86);
+  ctx.fillStyle = '#ff5a28';
+  ctx.font = `800 26px ${font}`;
+  ctx.fillText('$6 · $9', 400, 108);
+  ctx.shadowBlur = 0;
+  // ---- Bottom half: two 2:1 lightbox cells (each panel samples one cell undistorted).
+  // Left cell (x 0–256): metro map. Right cell (x 256–512): shuttle departure board.
+  const y0 = H / 2;
+  ctx.fillStyle = '#04080e';
+  ctx.fillRect(0, y0, W, H / 2);
+  ctx.strokeStyle = 'rgba(80,140,180,0.16)';
+  ctx.lineWidth = 1;
+  for (let x = 0; x < 256; x += 16) {
+    ctx.beginPath();
+    ctx.moveTo(x, y0);
+    ctx.lineTo(x, H);
+    ctx.stroke();
+  }
+  ctx.fillStyle = '#e0fbff';
+  ctx.font = `800 15px ${font}`;
+  ctx.fillText('NEO-KOWLOON METRO', 10, y0 + 14);
+  const lines: ReadonlyArray<{ col: string; pts: ReadonlyArray<readonly [number, number]> }> = [
+    { col: '#38f8ff', pts: [[16, 58], [70, 58], [96, 40], [166, 40], [190, 58], [240, 58]] },
+    { col: '#ff2bd6', pts: [[20, 92], [60, 92], [86, 64], [130, 64], [156, 86], [236, 86]] },
+    { col: '#ffa21f', pts: [[30, 40], [50, 72], [116, 72], [140, 50], [210, 50], [230, 100]] },
+  ];
+  ctx.shadowBlur = 8;
+  for (const ln of lines) {
+    ctx.shadowColor = ln.col;
+    ctx.strokeStyle = ln.col;
+    ctx.lineWidth = 4;
+    ctx.beginPath();
+    ln.pts.forEach(([x, y], i) => (i ? ctx.lineTo(x, y0 + y) : ctx.moveTo(x, y0 + y)));
+    ctx.stroke();
+    ctx.fillStyle = '#ffffff';
+    for (const [x, y] of ln.pts) {
+      ctx.beginPath();
+      ctx.arc(x, y0 + y, 3.5, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+  ctx.shadowBlur = 0;
+  ctx.font = `700 11px ${font}`;
+  ctx.fillStyle = '#9fdcff';
+  ['S1', 'S2', 'S3', 'S4', 'S5'].forEach((t, i) => ctx.fillText(t, 14 + i * 50, y0 + 116));
+  // Right cell: departure board.
+  ctx.fillStyle = '#060a10';
+  ctx.fillRect(256, y0, 256, H / 2);
+  ctx.strokeStyle = '#38f8ff';
+  ctx.lineWidth = 2;
+  ctx.strokeRect(260, y0 + 4, 248, H / 2 - 8);
+  ctx.fillStyle = '#e0fbff';
+  ctx.font = `800 17px ${font}`;
+  ctx.fillText('SECTOR TRANSIT', 270, y0 + 22);
+  ctx.fillStyle = '#ffd36a';
+  ctx.font = `800 16px ${font}`;
+  ctx.fillText('NEXT SHUTTLE: 02 MIN', 270, y0 + 48);
+  ctx.font = `700 13px ${font}`;
+  const rows = [['S2 CANAL', '06 MIN', '#ff2bd6'], ['S3 CROSSING', '11 MIN', '#ffa21f'], ['S5 PLAZA', '18 MIN', '#38f8ff']] as const;
+  rows.forEach(([dst, eta, col], i) => {
+    ctx.fillStyle = col;
+    ctx.fillText(dst, 270, y0 + 74 + i * 18);
+    ctx.fillStyle = '#e0fbff';
+    ctx.fillText(eta, 440, y0 + 74 + i * 18);
+  });
+  const tex = finalizeTexture(c, THREE.SRGBColorSpace, anisotropy, false);
+  tex.name = 'FurnishingsAtlas';
+  return tex;
+}
 
 function generateVendingAtlas(anisotropy: number): THREE.Texture {
   const S = VENDING_ATLAS.SIZE;
@@ -2930,6 +3066,7 @@ export function getProceduralTextures(renderer: THREE.WebGLRenderer): Procedural
       graffitiAtlas: new THREE.Texture(),
       megaBillboard: new THREE.Texture(),
       vendingAtlas: new THREE.Texture(),
+      furnishingsAtlas: new THREE.Texture(),
       glove: pbr(),
       gun: pbr(),
     };
@@ -2951,6 +3088,7 @@ export function getProceduralTextures(renderer: THREE.WebGLRenderer): Procedural
     graffitiAtlas: generateGraffitiAtlas(aniso),
     megaBillboard: generateMegaBillboardAtlas(aniso),
     vendingAtlas: generateVendingAtlas(aniso),
+    furnishingsAtlas: generateFurnishingsAtlas(aniso),
     glove: generateGloveSet(aniso),
     gun: generateGunSet(aniso),
   };

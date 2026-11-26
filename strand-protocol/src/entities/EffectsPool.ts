@@ -138,6 +138,10 @@ export const BURST = {
   SLASH: { count: 14, color: 0xd04dff, intensity: 3.6, speed: 9, spread: 0.7, life: 0.3, gravity: -4, size: 0.035 },
   /** 10A-3.2: Sniper post-shot rising translucent barrel heat-vent vapor puffs. */
   BARREL_STEAM: { count: 2, color: 0x9ceeff, intensity: 0.48, speed: 0.45, spread: 0.42, life: 0.55, gravity: 1.35, size: 0.022 },
+  /** 10D-4: faulty alley breaker — blue-white arcing sparks spraying out of the wall box. */
+  BREAKER_SPARK: { count: 8, color: 0xbfe8ff, intensity: 3.2, speed: 6.5, spread: 0.55, life: 0.45, gravity: -14, size: 0.03, minor: true },
+  /** 10D-4: rain dripping off a storefront canopy lip (falls straight down). */
+  CANOPY_DRIP: { count: 1, color: 0xa8d8ff, intensity: 0.7, speed: 0.4, spread: 0.06, life: 0.42, gravity: -9.8, size: 0.022, minor: true },
 } as const satisfies Record<string, ParticleBurst>;
 
 /** Telegraph-line style (§5.1). */

@@ -40,6 +40,7 @@ function mockTextures(): ProceduralTextureLibrary {
     graffitiAtlas: new THREE.Texture(),
     megaBillboard: new THREE.Texture(),
     vendingAtlas: new THREE.Texture(),
+    furnishingsAtlas: new THREE.Texture(),
     glove: mockPbr(),
     gun: mockPbr(),
   };
@@ -159,9 +160,8 @@ test('10C §6.3 triangle budgets: vehicles ≤ 1,100 · vending / lamp / each fu
   assert.ok(triCount(buildLampGeometry()) <= FURNITURE_TRI_BUDGET, 'lamp');
   for (const v of [KIT_VARIANT.LANTERNS, KIT_VARIANT.PARASOL]) assert.ok(kitVariantTris(v) <= 380, `kit variant ${v}: ${kitVariantTris(v)} tris`);
   assert.ok(KIT_CAP === 300);
-  // Variants 2 / 3 are reserved for 10D: the builder accepts the ids and emits nothing for them yet.
-  assert.equal(kitVariantTris(KIT_VARIANT.RAMEN_CART), 0);
-  assert.equal(kitVariantTris(KIT_VARIANT.BUS_SHELTER), 0);
+  // 10D implements the two reserved variants (ramen cart v2, bus shelter v3) inside the same ≤ 380-tri budget.
+  for (const v of [KIT_VARIANT.RAMEN_CART, KIT_VARIANT.BUS_SHELTER]) assert.ok(kitVariantTris(v) > 0 && kitVariantTris(v) <= 380, `kit variant ${v}: ${kitVariantTris(v)} tris`);
 });
 
 // =============================================================================================
@@ -183,7 +183,7 @@ test('10C-1 hero details: Y-beam DRLs + splitter + scoops + GT wing (coupe), mes
   assert.ok(maxY(c, 4, -2.4, -1.9) >= 1.15, 'twin-strut GT wing rides above the roof');
   assert.ok(Array.from(c.part).some((p, i) => p === 4 && c.pos[i * 3 + 2] > 2.0 && c.pos[i * 3 + 1] < 0.2), 'front carbon splitter');
   assert.ok(Array.from(c.ao).filter((a) => a <= 0.5).length > 30, 'recessed cavities carry baked aAo ≤ 0.5');
-  assert.ok(count(c, 7) >= 4 * 36 - 1, 'four crimson brake calipers');
+  assert.ok(count(c, 7) >= 4 * 30, 'four crimson brake calipers (10D-5: open-bottom boxes, 10 tris each)');
   assert.ok(count(c, 2) > 0 && count(c, 3) > 0 && count(c, 8) > 0);
   // Pickup: open bed — bed floor below the side walls, tow hooks + plate, roll bar above the cab line.
   const p = sets[1];

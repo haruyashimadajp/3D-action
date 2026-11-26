@@ -116,6 +116,8 @@ export interface EnemyEvents {
   onWaveStart?(wave: number, waves: number): void;
   onSectorClear?(): void;
   onExplosion?(position: THREE.Vector3): void;
+  /** 10D-4: a grounded ALERT investigator's wet footstep (within 22 m of the player). */
+  onEnemyStep?(position: THREE.Vector3): void;
   /** 8A-5 awareness cues: UNAWARE → ALERT (suspicion hum), spotted sting, sector-wide radio alarm, search over. */
   onAlertState?(kind: 'ALERT' | 'DETECTED' | 'COMBAT' | 'GLOBAL_COMBAT' | 'DEESCALATE' | 'CALM', position: THREE.Vector3 | null): void;
 }
@@ -935,6 +937,8 @@ class Enemy implements StealthAgent {
   investigateStallT = 0;
   investigateBestDist = Infinity;
   investigateSweepT = 0;
+  /** 10D-4 footstep cadence phase (0…1, wraps on each step). */
+  stepPhase = 0;
   locked = false;
   /** Engaged without LOS and not getting ≥ 1 m closer to the shared position (unreachable-rooftop fallback). */
   stallT = 0;
@@ -2419,6 +2423,15 @@ export class EnemyManager {
         } else {
           e.goal.set(e.investigateGoal.x, e.pos.y, e.investigateGoal.z);
           this.moveToGoal(e, invSpeed, dt);
+          // 10D-4: approaching investigators splash audibly on the wet asphalt (≤ 22 m from the player).
+          const spd = Math.hypot(e.vel.x, e.vel.z);
+          if (spd > 0.6 && e.pos.distanceToSquared(this.player.position) <= 22 * 22) {
+            e.stepPhase += spd * dt * 0.55;
+            if (e.stepPhase >= 1) {
+              e.stepPhase -= 1;
+              this.events.onEnemyStep?.(e.pos);
+            }
+          }
           if (Math.hypot(e.vel.x, e.vel.z) > 0.25) this.faceYaw(e, yawOf(dx, dz), turn, dt);
           else this.faceYaw(e, yawOf(e.investigatePos.x - e.pos.x, e.investigatePos.z - e.pos.z), turn, dt);
         }

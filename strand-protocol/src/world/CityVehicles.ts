@@ -231,13 +231,19 @@ export function buildHeroWheel(list: PartList, radius: number, width: number, x:
   const y = radius;
   const M = new THREE.Matrix4().makeRotationZ((-side * Math.PI) / 2);
   const local: Array<[THREE.BufferGeometry, number, number]> = [];
-  const lathe = (pts: Array<[number, number]>, seg: number): THREE.BufferGeometry => {
-    const g = new THREE.LatheGeometry(pts.map(([r, yy]) => new THREE.Vector2(r, yy)), seg).toNonIndexed();
+  const lathe = (pts: Array<[number, number]>, seg: number, phiStart = 0): THREE.BufferGeometry => {
+    const g = new THREE.LatheGeometry(pts.map(([r, yy]) => new THREE.Vector2(r, yy)), seg, phiStart).toNonIndexed();
     g.deleteAttribute('uv');
     return g;
   };
   // Tyre (+Y = outer face): inner crown edge → tread → shoulder → sidewall to the rim.
-  local.push([lathe([[0.97 * R, -hw], [R, -hw * 0.5], [R, hw * 0.55], [0.64 * R, hw]], 12), 4, 1]);
+  // 10D-5: 10 radial facets (smooth normals) starting at 90° so a tread vertex still lands exactly on y = 0.
+  local.push([lathe([[0.97 * R, -hw], [R, -hw * 0.5], [R, hw * 0.55], [0.64 * R, hw]], 10, Math.PI / 2), 4, 1]);
+  // 10D-5: sealed tyre cavity — dark backing disc just inside the inner crown edge (never below the chassis).
+  const backing = new THREE.CircleGeometry(0.95 * R, 6);
+  backing.rotateX(-Math.PI / 2);
+  backing.translate(0, -hw + 0.01, 0);
+  local.push([backing.toNonIndexed(), 4, 0.26]);
   // Alloy barrel (deep dish) and the brake rotor / caliper sitting behind the spokes.
   // 10BC-Fix FIX-8: points run outer face → hub side so the lathe normals face the axle (barrel seen from outside).
   local.push([lathe([[0.62 * R, hw * 0.92], [0.62 * R, hw * 0.25]], 8), 6, 0.5]);
@@ -254,8 +260,7 @@ export function buildHeroWheel(list: PartList, radius: number, width: number, x:
   }
   // Caliper: world rear-upper quadrant (+40° behind the top). Local x = −side × world up, local z = world z.
   const ang = (40 * Math.PI) / 180;
-  const cal = new THREE.BoxGeometry(0.14, 0.05, 0.06).toNonIndexed();
-  cal.translate(-side * 0.42 * R * Math.cos(ang), hw * 0.52, -0.42 * R * Math.sin(ang));
+  const cal = box(0.14, 0.05, 0.06, -side * 0.42 * R * Math.cos(ang), hw * 0.52, -0.42 * R * Math.sin(ang));
   local.push([cal, 7, 1]);
   const T = new THREE.Matrix4().makeTranslation(x, y, 0);
   for (const [g, part, cav] of local) {
@@ -336,7 +341,13 @@ function buildCoupe(): PartList {
     tag(L, box(0.04, 0.28, 0.06, sx * 0.46, 1.03, -2.12), 4);
     tag(L, box(0.025, 0.16, 0.32, sx * 0.94, 1.16, -2.18), 4);
   });
-  tag(L, box(1.92, 0.045, 0.42, 0, 0.16, 2.14), 4); // carbon chin splitter
+  // 10D-5: tapered V-nose carbon chin splitter following the nose planform (3-station loft) + dive-plane winglets.
+  tag(L, loftSymHull([
+    { z: 2.38, pts: [[0, 0.14], [0.52, 0.14], [0.54, 0.185], [0, 0.185]] },
+    { z: 2.06, pts: [[0, 0.14], [0.91, 0.14], [0.93, 0.185], [0, 0.185]] },
+    { z: 1.9, pts: [[0, 0.14], [0.92, 0.14], [0.92, 0.185], [0, 0.185]] },
+  ]), 4);
+  for (const sx of [-1, 1]) for (const back of [false, true]) tag(L, plane(0.2, 0.06, sx * 0.92, 0.21, 2.02, [0.35, sx * (Math.PI / 2) + (back ? Math.PI : 0), 0]), 4);
   tag(L, box(1.88, 0.035, 0.28, 0, 1.18, -2.18, [0.105, 0, 0]), 4); // wing airfoil
   tag(L, box(0.36, 0.1, 0.18, 0, 1.2, -0.45), 5); // cyber-taxi roof sign (taxi paint only)
   for (const z of [-1.35, -1.75]) tag(L, box(0.9, 0.02, 0.1, 0, 0.93, z, [0.12, 0, 0]), 4); // louvered engine deck

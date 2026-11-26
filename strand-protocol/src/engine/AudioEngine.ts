@@ -791,6 +791,130 @@ export class AudioEngine {
     }
   }
 
+  // =============================================================================================
+  // 10D-1 / 10D-4 world immersion (every 3D source → seBus: city reverb + Bullet-Time lowpass apply)
+  // =============================================================================================
+  private lastWetStepT = -10;
+  private lastSquelchT = -10;
+  private lastCrackleT = -10;
+
+  /** 10D-1: expressway car brushing past the player — air whoosh + short two-tone horn (spatial). */
+  trafficWhoosh(pos: THREE.Vector3): void {
+    const c = this.can();
+    if (!c) return;
+    const t = c.currentTime;
+    const p = this.panner(c, pos, true, this.seBus);
+    this.noise(c, 'bandpass', 700, 160, 0.8, 0.62, 0.3, p, t, 0.03, this.softCurve);
+    this.tone(c, 'square', 392, 392, 0.16, 0.05, p, t + 0.02, 0.004);
+    this.tone(c, 'square', 494, 494, 0.16, 0.04, p, t + 0.02, 0.004);
+  }
+
+  /** 10D-4: approaching ALERT enemy wet footstep — heel thud 140 → 65 Hz + 1.9 kHz splash (≤ 4 / s globally). */
+  enemyWetStep(pos: THREE.Vector3): void {
+    const c = this.can();
+    if (!c) return;
+    const t = c.currentTime;
+    if (t - this.lastWetStepT < 0.25) return;
+    this.lastWetStepT = t;
+    const p = this.panner(c, pos, true, this.seBus);
+    p.refDistance = 3.5;
+    p.rolloffFactor = 1.6;
+    this.tone(c, 'sine', 140, 65, 0.09, 0.22, p, t, 0.003);
+    this.noise(c, 'bandpass', 1900, 1900, 2.4, 0.055, 0.12, p, t + 0.004, 0.002);
+  }
+
+  /**
+   * 10D-4: synthetic enemy radio vocoder squelch (DETECTED 135 ms / COMBAT 220 ms): 18 ms bandpassed static →
+   * sawtooth cipher through 700 / 1350 / 2200 Hz formants → 20 ms roger click. ≥ 0.8 s global cooldown.
+   */
+  enemyRadioSquelch(pos: THREE.Vector3, urgent: boolean): void {
+    const c = this.can();
+    if (!c) return;
+    const t = c.currentTime;
+    if (t - this.lastSquelchT < 0.8) return;
+    this.lastSquelchT = t;
+    const p = this.panner(c, pos, true, this.seBus);
+    p.refDistance = 4;
+    p.rolloffFactor = 1.2;
+    this.noise(c, 'bandpass', 2400, 2400, 3, 0.018, 0.09, p, t, 0.001);
+    const body = urgent ? 0.18 : 0.095;
+    const t0 = t + 0.018;
+    const o = c.createOscillator();
+    o.type = 'sawtooth';
+    o.frequency.setValueAtTime(urgent ? 240 : 160, t0);
+    o.frequency.linearRampToValueAtTime(urgent ? 170 : 220, t0 + body * 0.5);
+    o.frequency.linearRampToValueAtTime(urgent ? 230 : 180, t0 + body);
+    const g = c.createGain();
+    g.gain.setValueAtTime(0.0001, t0);
+    g.gain.exponentialRampToValueAtTime(0.07, t0 + 0.008);
+    g.gain.setValueAtTime(0.07, t0 + body - 0.012);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + body);
+    for (const f of [700, 1350, 2200]) {
+      const bp = c.createBiquadFilter();
+      bp.type = 'bandpass';
+      bp.frequency.value = f;
+      bp.Q.value = 7;
+      o.connect(bp).connect(g);
+    }
+    g.connect(p);
+    o.start(t0);
+    o.stop(t0 + body + 0.03);
+    this.track(o);
+    this.noise(c, 'highpass', 3200, 3200, 0.9, 0.02, 0.06, p, t0 + body + 0.004, 0.001);
+  }
+
+  /**
+   * 10D-4: speed-of-sound delayed rolling thunder. Reuses the pre-allocated 4 s pink buffer through a lowpass
+   * sweeping 95 → 38 Hz (Q 1.4) over 3.2 s with a 1.8 Hz rumble LFO, stereo-panned (−0.85…0.85) into seBus.
+   */
+  thunderRumble(pan: number, intensity: number): void {
+    const c = this.can();
+    if (!c) return;
+    const t = c.currentTime;
+    const src = c.createBufferSource();
+    src.buffer = this.pink;
+    const lp = c.createBiquadFilter();
+    lp.type = 'lowpass';
+    lp.Q.value = 1.4;
+    lp.frequency.setValueAtTime(95, t);
+    lp.frequency.exponentialRampToValueAtTime(38, t + 3.2);
+    const g = c.createGain();
+    const peak = 0.12 + 0.5 * Math.min(1, Math.max(0, intensity));
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(peak, t + 0.35);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 3.4);
+    const lfo = c.createOscillator();
+    lfo.frequency.value = 1.8;
+    const lfoG = c.createGain();
+    // LFO depth follows the envelope (no ±35 % start / cut-off click).
+    lfoG.gain.setValueAtTime(0.0001, t);
+    lfoG.gain.exponentialRampToValueAtTime(peak * 0.35, t + 0.35);
+    lfoG.gain.exponentialRampToValueAtTime(0.0001, t + 3.4);
+    lfo.connect(lfoG).connect(g.gain);
+    const sp = c.createStereoPanner();
+    sp.pan.value = Math.max(-0.85, Math.min(0.85, pan));
+    src.connect(lp).connect(g).connect(sp).connect(this.seBus);
+    src.start(t, Math.random() * 0.5);
+    src.stop(t + 3.5);
+    lfo.start(t);
+    lfo.stop(t + 3.5);
+    this.track(src);
+  }
+
+  /** 10D-4: faulty alley breaker — crackling high arcs + mains buzz (spatial, ≤ 1 per 0.3 s). */
+  breakerCrackle(pos: THREE.Vector3): void {
+    const c = this.can();
+    if (!c) return;
+    const t = c.currentTime;
+    if (t - this.lastCrackleT < 0.3) return;
+    this.lastCrackleT = t;
+    const p = this.panner(c, pos, true, this.seBus);
+    p.refDistance = 3;
+    p.rolloffFactor = 1.4;
+    for (let k = 0; k < 4; k++) this.noise(c, 'highpass', 4200, 2600, 0.7, 0.03, 0.09, p, t + k * 0.045 + Math.random() * 0.02, 0.001);
+    this.fm(c, 100, 50, 6, 0.22, 0.05, p, t, 'square');
+  }
+
   /** 10A-6: Faint subtle sonar ping SE every 3.5 s pulse-radar sweep while enemies remain alive. */
   radarPing(): void {
     const c = this.can();

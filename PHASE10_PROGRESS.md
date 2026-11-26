@@ -15,7 +15,7 @@
 | **Step 10B-2 修正** | レーダー / 1F ドア | **完了 (Committed: `22dfddc`)** | `PLAYING` 以外でミニレーダーを完全停止（スイープ・ブリップ・再描画・`radarPing` 停止、オーバーレイ背後で 22% に減光）。1F ドアをベイ中央に配置し部材全体をピアから 0.05 m 以上離す（狭いベイでは門柱・庇を縮小/省略）、外周壁 0.7 m 手前の面にはドアを置かない、ギャラリー柱の正面を避ける、自販機をドア前から排除、イータリーのカウンター棚を隣ベイ内に収める、ファサードアトラス 1 階行の 2D 描き込みドアを撤去（全幅の水平帯のみ） |
 | **Step 10C** | `10C-1` 〜 `10C-3` | **完了 (Committed: `d9b1c11`)** | `src/world/CityVehicles.ts` (`loftSymHull`・3 ヒーロー車両: スーパーカー / ピックアップ / 装甲バン、7 本スポーク・ブレーキキャリパー付きホイール、濡れたクリアコート)、`src/world/CityFurniture.ts` (凹み表示窓付き自販機 + `512×512` 英語 `vendingAtlas`、ガチョウ首街灯、`StreetFurnishingsKit` cap 300 = **+1 call**: 提灯ストリング v0 / カフェパラソル v1、v2・v3 は 10D 予約)、縁石 LED ガイド、英語オープンフレーム看板足場 (`OPEN 24H` / `CYBER RAMEN` / `NIGHT BAR` / `MOTEL 09`)、波板小屋、赤ビーコン付き鉄骨ガントリー (+0 calls) |
 | **Step 10BC-Fix** | `PHASE10BC_AUDIT_FIX_SPEC.md` FIX-1 〜 FIX-13 | **完了 (本コミット, `d9b1c11` の次)** | 市場トレッスルの横つなぎ梁 + 通路柱 + 斜材（浮遊ゼロ）、円筒タワー屋上アンカー支柱を 12 角形パラペット中心線上へ、`SLANT_CORP_TOWER` 傾斜クラウン側面を段状ソリッドで封鎖（`slope·0.42` クリアランスで引っかかりなし）、ループ 1・2 でもメガストラクチャ割当を保証（不足時のみ A 型予約 + 再割当、ループ 0 は完全不変）、狭い `CAPSULE_HOTEL` / `ALLEY_INFRA` ソケット補正、イータリー提灯の 90° 回転修正、縁石 LED を縁石上端の車道側リップへ、ホイールバレル法線・ピックアップ/バンのガラス角度修正、奇数街灯のバナー部材を一括非表示、自販機ピッチ 1.20 m + 1.16 m 間隔ガード + 2.05 m コライダー、小屋 AC をフットプリント内へ、ガントリー間隔判定を通り単位に、街灯 `aAo` + 街灯/自販機へのシティライト (+0 calls) |
-| **Step 10D** | `10D-1` 〜 `10D-4` | **未着手** | 6B・7B・8A・9A・9B の統合ポリッシュおよび最終パフォーマンス・ビジュアル監査 |
+| **Step 10D** | `PHASE10D_SPEC.md` 10D-1 〜 10D-5 | **完了 (本コミット)** | 高架道路の走行交通 `ElevatedTraffic` (cap 36, +1 call: S1–S4 外側 2 車線、S3 交差点は 22 m/s × 8 台で常に ≥ 15 m 離隔、S5 は角丸リング 2 周回、0 ダメージの内向きバンプ、駐車車両は全て地上へ)、GPU アニメ `AnimatedEnvKit` (cap 220, +1 call: 回転換気扇・のれん・屋上ホログラム)、`StreetFurnishingsKit` v2 ラーメン屋台 (湯気付き) / v3 バス停 (英語 `furnishingsAtlas`, +0)、ブレーカー火花・庇の雨だれ・敵の濡れた足音・無線スケルチ・音速遅延の雷鳴 (+0)、クーペ V ノーズスプリッター + タイヤ裏面ディスク (≤ 1,100 tris)、二重ローブ Mie 街灯ハロー、市場屋台の強化、カメラスナップ時の雨スミア防止 |
 
 ---
 
@@ -71,11 +71,11 @@
 ## 検証結果 (`npm run build` & `npm test`)
 
 - `npm run build`: **成功** (`tsc --noEmit && vite build` エラーゼロ)
-- `npm test`: **全 94 テスト合格** (10C 時点の 86 テスト + 10BC-Fix 回帰テスト 8 件: `tests/phase10b.test.ts` 4 件・`tests/phase10b2.test.ts` 1 件・`tests/phase10c.test.ts` 3 件)
-- 描画コール: Sector 4 HIGH・全敵戦闘中で `renderer.info.render.calls` = 82（S1 80 / S5 79）（10C 比 +0、≤ 120）
+- `npm test`: **全 106 テスト合格** (10BC-Fix 時点の 94 テスト + 10D の新規 `tests/phase10d.test.ts` 12 件)
+- 描画コール: Sector 4 HIGH・全敵戦闘中で `renderer.info.render.calls` = 84（10BC-Fix 比 +2: `ElevatedTraffic` + `AnimatedEnvKit`、上限 92 / ≤ 120）
 
 ---
 
 ## 次に再開する作業 (Next Steps)
 
-次回は [`PHASE10_OVERHAUL_PLAN.md`](PHASE10_OVERHAUL_PLAN.md) の **Step 10D（統合ポリッシュ・ラーメン屋台 / バス停 = `StreetFurnishingsKit` v2・v3）** から着手してください（10BC-Fix 完了済み）。Phase 10C の検証: `npm run build` 成功、`npm test` 86/86 合格（新規 `tests/phase10c.test.ts` 10 件、`HERO_3D_MODELING_SPEC.md` §6 の非ブリック輪郭・接地 `min.y≈0`・三角形予算を含む）、Sector 4 HIGH・全敵戦闘中で `renderer.info.render.calls` = 82（10B 比 +1、≤ 120）。Phase 10B の検証: `npm run build` 成功、`npm test` 69/69 合格（新規 `tests/phase10b.test.ts` 8 件）、Sector 4 HIGH・全敵戦闘中で `renderer.info.render.calls` = 81（≤ 120）。10B-2 修正パスの検証: `npm test` 76/76 合格（新規 `tests/phase10b2.test.ts` 7 件）。
+Phase 10 (10A〜10D + 10BC-Fix) は完了しました。次は `PHASE12_AAA_RENDER_CINEMA_PLAN.md` などの後続フェーズ仕様から着手してください。Phase 10C の検証: `npm run build` 成功、`npm test` 86/86 合格（新規 `tests/phase10c.test.ts` 10 件、`HERO_3D_MODELING_SPEC.md` §6 の非ブリック輪郭・接地 `min.y≈0`・三角形予算を含む）、Sector 4 HIGH・全敵戦闘中で `renderer.info.render.calls` = 82（10B 比 +1、≤ 120）。Phase 10B の検証: `npm run build` 成功、`npm test` 69/69 合格（新規 `tests/phase10b.test.ts` 8 件）、Sector 4 HIGH・全敵戦闘中で `renderer.info.render.calls` = 81（≤ 120）。10B-2 修正パスの検証: `npm test` 76/76 合格（新規 `tests/phase10b2.test.ts` 7 件）。

@@ -97,11 +97,12 @@ import {
   type PropInstance,
 } from './CityProps';
 import { CityPropMeshes, type ContactShadowDesc } from './CityPropMeshes';
+import { AnimatedEnvKit, ENV_CAP, ENV_DIMS, ENV_VARIANT, ElevatedTraffic, buildTrafficLanes, type EnvInstance } from './CityAtmosphere';
 
 /** 10BC-Fix FIX-4: megastructure reservation order (rarest eligibility first, as in assignMassings). */
 const MEGA_ORDER: readonly MegaStructureKind[] = ['TWIN_ARCH_GATE', 'CYLINDER_RING_TOWER', 'SLANT_CORP_TOWER', 'X_TRUSS_TOWER'];
 import { CAR_DIMS, CAR_VARIANT_NAMES, buildCarVariant } from './CityVehicles';
-import { KIT_CAP, KIT_VARIANT, buildFurnishingsKit, buildLampGeometry, buildVendingGeometry } from './CityFurniture';
+import { FURNITURE_BOUNDS, FURNITURE_SOCKETS, KIT_CAP, KIT_VARIANT, buildFurnishingsKit, buildLampGeometry, buildVendingGeometry } from './CityFurniture';
 
 // =============================================================================================
 // Public layout data (consumed by PhysicsWorld / PlayerController / EnemyManager / HUD)
@@ -321,6 +322,20 @@ export interface SectorLayout {
   /** 10BC-Fix FIX-1 QA: each market ridge trestle (world AABBs of its cross-tie, king-post and the aisle posts under it). */
   readonly marketTrestles: ReadonlyArray<{ readonly tie: Aabb3; readonly king: Aabb3; readonly posts: readonly Aabb3[]; readonly awningEdges: readonly Aabb3[] }>;
   /** 10BC-Fix FIX-7 QA: curb LED bar AABBs with the kerb line (lateral coord of the curb's road face) and road side. */
+  /** Street lamp pole positions (x, z). */
+  readonly lampPoles: ReadonlyArray<readonly [number, number]>;
+  /** 10D-4 faulty alley breaker spark emitters (outward wall normal nx / nz). */
+  readonly sparkNodes: ReadonlyArray<{ readonly pos: THREE.Vector3; readonly nx: number; readonly nz: number }>;
+  /** 10D-4 dripping canopy / awning front lips (world segments at the lip height). */
+  readonly canopyDripEdges: ReadonlyArray<{ readonly x0: number; readonly z0: number; readonly x1: number; readonly z1: number; readonly y: number }>;
+  /** 10D-3 ramen carts (kit v2) with their anchored boiler-steam point. */
+  readonly ramenCarts: ReadonlyArray<{ readonly x: number; readonly z: number; readonly yaw: number; readonly steam: readonly [number, number, number] }>;
+  /** 10D-3 bus shelters (kit v3): front roof lip offset from the street centreline vs the kerb line. */
+  readonly busShelters: ReadonlyArray<{ readonly x: number; readonly z: number; readonly yaw: number; readonly front: number; readonly kerb: number; readonly axis: Axis; readonly side: 1 | -1 }>;
+  /** 10D-2 AnimatedEnvKit instances (fans / noren / holograms) with their host kind. */
+  readonly animatedEnv: readonly EnvInstance[];
+  /** 10D-2 rooftop machine-room boxes (rooftop fans mount on their non-door flanks). */
+  readonly machineRoomBoxes: ReadonlyArray<{ readonly x0: number; readonly x1: number; readonly y0: number; readonly y1: number; readonly z0: number; readonly z1: number; readonly doorFace: string | null; readonly building: number }>;
   readonly curbLedBoxes: ReadonlyArray<{ readonly box: Aabb3; readonly axis: Axis; readonly kerb: number; readonly side: 1 | -1 }>;
   /** 10B-2 audit: every 1F street doorway assembly and every 1F pier (face frame). */
   readonly groundDoors: readonly GroundDoorRecord[];
@@ -345,6 +360,8 @@ export interface SectorLayout {
     readonly skybridges: number;
     readonly lamps: number;
     readonly cityLights: number;
+    /** 10D-1 moving expressway vehicles (24–36). */
+    readonly traffic: number;
     /** 6A-2 tower count per archetype (A · B · C · D). */
     readonly archetypes: readonly number[];
     readonly balconies: number;
@@ -966,14 +983,32 @@ const _bp = { x: 0, y: 0, z: 0, yaw: 0 };
  * k·22 + 11 + jitter(k) with jitter ∈ ±2 s ⇒ 18–26 s apart; azimuth per cycle. Pattern: 0.08 s flash →
  * 0.10 s dark → 0.14 s second flash. Returns the strike intensity (0 … 1) at time t.
  */
-export function lightningAt(t: number): { k: number; start: number; azimuth: number; intensity: number } {
+/** Fractional part (module scope: lightningAt runs every frame and must not allocate a closure). */
+function fract01(x: number): number {
+  return x - Math.floor(x);
+}
+export interface LightningSample {
+  k: number;
+  start: number;
+  azimuth: number;
+  intensity: number;
+}
+export function lightningAt(t: number, out?: LightningSample): LightningSample {
   const P = CITY_FX.LIGHTNING_PERIOD_S;
   const k = Math.floor(t / P);
-  const g = (x: number): number => x - Math.floor(x);
+  const g = fract01;
   const start = k * P + P * 0.5 + (g(k * 0.618034 + 0.137) - 0.5) * 2 * CITY_FX.LIGHTNING_JITTER_S;
   const az = g(k * 0.754877 + 0.31) * Math.PI * 2;
   const d = t - start;
   const intensity = d >= 0 && d < 0.08 ? 1 - (d / 0.08) * 0.3 : d >= 0.18 && d < 0.32 ? 0.85 * (1 - (d - 0.18) / 0.14) : 0;
+  // 10D-4: zero-allocation path — the caller passes a pre-allocated sample every frame.
+  if (out) {
+    out.k = k;
+    out.start = start;
+    out.azimuth = az;
+    out.intensity = intensity;
+    return out;
+  }
   return { k, start, azimuth: az, intensity };
 }
 
@@ -1092,7 +1127,7 @@ const CAP = {
   /** 7B-1: lamps, crowns, balconies, neon signs, car head / tail lights, vending fronts. */
   CITY_LIGHTS: 1100,
   /** 9A-6: steam columns anchored on manholes and eatery vents (2 puffs each) + canal mist. */
-  STEAM: 200,
+  STEAM: 232,
   /** 9A-6 cast-iron manholes. */
   MANHOLE: 55,
   /** 10B-2 Mega-Billboards (avenue screens, L-corner wraps, monolith blades, cylinder ad rings): one draw call. */
@@ -1170,6 +1205,10 @@ export class CityBuilder {
 
   // Shared uniforms
   private readonly uTime = { value: 0 };
+  /** 10D-1 expressway traffic (persistent, +1 call). */
+  readonly traffic: ElevatedTraffic;
+  /** 10D-2 GPU-animated micro-environment kit (persistent, +1 call). */
+  readonly envKit: AnimatedEnvKit;
   private readonly uNeonBoost = { value: 1.0 };
   private readonly uSearchPulse = { value: 0.0 };
   private readonly uGateOpen = { value: 0.0 };
@@ -1345,6 +1384,9 @@ export class CityBuilder {
       this.lampCones, this.signals, this.carPools, this.blimpHull, this.blimpBanner, this.manholes,
       ...this.propMeshes.meshes,
     );
+    this.traffic = new ElevatedTraffic((shader, apply) => this.injectCityLights(shader, apply));
+    this.envKit = new AnimatedEnvKit((shader, apply) => this.injectCityLights(shader, apply), this.uTime);
+    this.persistent.add(this.traffic.mesh, this.envKit.mesh);
   }
 
   get currentLayout(): SectorLayout | null {
@@ -2155,46 +2197,73 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
    */
   private createFurnishingsMaterial(): THREE.MeshStandardMaterial {
     const mat = new THREE.MeshStandardMaterial({ color: 0x20242c, roughness: 0.4, metalness: 0.5, emissive: new THREE.Color(0xffffff) });
+    const atlas = this.tex.furnishingsAtlas ?? null;
     mat.onBeforeCompile = (shader) => {
       this.injectCityLights(shader);
+      // 10D-3: custom atlas uniform (never mat.map) for the ramen marquee / transit map.
+      shader.uniforms.uFurnAtlas = { value: atlas };
       shader.vertexShader = shader.vertexShader
-        .replace('#include <common>', '#include <common>\nattribute float aPart;\nattribute float aAo;\nattribute float aVar;\nattribute vec4 aKit;\nvarying float vPart;\nvarying float vAoK;\nvarying float vVar;\nvarying vec4 vKit;')
-        .replace('#include <uv_vertex>', '#include <uv_vertex>\nvPart = aPart;\nvAoK = aAo;\nvVar = aVar;\nvKit = aKit;')
+        .replace('#include <common>', '#include <common>\nattribute float aPart;\nattribute float aAo;\nattribute float aVar;\nattribute vec4 aKit;\nvarying float vPart;\nvarying float vAoK;\nvarying float vVar;\nvarying vec4 vKit;\nvarying vec2 vFUv;')
+        .replace('#include <uv_vertex>', '#include <uv_vertex>\nvPart = aPart;\nvAoK = aAo;\nvVar = aVar;\nvKit = aKit;\nvFUv = uv;')
         .replace('#include <begin_vertex>', '#include <begin_vertex>\nif (abs(aVar - aKit.x) > 0.5) transformed = vec3(0.0);');
       shader.fragmentShader = shader.fragmentShader
-        .replace('#include <common>', '#include <common>\nvarying float vPart;\nvarying float vAoK;\nvarying float vVar;\nvarying vec4 vKit;')
+        .replace('#include <common>', '#include <common>\nuniform sampler2D uFurnAtlas;\nvarying float vPart;\nvarying float vAoK;\nvarying float vVar;\nvarying vec4 vKit;\nvarying vec2 vFUv;')
         .replace('#include <map_fragment>', `#include <map_fragment>
           float kp = floor(vPart + 0.5);
           float kv = floor(vVar + 0.5);
+          vec3 fAtl = vec3(0.0);
+          if (kv >= 1.5 && kp == 4.0) fAtl = texture2D(uFurnAtlas, vFUv).rgb;
           if (kv == 0.0) {
             diffuseColor.rgb = kp == 1.0 ? vec3(0.35, 0.03, 0.02) : (kp == 2.0 ? vec3(0.4, 0.12, 0.02) : vec3(0.03, 0.022, 0.02));
-          } else {
+          } else if (kv == 1.0) {
             if (kp == 0.0) diffuseColor.rgb = vec3(0.17, 0.18, 0.2);
             else if (kp == 1.0) diffuseColor.rgb = mix(vec3(0.22, 0.012, 0.02), vec3(0.04, 0.04, 0.05), vKit.y);
             else if (kp == 2.0) diffuseColor.rgb = mix(vec3(0.08, 0.008, 0.012), vec3(0.02, 0.02, 0.025), vKit.y);
             else diffuseColor.rgb = vec3(0.3, 0.2, 0.1);
+          } else if (kv == 2.0) {
+            if (kp == 0.0) diffuseColor.rgb = vec3(0.05, 0.055, 0.06);
+            else if (kp == 1.0) diffuseColor.rgb = vec3(0.42, 0.43, 0.45);
+            else if (kp == 2.0) diffuseColor.rgb = vec3(0.13, 0.065, 0.03);
+            else if (kp == 4.0) diffuseColor.rgb = fAtl * 0.2;
+            else if (kp == 5.0) diffuseColor.rgb = vec3(0.02, 0.025, 0.03);
+            else if (kp == 6.0) diffuseColor.rgb = vec3(0.55, 0.5, 0.44);
+            else if (kp == 7.0) diffuseColor.rgb = vec3(0.24, 0.025, 0.02);
+            else diffuseColor.rgb = vec3(0.05);
+          } else {
+            if (kp == 0.0) diffuseColor.rgb = vec3(0.05, 0.055, 0.065);
+            else if (kp == 1.0) diffuseColor.rgb = vec3(0.4, 0.42, 0.45);
+            else if (kp == 2.0) diffuseColor.rgb = vec3(0.08, 0.085, 0.09);
+            else if (kp == 4.0) diffuseColor.rgb = fAtl * 0.2;
+            else if (kp == 5.0) diffuseColor.rgb = vec3(0.02, 0.03, 0.035);
+            else diffuseColor.rgb = vec3(0.05);
           }
           diffuseColor.rgb *= vAoK;`)
         .replace('#include <roughnessmap_fragment>', `#include <roughnessmap_fragment>
-          if (kv == 1.0 && kp == 1.0) roughnessFactor = 0.26;
-          else if (kv == 1.0 && kp == 0.0) roughnessFactor = 0.35;`)
+          if (kv == 0.0) roughnessFactor = 0.6;
+          else if (kv == 1.0) roughnessFactor = kp == 1.0 ? 0.26 : (kp == 0.0 ? 0.35 : 0.5);
+          else if (kv == 2.0) roughnessFactor = kp == 1.0 ? 0.4 : (kp == 2.0 ? 0.72 : (kp == 5.0 || kp == 4.0 ? 0.08 : (kp == 6.0 ? 0.35 : 0.5)));
+          else roughnessFactor = kp == 1.0 ? 0.3 : (kp == 5.0 || kp == 4.0 ? 0.06 : 0.42);`)
         .replace('#include <metalnessmap_fragment>', `#include <metalnessmap_fragment>
-          if (kv == 1.0 && kp == 1.0) metalnessFactor = 0.05;
-          else if (kv == 0.0) metalnessFactor = 0.0;`)
+          if (kv == 0.0) metalnessFactor = 0.0;
+          else if (kv == 1.0) metalnessFactor = kp == 1.0 ? 0.05 : 0.5;
+          else if (kv == 2.0) metalnessFactor = kp == 1.0 ? 0.72 : (kp == 0.0 ? 0.6 : 0.05);
+          else metalnessFactor = kp == 1.0 ? 0.85 : (kp == 0.0 || kp == 2.0 ? 0.6 : 0.05);`)
         .replace('#include <emissivemap_fragment>', `#include <emissivemap_fragment>
           totalEmissiveRadiance = vec3(0.0);
           if (kv == 0.0) {
             if (kp == 1.0) totalEmissiveRadiance = vec3(1.0, 0.22, 0.08) * 1.35;
             else if (kp == 2.0) totalEmissiveRadiance = vec3(1.0, 0.52, 0.14) * 1.35;
-          } else {
+          } else if (kv == 1.0) {
             if (kp == 3.0) totalEmissiveRadiance = vec3(1.0, 0.7, 0.38) * 1.3;
-            else if (kp == 1.0) {
-              float fr = pow(1.0 - clamp(dot(normalize(normal), normalize(vViewPosition)), 0.0, 1.0), 4.0);
-              totalEmissiveRadiance = vec3(0.22, 0.26, 0.34) * fr * 0.5;
-            }
+          } else if (kv == 2.0) {
+            if (kp == 3.0) totalEmissiveRadiance = vec3(1.0, 0.62, 0.3) * 1.3;
+            else if (kp == 4.0) totalEmissiveRadiance = fAtl * 1.05;
+          } else {
+            if (kp == 3.0) totalEmissiveRadiance = vec3(0.75, 0.95, 1.0) * 1.15;
+            else if (kp == 4.0) totalEmissiveRadiance = fAtl * 0.95;
           }`);
     };
-    mat.customProgramCacheKey = () => 'strand-furnishings-v1';
+    mat.customProgramCacheKey = () => 'strand-furnishings-v2';
     return mat;
   }
 
@@ -3153,9 +3222,13 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
         void main() {
           float r = length(vUv - 0.5) * 2.0;
           float mist = step(4.0, vR);
-          // Lamps: tight 2.2 m glow; mist: ultra-soft wide falloff.
-          float fall = mix(${NEON_BLOOM.LAMP_HALO_FALLOFF.toFixed(2)}, 2.2, mist);
-          float a = ${NEON_BLOOM.LAMP_HALO_OPACITY.toFixed(2)} * exp(-r * r * fall) * (1.0 - smoothstep(0.85, 1.0, r));
+          // 10D-5 dual-lobe Mie haze: lamps get a crisp luminous core dissolving softly into the wet air (no cotton
+          // ball edge); billboard mist keeps its ultra-soft wide falloff.
+          float r2 = r * r;
+          float outerFade = pow(clamp(1.0 - r, 0.0, 1.0), 1.8);
+          float lampGlow = (exp(-r2 * 11.5) * 0.20 + exp(-r2 * 2.6) * 0.075) * outerFade;
+          float mistGlow = ${NEON_BLOOM.LAMP_HALO_OPACITY.toFixed(2)} * exp(-r2 * 2.2) * (1.0 - smoothstep(0.82, 1.0, r));
+          float a = mix(lampGlow, mistGlow, mist);
           // Close-up: fade so the halo never washes the screen when the camera passes through it.
           a *= mix(smoothstep(0.6, 2.4, vDist), smoothstep(vR * 0.35, vR * 1.1, vDist), mist) * strandFogFade(vDist, uFogDensity * 0.6);
           gl_FragColor = vec4(vCol * a, 1.0);
@@ -5656,6 +5729,14 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
     const propObstacles: Aabb3[] = [];
     const decalSurfaces: DecalSurface[] = [];
     const eateryVents: THREE.Vector3[] = [];
+    /** 10D-4 storefront canopy / market awning front lips that drip rain (world segments, ≤ 48). */
+    const canopyDripEdges: Array<{ x0: number; z0: number; x1: number; z1: number; y: number }> = [];
+    const addDripEdge = (f: { P3: (a: number, y: number, d: number) => THREE.Vector3 }, a0: number, a1: number, d: number, y: number): void => {
+      if (canopyDripEdges.length >= 48 || a1 - a0 < 1) return;
+      const p = f.P3(a0, y, d);
+      const q = f.P3(a1, y, d);
+      canopyDripEdges.push({ x0: p.x, z0: p.z, x1: q.x, z1: q.z, y });
+    };
     const programCounts: Record<GroundProgram, number> = { CYBER_EATERY: 0, TECH_APPAREL: 0, CAPSULE_HOTEL: 0, CYBER_APARTMENT: 0, ALLEY_INFRA: 0 };
     const doorSizes: Array<[number, number]> = [];
     const groundDoors: GroundDoorRecord[] = [];
@@ -6055,6 +6136,7 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
           G.strips.push(f.glow(0xffc884, 0.95, ca0 + 0.2, ca1 - 0.2, 3.12, 3.15, 1.05, 1.15));
           G.strips.push(f.glow(0xffa848, 0.75, ca0 + 0.3, ca1 - 0.3, 3.66, 3.95, 0.02, 0.1));
           f.coll(ca0, ca1, 3.12, 3.22, 0, 1.35, b.index);
+          addDripEdge(f, ca0, ca1, 1.35, 3.15);
           const lp = f.P3((ca0 + ca1) / 2, 2.8, 1.0);
           addLight(lp.x, lp.y, lp.z, 0xffa860, 1.3);
           // 10B-2: counter shelf centred in the bay right of the entrance (never across a pier); skipped when that
@@ -6082,6 +6164,7 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
           G.steel.push(...f.bx(ca0, ca1, 3.29, 3.41, 0, 1.45, { bottom: GR.AO_UNDERSIDE }));
           G.strips.push(f.glow(tint(0), 1.35, ca0, ca1, 3.29, 3.33, 1.43, 1.47), f.glow(0xe8f4ff, 0.85, ca0 + 0.3, ca1 - 0.3, 3.26, 3.29, 0.3, 0.36));
           f.coll(ca0, ca1, 3.29, 3.41, 0, 1.45, b.index);
+          addDripEdge(f, ca0, ca1, 1.45, 3.29);
           const ba = Math.min(span.a1 - 0.3, Math.max(span.a0 + 0.3, ca1 - 0.6));
           const maxH = span.y1 - 0.4 - Math.max(span.y0 + 0.4, 3.9);
           if (maxH >= 1.8 && span.a1 - span.a0 >= 0.8) {
@@ -6417,6 +6500,40 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
 
 
     // ------------------------------------------------------------------ 8. rooftop details, signs, vending
+    // 10D-2: reserve the rooftop hologram footprints first (full 3.6 m ring sweep) so machine rooms, AC units, ducts
+    // and roof spawns keep clear of the spinning rings. Never on cylinder / slant / twin-arch megastructures or on the
+    // two searchlight towers; ≥ 18 m from every blimp orbit.
+    const holoReserve: Array<{ b: Building; x: number; z: number }> = [];
+    {
+      const SW = ENV_DIMS.HOLO_SWEEP;
+      const searchTowers = new Set([...buildings].sort((p, o) => o.roofY - p.roofY).slice(0, 2).map((b) => b.index));
+      const elig = [...buildings]
+        .filter((b) => b.roofY >= 28 && b.halfW >= 5.5 && b.halfD >= 5.5 && !searchTowers.has(b.index) && b.massing !== 'CYLINDER_RING_TOWER' && b.massing !== 'SLANT_CORP_TOWER' && b.massing !== 'TWIN_ARCH_GATE')
+        .sort((p, o) => o.roofY - p.roofY);
+      for (const b of elig) {
+        if (holoReserve.length >= 10) break;
+        const ex = Math.max(0, b.halfW - SW - 0.6);
+        const ez = Math.max(0, b.halfD - SW - 0.6);
+        let best: [number, number] | null = null;
+        for (let dx = -ex; dx <= ex + 1e-6; dx += 0.5) {
+          for (let dz = -ez; dz <= ez + 1e-6; dz += 0.5) {
+            const x = b.cx + dx;
+            const z = b.cz + dz;
+            if (best && Math.hypot(dx, dz) >= Math.hypot(best[0] - b.cx, best[1] - b.cz)) continue;
+            const r = rectFrom(x - SW, z - SW, x + SW, z + SW);
+            if (roofRects[b.index].some((o) => rectsOverlap(r, o, 0.2)) || !inArea(x, z, 0)) continue;
+            const y0 = b.roofY + 0.05;
+            const y1 = b.roofY + ENV_DIMS.HOLO_TOP + 0.3;
+            if (colliders.some((c) => c.kind !== 'BARRIER' && r.x0 < c.max.x && r.x1 > c.min.x && y0 < c.max.y && y1 > c.min.y && r.z0 < c.max.z && r.z1 > c.min.z)) continue;
+            if (CITY_FX.BLIMPS.some((bl) => Math.hypot(Math.abs(Math.hypot(x, z) - bl.radius), Math.max(0, bl.y - y1)) < 18 + SW + CITY_FX.BLIMP_RADIUS)) continue;
+            best = [x, z];
+          }
+        }
+        if (!best) continue;
+        roofRects[b.index].push(rectFrom(best[0] - SW, best[1] - SW, best[0] + SW, best[1] + SW));
+        holoReserve.push({ b, x: best[0], z: best[1] });
+      }
+    }
     /** 9A-2 audit: every roof prop footprint (machine rooms, AC units, ducts, spawns) must sit on solid roof. */
     const roofPropRects: Array<{ b: Building; r: RectXZ }> = [];
     const tryPlace = (b: Building, hw: number, hd: number, margin: number): RectXZ | null => {
@@ -6447,6 +6564,8 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
         : out.set(b.lcx + (along01 - 0.5) * b.lotHalfW * 2, 0, b.lcz + sign * b.lotHalfD);
 
     let bulkheads = 0;
+    /** 10D-2: explicit rooftop machine-room boxes (rooftop fans mount on their non-door flanks, never on roofRects). */
+    const machineRoomBoxes: Array<{ x0: number; x1: number; y0: number; y1: number; z0: number; z1: number; doorFace: string | null; building: number }> = [];
     buildings.forEach((b) => {
       const area = b.halfW * b.halfD * 4;
       // Machine room + antenna.
@@ -6458,6 +6577,8 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
         if (r) {
           placeInstance(this.machineRooms, counts.room++, (r.x0 + r.x1) / 2, b.roofY, (r.z0 + r.z1) / 2, 0, rw, rh, rd);
           colliders.push({ min: new THREE.Vector3(r.x0, b.roofY, r.z0), max: new THREE.Vector3(r.x1, b.roofY + rh + 0.06, r.z1), kind: 'PROP', building: b.index });
+          const roomRec = { x0: r.x0, x1: r.x1, y0: b.roofY, y1: b.roofY + rh, z0: r.z0, z1: r.z1, doorFace: null as string | null, building: b.index };
+          machineRoomBoxes.push(roomRec);
           // 9A-1 rooftop access bulkhead: recessed painted steel door (1.0 × 2.1 m) on the side facing the roof centre,
           // with a small caged amber / cyan door light.
           if (b.halfW * 2 >= GRAMMAR.BULKHEAD_MIN_ROOF_M && b.halfD * 2 >= GRAMMAR.BULKHEAD_MIN_ROOF_M) {
@@ -6485,6 +6606,7 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
             const [w3, h3, d3, x3, y3, z3] = pbox(along - 0.1, along + 0.1, ry + 2.38, ry + 2.56, 0.04, 0.16);
             const lightHex = b.seed < 0.5 ? 0xffb040 : COLORS.WALLRUN_CYAN;
             G.strips.push(withColor(boxAt(w3, h3, d3, x3, y3, z3), lightHex, 1.0));
+            roomRec.doorFace = `${fx ? 'x' : 'z'}:${sgn}`;
             bulkheads++;
           }
           if (counts.ant < CAP.ANTENNA) {
@@ -6624,11 +6746,16 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
       }
       const vendFaces = streetFaces.filter(([ax, sg]) => !escapeFaces.has(fkey(b, ax, sg)) && !ductFaces.has(fkey(b, ax, sg)) && !galleryFaces.has(fkey(b, ax, sg)) && !spineFaces.has(fkey(b, ax, sg)));
       if (vendFaces.length && rng() < 0.75) {
-        const [ax, sg] = vendFaces[Math.floor(rng() * vendFaces.length)];
-        facePoint(b, ax, sg, 0.2 + rng() * 0.5, fp);
-        const yaw = ax === 'x' ? (sg > 0 ? Math.PI / 2 : -Math.PI / 2) : sg > 0 ? 0 : Math.PI;
+        const fi = Math.floor(rng() * vendFaces.length);
+        const along01 = 0.2 + rng() * 0.5;
         const n = 2 + Math.floor(rng() * 2);
         const off = 0.45;
+        // 10D: a row that places nothing (piers / doors / span ends) moves to the next eligible face — no extra RNG.
+        for (let fo = 0; fo < vendFaces.length; fo++) {
+        const [ax, sg] = vendFaces[(fi + fo) % vendFaces.length];
+        facePoint(b, ax, sg, along01, fp);
+        const yaw = ax === 'x' ? (sg > 0 ? Math.PI / 2 : -Math.PI / 2) : sg > 0 ? 0 : Math.PI;
+        const before = counts.vend;
         // 10BC-Fix FIX-10: 1.20 m stride (1.14 m hero kiosk + 6 cm air), every kiosk inside the lot face span.
         const [fa0, fa1] = lotRange(b, ax);
         for (let k = 0; k < n; k++) {
@@ -6640,6 +6767,8 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
           if (groundPiers.some((gp) => gp.building === b.index && gp.ax === ax && gp.sg === sg && gp.a0 < along + 0.6 && gp.a1 > along - 0.6)) continue;
           // 10B-2: never in a doorway's 1.8 m clear zone or against its assembly (jambs / portal / canopy).
           if (inArea(x, z, 2) && !blocksDoor(x, z, 0.6)) addVending(x, z, yaw);
+        }
+        if (counts.vend > before) break;
         }
       }
     });
@@ -6710,7 +6839,15 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
           const b0 = sA0 + k * bay + 0.08;
           const b1 = b0 + bay - 0.16;
           const cab = STALL_PAINT[(k * 3 + (sg > 0 ? 0 : 2)) % STALL_PAINT.length];
-          G.archPaint.push(...f.paint(cab, b0, b1, 0, 2.3, back0, back1, { ground: true }));
+          // 10D-5: recessed illuminated display alcove — back panel 0.24 m behind the stall face, 0.12 m divider fins,
+          // fascia valance (2.0–2.3 m), inner shelf (1.25 m) lit by a warm under-valance strip.
+          G.archPaint.push(...f.paint(cab, b0, b1, 0, 2.3, back0, back1 - 0.24, { ground: true }));
+          for (const [fa0, fa1] of [[b0, b0 + 0.12], [b1 - 0.12, b1]] as const) G.archPaint.push(...f.paint(cab, fa0, fa1, 0, 2.3, back1 - 0.24, back1, { ground: true }));
+          G.archPaint.push(...f.paint(cab, b0 + 0.12, b1 - 0.12, 2.0, 2.3, back1 - 0.24, back1, { bottom: 0.6 }));
+          G.archPaint.push(...f.paint(0x2a241e, b0 + 0.12, b1 - 0.12, 1.22, 1.25, back1 - 0.24, back1 - 0.02, { all: 0.42 }));
+          G.strips.push(f.glow(0xffc880, 0.85, b0 + 0.2, b1 - 0.2, 1.96, 2.0, back1 - 0.22, back1 - 0.16));
+          // Stall-sign backing board (the lit sign strip at 2.45–2.75 m sits on it, never floating over the cabinet).
+          G.archPaint.push(...f.paint(PAINT.FRAME_DARK, b0 + 0.25, b1 - 0.25, 2.3, 2.82, back1 - 0.14, back1 - 0.02));
           G.archPaint.push(...f.paint(PAINT.FRAME_DARK, b0 + 0.15, b1 - 0.15, 0, 0.95, front - 0.6, front, { ground: true }));
           f.coll(b0, b1, 0, 2.3, back0, back1, -1);
           f.coll(b0 + 0.15, b1 - 0.15, 0, 0.95, front - 0.6, front, -1);
@@ -6723,9 +6860,23 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
         G.archPaint.push(withTint(f.slant(sA0 - 0.2, sA1 + 0.2, yIn, yOut, back0 - 0.1, front + 0.7, 0.1), PAINT.AWNINGS[sg > 0 ? 0 : 1]));
         G.strips.push(f.glow(PAL[sg > 0 ? 0 : 1 % PAL.length], 1.8, sA0 - 0.2, sA1 + 0.2, yOut - 0.14, yOut - 0.06, front + 0.62, front + 0.72));
         f.coll(sA0 - 0.2, sA1 + 0.2, yOut - 0.1, yIn, back0 - 0.1, front + 0.7, -1);
+        addDripEdge(f, sA0 - 0.2, sA1 + 0.2, front + 0.7, yOut - 0.1);
         for (const a of postAs) {
           G.steel.push(...f.bx(a - 0.06, a + 0.06, 0, yOut, front + 0.45, front + 0.57, { ground: true }));
           f.coll(a - 0.06, a + 0.06, 0, yOut, front + 0.45, front + 0.57, -1, 'STEEL');
+          // 10D-5: vertical power conduit clamped to the post's side.
+          G.steel.push(...f.bx(a + 0.06, a + 0.1, 0.3, yOut - 0.1, front + 0.47, front + 0.51));
+        }
+        // 10D-5: 4 longitudinal corrugated roof purlins resting on the awning's slanted top.
+        {
+          const d0 = back0 - 0.1;
+          const d1 = front + 0.7;
+          const len = Math.hypot(d1 - d0, yIn - yOut);
+          for (const u of [0.15, 0.4, 0.65, 0.9]) {
+            const d = d0 + (d1 - d0) * u;
+            const yTop = yIn + (yOut - yIn) * u + (0.05 * len) / (d1 - d0);
+            G.steel.push(...f.bx(sA0 - 0.15, sA1 + 0.15, yTop, yTop + 0.05, d - 0.025, d + 0.025));
+          }
         }
       }
       // Covered ridge over the aisle: steel spine on two trestles, lantern strings + cables across every 3 m.
@@ -6823,16 +6974,6 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
         }
       }
     });
-    const hwSlots: CarSlot[] = [];
-    decks.forEach((d) => {
-      for (let a = Math.max(d.a0, -H + 8) + 5; a < Math.min(d.a1, H - 8) - 5; a += 9) {
-        for (const lat of [-5.25, 5.25]) {
-          const p = pt(d.axis, a, DECK, d.coord + lat);
-          if (highwayRects.some((r, ri) => ri !== d.hi && insideRect(p.x, p.z, r, 2))) continue;
-          hwSlots.push({ x: p.x, z: p.z, y: DECK, yaw: d.axis === 'z' ? (lat > 0 ? 0 : Math.PI) : lat > 0 ? Math.PI / 2 : -Math.PI / 2, onHighway: true });
-        }
-      }
-    });
 
     // ------------------------------------------------------------------ 10. player spawn
     const av = streets[plan.avenue];
@@ -6852,7 +6993,8 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
       return arr;
     };
     const farFromSpawn = (c: CarSlot): boolean => Math.hypot(c.x - playerSpawn.x, c.z - playerSpawn.z) > 7;
-    const pick: CarSlot[] = shuffle(hwSlots.filter(farFromSpawn)).slice(0, plan.highways.length * 3);
+    // 10D-1: the expressway decks carry moving traffic now — every parked car stands on a ground slot.
+    const pick: CarSlot[] = [];
     for (const c of shuffle([...carSlots, ...parkingSlots].filter(farFromSpawn))) {
       if (pick.length >= nCars) break;
       if (pick.some((o) => Math.abs(o.y - c.y) < 1 && Math.hypot(o.x - c.x, o.z - c.z) < 5.2)) continue;
@@ -7005,7 +7147,9 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
     });
     decks.forEach((d) => {
       for (let a = Math.max(d.a0, -H + 10); a < Math.min(d.a1, H - 10); a += 18) {
-        const p = pt(d.axis, a, DECK, d.coord + (rng() < 0.5 ? -2.5 : 2.5));
+        // 10D-1: Sector 5's ring lanes run 3.8 / 4.0 m off the centreline — its deck spawns stay nearer the median.
+        const spawnLat = plan.plaza && plan.highways.length === 4 ? 1.8 : 2.5;
+        const p = pt(d.axis, a, DECK, d.coord + (rng() < 0.5 ? -spawnLat : spawnLat));
         if (Math.hypot(p.x - playerSpawn.x, p.z - playerSpawn.z) > 25) highwaySpawns.push({ position: p, layer: 1, building: -1 });
       }
     });
@@ -7484,6 +7628,260 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
       stat.lanternStrings++;
     }
 
+    // ------------------------------------------------------------------ 15c. 10D-2 AnimatedEnvKit (+1 call)
+    // Spinning exhaust fans on solid facade spans + machine-room flanks, noren curtains under eatery awning lips and
+    // in door-free alley bays, counter-rotating wireframe holograms on tall flat roofs. Own RNG stream.
+    const p10dRng = createRng(0x10d2 + sector.index * 71 + loop * 433);
+    const env = this.envKit;
+    env.begin();
+    const faceYaw = (ax: Axis, sg: number): number => (ax === 'x' ? (sg > 0 ? Math.PI / 2 : -Math.PI / 2) : sg > 0 ? 0 : Math.PI);
+    const FAN_COLS = [0xffa040, 0x38f8ff, 0xff8a3a];
+    const NOREN_COLS = [0x1c2a7a, 0x8a1420, 0xa8561a, 0x2a1a3a];
+    const fanAt: Array<[number, number, number]> = [];
+    const hitsFootprint = (x0: number, y0: number, z0: number, x1: number, y1: number, z1: number): boolean =>
+      [...footprints, ...propObstacles].some((o) => x0 < o.maxX && x1 > o.minX && y0 < o.maxY && y1 > o.minY && z0 < o.maxZ && z1 > o.minZ);
+    const faceBox = (f: SF, a0: number, a1: number, y0: number, y1: number, d0: number, d1: number): [number, number, number, number, number, number] => {
+      const p = f.P3(a0, y0, d0);
+      const q = f.P3(a1, y1, d1);
+      return [Math.min(p.x, q.x), y0, Math.min(p.z, q.z), Math.max(p.x, q.x), y1, Math.max(p.z, q.z)];
+    };
+    const solidAt = (b: Building, ax: Axis, sg: number, plane: number, a: number, ha: number, y: number, hy: number): boolean =>
+      b.plan.faces.some((sp) => sp.ax === ax && sp.sg === sg && Math.abs(sp.plane - plane) < 1e-6 && a - ha >= sp.a0 && a + ha <= sp.a1 && y - hy >= sp.y0 && y + hy <= sp.y1);
+    const envStat = { wallFans: 0, roomFans: 0, awningNoren: 0, bayNoren: 0, holos: 0 };
+    // (1) Wall fans on non-run lot faces (wall-run faces stay clean). Ground band: 4.95–5.5 m on programs whose 1F
+    // carries awnings / canopies / conduits / transformer boxes (eatery, apparel, hotel, alley infra), 2.6–3.4 m on
+    // apartment fronts; upper band: mid-floor of storeys 1–2. Door bays, piers, slab drip bands, signs, pipe risers,
+    // exhaust ducts, socket props and every collider stay clear.
+    const bandClear = (b: Building, y: number): boolean => {
+      for (let n = 1; floorTopY(b.arch, n) <= GR.BAND_MAX_Y_M; n++) {
+        const by = floorTopY(b.arch, n);
+        if (y + 0.55 > by - GR.BAND_H_M - 0.05 && y - 0.55 < by + 0.05) return false;
+      }
+      return true;
+    };
+    for (const g of groundFaces) {
+      if (env.count >= 150 || envStat.wallFans >= 72) break;
+      const { b, span } = g;
+      if (g.run || span.court || megaBuilding.has(b.index)) continue;
+      const k = g.key;
+      if (escapeFaces.has(k) || balconyFaces.has(k) || galleryFaces.has(k) || megaFaces.has(k) || spineFaces.has(k) || ductFaces.has(k)) continue;
+      const program = faceProgram.get(g);
+      const low = program === 'CYBER_APARTMENT';
+      const f = sf(span.ax, span.sg, span.plane);
+      const doors = groundDoors.filter((d) => d.building === b.index && d.ax === span.ax && d.sg === span.sg && Math.abs(d.plane - span.plane) < 1e-6);
+      const piersHere = groundPiers.filter((gp) => gp.building === b.index && gp.ax === span.ax && gp.sg === span.sg && Math.abs(gp.plane - span.plane) < 1e-6);
+      const ducts = program === 'CYBER_EATERY' ? eateryVents.filter((v) => Math.abs((span.ax === 'x' ? v.x : v.z) - (span.plane + span.sg * 0.3)) < 0.05).map((v) => (span.ax === 'x' ? v.z : v.x)) : [];
+      let placedHere = 0;
+      for (let a = span.a0 + 0.65 + p10dRng() * 1.5; a <= span.a1 - 0.65 && placedHere < 3; a += 2.4 + p10dRng() * 2) {
+        const band = p10dRng();
+        const y = band < 0.45 ? (low ? 2.6 + p10dRng() * 0.8 : 4.95 + p10dRng() * 0.55) : floorTopY(b.arch, band < 0.75 ? 1 : 2) + 1.7 + p10dRng() * 0.6;
+        if (!solidAt(b, span.ax, span.sg, span.plane, a, 0.65, y, 0.55) || !bandClear(b, y)) continue;
+        if (y < 6 && doors.some((d) => a + 0.55 > d.bay.a0 - 0.3 && a - 0.55 < d.bay.a1 + 0.3)) continue;
+        if (piersHere.some((gp) => a + 0.55 > gp.a0 - 0.05 && a - 0.55 < gp.a1 + 0.05 && y - 0.55 < gp.top)) continue;
+        if (ducts.some((da) => Math.abs(da - a) < 1.25)) continue;
+        const [x0, y0, z0, x1, y1, z1] = faceBox(f, a - 0.55, a + 0.55, y - 0.55, y + 0.55, 0.03, 0.32);
+        if (hitsSign(x0, y0, z0, x1, y1, z1) || hitsCollider(x0, y0, z0, x1, y1, z1) || hitsFootprint(x0, y0, z0, x1, y1, z1)) continue;
+        const c = f.P3(a, y, 0);
+        if (fanAt.some(([fx, fy, fz]) => Math.hypot(fx - c.x, fy - c.y, fz - c.z) < 2.2)) continue;
+        if (!inArea(c.x, c.z, 2)) continue;
+        if (!env.add(ENV_VARIANT.FAN, c.x, c.y, c.z, faceYaw(span.ax, span.sg), (4.5 + p10dRng() * 4.5) * (p10dRng() < 0.5 ? 1 : -1), p10dRng() * 6.28, FAN_COLS[Math.floor(p10dRng() * 3)], 'WALL')) break;
+        fanAt.push([c.x, c.y, c.z]);
+        envStat.wallFans++;
+        placedHere++;
+      }
+    }
+    // (2) Rooftop fans flush on the non-door vertical flanks of the explicit machine-room boxes.
+    for (const rm of machineRoomBoxes) {
+      if (env.count >= 190) break;
+      const h = rm.y1 - rm.y0;
+      if (h < 1.6) continue;
+      for (const [ax, sg] of FACES) {
+        if (rm.doorFace === `${ax}:${sg}`) continue;
+        const plane = ax === 'x' ? (sg > 0 ? rm.x1 : rm.x0) : sg > 0 ? rm.z1 : rm.z0;
+        const [l0, l1] = ax === 'x' ? [rm.z0, rm.z1] : [rm.x0, rm.x1];
+        if (l1 - l0 < 1.4 || p10dRng() < 0.35) continue;
+        const a = (l0 + l1) / 2;
+        const y = rm.y0 + Math.min(h - 0.62, Math.max(0.62, h * 0.5));
+        const f = sf(ax, sg, plane);
+        const [x0, y0, z0, x1, y1, z1] = faceBox(f, a - 0.55, a + 0.55, y - 0.55, y + 0.55, 0.03, 0.32);
+        if (hitsCollider(x0, y0, z0, x1, y1, z1) || hitsSign(x0, y0, z0, x1, y1, z1)) continue;
+        const c = f.P3(a, y, 0);
+        if (!env.add(ENV_VARIANT.FAN, c.x, c.y, c.z, faceYaw(ax, sg), (4.5 + p10dRng() * 4.5) * (p10dRng() < 0.5 ? 1 : -1), p10dRng() * 6.28, FAN_COLS[Math.floor(p10dRng() * 3)], 'ROOM')) break;
+        envStat.roomFans++;
+      }
+    }
+    // (3) Noren: under eatery awning lips (rod d 1.18 / y 3.08 → lowest 2.40 m) one per bay, and in door-free alley
+    // bays (rod d 0.28 / y 3.05, standoffs back to the wall), never on run faces or infra transformer walls.
+    const norenNearLamp = (x: number, z: number): boolean => lampPoles.some(([lx, lz]) => Math.hypot(lx - x, lz - z) < 1.6);
+    for (const g of groundFaces) {
+      if (env.count >= 212) break;
+      const { b, span } = g;
+      if (g.run || span.court) continue;
+      const program = faceProgram.get(g);
+      // Under shop canopies (eatery awning / apparel canopy / hotel entry canopy) or in door-free alley bays.
+      const canopy = g.alley ? null : program === 'CYBER_EATERY' ? { y: 3.08, d: 1.18 } : program === 'TECH_APPAREL' ? { y: 3.22, d: 1.3 } : program === 'CAPSULE_HOTEL' ? { y: 3.4, d: 1.7 } : null;
+      const awning = canopy !== null && span.a1 - span.a0 - 0.8 > 2;
+      if (!awning && !(g.alley && program !== 'ALLEY_INFRA')) continue;
+      const f = sf(span.ax, span.sg, span.plane);
+      const piersHere = groundPiers
+        .filter((gp) => gp.building === b.index && gp.ax === span.ax && gp.sg === span.sg && Math.abs(gp.plane - span.plane) < 1e-6)
+        .sort((p, q) => p.a0 - q.a0);
+      const doors = groundDoors.filter((d) => d.building === b.index && d.ax === span.ax && d.sg === span.sg && Math.abs(d.plane - span.plane) < 1e-6);
+      const yRod = awning && canopy ? canopy.y : 3.05;
+      const dRod = awning && canopy ? canopy.d : 0.28;
+      /** The rod must hang directly under a canopy collider at both ends (hangers reach ≤ 0.2 m up into it). */
+      const underCanopy = (a: number): boolean =>
+        [a - 0.75, a + 0.75].every((ae) => {
+          const q = f.P3(ae, yRod, dRod);
+          return colliders.some((c) => c.building === b.index && c.min.y >= yRod + 0.02 && c.min.y <= yRod + 0.2 && q.x > c.min.x && q.x < c.max.x && q.z > c.min.z && q.z < c.max.z);
+        });
+      for (let i = 0; i + 1 < piersHere.length; i++) {
+        const b0 = piersHere[i].a1;
+        const b1 = piersHere[i + 1].a0;
+        if (b1 - b0 < ENV_DIMS.NOREN_W + 0.1) continue;
+        const a = (b0 + b1) / 2;
+        if (awning && (a - 0.85 < span.a0 + 0.5 || a + 0.85 > span.a1 - 0.5 || !underCanopy(a))) continue;
+        if (!awning && doors.some((d) => a + 0.85 > d.bay.a0 && a - 0.85 < d.bay.a1)) continue;
+        const [x0, y0, z0, x1, y1, z1] = faceBox(f, a - 0.86, a + 0.86, yRod - 0.7, yRod + (awning ? 0.02 : 0.16), awning ? dRod - 0.12 : 0.02, dRod + 0.14);
+        if (hitsSign(x0, y0, z0, x1, y1, z1) || hitsCollider(x0, y0, z0, x1, y1, z1) || hitsFootprint(x0, y0, z0, x1, y1, z1)) continue;
+        const c = f.P3(a, yRod, dRod - 0.06);
+        if (!inArea(c.x, c.z, 2) || norenNearLamp(c.x, c.z)) continue;
+        if (!awning && doorClearZones.some((r) => c.x + 0.9 > r.x0 && c.x - 0.9 < r.x1 && c.z + 0.9 > r.z0 && c.z - 0.9 < r.z1)) continue;
+        if (!env.add(ENV_VARIANT.NOREN, c.x, c.y, c.z, faceYaw(span.ax, span.sg), 1.5 + p10dRng() * 0.9, p10dRng() * 6.28, NOREN_COLS[Math.floor(p10dRng() * NOREN_COLS.length)], awning ? 'AWNING' : 'BAY')) break;
+        if (awning) envStat.awningNoren++;
+        else envStat.bayNoren++;
+      }
+    }
+    // (4) Rooftop wireframe holograms on the reserved tall flat roofs (full 3.6 m sweep already clear of roofRects and
+    // roof colliders); a final sign check drops any that a later roof sign overlaps.
+    for (const h of holoReserve) {
+      if (env.count >= ENV_CAP) break;
+      const SW = ENV_DIMS.HOLO_SWEEP;
+      if (hitsSign(h.x - SW, h.b.roofY, h.z - SW, h.x + SW, h.b.roofY + ENV_DIMS.HOLO_TOP + 0.3, h.z + SW)) continue;
+      if (!env.add(ENV_VARIANT.HOLO, h.x, h.b.roofY, h.z, p10dRng() * 6.28, 0, p10dRng() * 6.28, PAL[Math.floor(p10dRng() * PAL.length)], 'ROOF')) break;
+      envStat.holos++;
+    }
+    env.end();
+
+    // ------------------------------------------------------------------ 15d. 10D-3 ramen carts + bus shelters (+0 calls)
+    // StreetFurnishingsKit v2 / v3 on avenue (and wide street) sidewalks: the ramen cart's counter and the shelter's
+    // open boarding side face the road; every footprint clears buildings (≥ 0.65 m), doorways, crosswalks (≥ 4 m),
+    // lamps, cars, vending kiosks and props. Solid PROP colliders, contact shadows, warm / cool lights, boiler steam.
+    const ramenCarts: Array<{ x: number; z: number; yaw: number; steam: [number, number, number] }> = [];
+    const busShelters: Array<{ x: number; z: number; yaw: number; front: number; kerb: number; axis: Axis; side: 1 | -1 }> = [];
+    const ramenSteam: Array<[number, number, number]> = [];
+    /** World AABB of a local box (yaw is a multiple of 90°) — x along the kit's local X, z along local Z. */
+    const kitBox = (x: number, z: number, yaw: number, lx0: number, lx1: number, lz0: number, lz1: number): RectXZ => {
+      const c = Math.round(Math.cos(yaw));
+      const sn = Math.round(Math.sin(yaw));
+      const pts = [[lx0, lz0], [lx1, lz0], [lx0, lz1], [lx1, lz1]].map(([lx, lz]) => [x + lx * c + lz * sn, z - lx * sn + lz * c]);
+      return rectFrom(Math.min(...pts.map((p) => p[0])), Math.min(...pts.map((p) => p[1])), Math.max(...pts.map((p) => p[0])), Math.max(...pts.map((p) => p[1])));
+    };
+    const rectDist = (r: RectXZ, x: number, z: number): number => Math.hypot(Math.max(r.x0 - x, 0, x - r.x1), Math.max(r.z0 - z, 0, z - r.z1));
+    const groundClear = (r: RectXZ, h: number, lampGap: number): boolean => {
+      if (!inArea((r.x0 + r.x1) / 2, (r.z0 + r.z1) / 2, 3)) return false;
+      for (const c of colliders) {
+        if (c.kind === 'BARRIER' || c.max.y <= 0.1 || c.min.y >= h) continue;
+        const m = c.kind === 'BUILDING' ? 0.65 : 0.2;
+        if (r.x0 - m < c.max.x && r.x1 + m > c.min.x && r.z0 - m < c.max.z && r.z1 + m > c.min.z) return false;
+      }
+      if ([...footprints, ...propObstacles].some((o) => o.minY < h && r.x0 - 0.15 < o.maxX && r.x1 + 0.15 > o.minX && r.z0 - 0.15 < o.maxZ && r.z1 + 0.15 > o.minZ)) return false;
+      if (doorClearZones.some((d) => d.y < 1 && r.x0 < d.x1 && r.x1 > d.x0 && r.z0 < d.z1 && r.z1 > d.z0)) return false;
+      if (crosswalkZones.some((cz) => r.x0 - 4 < cz.x1 && r.x1 + 4 > cz.x0 && r.z0 - 4 < cz.z1 && r.z1 + 4 > cz.z0)) return false;
+      if (intersectionSquares.some((q) => r.x0 - 2 < q.x1 && r.x1 + 2 > q.x0 && r.z0 - 2 < q.z1 && r.z1 + 2 > q.z0)) return false;
+      if (lampPoles.some(([lx, lz]) => rectDist(r, lx, lz) < lampGap)) return false;
+      return true;
+    };
+    const ring5 = !!plan.plaza;
+    const shelterCap = ring5 ? 2 : 4;
+    const cartCap = ring5 ? 2 : 4;
+    const SH = FURNITURE_BOUNDS.BUS_SHELTER;
+    for (const pass of ['SHELTER', 'CART'] as const) {
+      for (const [si, st] of streets.entries()) {
+        if (pass === 'SHELTER' && st.kind !== 'AVENUE') continue;
+        const lh = laneHalf(st.kind);
+        if (sidewalk(st.kind) < 3.2) continue;
+        for (const [a0, a1] of segmentsByStreet[si]) {
+          for (const side of [-1, 1] as const) {
+            for (let a = a0 + 8 + p10dRng() * 6; a < a1 - 8; a += 6 + p10dRng() * 4) {
+              const done = pass === 'SHELTER' ? busShelters.length >= shelterCap : ramenCarts.length >= cartCap;
+              if (done) break;
+              // Face the road: local +Z → −side along the lateral axis.
+              const yaw = st.axis === 'z' ? -side * (Math.PI / 2) : side > 0 ? Math.PI : 0;
+              if (pass === 'SHELTER') {
+                const lat = st.coord + side * (lh + 1.35);
+                const p = pt(st.axis, a, 0, lat);
+                if (busShelters.some((o) => Math.hypot(o.x - p.x, o.z - p.z) < 28)) continue;
+                const r = kitBox(p.x, p.z, yaw, -SH.w / 2, SH.w / 2, 0.03 - SH.d / 2, 0.03 + SH.d / 2);
+                if (!groundClear(r, 2.6, 2.2)) continue;
+                if (!addKit(KIT_VARIANT.BUS_SHELTER, p.x, 0, p.z, yaw, 1, 0)) break;
+                const glass = kitBox(p.x, p.z, yaw, -1.78, 1.78, -0.7, -0.6);
+                const kiosk = kitBox(p.x, p.z, yaw, 1.63, 1.81, -0.625, 0.625);
+                const roof = kitBox(p.x, p.z, yaw, -SH.w / 2, SH.w / 2, 0.03 - SH.d / 2, 0.03 + SH.d / 2);
+                colliders.push(
+                  { min: new THREE.Vector3(glass.x0, 0, glass.z0), max: new THREE.Vector3(glass.x1, 2.41, glass.z1), kind: 'PROP', building: -1 },
+                  { min: new THREE.Vector3(kiosk.x0, 0, kiosk.z0), max: new THREE.Vector3(kiosk.x1, 2.15, kiosk.z1), kind: 'PROP', building: -1 },
+                  { min: new THREE.Vector3(roof.x0, 2.41, roof.z0), max: new THREE.Vector3(roof.x1, 2.55, roof.z1), kind: 'PROP', building: -1 },
+                );
+                extraShadows.push({ x: p.x, z: p.z, yaw, w: SH.w + 0.1, d: SH.d + 0.05, alpha: 0.45 });
+                if (!lightNear(p.x, 2.2, p.z, 2.5)) addLight(p.x, 2.25, p.z, 0x9fe8ff, 1.0);
+                busShelters.push({ x: p.x, z: p.z, yaw, front: lh + 1.35 - (0.03 + SH.d / 2), kerb: st.coord + side * lh, axis: st.axis, side });
+              } else {
+                const lat = st.coord + side * (lh + (st.kind === 'AVENUE' ? 2.4 : 2.1));
+                const p = pt(st.axis, a, 0, lat);
+                if (ramenCarts.some((o) => Math.hypot(o.x - p.x, o.z - p.z) < 20) || busShelters.some((o) => Math.hypot(o.x - p.x, o.z - p.z) < 8)) continue;
+                const r = kitBox(p.x, p.z, yaw, -1.1, 1.1, -0.58, 0.58);
+                if (!groundClear(r, 2.4, 1.0)) continue;
+                if (!addKit(KIT_VARIANT.RAMEN_CART, p.x, 0, p.z, yaw, 1, 0)) break;
+                const cb = kitBox(p.x, p.z, yaw, -1.05, 1.05, -0.55, 0.55);
+                colliders.push({ min: new THREE.Vector3(cb.x0, 0, cb.z0), max: new THREE.Vector3(cb.x1, 2.3, cb.z1), kind: 'PROP', building: -1 });
+                extraShadows.push({ x: p.x, z: p.z, yaw, w: 2.3, d: 1.25, alpha: 0.6 });
+                if (!lightNear(p.x, 1.9, p.z, 2.5)) addLight(p.x, 1.9, p.z, 0xffa860, 1.25);
+                const [sx, sy, sz] = FURNITURE_SOCKETS.RAMEN_STEAM;
+                const steam: [number, number, number] = [p.x + sx * Math.cos(yaw) + sz * Math.sin(yaw), sy, p.z - sx * Math.sin(yaw) + sz * Math.cos(yaw)];
+                ramenSteam.push(steam);
+                ramenCarts.push({ x: p.x, z: p.z, yaw, steam });
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // ------------------------------------------------------------------ 15e. 10D-4 breaker spark nodes
+    // 8–12 faulty BREAKER wall fixtures (alley / service-corridor ones first); fallback: alley wall junction points.
+    const sparkNodes: Array<{ pos: THREE.Vector3; nx: number; nz: number }> = [];
+    {
+      const inAlley = (x: number, z: number): boolean => alleyBands.some((r) => x > r.x0 - 1.5 && x < r.x1 + 1.5 && z > r.z0 - 1.5 && z < r.z1 + 1.5);
+      const breakers = socketProps
+        .filter((p) => p.id === 'BREAKER' && p.y < 3.5)
+        .map((p) => ({ p, alley: inAlley(p.x, p.z) ? 0 : 1, roll: p10dRng() }))
+        .sort((a, b) => a.alley - b.alley || a.roll - b.roll);
+      const want = 8 + Math.floor(p10dRng() * 5);
+      for (const { p } of breakers) {
+        if (sparkNodes.length >= want) break;
+        const nx = Math.sin(p.yaw);
+        const nz = Math.cos(p.yaw);
+        if (sparkNodes.some((o) => Math.hypot(o.pos.x - p.x, o.pos.z - p.z) < 6)) continue;
+        sparkNodes.push({ pos: new THREE.Vector3(p.x + nx * 0.2, p.y + 0.1, p.z + nz * 0.2), nx, nz });
+      }
+      // Fallback: alley walls first, then any street-level wall, at junction-box height (2.4 m) on a solid span.
+      for (const alleyOnly of [true, false]) {
+        for (const g of groundFaces) {
+          if (sparkNodes.length >= 8) break;
+          if ((alleyOnly && !g.alley) || g.span.court || g.span.y0 > 1.8 || g.span.y1 < 3) continue;
+          const f = sf(g.span.ax, g.span.sg, g.span.plane);
+          for (const u of [0.35, 0.65]) {
+            const a = g.span.a0 + (g.span.a1 - g.span.a0) * u;
+            const q = f.P3(a, 2.4, 0.18);
+            if (!inArea(q.x, q.z, 2) || sparkNodes.some((o) => Math.hypot(o.pos.x - q.x, o.pos.z - q.z) < 6)) continue;
+            sparkNodes.push({ pos: q, nx: f.nx, nz: f.nz });
+            break;
+          }
+        }
+      }
+    }
+
     // ------------------------------------------------------------------ 16. commit merged geometry & instances
     const mk = (geos: THREE.BufferGeometry[], mat: THREE.Material, name: string, renderOrder = 0): THREE.Mesh => {
       const geo = mergeOrEmpty(geos);
@@ -7612,6 +8010,13 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
       addSteam(v.x, v.y, v.z, 0.6 + srng() * 0.3, 2.5 + srng() * 2, ph + 0.5);
       steamColumns++;
     }
+    // 10D-3: delicate anchored noodle-boiler steam over every ramen cart's vat (before the canal mist fills up).
+    for (const [x, y, z] of ramenSteam) {
+      const ph = srng();
+      // Small puffs, short rise: the visible column (base + rise + size · 0.35 + size / 2) stays under the awning (≤ 1.95 m).
+      addSteam(x, y, z, 0.25 + srng() * 0.05, 0.6 + srng() * 0.1, ph);
+      addSteam(x, y, z, 0.25 + srng() * 0.05, 0.6 + srng() * 0.1, ph + 0.5);
+    }
     const canalSteam = canalWater.length ? 24 : 0;
     for (let k = 0; k < canalSteam * 4 && steamN < CAP.STEAM && k < 400; k++) {
       if (k >= canalSteam) break;
@@ -7666,6 +8071,11 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
     buildings.forEach((b) => center.add(_pos.set(b.cx, 0, b.cz)));
     center.divideScalar(Math.max(1, buildings.length));
 
+    // 10D-1 expressway traffic lanes (own RNG stream: layouts stay where they were).
+    {
+      const trng = createRng(0x10d1 + sector.index * 71 + loop * 433);
+      this.traffic.setLanes(buildTrafficLanes(plan.highways, !!plan.plaza && plan.highways.length === 4, trng), trng);
+    }
     this.layout = {
       sector,
       loop,
@@ -7699,6 +8109,13 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
       marketRects: plazas,
       marketTrestles,
       curbLedBoxes,
+      animatedEnv: [...env.instances],
+      ramenCarts,
+      busShelters,
+      sparkNodes,
+      canopyDripEdges,
+      lampPoles,
+      machineRoomBoxes,
       groundDoors,
       groundPiers,
       stats: {
@@ -7711,6 +8128,7 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
         streetscape: { ...stat, kitInstances: counts.kit, vending: counts.vend },
         lamps: counts.lamp,
         cityLights: this.lightCount,
+        traffic: this.traffic.count,
         archetypes: [ARCH_A, ARCH_B, ARCH_C, ARCH_D].map((a) => buildings.filter((b) => b.arch === a).length),
         balconies: balconyCount,
         fireEscapes: escapeCount,
@@ -7974,6 +8392,7 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
    */
   update(simTime: number, cameraPos: THREE.Vector3): void {
     this.uTime.value = simTime;
+    this.traffic.update(simTime);
     this.sky.position.copy(cameraPos);
     // 7B-5: the two blimps cruise slow circles over the far skyline (heading along the orbit tangent).
     CITY_FX.BLIMPS.forEach((b, i) => {

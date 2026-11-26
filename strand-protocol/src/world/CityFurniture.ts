@@ -1,7 +1,7 @@
 /**
  * STRAND // PROTOCOL — Phase 10C hero street furniture (HERO_3D_MODELING_SPEC §2–§3): recessed vending kiosk,
  * detailed gooseneck street lamp, and the `StreetFurnishingsKit` (one instanced draw, variants 0..3 reserved:
- * v0 festoon lantern string · v1 rain-wet cafe parasol · v2 ramen cart · v3 bus shelter — the last two are 10D).
+ * v0 festoon lantern string · v1 rain-wet cafe parasol · v2 steaming ramen cart · v3 holographic bus shelter).
  * Pure geometry builders (no CityBuilder dependency) so the triangle / ground-contact budgets are unit-testable.
  */
 import * as THREE from 'three';
@@ -17,7 +17,7 @@ function finish(list: PartList): THREE.BufferGeometry {
   if (list.length === 0) {
     // Reserved variants (10D) emit nothing yet: an empty geometry with the kit's attribute layout.
     const e = new THREE.BufferGeometry();
-    for (const [name, size] of [['position', 3], ['normal', 3], ['aPart', 1], ['aAo', 1], ['aVar', 1]] as const) e.setAttribute(name, new THREE.BufferAttribute(new Float32Array(0), size));
+    for (const [name, size] of [['position', 3], ['normal', 3], ['uv', 2], ['aPart', 1], ['aAo', 1], ['aVar', 1]] as const) e.setAttribute(name, new THREE.BufferAttribute(new Float32Array(0), size));
     e.computeBoundingBox();
     return e;
   }
@@ -44,16 +44,15 @@ function tag(list: PartList, g: THREE.BufferGeometry, part: number, cavity = 1, 
   }
   out.setAttribute('aPart', new THREE.BufferAttribute(new Float32Array(n).fill(part), 1));
   out.setAttribute('aAo', new THREE.BufferAttribute(ao, 1));
-  if (uvRect !== undefined || variant === undefined) {
-    const uv = new Float32Array(n * 2);
-    for (let i = 0; i < n; i++) {
-      if (uvRect && uvVals) {
-        uv[i * 2] = uvRect[0] + (uvRect[2] - uvRect[0]) * uvVals[i * 2];
-        uv[i * 2 + 1] = uvRect[1] + (uvRect[3] - uvRect[1]) * uvVals[i * 2 + 1];
-      }
+  // 10D: every part carries `uv` (zeros unless an atlas rect is given) so all kit variants merge cleanly.
+  const uv = new Float32Array(n * 2);
+  for (let i = 0; i < n; i++) {
+    if (uvRect && uvVals) {
+      uv[i * 2] = uvRect[0] + (uvRect[2] - uvRect[0]) * uvVals[i * 2];
+      uv[i * 2 + 1] = uvRect[1] + (uvRect[3] - uvRect[1]) * uvVals[i * 2 + 1];
     }
-    out.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
   }
+  out.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
   if (variant !== undefined) out.setAttribute('aVar', new THREE.BufferAttribute(new Float32Array(n).fill(variant), 1));
   list.push(out);
 }
@@ -184,11 +183,104 @@ function parasol(L: PartList): void {
   tag(L, box(0.07, 0.09, 0.07, 0, 2.03, 0), 3, 1, undefined, V); // tiny warm cage bulb under the hub
 }
 
-/** Merged kit geometry: `position`, `normal`, `uv` (unused), `aPart`, `aAo`, `aVar`. Variants 2 / 3 are 10D. */
-export function buildFurnishingsKit(variants: readonly number[] = [KIT_VARIANT.LANTERNS, KIT_VARIANT.PARASOL]): THREE.BufferGeometry {
+/** Phase 13 swap contract: canonical sockets (local metres, kit frame) and variant envelopes. */
+export const FURNITURE_SOCKETS = { RAMEN_STEAM: [-0.32, 1.05, -0.05] as const } as const;
+export const FURNITURE_BOUNDS = {
+  RAMEN_CART: { w: 2.2, h: 2.35, d: 1.15 },
+  BUS_SHELTER: { w: 3.7, h: 2.55, d: 1.55 },
+} as const;
+/** furnishingsAtlas halves (uv rects u0, v0, u1, v1): top = ramen marquee, bottom = transit map. */
+const ATLAS_RAMEN = [0, 0.5, 1, 1] as const;
+const ATLAS_TRANSIT_MAP = [0, 0, 0.5, 0.5] as const;
+const ATLAS_TRANSIT_BOARD = [0.5, 0, 1, 0.5] as const;
+
+/**
+ * v2 steaming ramen street-vendor cart (2.20 × 2.35 × 1.15 m, counter facing +Z, casters on y = 0). aPart: 0 dark
+ * steel · 1 stainless · 2 slatted timber · 3 warm glow (boiler vat, lanterns) · 4 marquee (atlas top half) · 5 glass ·
+ * 6 ceramic bowls / bottles · 7 awning fabric.
+ */
+function ramenCart(L: PartList): void {
+  const V = KIT_VARIANT.RAMEN_CART;
+  for (const sx of [-1, 1]) for (const sz of [-1, 1]) tag(L, cyl(0.09, 0.09, 0.05, 6, sx * 0.8, 0.09 * Math.cos(Math.PI / 6), sz * 0.3, [0, Math.PI / 6, Math.PI / 2], true), 0, 0.8, undefined, V); // solid casters
+  tag(L, box(1.85, 0.79, 0.84, 0, 0.545, 0), 1, 1, undefined, V); // stainless chassis (y 0.15–0.94, resting on the casters)
+  tag(L, plane(1.8, 0.6, 0, 0.52, 0.425), 2, 0.9, undefined, V); // slatted timber skirt
+  for (let k = 0; k < 4; k++) tag(L, plane(1.8, 0.018, 0, 0.3 + k * 0.14, 0.428), 0, 1, undefined, V);
+  tag(L, box(1.95, 0.05, 0.22, 0, 0.965, 0.46), 1, 1, undefined, V); // cantilevered counter lip
+  tag(L, cyl(0.18, 0.18, 0.08, 6, FURNITURE_SOCKETS.RAMEN_STEAM[0], 0.92, FURNITURE_SOCKETS.RAMEN_STEAM[2]), 1, 0.8, undefined, V);
+  const vat = new THREE.CircleGeometry(0.17, 6);
+  vat.rotateX(-Math.PI / 2);
+  vat.translate(FURNITURE_SOCKETS.RAMEN_STEAM[0], 0.945, FURNITURE_SOCKETS.RAMEN_STEAM[2]);
+  tag(L, vat, 3, 1, undefined, V); // recessed boiler vat (warm glow)
+  tag(L, plane(1.0, 0.35, 0.38, 1.16, 0.36, [-0.3, 0, 0]), 5, 1, undefined, V); // glass sneeze-guard hood
+  for (let k = 0; k < 3; k++) {
+    tag(L, cyl(0.08, 0.055, 0.05, 5, 0.25 + k * 0.17, 0.94 + 0.025, -0.2), 6, 1, undefined, V); // bowls on the counter
+    const soup = new THREE.CircleGeometry(0.075, 5, -Math.PI / 10); // corners aligned with the 5-sided bowl wall
+    soup.rotateX(-Math.PI / 2);
+    soup.translate(0.25 + k * 0.17, 0.98, -0.2);
+    tag(L, soup, 6, 0.7, undefined, V); // filled (never see-through from above)
+  }
+  for (let k = 0; k < 3; k++) tag(L, cyl(0.03, 0.03, 0.2, 4, 0.72 - k * 0.08, 1.04, -0.3), 6, 1, undefined, V);
+  // Roof posts end inside the slanted awning slab (it drops toward the front: +0.09 rad about X).
+  for (const sx of [-1, 1]) for (const sz of [-1, 1]) tag(L, rod(new THREE.Vector3(sx * 0.9, 0.94, sz * 0.38), new THREE.Vector3(sx * 0.9, 2.26 - sz * 0.38 * Math.sin(0.09), sz * 0.38), 0.025, 4), 0, 1, undefined, V);
+  tag(L, box(2.2, 0.04, 1.15, 0, 2.26, 0, [0.09, 0, 0], true), 7, 1, undefined, V); // slanted corrugated awning
+  for (let k = 0; k < 5; k++) {
+    const x = -0.88 + k * 0.44;
+    tag(L, rod(new THREE.Vector3(x, 2.338, -0.56), new THREE.Vector3(x, 2.238, 0.56), 0.018, 3), 0, 1, undefined, V); // ribs on the top face
+  }
+  tag(L, box(1.86, 0.36, 0.05, 0, 2.03, 0.39), 0, 1, undefined, V); // marquee backing
+  tag(L, plane(1.8, 0.32, 0, 2.03, 0.425), 4, 1, ATLAS_RAMEN, V); // backlit English marquee (1 cm proud)
+  for (let k = 0; k < 3; k++) {
+    for (const back of [false, true]) tag(L, plane(0.58, 0.2, -0.62 + k * 0.62, 1.77, 0.42, [0, back ? Math.PI : 0, 0]), 7, 1, undefined, V); // hangs from the backing
+  }
+  for (const sx of [-1, 1]) {
+    tag(L, cyl(0.08, 0.08, 0.18, 5, sx * 1.0, 1.95, 0.5), 3, 1, undefined, V); // corner lanterns
+    const cap = new THREE.CircleGeometry(0.08, 5, Math.PI / 10); // corners aligned with the 5-sided lantern wall
+    cap.rotateX(Math.PI / 2);
+    cap.translate(sx * 1.0, 1.86, 0.5);
+    tag(L, cap, 3, 1, undefined, V); // lantern bottom
+    tag(L, rod(new THREE.Vector3(sx * 1.0, 2.04, 0.5), new THREE.Vector3(sx * 1.0, 2.23, 0.5), 0.012, 3), 0, 1, undefined, V); // hanger into the awning
+  }
+  tag(L, rod(new THREE.Vector3(-1.02, 1.0, -0.32), new THREE.Vector3(-1.02, 1.0, 0.32), 0.02, 4), 1, 1, undefined, V); // push handle
+  for (const sz of [-0.32, 0.32]) tag(L, rod(new THREE.Vector3(-0.92, 0.9, sz), new THREE.Vector3(-1.02, 1.0, sz), 0.018, 4), 1, 1, undefined, V);
+}
+
+/**
+ * v3 holographic bus-stop shelter (3.70 × 2.55 × 1.55 m roof, open boarding side +Z, rear glass at z −0.66). aPart:
+ * 0 dark steel · 1 aluminium mullions · 2 bench steel · 3 cyan-white ceiling LED · 4 transit map (atlas bottom half) ·
+ * 5 tempered glass.
+ */
+function busShelter(L: PartList): void {
+  const V = KIT_VARIANT.BUS_SHELTER;
+  for (const x of [-1.75, 0, 1.75]) {
+    tag(L, rod(new THREE.Vector3(x, 0.04, -0.62), new THREE.Vector3(x, 2.41, -0.62), 0.05, 4), 0, 1, undefined, V);
+    tag(L, rod(new THREE.Vector3(x, 2.41, -0.62), new THREE.Vector3(x, 2.44, 0.7), 0.045, 4), 0, 1, undefined, V);
+    tag(L, box(0.2, 0.04, 0.2, x, 0.02, -0.62), 0, 0.8, undefined, V);
+  }
+  tag(L, box(3.7, 0.14, 1.55, 0, 2.48, 0.03, [0, 0, 0], true), 0, 1, undefined, V); // chamfered rain roof
+  tag(L, box(3.2, 0.02, 0.08, 0, 2.4, 0.3, [0, 0, 0], true), 3, 1, undefined, V); // recessed ceiling LED strip
+  for (const back of [false, true]) tag(L, plane(3.4, 1.9, 0, 1.25, -0.66, [0, back ? Math.PI : 0, 0]), 5, 1, undefined, V);
+  for (const x of [-1.2, -0.4, 0.4, 1.2]) tag(L, box(0.04, 1.9, 0.05, x, 1.25, -0.66), 1, 1, undefined, V);
+  for (const y of [0.3, 2.2]) tag(L, box(3.45, 0.05, 0.06, 0, y, -0.66), 1, 1, undefined, V);
+  tag(L, box(0.18, 2.15, 1.25, 1.72, 1.075, 0), 0, 1, undefined, V); // transit-map lightbox kiosk
+  // Two stacked 2:1 lightbox panels per side (undistorted 256 × 128 atlas cells): metro map over shuttle board.
+  for (const sx of [-1, 1]) {
+    tag(L, plane(1.15, 0.575, 1.72 + sx * 0.095, 1.8, 0, [0, sx * (Math.PI / 2), 0]), 4, 1, ATLAS_TRANSIT_MAP, V);
+    tag(L, plane(1.15, 0.575, 1.72 + sx * 0.095, 1.2, 0, [0, sx * (Math.PI / 2), 0]), 4, 1, ATLAS_TRANSIT_BOARD, V);
+  }
+  tag(L, box(1.85, 0.05, 0.4, -0.35, 0.46, -0.38), 2, 1, undefined, V); // slatted bench
+  for (let k = 0; k < 3; k++) tag(L, box(1.85, 0.012, 0.03, -0.35, 0.49, -0.52 + k * 0.14), 0, 1, undefined, V);
+  tag(L, box(1.85, 0.22, 0.04, -0.35, 0.84, -0.6), 2, 1, undefined, V);
+  for (const x of [-1.25, -0.35, 0.55]) tag(L, box(0.05, 0.22, 0.4, x, 0.6, -0.38), 0, 1, undefined, V);
+  for (const x of [-1.15, 0.45]) tag(L, box(0.06, 0.44, 0.3, x, 0.22, -0.4), 0, 0.8, undefined, V);
+}
+
+/** Merged kit geometry: `position`, `normal`, `uv` (atlas parts only), `aPart`, `aAo`, `aVar` — all four variants. */
+export function buildFurnishingsKit(variants: readonly number[] = [KIT_VARIANT.LANTERNS, KIT_VARIANT.PARASOL, KIT_VARIANT.RAMEN_CART, KIT_VARIANT.BUS_SHELTER]): THREE.BufferGeometry {
   const L: PartList = [];
   if (variants.includes(KIT_VARIANT.LANTERNS)) lanternString(L);
   if (variants.includes(KIT_VARIANT.PARASOL)) parasol(L);
+  if (variants.includes(KIT_VARIANT.RAMEN_CART)) ramenCart(L);
+  if (variants.includes(KIT_VARIANT.BUS_SHELTER)) busShelter(L);
   return finish(L);
 }
 
