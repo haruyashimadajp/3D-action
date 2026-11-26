@@ -1,7 +1,7 @@
 # STRAND // PROTOCOL — Hero Close-Up Procedural 3D Modeling Blueprint Specification
 
 **Purpose**: Precision procedural 3D CAD-style geometry recipes for every close-up hero asset across **Phases 10C, 10D, 11A, and 12B** so the implementation AI builds authentic, beveled, multi-part AAA silhouettes instead of plain box primitives.  
-**Referenced By**: `PHASE10_OVERHAUL_PLAN.md` (10C, 10D), `PHASE11_INTERIORS_DESTRUCTION_PLAN.md` (11A-1c, 11A-2), `PHASE12_AAA_RENDER_CINEMA_PLAN.md` (12B-3).  
+**Referenced By**: `PHASE10_OVERHAUL_PLAN.md` (10C), `PHASE10D_SPEC.md` (10D-3, 10D-5), `PHASE11_INTERIORS_DESTRUCTION_PLAN.md` (11A-1c, 11A-2), `PHASE12_AAA_RENDER_CINEMA_PLAN.md` (12B-1).  
 **Coordinate Convention**: Right-handed Y-up (`+Y` up, `+Z` forward/front face, `+X` right). Ground contact strictly at `y = 0.000`. All dimensions in **meters (`m`)**.
 
 ---
@@ -60,7 +60,7 @@ Used on all 4 corners of every vehicle (~95 tris/wheel, placed inside real carve
   - `z = -1.25` (fastback engine bay taper): `(0, 0.86), (0.58, 0.88), (0.44, 0.94), (0, 0.95)`
   - Add angled painted A-pillars (`bevelBox` `0.045 × 0.045 × 0.78 m`, `aPart = 0`) framing the windshield + matte carbon roof scoop accent (`aPart = 4`).
 * **Signature Supercar Details**:
-  1. **Front Carbon Splitter & Dual Angular Air Intakes (`aPart = 4`)**: Low chin lip (`1.92 × 0.045 × 0.42 m` at `y = 0.16, z = +2.14`) + twin trapezoidal recessed dark intake pockets (`x = ±0.56, y = 0.30, z = +2.16`, `aAo = 0.35`) with angled vertical carbon strakes.
+  1. **Tapered V-Nose Front Carbon Splitter & Dual Angular Air Intakes (`aPart = 4`)**: 3-station `loftSymHull` tapered chin lip following the V-nose planform (`z = +2.38: halfW 0.54`, `z = +2.06: halfW 0.93`, `z = +1.90: halfW 0.92`, `y = 0.14..0.185`, with small aero end-fences; see `PHASE10D_SPEC.md` §10D-5) + twin trapezoidal recessed dark intake pockets (`x = ±0.56, y = 0.30, z = +2.16`, `aAo = 0.35`) with angled vertical carbon strakes.
   2. **Recessed Angular Y-Beam Headlights (`aPart = 4` housing + `aPart = 2` LED)**: Dark recessed triangular housing at `x = ±0.66, y = 0.54, z = +1.96` (pitched `-16°`, yawed `±18°`) containing sharp glowing Y-shaped DRL blades (`0.024 m` thin LED strips!).
   3. **Deep Sculpted Side Air Intake Scoops (`aPart = 4`)**: Behind doors (`x = ±0.96, y = 0.58, z = -0.62`), dark recessed wedge pocket (`0.14 × 0.36 × 0.58 m`, `aAo = 0.35`) framed by an angled carbon intake splitter vane.
   4. **Lower Carbon Side Skirts (`aPart = 4`)**: Running between wheel arches (`x = ±0.94, y = 0.18, z = 0.0`, `length 1.96 m`).
@@ -157,7 +157,7 @@ Every variant sits cleanly at local `y = 0.0` (tabletop variants sit on counter 
 
 ---
 
-## 5. First-Person Breach Boot, Interactive Door & Humanoid Endo-Core (`Phases 11A-2` & `12B-3`)
+## 5. First-Person Breach Boot, Interactive Door & Humanoid Endo-Core (`Phases 11A-2` & `12B-1`)
 
 ### 5.1 First-Person Cyber-Boot Kick Rig (`ViewModelRenderer.ts` — Phase 11A-2, `~280` tris)
 Built with `ViewModelKit` (`MeshKit` + `bevelBox` + `cylinder`, sharing existing `gearMat` & `hardMat` — **`+0` extra draw calls!**):
@@ -169,12 +169,12 @@ Built with `ViewModelKit` (`MeshKit` + `bevelBox` + `cylinder`, sharing existing
 * Standard dimensions: `1.04 m × 2.16 m × 0.075 m` (scaled cleanly per doorway width).
 * Beveled outer steel door leaf (`withTint` weathered olive/slate/charcoal), **2 recessed stamped structural panels** (upper `0.74 × 0.88 m`, lower `0.74 × 0.72 m`, inner bevel AO `0.55`), narrow armored wire-glass vision slit (`0.18 × 0.44 m` at `y = 1.55`), horizontal brushed-steel **crash push-bar** on interior / heavy lever handle + armored lock escutcheon on exterior (`x = +0.38, y = 1.02`), bottom stainless kickplate (`h = 0.24 m`), and tiny **glowing lock status LED** (amber when closed/kickable, green while quietly unlocked).
 
-### 5.3 Humanoid Strippable Armor & Inner Cyber-Endo Core (`EnemyManager.ts` — Phase 12B-3, `+0` extra draw calls!)
-Inside every humanoid torso/shoulder hierarchy (`ENFORCER`, `AEGIS`, `VEIL`, `PHANTOM`):
-* **Inner Cyber-Endo Core (Always Built Inside Torso, Revealed on Strip)**:
-  - Dark ribbed titanium sternum & `3` curved horizontal ribcage struts (`bevelBox`, `#2b323c`, `metalness 0.88`), recessed central **pulsing glowing power reactor cell** (`cylinder` `r = 0.065 m`, emissive orange/cyan), exposed braided neck/clavicle power conduit cables, and machined metallic shoulder ball-socket joints (`r = 0.07 m`).
-* **Outer Detachable Armor Plates (Tagged `armorLeftShoulder`, `armorRightShoulder`, `armorChestPlate`)**:
-  - Fit snugly (`+0.025 m`) over the inner endo-core so intact enemies look sleek and armored; when `HP < 60%` (or on heavy hit/shield break), toggle `visible = false` on `1–2` plates and eject matching beveled dark plates into `DestructDebris` while sparking continuously from the revealed power conduits!
+### 5.3 Humanoid Strippable Armor & Inner Cyber-Endo Core (`EnemyManager.ts` — Phase 12B-1, `+0` extra draw calls!)
+Inside every humanoid torso/shoulder hierarchy (`ENFORCER`, `AEGIS`, `VEIL`, `PHANTOM`, packed into existing `EnemyArmour` & `EnemyGlow` `THREE.BatchedMesh` draws):
+* **Inner Cyber-Endo Core (Always Built Inside Torso, Role `'ENDO'` / `'CORE'`, Revealed on Strip)**:
+  - Dark ribbed titanium sternum & `3` curved horizontal ribcage struts (`#2b323c`, `metalness 0.88`), recessed central **pulsing glowing power reactor cell** (`r = 0.065 m`, emissive orange/cyan), exposed braided neck/clavicle power conduit cables, and machined metallic shoulder ball-socket joints (`r = 0.072 m`).
+* **Outer Detachable Armor Plates (Roles `'STRIP_CHEST'`, `'STRIP_SHOULDER_L'`, `'STRIP_SHOULDER_R'`)**:
+  - Fit snugly (`+0.025 m`) over the inner endo-core so intact enemies look sleek and armored; when `HP < 60%` (or on heavy sniper hit / shield break), hide `1–2` plates in the `BatchedMesh` (zero-scale matrix) and eject matching beveled dark plates into `DestructDebris` while sparking continuously from the revealed power conduits!
 
 ---
 
@@ -183,3 +183,25 @@ Before completing 10C, 10D, 11A, or 12B, assert in unit tests:
 1. **Non-Brick Car Silhouette Check**: For Variant 0 Supercar Coupe, assert front nose width (`|x|` at `z > 2.2`) is `< 0.70 ×` rear fender width (`|x|` at `z ∈ [-1.2, -0.9]`), greenhouse roof width (`|x|` at `y > 1.05`) is `< 0.65 ×` body fender width, and `aPart` includes ALL required material IDs (`0, 1, 2, 3, 4, 6, 7, 8`).
 2. **Ground Contact Check**: Every floor-resting hero model's geometry bounding box satisfies `Math.abs(bbox.min.y) <= 0.02` (zero floating wheels, vending feet, carts, desks, or racks!).
 3. **Triangle Budget Check**: Every hero vehicle variant `<= 1,100` tris; every vending/furnishing/interior variant `<= 450` tris (keeping 60fps locked across all 5 sectors!).
+
+---
+
+## 7. Phase 13 Blender `.glb` (glTF 2.0) Swap-Ready Asset Contract
+
+After Phase 12B completes the rendering, lighting, interior, destruction, and audio foundation, hero 3D models will be rebuilt in **Blender** and exported as `.glb` (glTF 2.0 PBR). Every procedural builder in Phases 10D–12B MUST preserve these exact invariants so Phase 13 swaps require **zero collider, socket, steam, or animation rework**:
+
+1. **Canonical Coordinate & Pivot Standard**:
+   - Right-handed Y-up (`+Y` up, `+Z` forward/front, `+X` right), `1 unit = 1.0 m`, applied scale `(1, 1, 1)`.
+   - Floor-resting assets pivot at ground-contact center `(0, 0, 0)` with `|bbox.min.y| <= 0.02`.
+   - Exceptions: `v0` Lantern String pivots at top-wire center `(0, 0, 0)` (hangs downward `-Y`); `v0` Counter Place-Setting pivots at counter-base center `(0, 0, 0)`; `InteractiveDoor` leaf is centered on X (`x ∈ [-0.52, +0.52], y ∈ [0, 2.16], z ∈ [-0.0375, +0.0375]`, matching §5.2 handle at `x = +0.38`) with its silent-open hinge rotation axis along local `x = -0.52`.
+2. **Locked Canonical Envelopes & Attachment Sockets** (exported as `const` tables from each builder module):
+   - **Parked Vehicles (`CityVehicles.ts`)**: Coupe `2.06 × 1.16 × 4.66 m`, Pickup `2.12 × 1.88 × 5.10 m`, Van `2.08 × 2.08 × 4.95 m`.
+   - **Street Furniture (`CityFurniture.ts`)**: Vending `1.10 × 2.05 × 0.78 m`, Lamp `h = 6.65 m` (arm `+Z` to `2.05 m`), Ramen Cart `2.20 × 2.35 × 1.15 m` with `steamOffset = (-0.32, 1.05, -0.05)`, Bus Shelter `3.60 × 2.55 × 1.45 m`.
+   - **Highway Traffic (`CityAtmosphere.ts`)**: Traffic Coupe `1.92 × 1.18 × 4.50 m` (light ribbon aft to `z = -5.2 m`).
+   - **Interior Props (`InteriorBuilder.ts`)**: Exact `v0..v7` footprints from §4; **Interactive Door (`DestructibleManager.ts`)**: `1.04 × 2.16 × 0.075 m`.
+3. **Locked Rig & ViewModel Node Names**:
+   - **Humanoid Enemy Hierarchy (`EnemyManager.ts`)**: `pelvis`, `torso`, `head`, `armL`, `foreL`, `armR`, `foreR`, `weapon`, `legL`, `shinL`, `legR`, `shinR`, `wingL`, `wingR`; detachable armor roles `'STRIP_CHEST'`, `'STRIP_SHOULDER_L'`, `'STRIP_SHOULDER_R'`, inner skeleton `'ENDO'`.
+   - **First-Person ViewModel (`ViewModelRenderer.ts`)**: `muzzle`, `eject`, `sight`, `slide`, `hook`, `reel`, plus Phase 11A-2 kick group `'BootKickRig'` (`'bootPivot'`) parented under `this.root`.
+4. **Standard UV-Mapped PBR Material Compatibility (`Phase 12A`)**:
+   - Blender `.glb` exports emit standard UV-mapped `THREE.MeshStandardMaterial` (BaseColor, Normal, MetallicRoughness, Emissive). Phase 12A exposes a reusable `applyStrandMaterialHooks(mat)` helper (injecting `strandCityLights` + optional rain-wet clearcoat Fresnel onto any standard `MeshStandardMaterial` without requiring custom `aPart` attributes!) so imported `.glb` assets automatically inherit all 12 dynamic city lights and per-sector PMREM IBL!
+

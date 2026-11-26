@@ -216,6 +216,9 @@ Replace the simple side-extruded car blocks with sculpted, multi-component high-
 
 ## PHASE 10D — Living Cyberpunk World Animations, Landmarks & Procedural Audio Immersion (`src/world/CityAtmosphere.ts`, `AudioEngine.ts`)
 
+> [!IMPORTANT]
+> **Authoritative Detailed AAA Spec**: See [`PHASE10D_SPEC.md`](PHASE10D_SPEC.md) for exact coordinates, lane math (including Sector 3 crossing anti-overlap & Sector 5 ring loop), `furnishingsAtlas` English signage, shader contracts, screenshot-audit visual fixes (tapered Coupe V-nose splitter, dual-lobe Mie `LampHalos`, richer covered market stalls), and unit tests. The section below is kept as a high-level summary.
+
 ### 10D-1. Elevated Highway Moving Cyber-Traffic (`CityAtmosphere.ts`, `ElevatedTraffic` `InstancedMesh`, `cap: 36`, `+1` draw call)
 * Stream **24–36 stylized low-poly moving cyber-traffic vehicles** gliding smoothly along the elevated highways (and distant sky-lanes) at `18–28 m/s` on a deterministic loop (pure GPU/lightweight matrix update, zero allocations).
 * Each car carries bright white/cyan headlights (`front`), blazing crimson taillight bars + **subtle elongated trailing red light ribbons** (`rear`), creating the iconic Cyberpunk 2077 flowing rivers of highway light!
@@ -225,7 +228,7 @@ Replace the simple side-extruded car blocks with sculpted, multi-component high-
 1. **`AnimatedEnvKit` (`InstancedMesh`, `cap: 220`, `+1` draw call, 100% GPU-animated via `uTime`!)**:
    - Variant 0 (**Spinning Industrial Exhaust Fans**): Circular steel vent housing with 6 angled fan blades rotating smoothly around local Z (`uTime * speed`) over a dim warm-orange/cyan backlit vent slit, mounted on `ALLEY_INFRA` / `CYBER_EATERY` walls and rooftop ducts!
    - Variant 1 (**Wind-Swaying Eatery `Noren` Curtains & Vertical Alley Banners**): Split fabric/vinyl shop curtain panels hanging under `CYBER_EATERY` awnings and narrow alley overhangs, gently rippling and billowing in the rainy night wind via vertex-shader sine displacement (`y`-pinned at top)!
-   - Variant 2 (**Giant Slowly Spinning Rooftop Corporate Wireframe Holograms**): Translucent additive rotating geometric logo rings / cyber-emblems (`diameter 6–10 m`) hovering above `STEPPED_SETBACK`, `CYLINDER_RING_TOWER`, and `SLANT_CORP_TOWER` rooftops!
+   - Variant 2 (**Giant Slowly Spinning Rooftop Corporate Wireframe Holograms**): Crisp opaque thin-strut counter-rotating neon wireframe logo rings / cyber-emblems (`diameter 6.8 m`) hovering above tall flat `STEPPED_SETBACK` and `TOWER` rooftops (clearing `machineRooms` and excluding spire/slant caps; see `PHASE10D_SPEC.md` §10D-2)!
 2. **Street Landmarks Added to Existing `StreetFurnishingsKit` (`+0` Extra Draw Calls!)**:
    - Variant 2 (**Steaming Cyberpunk Ramen Street-Vendor Cart**): Tucked into `L_SHAPE` courtyards and compact market pockets — wheeled stainless steel stall, glowing warm menu backboard, hanging canopy roof, stacked bowls, and anchored rising steam puff!
    - Variant 3 (**Illuminated Holographic Bus-Stop Shelter**): Placed along major avenue sidewalks (`2–4` per sector) — cantilevered dark steel & rain-streaked glass canopy, backlit glowing transit map panel, and integrated metal waiting bench!
