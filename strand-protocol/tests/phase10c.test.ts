@@ -9,6 +9,7 @@ import * as THREE from 'three';
 import { SECTORS } from '../src/config/skills';
 import { VENDING_ATLAS, type PbrTextureSet, type ProceduralTextureLibrary } from '../src/engine/ProceduralTextures';
 import { CityBuilder, type NeonSignRecord, type SectorLayout } from '../src/world/CityBuilder';
+import { PhysicsWorld } from '../src/world/PhysicsWorld';
 import {
   FURNITURE_TRI_BUDGET,
   KIT_CAP,
@@ -18,7 +19,7 @@ import {
   buildVendingGeometry,
   kitVariantTris,
 } from '../src/world/CityFurniture';
-import { CAR_DIMS, CAR_TRI_BUDGET, buildCarVariant, loftSymHull, triCount } from '../src/world/CityVehicles';
+import { CAR_DIMS, CAR_TRI_BUDGET, buildCarVariant, buildHeroWheel, loftSymHull, triCount, type PartList } from '../src/world/CityVehicles';
 
 function mockPbr(): Required<PbrTextureSet> {
   return { map: new THREE.Texture(), roughnessMap: new THREE.Texture(), normalMap: new THREE.Texture(), emissiveMap: new THREE.Texture() };
@@ -234,6 +235,32 @@ test('10C-2 vending kiosk: 1.10 × 2.05 × 0.78 m, 0.14 m recessed display, 0.19
 const CITY = new CityBuilder(mockTextures());
 const ALL: SectorLayout[] = [];
 const MESHES: string[][] = [];
+/** 10BC-Fix loops 0..2: vending kiosk centres + lantern-string endpoints per built district. */
+const LOOPED: Array<{ L: SectorLayout; loop: number; vend: Array<[number, number]>; strings: Array<[THREE.Vector3, THREE.Vector3]> }> = [];
+const LANTERN_BB = bbox(buildFurnishingsKit([KIT_VARIANT.LANTERNS]));
+function capture(L: SectorLayout, loop: number): void {
+  const vend: Array<[number, number]> = [];
+  const strings: Array<[THREE.Vector3, THREE.Vector3]> = [];
+  const m = new THREE.Matrix4();
+  CITY.root.traverse((o) => {
+    const im = o as THREE.InstancedMesh;
+    if (!im.isInstancedMesh) return;
+    if (o.name === 'VendingKiosks') {
+      for (let i = 0; i < im.count; i++) {
+        im.getMatrixAt(i, m);
+        vend.push([m.elements[12], m.elements[14]]);
+      }
+    } else if (o.name === 'StreetFurnishingsKit') {
+      const kit = im.geometry.getAttribute('aKit');
+      for (let i = 0; i < im.count; i++) {
+        if (Math.round(kit.getX(i)) !== KIT_VARIANT.LANTERNS) continue;
+        im.getMatrixAt(i, m);
+        strings.push([new THREE.Vector3(LANTERN_BB.min.x, 0, 0).applyMatrix4(m), new THREE.Vector3(LANTERN_BB.max.x, 0, 0).applyMatrix4(m)]);
+      }
+    }
+  });
+  LOOPED.push({ L, loop, vend, strings });
+}
 for (let s = 1; s <= SECTORS.length; s++) {
   ALL.push(CITY.buildSector(s, 0));
   const names: string[] = [];
@@ -241,7 +268,9 @@ for (let s = 1; s <= SECTORS.length; s++) {
     if ((o as THREE.Mesh).isMesh) names.push(o.name);
   });
   MESHES.push(names);
+  capture(ALL[s - 1], 0);
 }
+for (let loop = 1; loop <= 2; loop++) for (let s = 1; s <= SECTORS.length; s++) capture(CITY.buildSector(s, loop), loop);
 
 test('10C +1 draw call: exactly one StreetFurnishingsKit mesh (cap 300); cars / vending / lamps stay one instanced draw each', () => {
   for (const [i, names] of MESHES.entries()) {
@@ -327,4 +356,147 @@ test('10C-3 English scaffold words + gantry beacons: OPEN 24H / CYBER RAMEN / NI
       }
     }
   }
+});
+
+// =============================================================================================
+// 10BC-Fix regression guards (Part B)
+// =============================================================================================
+/** Triangles of a merged hero geometry whose aPart matches. */
+function trisOf(g: THREE.BufferGeometry, keep: (part: number) => boolean): THREE.Triangle[] {
+  const pos = attr(g, 'position');
+  const part = attr(g, 'aPart');
+  const out: THREE.Triangle[] = [];
+  for (let t = 0; t < pos.length / 9; t++) {
+    if (!keep(part[t * 3])) continue;
+    const v = (k: number) => new THREE.Vector3(pos[t * 9 + k * 3], pos[t * 9 + k * 3 + 1], pos[t * 9 + k * 3 + 2]);
+    out.push(new THREE.Triangle(v(0), v(1), v(2)));
+  }
+  return out;
+}
+/** Distance along `dir` from `o` to the nearest hit among `tris` (Infinity on a miss). */
+function rayHit(o: THREE.Vector3, dir: THREE.Vector3, tris: readonly THREE.Triangle[]): number {
+  const ray = new THREE.Ray(o, dir);
+  const hit = new THREE.Vector3();
+  let best = Infinity;
+  for (const t of tris) if (ray.intersectTriangle(t.a, t.b, t.c, false, hit)) best = Math.min(best, hit.distanceTo(o));
+  return best;
+}
+/** Every glass vertex (selected by `pick`) sits +0.005..+0.05 m proud of the lofted hull along its outward normal. */
+function assertGlassProud(variant: 0 | 1 | 2, label: string, pick: (p: THREE.Vector3) => boolean): THREE.Vector3[] {
+  const g = buildCarVariant(variant);
+  const hull = trisOf(g, (p) => p === 0);
+  const pos = attr(g, 'position');
+  const nor = attr(g, 'normal');
+  const part = attr(g, 'aPart');
+  const pts: THREE.Vector3[] = [];
+  for (let i = 0; i < pos.length / 3; i++) {
+    if (part[i] !== 1) continue;
+    const p = new THREE.Vector3(pos[i * 3], pos[i * 3 + 1], pos[i * 3 + 2]);
+    if (!pick(p)) continue;
+    const n = new THREE.Vector3(nor[i * 3], nor[i * 3 + 1], nor[i * 3 + 2]).normalize();
+    pts.push(p);
+    const inward = rayHit(p, n.clone().negate(), hull);
+    assert.ok(inward >= 0.005 && inward <= 0.05, `${label}: vertex (${p.x.toFixed(2)}, ${p.y.toFixed(2)}, ${p.z.toFixed(2)}) ${inward.toFixed(3)} m proud of the hull`);
+    assert.ok(rayHit(p, n, hull) > 0.05, `${label}: vertex (${p.x.toFixed(2)}, ${p.y.toFixed(2)}, ${p.z.toFixed(2)}) not buried in the hull`);
+  }
+  assert.ok(pts.length >= 4, `${label}: glass found (${pts.length} vertices)`);
+  return pts;
+}
+
+test('10BC-Fix FIX-8 hero vehicles: rim barrel normals face the hub; pickup / van glass sits proud of the lofted hull', () => {
+  for (const side of [1, -1] as const) {
+    const parts: PartList = [];
+    const R = 0.36;
+    buildHeroWheel(parts, R, 0.3, 0, side);
+    let dot = 0;
+    let n = 0;
+    for (const g of parts) {
+      const pos = attr(g, 'position');
+      const nor = attr(g, 'normal');
+      const part = attr(g, 'aPart');
+      for (let i = 0; i < pos.length / 3; i++) {
+        const ry = pos[i * 3 + 1] - R;
+        const rz = pos[i * 3 + 2];
+        const rad = Math.hypot(ry, rz);
+        if (part[i] !== 6 || Math.abs(rad - 0.62 * R) > 0.003) continue;
+        dot += (nor[i * 3 + 1] * ry + nor[i * 3 + 2] * rz) / rad;
+        n++;
+      }
+    }
+    assert.ok(n >= 16, `side ${side}: barrel vertices (${n})`);
+    assert.ok(dot / n < -0.95, `side ${side}: barrel radial normal dot ${(dot / n).toFixed(3)} < −0.95 (inward, visible from outside)`);
+  }
+  assertGlassProud(1, 'pickup windshield', (p) => p.z > 0.3 && Math.abs(p.x) < 0.8);
+  const side = assertGlassProud(1, 'pickup side windows', (p) => Math.abs(p.x) >= 0.8);
+  const pg = buildCarVariant(1);
+  const pp = attr(pg, 'position');
+  const pn = attr(pg, 'normal');
+  const ppart = attr(pg, 'aPart');
+  for (let i = 0; i < pp.length / 3; i++) {
+    if (ppart[i] !== 1 || Math.abs(pp[i * 3]) < 0.8) continue;
+    assert.ok(pn[i * 3 + 1] > 0.25 && Math.sign(pn[i * 3]) === Math.sign(pp[i * 3]), `pickup side window normal (${pn[i * 3].toFixed(2)}, ${pn[i * 3 + 1].toFixed(2)}) faces out and up`);
+  }
+  assert.ok(Math.max(...side.map((p) => p.y)) < 1.84, 'pickup side windows stay below the 1.84 m roof');
+  assertGlassProud(2, 'van slit windshield', (p) => p.z > 1.4);
+});
+
+test('10BC-Fix FIX-10 vending: kiosk centres ≥ 1.16 m apart in every sector, loops 0..2; collider 2.05 m tall', () => {
+  for (const { L, loop, vend } of LOOPED) {
+    let min = Infinity;
+    for (let i = 0; i < vend.length; i++) for (let j = i + 1; j < vend.length; j++) min = Math.min(min, Math.hypot(vend[i][0] - vend[j][0], vend[i][1] - vend[j][1]));
+    assert.ok(vend.length >= 4, `loop ${loop} S${L.sector.index}: kiosks placed (${vend.length})`);
+    assert.ok(min >= 1.16 - 1e-6, `loop ${loop} S${L.sector.index}: closest kiosk pair ${min.toFixed(3)} m ≥ 1.16 m`);
+    // Every kiosk carries a PROP collider reaching the 2.05 m marquee top.
+    for (const [x, z] of vend) {
+      assert.ok(L.colliders.some((c) => c.kind === 'PROP' && Math.abs(c.max.y - 2.05) < 0.01 && x > c.min.x && x < c.max.x && z > c.min.z && z < c.max.z), `loop ${loop} S${L.sector.index}: 2.05 m kiosk collider at (${x.toFixed(1)}, ${z.toFixed(1)})`);
+    }
+  }
+});
+
+test('10BC-Fix FIX-6 / FIX-7 / FIX-9: lantern strings never pierce buildings (loops 0..2), curb LEDs proud of the curb, lamp banner parts hide together', () => {
+  let strings = 0;
+  for (const { L, loop, strings: ss } of LOOPED) {
+    const walls = L.colliders.filter((c) => c.kind === 'BUILDING');
+    for (const [p, q] of ss) {
+      strings++;
+      for (const e of [p, q]) {
+        const inside = walls.find((c) => e.x > c.min.x + 0.02 && e.x < c.max.x - 0.02 && e.y > c.min.y + 0.02 && e.y < c.max.y - 0.02 && e.z > c.min.z + 0.02 && e.z < c.max.z - 0.02);
+        assert.ok(!inside, `loop ${loop} S${L.sector.index}: lantern end (${e.x.toFixed(2)}, ${e.y.toFixed(2)}, ${e.z.toFixed(2)}) inside building ${inside?.building}`);
+      }
+    }
+  }
+  assert.ok(strings >= 30, `lantern strings checked (${strings})`);
+  // Curb LEDs: above the 0.12 m curb top and past the kerb face toward the gutter (never buried in the concrete).
+  let leds = 0;
+  for (const L of ALL) {
+    for (const r of L.curbLedBoxes) {
+      leds++;
+      assert.ok(r.box.maxY > 0.12 + 0.01, `LED top ${r.box.maxY} above the curb top`);
+      assert.ok(r.box.minY < 0.12, 'LED seated on the curb lip');
+      const [lo, hi] = r.axis === 'x' ? [r.box.minZ, r.box.maxZ] : [r.box.minX, r.box.maxX];
+      const roadEdge = r.side > 0 ? lo : hi;
+      const curbEdge = r.side > 0 ? hi : lo;
+      assert.ok(r.side > 0 ? roadEdge < r.kerb - 0.01 : roadEdge > r.kerb + 0.01, 'road-side edge proud of the kerb face');
+      assert.ok(r.side > 0 ? curbEdge > r.kerb : curbEdge < r.kerb, 'bar still rests on the curb');
+    }
+  }
+  assert.ok(leds >= 100, `curb LED bars (${leds})`);
+  // Lamp banner: only the pole ring is part 2; flag (5), trim (6), arms (7) all collapse (> 4.5) on odd poles.
+  const lamp = buildLampGeometry();
+  const pos = attr(lamp, 'position');
+  const part = attr(lamp, 'aPart');
+  const yr: Record<number, [number, number]> = {};
+  for (let i = 0; i < part.length; i++) {
+    const x = pos[i * 3];
+    const y = pos[i * 3 + 1];
+    if (part[i] === 2) assert.ok(x <= 0.17, `part-2 vertex at x ${x.toFixed(3)} (banner trim must be part 6)`);
+    const r = (yr[part[i]] ??= [Infinity, -Infinity]);
+    r[0] = Math.min(r[0], y);
+    r[1] = Math.max(r[1], y);
+    // Everything out on the banner side above the accent ring belongs to the hidden banner group.
+    if (x > 0.17 && y > 3.1 && y < 4.5) assert.ok(part[i] > 4.5, `banner vertex (${x.toFixed(2)}, ${y.toFixed(2)}) part ${part[i]} collapses on odd poles`);
+  }
+  for (const p of [5, 6, 7]) assert.ok(yr[p], `banner part ${p} exists`);
+  assert.ok(yr[5][0] <= 3.24 + 1e-3 && yr[5][1] >= 4.38 - 1e-3, `flag spans arm to arm (${yr[5][0].toFixed(2)}..${yr[5][1].toFixed(2)})`);
+  assert.ok(yr[6][0] < 3.25 && yr[6][1] > 3.21, 'trim along the bottom arm');
 });

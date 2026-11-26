@@ -143,9 +143,9 @@ const _q = new THREE.Quaternion();
 const _e = new THREE.Euler();
 const _s1 = new THREE.Vector3(1, 1, 1);
 
-export function place(g: THREE.BufferGeometry, x: number, y: number, z: number, rot: Euler3 = [0, 0, 0]): THREE.BufferGeometry {
+export function place(g: THREE.BufferGeometry, x: number, y: number, z: number, rot: Euler3 = [0, 0, 0], order: THREE.EulerOrder = 'XYZ'): THREE.BufferGeometry {
   const out = g.index ? g.toNonIndexed() : g;
-  _q.setFromEuler(_e.set(rot[0], rot[1], rot[2], 'XYZ'));
+  _q.setFromEuler(_e.set(rot[0], rot[1], rot[2], order));
   _m.compose(new THREE.Vector3(x, y, z), _q, _s1);
   out.applyMatrix4(_m);
   return out;
@@ -176,8 +176,8 @@ export function box(w: number, h: number, d: number, x: number, y: number, z: nu
 }
 
 /** Single-sided quad facing +Z before rotation (2 triangles). */
-export function plane(w: number, h: number, x: number, y: number, z: number, rot: Euler3 = [0, 0, 0]): THREE.BufferGeometry {
-  return place(new THREE.PlaneGeometry(w, h), x, y, z, rot);
+export function plane(w: number, h: number, x: number, y: number, z: number, rot: Euler3 = [0, 0, 0], order: THREE.EulerOrder = 'XYZ'): THREE.BufferGeometry {
+  return place(new THREE.PlaneGeometry(w, h), x, y, z, rot, order);
 }
 
 /** Cylinder along Y (rotate to aim it), open-ended unless `caps`. */
@@ -239,7 +239,8 @@ export function buildHeroWheel(list: PartList, radius: number, width: number, x:
   // Tyre (+Y = outer face): inner crown edge → tread → shoulder → sidewall to the rim.
   local.push([lathe([[0.97 * R, -hw], [R, -hw * 0.5], [R, hw * 0.55], [0.64 * R, hw]], 12), 4, 1]);
   // Alloy barrel (deep dish) and the brake rotor / caliper sitting behind the spokes.
-  local.push([lathe([[0.62 * R, hw * 0.25], [0.62 * R, hw * 0.92]], 8), 6, 0.5]);
+  // 10BC-Fix FIX-8: points run outer face → hub side so the lathe normals face the axle (barrel seen from outside).
+  local.push([lathe([[0.62 * R, hw * 0.92], [0.62 * R, hw * 0.25]], 8), 6, 0.5]);
   const rotor = new THREE.CircleGeometry(0.46 * R, 8);
   rotor.rotateX(-Math.PI / 2);
   rotor.translate(0, hw * 0.3, 0);
@@ -365,10 +366,11 @@ function buildPickup(): PartList {
   ]);
   tag(L, cab, 0);
   // Greenhouse glass: windshield + side windows.
-  tag(L, plane(1.56, 0.78, 0, 1.49, 0.73, [-0.97, 0, 0]), 1);
+  // 10BC-Fix FIX-8: cab front slope (z 0.95, y 1.20) → (z 0.50, y 1.84) leans atan2(0.45, 0.64) back from vertical.
+  tag(L, plane(1.52, 0.64, 0, 1.52, 0.745, [-0.613, 0, 0]), 1);
   mirror((sx) => {
-    // Side window on the sloped upper cab flank.
-    tag(L, plane(0.86, 0.5, sx * 0.93, 1.52, 0.02, [0, sx * Math.PI / 2, sx * -0.3]), 1);
+    // Side window on the sloped upper cab flank (x 1.045, y 1.21) → (x 0.81, y 1.81): tilt first, then yaw (YXZ).
+    tag(L, plane(0.84, 0.48, sx * 0.945, 1.52, 0.02, [-0.373, sx * Math.PI / 2, 0], 'YXZ'), 1);
   });
   // Front: illuminated-rim mesh grille, stacked quad LED bars, armoured bumper, plate, tow hooks.
   tag(L, box(1.36, 0.42, 0.06, 0, 0.76, 2.52), 4, 0.38);
@@ -418,7 +420,8 @@ function buildVan(): PartList {
     { z: -2.475, pts: [[0, 0.32], [0.94, 0.32], [0.99, 0.64], [0.99, 1.48], [0.86, 2.0], [0, 2.04]] },
   ]);
   tag(L, hull, 0);
-  tag(L, plane(1.22, 0.3, 0, 1.64, 1.68, [-1.05, 0, 0]), 1); // slit windshield under the visor brow
+  // 10BC-Fix FIX-8: front armour slope (z 1.95, y 1.18) → (z 1.45, y 2.08) leans atan2(0.50, 0.90) from vertical.
+  tag(L, plane(1.36, 0.34, 0, 1.64, 1.715, [-0.507, 0, 0]), 1); // slit windshield under the visor brow
   tag(L, box(1.84, 0.06, 0.3, 0, 1.94, 1.52), 4); // overhanging steel visor
   tag(L, box(1.7, 0.2, 0.05, 0, 0.62, 2.45), 4, 0.4); // grille mesh
   tag(L, box(1.9, 0.18, 0.2, 0, 0.42, 2.42), 4);

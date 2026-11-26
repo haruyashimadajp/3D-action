@@ -41,7 +41,7 @@ import * as THREE from 'three';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 import { ARCHETYPE, BALCONY, CITY_FX, CITY_SHADING, COLORS, FACADE, FIRE_ESCAPE, LEVEL, LIMITS, MATERIALS, NEON_BLOOM, PHYSICS, RENDER, SILHOUETTE, createRng, clamp } from '../config/constants';
 import { ARCH_A, ARCH_B, ARCH_C, ARCH_D, GLSL_FACADE, facadeFloorY, facadeRoomState, faceKey, isMachineFloor, roomOffset, roomsPerTile, seedInt } from './FacadeLighting';
-import { SECTORS, type SectorDef } from '../config/skills';
+import { SECTORS, type MegaStructureKind, type SectorDef } from '../config/skills';
 import { MEGA_ATLAS, NEON_STRIP_GLOW, ROAD_ATLAS, SIGN_ATLAS, type AtlasRegion, type ProceduralTextureLibrary } from '../engine/ProceduralTextures';
 import {
   GRAMMAR,
@@ -70,6 +70,7 @@ import {
   planGroundFace,
   planMassing,
   quantizeToFloors,
+  canMega,
   withTint,
   type FaceSpan,
   type GroundProgram,
@@ -96,6 +97,9 @@ import {
   type PropInstance,
 } from './CityProps';
 import { CityPropMeshes, type ContactShadowDesc } from './CityPropMeshes';
+
+/** 10BC-Fix FIX-4: megastructure reservation order (rarest eligibility first, as in assignMassings). */
+const MEGA_ORDER: readonly MegaStructureKind[] = ['TWIN_ARCH_GATE', 'CYLINDER_RING_TOWER', 'SLANT_CORP_TOWER', 'X_TRUSS_TOWER'];
 import { CAR_DIMS, CAR_VARIANT_NAMES, buildCarVariant } from './CityVehicles';
 import { KIT_CAP, KIT_VARIANT, buildFurnishingsKit, buildLampGeometry, buildVendingGeometry } from './CityFurniture';
 
@@ -157,6 +161,10 @@ export interface BuildingInfo {
   voidBox?: { x0: number; x1: number; y0: number; y1: number; z0: number; z1: number };
   /** 10B-3 SLANT_CORP_TOWER cap height above the flat deck. */
   slantH?: number;
+  /** 10BC-Fix CYLINDER_RING_TOWER shaft centre. */
+  cylC?: { x: number; z: number };
+  /** 10BC-Fix SLANT_CORP_TOWER cap frame: ramp foot a0 → crest a1 along `axis`, lateral [l0, l1], deck y0, rise h. */
+  slant?: { axis: Axis; a0: number; a1: number; l0: number; l1: number; y0: number; h: number };
   /** 9A-1 first terrace height (0 = none). */
   setbackY?: number;
   readonly index: number;
@@ -310,6 +318,10 @@ export interface SectorLayout {
   readonly megaBillboards: readonly MegaBillboardRecord[];
   /** 10B-1 the open pocket(s) built as a covered cyber street-market (≤ 1 per district). */
   readonly marketRects: readonly RectXZ[];
+  /** 10BC-Fix FIX-1 QA: each market ridge trestle (world AABBs of its cross-tie, king-post and the aisle posts under it). */
+  readonly marketTrestles: ReadonlyArray<{ readonly tie: Aabb3; readonly king: Aabb3; readonly posts: readonly Aabb3[]; readonly awningEdges: readonly Aabb3[] }>;
+  /** 10BC-Fix FIX-7 QA: curb LED bar AABBs with the kerb line (lateral coord of the curb's road face) and road side. */
+  readonly curbLedBoxes: ReadonlyArray<{ readonly box: Aabb3; readonly axis: Axis; readonly kerb: number; readonly side: 1 | -1 }>;
   /** 10B-2 audit: every 1F street doorway assembly and every 1F pier (face frame). */
   readonly groundDoors: readonly GroundDoorRecord[];
   readonly groundPiers: readonly GroundPierRecord[];
@@ -2069,22 +2081,27 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
     const mat = new THREE.MeshStandardMaterial({ color: 0x252a33, roughness: 0.4, metalness: 0.85, emissive: new THREE.Color(0xffffff) });
     const lamp = new THREE.Color(COLORS.STREET_LAMP);
     mat.onBeforeCompile = (shader) => {
+      // 10BC-Fix FIX-13: close-up metal picks up the city lights and the baked per-vertex AO.
+      this.injectCityLights(shader);
       shader.vertexShader = shader.vertexShader
-        .replace('#include <common>', '#include <common>\nattribute float aPart;\nattribute vec3 aTint;\nvarying float vPart;\nvarying vec3 vTint;')
-        .replace('#include <uv_vertex>', '#include <uv_vertex>\nvPart = aPart;\nvTint = aTint;')
+        .replace('#include <common>', '#include <common>\nattribute float aPart;\nattribute float aAo;\nattribute vec3 aTint;\nvarying float vPart;\nvarying float vAoL;\nvarying vec3 vTint;')
+        .replace('#include <uv_vertex>', '#include <uv_vertex>\nvPart = aPart;\nvAoL = aAo;\nvTint = aTint;')
+        // 10BC-Fix FIX-9: flag cloth (5), banner trim (6) and banner arms (7) collapse together on odd poles.
         .replace('#include <begin_vertex>', '#include <begin_vertex>\nif (aPart > 4.5 && (gl_InstanceID & 1) == 1) transformed = vec3(0.0);');
       shader.fragmentShader = shader.fragmentShader
-        .replace('#include <common>', '#include <common>\nvarying float vPart;\nvarying vec3 vTint;')
+        .replace('#include <common>', '#include <common>\nvarying float vPart;\nvarying float vAoL;\nvarying vec3 vTint;')
+        .replace('#include <map_fragment>', '#include <map_fragment>\ndiffuseColor.rgb *= vAoL;')
         .replace('#include <emissivemap_fragment>', `#include <emissivemap_fragment>
           {
             float p = floor(vPart + 0.5);
             // 5B-1: lamp head 1.45 / neon ring 1.30 — point accents bloom (wide window walls stay ≤ 0.28).
-            totalEmissiveRadiance = p == 1.0 ? vec3(${lamp.r.toFixed(3)}, ${lamp.g.toFixed(3)}, ${lamp.b.toFixed(3)}) * ${NEON_BLOOM.LAMP_HEAD.toFixed(2)} : (p == 2.0 ? vTint * ${NEON_BLOOM.LAMP_RING.toFixed(2)} : vec3(0.0));
+            totalEmissiveRadiance = p == 1.0 ? vec3(${lamp.r.toFixed(3)}, ${lamp.g.toFixed(3)}, ${lamp.b.toFixed(3)}) * ${NEON_BLOOM.LAMP_HEAD.toFixed(2)} : ((p == 2.0 || p == 6.0) ? vTint * ${NEON_BLOOM.LAMP_RING.toFixed(2)} : vec3(0.0));
             if (p == 3.0) totalEmissiveRadiance = vec3(0.2, 1.0, 0.35) * 1.1;
             else if (p == 5.0) totalEmissiveRadiance = vTint * 0.32;
+            else if (p == 0.0 || p == 7.0) totalEmissiveRadiance = vec3(0.0);
           }`);
     };
-    mat.customProgramCacheKey = () => 'strand-lamp-v13-hero';
+    mat.customProgramCacheKey = () => 'strand-lamp-v14-hero';
     return mat;
   }
 
@@ -2097,6 +2114,8 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
     const mat = new THREE.MeshStandardMaterial({ color: 0x1c2230, roughness: 0.3, metalness: 0.6, emissive: new THREE.Color(0xffffff) });
     const atlas = this.tex.vendingAtlas ?? null;
     mat.onBeforeCompile = (shader) => {
+      // 10BC-Fix FIX-13: the brushed-steel cabinet picks up the nearby city lights up close.
+      this.injectCityLights(shader);
       shader.uniforms.uVendAtlas = { value: atlas };
       shader.vertexShader = shader.vertexShader
         .replace('#include <common>', '#include <common>\nattribute float aPart;\nattribute float aAo;\nattribute vec3 aTint;\nattribute float aBrand;\nvarying float vPart;\nvarying float vAoV;\nvarying vec3 vTint;\nvarying vec2 vVUv;')
@@ -2125,7 +2144,7 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
           else if (vp == 6.0) totalEmissiveRadiance = vec3(1.0, 0.96, 0.88) * 1.05;
           else if (vp == 7.0) totalEmissiveRadiance = vTint * 0.9;`);
     };
-    mat.customProgramCacheKey = () => 'strand-vending-v12-hero';
+    mat.customProgramCacheKey = () => 'strand-vending-v13-hero';
     return mat;
   }
 
@@ -3654,10 +3673,14 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
       this.lampCones.setMatrixAt(counts.lamp - 1, _m4);
       coneTint.setXYZ(counts.lamp - 1, _col.r, _col.g, _col.b);
     };
+    /** 10BC-Fix FIX-10: placed kiosk centres (no two hero kiosks closer than 1.16 m: bumpers / marquees clear). */
+    const vendPos: Array<[number, number]> = [];
     const addVending = (x: number, z: number, yaw: number, scale = 1): void => {
       if (counts.vend >= CAP.VENDING) return;
-      placeInstance(this.vending, counts.vend, x, 0, z, yaw, scale, scale, scale);
       const vHex = LAMP_TINTS[Math.floor(rng() * LAMP_TINTS.length)];
+      if (vendPos.some(([px, pz]) => Math.hypot(px - x, pz - z) < 1.16)) return;
+      vendPos.push([x, z]);
+      placeInstance(this.vending, counts.vend, x, 0, z, yaw, scale, scale, scale);
       _col.setHex(vHex);
       vendTint.setXYZ(counts.vend, _col.r, _col.g, _col.b);
       vendBrand.setX(counts.vend, (((Math.floor(x * 7.3) + Math.floor(z * 3.1)) % 4) + 4) % 4); // position hash: keeps the RNG stream untouched
@@ -3672,7 +3695,7 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
       const ax = Math.abs(Math.sin(yaw)) > 0.5;
       colliders.push({
         min: new THREE.Vector3(x - (ax ? hd : hw), 0, z - (ax ? hw : hd)),
-        max: new THREE.Vector3(x + (ax ? hd : hw), 1.9 * scale, z + (ax ? hw : hd)),
+        max: new THREE.Vector3(x + (ax ? hd : hw), 2.05 * scale, z + (ax ? hw : hd)),
         kind: 'PROP',
         building: -1,
       });
@@ -4290,6 +4313,79 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
     for (let k = 0; archCount.reduce((s, v) => s + v, 0) < N; k++) archCount[remOrder[k % 4].i]++;
     const archOf: number[] = new Array<number>(N).fill(ARCH_D);
     const byHeight = heights.map((h, i) => ({ i, h, roll: arng() })).sort((p, o) => o.h - p.h || p.roll - o.roll);
+    /** Face sets for a lot (alley-facing / within 4 m of the lockdown wall) shared by the massing candidates. */
+    const lotFaceSets = (i: number): { alley: Set<string>; edge: Set<string> } => {
+      const r = chosen[i];
+      const alley = new Set<string>();
+      for (const [ax, sg] of FACES) if (alleyFaces.has(`${i}:${ax}:${sg}`)) alley.add(faceKeyOf(ax, sg));
+      // 10B-3: faces within 4 m of the lockdown wall never cantilever / open a void toward it.
+      const edge = new Set<string>();
+      if (r.x1 > H - 4) edge.add('x:1');
+      if (r.x0 < -H + 4) edge.add('x:-1');
+      if (r.z1 > H - 4) edge.add('z:1');
+      if (r.z0 < -H + 4) edge.add('z:-1');
+      return { alley, edge };
+    };
+    /** Final 9A-1 roof of lot i under archetype a (band clamp + floor quantization, as applied below). */
+    const roofFor = (i: number, a: number): number => {
+      const [lo0, hi] = heightBand(a, sector.heightMin, sector.heightMax);
+      const lo = isPerimeter(chosen[i]) ? Math.min(hi, Math.max(lo0, PERIM_MIN_H)) : lo0;
+      return quantizeToFloors(a, clamp(heights[i], lo, hi), lo, hi, bridged.has(i) || isPerimeter(chosen[i]) ? 'ceil' : 'round');
+    };
+    // 10BC-Fix FIX-4: deficit-aware Type A reservation. Only when the tallest archCount[0] lots cannot host the
+    // district's megastructure quotas (endless loops reshuffle heights) is the tallest eligible lower lot swapped
+    // in for the shortest A lot that hosts nothing — zero churn whenever the quotas already fit (loop 0).
+    const megaWant = sector.identity?.megastructures ?? {};
+    if (MEGA_ORDER.some((k) => (megaWant[k] ?? 0) > 0)) {
+      const okFor = (k: MegaStructureKind, i: number): boolean =>
+        !((k === 'CYLINDER_RING_TOWER' || k === 'TWIN_ARCH_GATE') && bridged.has(i)) &&
+        canMega(k, { arch: ARCH_A, lot: chosen[i], roofY: roofFor(i, ARCH_A), ...lotFaceSets(i) });
+      const nA = archCount[0];
+      const slots: MegaStructureKind[] = [];
+      for (const k of MEGA_ORDER) for (let n = 0; n < (megaWant[k] ?? 0); n++) slots.push(k);
+      const okMemo = new Map<string, boolean>();
+      const ok = (k: MegaStructureKind, i: number): boolean => {
+        const key = `${k}:${i}`;
+        let v = okMemo.get(key);
+        if (v === undefined) okMemo.set(key, (v = okFor(k, i)));
+        return v;
+      };
+      /** Max bipartite matching of quota slots onto the current A slice (Kuhn); returns the matched positions. */
+      const match = (): { n: number; used: Set<number> } => {
+        const owner = new Array<number>(nA).fill(-1);
+        const tryS = (si: number, seen: boolean[]): boolean => {
+          for (let p = 0; p < nA; p++) {
+            if (seen[p] || !ok(slots[si], byHeight[p].i)) continue;
+            seen[p] = true;
+            if (owner[p] < 0 || tryS(owner[p], seen)) {
+              owner[p] = si;
+              return true;
+            }
+          }
+          return false;
+        };
+        let n = 0;
+        for (let si = 0; si < slots.length; si++) if (tryS(si, new Array<boolean>(nA).fill(false))) n++;
+        return { n, used: new Set(owner.map((o, p) => (o >= 0 ? p : -1)).filter((p) => p >= 0)) };
+      };
+      let m = match();
+      for (let guard = 0; guard < slots.length && m.n < slots.length; guard++) {
+        let dst = -1;
+        for (let p = nA - 1; p >= 0 && dst < 0; p--) if (!m.used.has(p)) dst = p;
+        if (dst < 0) break;
+        let improved = false;
+        for (let src = nA; src < byHeight.length && !improved; src++) {
+          if (!slots.some((k) => ok(k, byHeight[src].i))) continue;
+          [byHeight[src], byHeight[dst]] = [byHeight[dst], byHeight[src]];
+          const m2 = match();
+          if (m2.n > m.n) {
+            m = m2;
+            improved = true;
+          } else [byHeight[src], byHeight[dst]] = [byHeight[dst], byHeight[src]];
+        }
+        if (!improved) break;
+      }
+    }
     byHeight.forEach((o, k) => {
       if (k < archCount[0]) archOf[o.i] = ARCH_A;
       else if (k < archCount[0] + archCount[1]) archOf[o.i] = ARCH_B;
@@ -4302,27 +4398,13 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
     // 9A-1: every roof sits on the archetype floor grid (FLOOR_BASE_M[arch] + n · 4 m) inside the archetype ∩ sector
     // band — zero sliced windows; sky-bridge towers round up so Layer 2 keeps its clearance. (Type C bases at 0 m,
     // so its fire escapes still land flush on whole 4 m storeys.)
-    heights.forEach((h, i) => {
-      const a = archOf[i];
-      const [lo0, hi] = heightBand(a, sector.heightMin, sector.heightMax);
-      const lo = isPerimeter(chosen[i]) ? Math.min(hi, Math.max(lo0, PERIM_MIN_H)) : lo0;
-      heights[i] = quantizeToFloors(a, clamp(h, lo, hi), lo, hi, bridged.has(i) || isPerimeter(chosen[i]) ? 'ceil' : 'round');
-    });
+    const roofs = heights.map((_, i) => roofFor(i, archOf[i]));
+    roofs.forEach((y, i) => (heights[i] = y));
 
     // 9A-2: five massings (own rng stream, so streets / cars / lamps stay where they were).
     const SB = SILHOUETTE;
     const mrng = createRng(0x9a55 + sector.index * 211 + loop * 1013);
-    const candidates: MassingCandidate[] = chosen.map((r, i) => {
-      const alley = new Set<string>();
-      for (const [ax, sg] of FACES) if (alleyFaces.has(`${i}:${ax}:${sg}`)) alley.add(faceKeyOf(ax, sg));
-      // 10B-3: faces within 4 m of the lockdown wall never cantilever / open a void toward it.
-      const edge = new Set<string>();
-      if (r.x1 > H - 4) edge.add('x:1');
-      if (r.x0 < -H + 4) edge.add('x:-1');
-      if (r.z1 > H - 4) edge.add('z:1');
-      if (r.z0 < -H + 4) edge.add('z:-1');
-      return { arch: archOf[i], lot: r, roofY: heights[i], alley, edge };
-    });
+    const candidates: MassingCandidate[] = chosen.map((r, i) => ({ arch: archOf[i], lot: r, roofY: heights[i], ...lotFaceSets(i) }));
     const ident = sector.identity;
     const massings = assignMassings(candidates, mrng, ident ? { minCounts: ident.minMassings, mega: ident.megastructures, noMega: bridged } : {});
     const buildings: Building[] = chosen.map((r, i) => {
@@ -4345,6 +4427,8 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
         massing: massings[i],
         plan,
         cylR: plan.cyl?.r,
+        cylC: plan.cyl ? { x: plan.cyl.cx, z: plan.cyl.cz } : undefined,
+        slant: plan.slant ? { axis: plan.slant.axis, a0: plan.slant.a0, a1: plan.slant.a1, l0: plan.slant.l0, l1: plan.slant.l1, y0: plan.slant.y0, h: plan.slant.h } : undefined,
         voidBox: plan.twin
           ? plan.twin.axis === 'x'
             ? { x0: plan.twin.v0, x1: plan.twin.v1, y0: plan.twin.y0, y1: plan.twin.y1, z0: plan.twin.l0, z1: plan.twin.l1 }
@@ -4760,6 +4844,28 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
         }
         G.strips.push(withColor(boxGeoWorld(sl.axis, sl.a1 - sl.sg * 0.12, sl.a1, sl.l0, sl.l1, yT - 0.06, yT + 0.06), neonB, 1.8));
         rampColliders.push({ axis: sl.axis, lateralMin: sl.l0, lateralMax: sl.l1, alongStart: sl.a1, alongEnd: sl.a0, yStart: yT, yEnd: sl.y0, thickness: 0.5 });
+        // 10BC-Fix FIX-3: seal the hollow cap's triangular sides with stepped solid bands under the ramp slab, each
+        // kept ≥ slope·0.42 below the ramp surface at its high end so the centre-sampled ramp never snags the feet.
+        {
+          const N = Math.max(8, Math.ceil(sl.h / 0.75));
+          const slope = sl.h / Math.abs(sl.a1 - sl.a0);
+          const clearance = Math.max(0.42, slope * 0.42);
+          for (let i = 0; i < N; i++) {
+            const t0 = i / N;
+            const t1 = (i + 1) / N;
+            const yTop = sl.y0 + sl.h * t0 - clearance;
+            if (yTop <= sl.y0 + 0.05) continue;
+            const p0 = sl.a0 + (sl.a1 - sl.a0) * t0;
+            const p1 = sl.a0 + (sl.a1 - sl.a0) * t1;
+            const lo = Math.min(p0, p1);
+            const hi = Math.max(p0, p1);
+            colliders.push(
+              sl.axis === 'x'
+                ? { min: V(lo, sl.y0, sl.l0), max: V(hi, yTop, sl.l1), kind: 'BUILDING', building: b.index }
+                : { min: V(sl.l0, sl.y0, lo), max: V(sl.l1, yTop, hi), kind: 'BUILDING', building: b.index },
+            );
+          }
+        }
         const wall = pt(sl.axis, sl.a1 - sl.sg * 0.2, 0, (sl.l0 + sl.l1) / 2);
         const half = (sl.l1 - sl.l0) / 2;
         colliders.push(
@@ -4847,11 +4953,33 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
       // the parapet corner (9A-1).
       const diag = rng() < 0.5 ? 1 : -1;
       const pTop = b.roofY + GRAMMAR.PARAPET_H + GRAMMAR.COPING_H;
+      const cyl = b.plan.cyl;
+      const cylR = cyl?.r;
+      const roofSegs = cylR === undefined ? parapetSegments(b.plan).filter((sg) => Math.abs(sg.y - b.roofY) < 0.1) : [];
       for (const [sx, sz] of [[1, diag], [-1, -diag]]) {
-        const ex = b.cx + sx * (b.halfW + 0.6);
-        const ez = b.cz + sz * (b.halfD + 0.6);
+        let ex = b.cx + sx * (b.halfW + 0.6);
+        let ez = b.cz + sz * (b.halfD + 0.6);
         const base = new THREE.Vector3(b.cx + sx * (b.halfW - 0.16), pTop, b.cz + sz * (b.halfD - 0.16));
-        G.steel.push(beam(base, new THREE.Vector3(ex, b.roofY + 2.4, ez), 0.22), beam(base, base.clone().setY(b.roofY + 2.6), 0.26));
+        let stubY0 = pTop;
+        if (cyl && cylR !== undefined) {
+          // 10BC-Fix FIX-2: round roofs stand the stub on the 12-gon parapet midline (45° vertices), not inside it.
+          const rMid = cylR + 0.12 - GRAMMAR.PARAPET_T * 0.5;
+          const ux = sx / Math.SQRT2;
+          const uz = sz / Math.SQRT2;
+          base.set(cyl.cx + ux * rMid, pTop, cyl.cz + uz * rMid);
+          ex = cyl.cx + ux * (rMid + 0.85);
+          ez = cyl.cz + uz * (rMid + 0.85);
+        } else {
+          // 10BC-Fix FIX-2: a corner on an open (parapet-less) roof edge carries the vertical stub down to the deck.
+          const onParapet = roofSegs.some((sg) => {
+            const lat = sg.ax === 'x' ? base.x : base.z;
+            const al = sg.ax === 'x' ? base.z : base.x;
+            const d = (lat - sg.plane) * sg.sg;
+            return d >= 0.12 - GRAMMAR.PARAPET_T - 0.02 && d <= 0.14 && al >= sg.a0 - 0.02 && al <= sg.a1 + 0.02;
+          });
+          if (!onParapet) stubY0 = b.roofY;
+        }
+        G.steel.push(beam(base, new THREE.Vector3(ex, b.roofY + 2.4, ez), 0.22), beam(base.clone().setY(stubY0), base.clone().setY(b.roofY + 2.6), 0.26));
         addBeacon(new THREE.Vector3(ex, b.roofY + 2.9, ez), 'BUILDING_CORNER');
         roofRects[b.index].push(rectFrom(base.x - 1, base.z - 1, base.x + 1, base.z + 1));
       }
@@ -6501,11 +6629,17 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
         const yaw = ax === 'x' ? (sg > 0 ? Math.PI / 2 : -Math.PI / 2) : sg > 0 ? 0 : Math.PI;
         const n = 2 + Math.floor(rng() * 2);
         const off = 0.45;
+        // 10BC-Fix FIX-10: 1.20 m stride (1.14 m hero kiosk + 6 cm air), every kiosk inside the lot face span.
+        const [fa0, fa1] = lotRange(b, ax);
         for (let k = 0; k < n; k++) {
-          const x = fp.x + (ax === 'x' ? sg * off : k * 1.05);
-          const z = fp.z + (ax === 'z' ? sg * off : k * 1.05);
+          const x = fp.x + (ax === 'x' ? sg * off : k * 1.2);
+          const z = fp.z + (ax === 'z' ? sg * off : k * 1.2);
+          const along = ax === 'x' ? z : x;
+          if (along - 0.57 < fa0 || along + 0.57 > fa1) continue;
+          // Never against a 1F ground pier (they stand 0.24–0.36 m proud of the wall; the kiosk back is 0.06 m off).
+          if (groundPiers.some((gp) => gp.building === b.index && gp.ax === ax && gp.sg === sg && gp.a0 < along + 0.6 && gp.a1 > along - 0.6)) continue;
           // 10B-2: never in a doorway's 1.8 m clear zone or against its assembly (jambs / portal / canopy).
-          if (inArea(x, z, 2) && !blocksDoor(x, z, 0.55)) addVending(x, z, yaw);
+          if (inArea(x, z, 2) && !blocksDoor(x, z, 0.6)) addVending(x, z, yaw);
         }
       }
     });
@@ -6540,6 +6674,12 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
     // steel ridge with lantern strings and cables, vending at the aisle mouth, a two-car parking bay, crates (9B).
     const parkingSlots: CarSlot[] = [];
     let marketStalls = 0;
+    const marketTrestles: Array<{ tie: Aabb3; king: Aabb3; posts: Aabb3[]; awningEdges: Aabb3[] }> = [];
+    const faceAabb = (f: SF, a0: number, a1: number, y0: number, y1: number, d0: number, d1: number): Aabb3 => {
+      const p = f.P3(a0, y0, d0);
+      const q = f.P3(a1, y1, d1);
+      return { minX: Math.min(p.x, q.x), minY: y0, minZ: Math.min(p.z, q.z), maxX: Math.max(p.x, q.x), maxY: y1, maxZ: Math.max(p.z, q.z) };
+    };
     const STALL_PAINT = [0x3a2a20, 0x2f3a2c, 0x4a3226, 0x272e38, 0x432d26];
     plazas.forEach((r) => {
       const alongX = r.x1 - r.x0 >= r.z1 - r.z0;
@@ -6559,6 +6699,11 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
       const back0 = 0.3;
       const back1 = back0 + Math.max(0.9, rowD * 0.45);
       const front = back0 + rowD;
+      const yOut = 3.05;
+      // 10BC-Fix FIX-1: aisle-edge posts from the first trestle every 6 m plus an exact end post under the last one.
+      const postAs: number[] = [];
+      for (let a = sA0 + 0.2; a < sA1 - 1.5; a += 6) postAs.push(a);
+      postAs.push(sA1 - 0.2);
       for (const sg of [1, -1] as const) {
         const f = sf(ax, sg, sg > 0 ? l0 : l1);
         for (let k = 0; k < nB; k++) {
@@ -6575,11 +6720,10 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
         }
         // Overhanging awning (walkable slab) over the row with a lit lip over the aisle, steel posts at the aisle edge.
         const yIn = 3.45;
-        const yOut = 3.05;
         G.archPaint.push(withTint(f.slant(sA0 - 0.2, sA1 + 0.2, yIn, yOut, back0 - 0.1, front + 0.7, 0.1), PAINT.AWNINGS[sg > 0 ? 0 : 1]));
         G.strips.push(f.glow(PAL[sg > 0 ? 0 : 1 % PAL.length], 1.8, sA0 - 0.2, sA1 + 0.2, yOut - 0.14, yOut - 0.06, front + 0.62, front + 0.72));
         f.coll(sA0 - 0.2, sA1 + 0.2, yOut - 0.1, yIn, back0 - 0.1, front + 0.7, -1);
-        for (let a = sA0; a <= sA1 + 0.01; a += 6) {
+        for (const a of postAs) {
           G.steel.push(...f.bx(a - 0.06, a + 0.06, 0, yOut, front + 0.45, front + 0.57, { ground: true }));
           f.coll(a - 0.06, a + 0.06, 0, yOut, front + 0.45, front + 0.57, -1, 'STEEL');
         }
@@ -6588,7 +6732,19 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
       const fC = sf(ax, 1, l0);
       const mid = S / 2;
       G.steel.push(...fC.bx(sA0, sA1, 4.25, 4.4, mid - 0.08, mid + 0.08));
-      for (const a of [sA0 + 0.2, sA1 - 0.2]) G.steel.push(...fC.bx(a - 0.07, a + 0.07, 3.05, 4.25, mid - 0.07, mid + 0.07));
+      // 10BC-Fix FIX-1: each trestle = cross-tie beam (aisle post to aisle post) + king-post + twin diagonal braces.
+      for (const a of [sA0 + 0.2, sA1 - 0.2]) {
+        marketTrestles.push({
+          tie: faceAabb(fC, a - 0.07, a + 0.07, yOut - 0.08, yOut + 0.06, front + 0.45, S - front - 0.45),
+          king: faceAabb(fC, a - 0.07, a + 0.07, yOut + 0.06, 4.25, mid - 0.07, mid + 0.07),
+          posts: postAs.filter((pa) => Math.abs(pa - a) < 0.07).flatMap((pa) => [faceAabb(fC, pa - 0.06, pa + 0.06, 0, yOut, front + 0.45, front + 0.57), faceAabb(fC, pa - 0.06, pa + 0.06, 0, yOut, S - front - 0.57, S - front - 0.45)]),
+          awningEdges: [faceAabb(fC, a - 0.01, a + 0.01, yOut - 0.1, yOut, front + 0.69, front + 0.7), faceAabb(fC, a - 0.01, a + 0.01, yOut - 0.1, yOut, S - front - 0.7, S - front - 0.69)],
+        });
+        G.steel.push(...fC.bx(a - 0.07, a + 0.07, yOut - 0.08, yOut + 0.06, front + 0.45, S - front - 0.45));
+        fC.coll(a - 0.07, a + 0.07, yOut - 0.08, yOut + 0.06, front + 0.45, S - front - 0.45, -1, 'STEEL');
+        G.steel.push(...fC.bx(a - 0.07, a + 0.07, yOut + 0.06, 4.25, mid - 0.07, mid + 0.07));
+        G.steel.push(beam(fC.P3(a, yOut, front + 0.51), fC.P3(a, 4.28, mid), 0.07), beam(fC.P3(a, yOut, S - front - 0.51), fC.P3(a, 4.28, mid), 0.07));
+      }
       for (let a = sA0 + 1.5; a < sA1; a += 3) {
         G.steel.push(...fC.bx(a - 0.015, a + 0.015, 3.86, 3.89, front + 0.6, S - front - 0.6));
         for (const q of [0.38, 0.5, 0.62]) G.strips.push(fC.glow(PAL[Math.floor(a + q * 7) % PAL.length], 1.5, a - 0.13, a + 0.13, 3.45, 3.78, q * S - 0.13, q * S + 0.13));
@@ -7031,6 +7187,7 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
 
     // (1) Glowing sidewalk curb LED guide bars: 1.8 m every 5 m along avenue kerbs (cyan / warm white / crimson, 0.95).
     const CURB_LED = [0x20d8ff, 0xffe0a8, 0xff3050];
+    const curbLedBoxes: Array<{ box: Aabb3; axis: Axis; kerb: number; side: 1 | -1 }> = [];
     streets.forEach((st, si) => {
       if (st.kind !== 'AVENUE') return;
       const lh = laneHalf(st.kind);
@@ -7039,13 +7196,16 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
           let k = 0;
           for (let a = a0 + 3.5; a + 1.8 < a1 - 3.5; a += 5, k++) {
             const c = a + 0.9;
-            const l = st.coord + side * (lh + 0.13);
+            // 10BC-Fix FIX-7: on the curb's upper road-facing lip, 1.5 cm proud of both the gutter face and the top.
+            const l = st.coord + side * (lh + 0.01);
             const cx = st.axis === 'x' ? c : l;
             const cz = st.axis === 'x' ? l : c;
             if (crosswalkZones.some((r) => cx > r.x0 - 1.2 && cx < r.x1 + 1.2 && cz > r.z0 - 1.2 && cz < r.z1 + 1.2)) continue;
             if (!inArea(cx, cz, 2)) continue;
-            G.strips.push(withColor(st.axis === 'x' ? boxAt(1.8, 0.035, 0.12, cx, ROAD_Y + 0.02, cz) : boxAt(0.12, 0.035, 1.8, cx, ROAD_Y + 0.02, cz), CURB_LED[(k + si + (side > 0 ? 1 : 0)) % CURB_LED.length], 0.95));
+            G.strips.push(withColor(st.axis === 'x' ? boxAt(1.8, 0.04, 0.05, cx, 0.115, cz) : boxAt(0.05, 0.04, 1.8, cx, 0.115, cz), CURB_LED[(k + si + (side > 0 ? 1 : 0)) % CURB_LED.length], 0.95));
             stat.curbLeds++;
+            const hl = st.axis === 'x' ? [0.9, 0.025] : [0.025, 0.9];
+            curbLedBoxes.push({ box: { minX: cx - hl[0], minY: 0.095, minZ: cz - hl[1], maxX: cx + hl[0], maxY: 0.135, maxZ: cz + hl[1] }, axis: st.axis, kerb: st.coord + side * lh, side });
           }
         }
       }
@@ -7117,7 +7277,8 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
           const x = pl.x0 + 1.4 + hx + p10Rng() * Math.max(0, pl.x1 - pl.x0 - 2.8 - 2 * hx);
           const z = pl.z0 + 1.4 + hz + p10Rng() * Math.max(0, pl.z1 - pl.z0 - 2.8 - 2 * hz);
           if (x + hx > pl.x1 - 1.3 || z + hz > pl.z1 - 1.3) continue;
-          const fp = rectFrom(x - hx - 0.35, z - hz - 0.35, x + hx + 0.35, z + hz + 0.35);
+          // 10BC-Fix FIX-11: the footprint also covers the exterior AC unit on the +lateral side (reach hL + 0.53 m).
+          const fp = rectFrom(x - hx - 0.35, z - hz - 0.35, x + hx + 0.35 + (alongX ? 0.58 : 0), z + hz + 0.35 + (alongX ? 0 : 0.58));
           if (b.plan.boxes.some((bx) => bx.y0 >= pl.y - 0.05 && fp.x0 < bx.x1 + 0.5 && fp.x1 > bx.x0 - 0.5 && fp.z0 < bx.z1 + 0.5 && fp.z1 > bx.z0 - 0.5)) continue;
           if (roofRects[b.index].some((o) => rectsOverlap(fp, o, 0.7))) continue;
           if (hitsCollider(fp.x0, pl.y, fp.z0, fp.x1, pl.y + 3.2, fp.z1)) continue;
@@ -7156,8 +7317,8 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
           const neon = [0x20d8ff, 0xff2bd6, 0xffa21f][Math.floor(p10Rng() * 3)];
           G.strips.push(withColor(la === 'x' ? boxAt(2 * hL, 0.05, 0.05, cLat, yB + hFront - 0.2, aFront - back * (oh - 0.05)) : boxAt(0.05, 0.05, 2 * hL, aFront - back * (oh - 0.05), yB + hFront - 0.2, cLat), neon, 1.1));
           // Small exterior AC unit on the side + a riser pipe up the back wall.
-          const sideL = cLat + hL + 0.4;
-          G.steel.push(la === 'x' ? boxAt(0.7, 0.5, 0.6, sideL, yB + 0.25, cDepth) : boxAt(0.6, 0.5, 0.7, cDepth, yB + 0.25, sideL));
+          const sideL = cLat + hL + 0.28;
+          G.steel.push(la === 'x' ? boxAt(0.5, 0.48, 0.55, sideL, yB + 0.24, cDepth) : boxAt(0.55, 0.48, 0.5, cDepth, yB + 0.24, sideL));
           G.steel.push(beam(pt(da, aBack - back * 0.1, yB, cLat - hL * 0.5), pt(da, aBack - back * 0.1, yB + hBack + 0.5, cLat - hL * 0.5), 0.07));
           colliders.push({ min: new THREE.Vector3(Math.min(x - hx, x + hx), pl.y, z - hz), max: new THREE.Vector3(x + hx, pl.y + hFront, z + hz), kind: 'PROP', building: b.index });
           stat.shacks++;
@@ -7168,11 +7329,12 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
 
     // (4) Overhead steel gantries across avenues (y 14–20 m, grapple-able) with blinking red beacon dots.
     const GANTRY_MAX = 5;
-    const gantryAt: number[] = [];
     // Avenues first, then side streets (keeps 4–5 gantries per district where the street walls allow it).
     const gantryOrder = streets.map((st, si) => ({ st, si })).sort((p, q) => (p.st.kind === 'AVENUE' ? 0 : 1) - (q.st.kind === 'AVENUE' ? 0 : 1)).map((o) => o.si);
     for (const si of gantryOrder) {
       if (stat.gantries >= GANTRY_MAX) break;
+      // 10BC-Fix FIX-12: the 30 m spacing compares positions along this street only (never across x / z streets).
+      const gantryAt: number[] = [];
       const st = streets[si];
       const ch = corridorHalf(st);
       const across: Axis = st.axis === 'x' ? 'z' : 'x';
@@ -7254,7 +7416,8 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
       const door = groundDoors.find((d) => d.building === g.b.index && d.ax === span.ax && d.sg === span.sg && Math.abs(d.plane - span.plane) < 1e-6);
       if (!door) continue;
       const f = sf(span.ax, span.sg, span.plane);
-      const yaw = span.ax === 'x' ? 0 : -Math.PI / 2;
+      // 10BC-Fix FIX-6: span.ax is the wall NORMAL — an x-normal facade runs along z, so the +X string turns −90°.
+      const yaw = span.ax === 'x' ? -Math.PI / 2 : 0;
       // Lantern string pier to pier across the entrance bay, 4.9 m up, 0.72 m out (clear of the exhaust duct / awning).
       const sa0 = door.bay.a0 - GR.PIER_W_M / 2;
       const sa1 = door.bay.a1 + GR.PIER_W_M / 2;
@@ -7506,7 +7669,7 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
     this.layout = {
       sector,
       loop,
-      buildings: buildings.map(({ index, cx, cz, halfW, halfD, roofY, arch, massing, setbackY, cylR, voidBox, slantH }) => ({ index, cx, cz, halfW, halfD, roofY, arch, massing, setbackY, cylR, voidBox, slantH })),
+      buildings: buildings.map(({ index, cx, cz, halfW, halfD, roofY, arch, massing, setbackY, cylR, cylC, voidBox, slantH, slant }) => ({ index, cx, cz, halfW, halfD, roofY, arch, massing, setbackY, cylR, cylC, voidBox, slantH, slant })),
       colliders,
       ramps: rampColliders,
       anchors,
@@ -7534,6 +7697,8 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
       farTowersInfo: this.farInfo.map((t) => ({ ...t })),
       megaBillboards: megaRecords,
       marketRects: plazas,
+      marketTrestles,
+      curbLedBoxes,
       groundDoors,
       groundPiers,
       stats: {

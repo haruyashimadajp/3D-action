@@ -400,11 +400,11 @@ export function assignMassings(cands: readonly MassingCandidate[], rng: () => nu
   const mins = opts.minCounts ?? {};
   const floorOf = (k: MassingKind): number =>
     isMegaKind(k) ? Infinity : Math.max(1, mins[k as BaseMassingKind] ?? 0, k === 'GALLERY_DANCHI' ? G.GALLERY_MIN_PER_SECTOR : 0);
-  const take = (k: MassingKind, ok: (c: MassingCandidate, i: number) => boolean, score: (c: MassingCandidate) => number): boolean => {
+  const take = (k: MassingKind, ok: (c: MassingCandidate, i: number) => boolean, score: (c: MassingCandidate) => number, floor = floorOf): boolean => {
     let best = -1;
     let bestS = -Infinity;
     cands.forEach((c, i) => {
-      if (kinds[i] === k || !ok(c, i) || count(kinds[i]) <= floorOf(kinds[i])) return;
+      if (kinds[i] === k || !ok(c, i) || count(kinds[i]) <= floor(kinds[i])) return;
       const s = score(c) + rng() * 1e-3;
       if (s > bestS) {
         bestS = s;
@@ -430,11 +430,14 @@ export function assignMassings(cands: readonly MassingCandidate[], rng: () => nu
     GALLERY_DANCHI: [(c) => (c.arch === ARCH_B || c.arch === ARCH_C) && canGallery(c) && galleryFace(c), (c) => (c.arch === ARCH_B ? 100 : 0) + c.roofY * 0.01],
     PENCIL_TOWER: [() => true, (c) => (c.arch === ARCH_C || c.arch === ARCH_D ? 100 : 0) + (isNarrow(c) ? 50 : 0) - minSide(c.lot)],
   };
-  for (const k of MASSING_KINDS) {
-    const want = mins[k] ?? 0;
-    const [ok, score] = baseRule[k];
-    for (let guard = 0; guard < 16 && count(k) < want; guard++) if (!take(k, ok, score)) break;
-  }
+  const topUpBase = (): void => {
+    for (const k of MASSING_KINDS) {
+      const want = mins[k] ?? 0;
+      const [ok, score] = baseRule[k];
+      for (let guard = 0; guard < 16 && count(k) < want; guard++) if (!take(k, ok, score)) break;
+    }
+  };
+  topUpBase();
   const megaScore: Record<MegaStructureKind, (c: MassingCandidate) => number> = {
     X_TRUSS_TOWER: (c) => c.roofY,
     CYLINDER_RING_TOWER: (c) => minSide(c.lot) + c.roofY * 0.1,
@@ -443,10 +446,32 @@ export function assignMassings(cands: readonly MassingCandidate[], rng: () => nu
   };
   // Rarest-eligibility first so a twin-arch / cylinder lot is not taken by a truss tower.
   const megaOrder: MegaStructureKind[] = ['TWIN_ARCH_GATE', 'CYLINDER_RING_TOWER', 'SLANT_CORP_TOWER', 'X_TRUSS_TOWER'];
-  for (const k of megaOrder) {
-    const want = opts.mega?.[k] ?? 0;
-    const needsSolidWalls = k === 'CYLINDER_RING_TOWER' || k === 'TWIN_ARCH_GATE';
-    for (let n = 0; n < want; n++) if (!take(k, (c, i) => !(needsSolidWalls && (opts.noMega?.has(i) ?? false)) && canMega(k, c), megaScore[k])) break;
+  const okMega = (k: MegaStructureKind) => (c: MassingCandidate, i: number): boolean =>
+    !((k === 'CYLINDER_RING_TOWER' || k === 'TWIN_ARCH_GATE') && (opts.noMega?.has(i) ?? false)) && canMega(k, c);
+  // 10BC-Fix FIX-4: still short (endless loops) → generic base massings yield down to the explicit identity
+  // minimum only (megastructures never yield to each other).
+  const megaFloor = (m: MassingKind): number => (isMegaKind(m) ? Infinity : (mins[m as BaseMassingKind] ?? 0));
+  const megaPass = (aware: boolean): void => {
+    megaOrder.forEach((k, ki) => {
+      const want = opts.mega?.[k] ?? 0;
+      const ok = okMega(k);
+      // Shortfall re-run: avoid lots that a later, still-wanted megastructure could also use.
+      const later = aware ? megaOrder.slice(ki + 1).filter((q) => (opts.mega?.[q] ?? 0) > 0) : [];
+      const score = (c: MassingCandidate): number => megaScore[k](c) - 1000 * later.filter((q) => canMega(q, c)).length;
+      for (let n = 0; n < want; n++) if (!take(k, ok, score)) break;
+      for (let guard = 0; guard < 8 && count(k) < want; guard++) if (!take(k, ok, score, aware ? anyBase : megaFloor)) break;
+    });
+  };
+  // Shortfall re-run only: a megastructure may take any base tower; the identity minimums are then restored
+  // from surplus lots (topUpBase never takes a megastructure).
+  const anyBase = (m: MassingKind): number => (isMegaKind(m) ? Infinity : 0);
+  const short = (): boolean => megaOrder.some((k) => count(k) < (opts.mega?.[k] ?? 0));
+  const before = kinds.slice();
+  megaPass(false);
+  if (short()) {
+    kinds.splice(0, kinds.length, ...before);
+    megaPass(true);
+    topUpBase();
   }
   return kinds;
 }
@@ -1167,8 +1192,21 @@ export function doorSockets(f: FaceRef, door: { a: number; w: number; h: number 
  * WALL_SIDE beside the frame (on the pillar front for hotels), WALL_HIGH above the lintel (beside the door lamp on
  * infra doors). `reach` = free depth in front of the wall; `low` = wall-run face; `run` = run-face pier depth.
  */
-export function groundDoorFit(program: GroundProgram, door: { a: number; w: number; h: number }, bay: { a0: number; a1: number } | undefined, reach: number, low: boolean, run: boolean): SocketFit {
+export function groundDoorFit(
+  program: GroundProgram,
+  door: { a: number; w: number; h: number; half?: number },
+  bay: { a0: number; a1: number } | undefined,
+  reach: number,
+  low: boolean,
+  run: boolean,
+): SocketFit {
   const { a, w, h } = door;
+  // 10BC-Fix FIX-5: the hotel pillar-front socket exists only when the portal pillars were actually built
+  // (door.half not clamped below w / 2 + 0.47); otherwise the standard wall-flush side socket is used.
+  const pillars = program === 'CAPSULE_HOTEL' && (door.half === undefined || door.half >= w / 2 + 0.47 - 1e-6);
+  // ALLEY_INFRA wall-high socket clamped inside the bay: clear of the left pier and of the door lamp [a ± 0.16].
+  const highA = bay ? Math.min(a - 0.36, Math.max(bay.a0 + 0.22, a - w / 2 - 0.5)) : Math.min(a - 0.36, a - w / 2 - 0.5);
+  const highOk = !bay || bay.a0 + 0.22 <= a - 0.36;
   const clear = doorClearHalf(w) + (program === 'CAPSULE_HOTEL' ? 0.08 : 0);
   const sideLo = Math.max(a + GRAMMAR.DOOR_CLEAR_M / 2 + 0.02, a + w / 2 + (program === 'CYBER_APARTMENT' ? 0.45 : 0.42));
   const sideHi = (bay ? bay.a1 : a + w / 2 + 1) - 0.05;
@@ -1179,12 +1217,12 @@ export function groundDoorFit(program: GroundProgram, door: { a: number; w: numb
     floorDepth: reach,
     low,
     side:
-      program === 'CAPSULE_HOTEL'
+      pillars
         ? { a: a + w / 2 + 0.36, d: (run ? GRAMMAR.PIER_D_RUN_M : 0.8) + 0.02, w: 0.2 }
         : sideHi - sideLo >= 0.16
           ? { a: (sideLo + sideHi) / 2, d: 0.02, w: sideHi - sideLo }
           : null,
-    high: program === 'ALLEY_INFRA' ? { a: a - w / 2 - 0.5, y: h + 0.3, w: 0.32 } : { a, y: h + 0.42, w: 0.4 },
+    high: program === 'ALLEY_INFRA' ? (highOk ? { a: highA, y: h + 0.3, w: 0.32 } : null) : { a, y: h + 0.42, w: 0.4 },
   };
 }
 

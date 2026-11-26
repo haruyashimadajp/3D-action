@@ -106,8 +106,9 @@ export function buildVendingGeometry(): THREE.BufferGeometry {
 // 3.1 Detailed street lamp (6.65 m, arm reaching +Z over the road)
 // =============================================================================================
 /**
- * aPart: 0 painted cast-iron / steel · 1 luminaire LED lens · 2 neon accent ring + banner trim (instance tint) ·
- * 3 green status LED · 5 banner flag cloth (hidden on every other lamp so only alternating poles carry one).
+ * aPart: 0 painted cast-iron / steel · 1 luminaire LED lens · 2 neon accent ring (instance tint) · 3 green status LED ·
+ * 5 banner flag cloth · 6 banner neon trim · 7 dark-steel banner arms. Parts > 4.5 (flag + trim + arms) collapse
+ * together on every other lamp, so alternating poles carry the banner with nothing left floating.
  */
 export function buildLampGeometry(): THREE.BufferGeometry {
   const L: PartList = [];
@@ -119,11 +120,12 @@ export function buildLampGeometry(): THREE.BufferGeometry {
   tag(L, box(0.22, 0.42, 0.16, 0, 1.35, -0.16), 0);
   tag(L, plane(0.035, 0.035, 0.06, 1.5, -0.2415, [0, Math.PI, 0]), 3);
   for (const y of [0.95, 1.75]) tag(L, cyl(0.1, 0.1, 0.06, 8, 0, y, 0), 0);
-  // Twin banner arms (+X); the upper one carries the district flag (alternating poles) with a neon trim.
-  for (const y of [3.2, 4.4]) tag(L, box(0.55, 0.04, 0.04, 0.3, y, 0), 0);
-  tag(L, plane(0.42, 0.95, 0.35, 3.88, 0.012), 5);
-  tag(L, plane(0.42, 0.95, 0.35, 3.88, -0.012, [0, Math.PI, 0]), 5);
-  tag(L, box(0.42, 0.04, 0.03, 0.35, 3.42, 0), 2);
+  // Twin banner arms (+X) with the district flag stretched arm to arm and a neon trim along its bottom edge
+  // (10BC-Fix FIX-9: arms 7, cloth 5, trim 6 all > 4.5, so they hide together on alternating poles).
+  for (const y of [3.2, 4.4]) tag(L, box(0.55, 0.04, 0.04, 0.3, y, 0), 7);
+  tag(L, plane(0.42, 1.14, 0.35, 3.81, 0.012), 5);
+  tag(L, plane(0.42, 1.14, 0.35, 3.81, -0.012, [0, Math.PI, 0]), 5);
+  tag(L, box(0.42, 0.04, 0.03, 0.35, 3.23, 0), 6);
   tag(L, cyl(0.16, 0.16, 0.07, 8, 0, 3.2, 0), 2); // accent light ring on the pole
   // Curved gooseneck (6-point arc) into the ribbed-heatsink luminaire head with a recessed LED lens.
   const arc = [[5.8, 0], [6.35, 0.25], [6.62, 0.6], [6.65, 1.0], [6.6, 1.5], [6.5, 2.05]];

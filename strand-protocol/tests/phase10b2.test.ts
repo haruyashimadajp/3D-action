@@ -11,7 +11,7 @@ import { SECTORS } from '../src/config/skills';
 import type { RadarEnemySample } from '../src/entities/EnemyManager';
 import { FACADE_BASE_BANDS, type PbrTextureSet, type ProceduralTextureLibrary } from '../src/engine/ProceduralTextures';
 import { PulseRadar } from '../src/ui/HudManager';
-import { DOOR_PIER_GAP_M, GRAMMAR, PROGRAM_DOOR, doorAssemblyHalf, planGroundFace } from '../src/world/BuildingGrammar';
+import { DOOR_PIER_GAP_M, GRAMMAR, PROGRAM_DOOR, doorAssemblyHalf, groundDoorFit, planGroundFace } from '../src/world/BuildingGrammar';
 import { CityBuilder, type GroundDoorRecord, type GroundPierRecord, type SectorLayout } from '../src/world/CityBuilder';
 
 function mockPbr(): Required<PbrTextureSet> {
@@ -201,4 +201,36 @@ test('10B-2 facade atlas: the row-0 street base is door-free (full-width bands o
   assert.ok(!/door|shutter|wicket|entrance|louvre\(|vbar\(|pool\(|graffiti\(/i.test(code), 'no door / shutter / pillar / downlight painting in the base');
   for (const m of code.matchAll(/\bR\(([^,]+),/g)) assert.ok(m[1].trim() === '0' || m[1].trim() === 'x', `R(${m[1]}, …): only full-width bands or random marks`);
   assert.match(code, /0\.2 \+ rng\(\) \* 0\.6/, 'marks are ≤ 0.8 m wide');
+});
+
+// =============================================================================================
+// 10BC-Fix FIX-5: groundDoorFit follows the clamped door assembly
+// =============================================================================================
+test('10BC-Fix FIX-5 groundDoorFit: clamped narrow CAPSULE_HOTEL door keeps WALL_SIDE flush on the wall; ALLEY_INFRA high socket inside the bay', () => {
+  const { w, h } = PROGRAM_DOOR.CAPSULE_HOTEL;
+  const bay = { a0: 0, a1: 4.2 };
+  const a = 2.1;
+  // Pillars omitted (half < w / 2 + 0.47): never the 0.82 m pillar-front socket.
+  for (const half of [w / 2 + 0.2, w / 2 + 0.3, w / 2 + 0.46]) {
+    for (const run of [false, true]) {
+      const fit = groundDoorFit('CAPSULE_HOTEL', { a, w, h, half }, bay, 1, false, run);
+      assert.ok(fit.side, `half ${half.toFixed(2)}: a WALL_SIDE socket exists`);
+      assert.ok(fit.side.d <= 0.05, `half ${half.toFixed(2)}: WALL_SIDE flush (d ${fit.side.d})`);
+      assert.ok(fit.side.a - fit.side.w / 2 >= a + w / 2 + 0.42 - EPS && fit.side.a + fit.side.w / 2 <= bay.a1 - 0.05 + EPS, 'inside the bay, clear of the door');
+    }
+  }
+  // Full portal built: the socket stands on the pillar front.
+  const full = groundDoorFit('CAPSULE_HOTEL', { a, w, h, half: w / 2 + 0.6 }, bay, 1, false, false);
+  assert.ok(full.side && Math.abs(full.side.d - 0.82) < EPS, 'pillar-front socket when the portal exists');
+  // ALLEY_INFRA wall-high socket: clear of the left pier (a0 + 0.22) and of the door lamp [a ± 0.16] (+ 0.16 half width).
+  const ai = PROGRAM_DOOR.ALLEY_INFRA;
+  for (const [a0, a1] of [[0, 4], [0.6, 3.0], [1.0, 3.2], [-2, 4]] as const) {
+    const ad = (a0 + a1) / 2;
+    const fit = groundDoorFit('ALLEY_INFRA', { a: ad, w: ai.w, h: ai.h, half: ai.w / 2 + 0.2 }, { a0, a1 }, 1, false, false);
+    if (a0 + 0.22 > ad - 0.36) assert.equal(fit.high, null, `bay ${a0}..${a1}: no room for the wall-high socket`);
+    else {
+      assert.ok(fit.high, `bay ${a0}..${a1}: wall-high socket`);
+      assert.ok(fit.high.a >= a0 + 0.22 - EPS && fit.high.a <= ad - 0.36 + EPS, `bay ${a0}..${a1}: high.a ${fit.high.a.toFixed(2)} clamped`);
+    }
+  }
 });

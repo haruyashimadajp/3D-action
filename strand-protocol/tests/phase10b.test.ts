@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import * as THREE from 'three';
-import { LEVEL } from '../src/config/constants';
+import { LEVEL, PLAYER } from '../src/config/constants';
 import { MEGA_STRUCTURE_KINDS, SECTORS } from '../src/config/skills';
 import { MEGA_ATLAS, type PbrTextureSet, type ProceduralTextureLibrary } from '../src/engine/ProceduralTextures';
 import {
@@ -20,6 +20,7 @@ import {
   type NeonSignRecord,
   type SectorLayout,
 } from '../src/world/CityBuilder';
+import { GRAMMAR } from '../src/world/BuildingGrammar';
 import { PhysicsWorld } from '../src/world/PhysicsWorld';
 
 function mockPbr(): Required<PbrTextureSet> {
@@ -48,14 +49,18 @@ function mockTextures(): ProceduralTextureLibrary {
 
 const CITY = new CityBuilder(mockTextures());
 /** Built sectors + the merged-mesh census of each (the megastructures must add zero draw calls). */
-const SECTOR_DATA: Array<{ layout: SectorLayout; meshNames: string[] }> = [];
+const SECTOR_DATA: Array<{ layout: SectorLayout; meshNames: string[]; steel: Float32Array }> = [];
 for (let s = 1; s <= SECTORS.length; s++) {
   const layout = CITY.buildSector(s, 0);
   const meshNames: string[] = [];
+  let steel = new Float32Array(0);
   CITY.root.traverse((o) => {
-    if ((o as THREE.Mesh).isMesh) meshNames.push(o.name);
+    if ((o as THREE.Mesh).isMesh) {
+      meshNames.push(o.name);
+      if (o.name === 'Steel') steel = ((o as THREE.Mesh).geometry.getAttribute('position').array as Float32Array).slice();
+    }
   });
-  SECTOR_DATA.push({ layout, meshNames: meshNames.sort() });
+  SECTOR_DATA.push({ layout, meshNames: meshNames.sort(), steel });
 }
 const ALL = SECTOR_DATA.map((d) => d.layout);
 const H = LEVEL.HALF_EXTENT_M;
@@ -320,4 +325,143 @@ test('10B-1 / 10B-2 LockdownBarrier proximity fade (0 beyond 14 m) and mist halo
   for (let i = L.stats.lamps; i < h.count; i++) mistR = Math.max(mistR, attr.getW(i));
   assert.ok(mistR >= 8 && mistR <= 16, `mist radius ${mistR}`);
   assert.equal((mega as THREE.InstancedMesh).count, L.stats.megaBillboards.total);
+});
+
+// =============================================================================================
+// 10BC-Fix regression guards (Part A)
+// =============================================================================================
+/** Steel vertices of a sector inside an AABB (± pad). */
+function steelIn(steel: Float32Array, b: { minX: number; minY: number; minZ: number; maxX: number; maxY: number; maxZ: number }, pad = 0.005): number {
+  let n = 0;
+  for (let i = 0; i < steel.length; i += 3) {
+    const x = steel[i];
+    const y = steel[i + 1];
+    const z = steel[i + 2];
+    if (x >= b.minX - pad && x <= b.maxX + pad && y >= b.minY - pad && y <= b.maxY + pad && z >= b.minZ - pad && z <= b.maxZ + pad) n++;
+  }
+  return n;
+}
+const overlaps = (p: { minX: number; minZ: number; maxX: number; maxZ: number }, q: { minX: number; minZ: number; maxX: number; maxZ: number }, e = 1e-6): boolean =>
+  p.minX <= q.maxX + e && p.maxX >= q.minX - e && p.minZ <= q.maxZ + e && p.maxZ >= q.minZ - e;
+
+test('10BC-Fix FIX-1 market trestles: cross-tie spans the aisle post to post, king-post rests on it, posts stand on y = 0', () => {
+  let trestles = 0;
+  for (const { layout: L, steel } of SECTOR_DATA) {
+    assert.equal(L.marketTrestles.length, 2 * L.marketRects.length, `S${L.sector.index}: two trestles per market`);
+    for (const t of L.marketTrestles) {
+      trestles++;
+      // Real merged steel geometry exists at the tie / king-post boxes (8 box corners each at least).
+      // The tie's own underside (no post / brace / king-post vertex lives at its bottom y) spans the whole aisle.
+      const alongX = t.tie.maxX - t.tie.minX > t.tie.maxZ - t.tie.minZ;
+      let lo = Infinity;
+      let hi = -Infinity;
+      for (let i = 0; i < steel.length; i += 3) {
+        if (Math.abs(steel[i + 1] - t.tie.minY) > 0.003) continue;
+        const x = steel[i];
+        const z = steel[i + 2];
+        if (x < t.tie.minX - 0.005 || x > t.tie.maxX + 0.005 || z < t.tie.minZ - 0.005 || z > t.tie.maxZ + 0.005) continue;
+        const l = alongX ? x : z;
+        lo = Math.min(lo, l);
+        hi = Math.max(hi, l);
+      }
+      const span = alongX ? t.tie.maxX - t.tie.minX : t.tie.maxZ - t.tie.minZ;
+      assert.ok(hi - lo >= span - 0.01, `cross-tie beam built across the aisle (${(hi - lo).toFixed(2)} / ${span.toFixed(2)} m)`);
+      assert.ok(steelIn(steel, t.king) >= 8, 'king-post is built');
+      assert.ok(Math.abs(t.king.minY - t.tie.maxY) < 1e-6, `king-post foot ${t.king.minY} on the tie top ${t.tie.maxY}`);
+      assert.ok(overlaps(t.king, t.tie), 'king-post sits over the tie');
+      assert.equal(t.posts.length, 2, 'an aisle post under each end of the tie');
+      for (const p of t.posts) {
+        assert.ok(steelIn(steel, p) >= 8, 'aisle post is built');
+        assert.ok(Math.abs(p.minY) < 1e-6 && p.maxY >= t.tie.minY - 1e-6, `post y ${p.minY}..${p.maxY} reaches the tie`);
+        assert.ok(overlaps(p, t.tie), 'tie end rests on the post');
+      }
+      // No floating gap: the tie runs under both awning edges, across the aisle centre.
+      for (const e of t.awningEdges) assert.ok(overlaps(e, t.tie), 'tie spans past the awning edge');
+    }
+  }
+  assert.ok(trestles >= 2, `at least one market built (${trestles} trestles)`);
+});
+
+test('10BC-Fix FIX-2 CYLINDER_RING_TOWER roof stubs stand on the round parapet; anchor tips at rMid + 0.85', () => {
+  let cyl = 0;
+  for (const { layout: L, steel } of SECTOR_DATA) {
+    for (const b of L.buildings) {
+      if (b.massing !== 'CYLINDER_RING_TOWER') continue;
+      cyl++;
+      const r = b.cylR as number;
+      const c = b.cylC as { x: number; z: number };
+      const rMid = r + 0.12 - GRAMMAR.PARAPET_T * 0.5;
+      const tips = L.anchors.filter((an) => an.kind === 'BUILDING_CORNER' && Math.abs(an.position.y - (b.roofY + 2.9)) < 0.05 && Math.abs(Math.hypot(an.position.x - c.x, an.position.z - c.z) - (rMid + 0.85)) < 0.05);
+      assert.equal(tips.length, 2, `S${L.sector.index} cylinder ${b.index}: two diagonal anchor tips at rMid + 0.85 (${tips.length})`);
+      for (const tip of tips) {
+        const d = Math.hypot(tip.position.x - c.x, tip.position.z - c.z);
+        const bx = c.x + ((tip.position.x - c.x) / d) * rMid;
+        const bz = c.z + ((tip.position.z - c.z) / d) * rMid;
+        // Top of the vertical stub (roofY + 2.6): its vertices ring the parapet-midline base point.
+        let n = 0;
+        let sx = 0;
+        let sz = 0;
+        for (let i = 0; i < steel.length; i += 3) {
+          if (Math.abs(steel[i + 1] - (b.roofY + 2.6)) > 0.02 || Math.hypot(steel[i] - bx, steel[i + 2] - bz) > 0.4) continue;
+          n++;
+          sx += steel[i];
+          sz += steel[i + 2];
+        }
+        assert.ok(n >= 4, `stub top built over the parapet (${n} vertices)`);
+        const rad = Math.hypot(sx / n - c.x, sz / n - c.z);
+        assert.ok(rad >= r - 0.2 - 1e-6 && rad <= r + 0.12 + 1e-6, `stub base radius ${rad.toFixed(3)} on the parapet [${(r - 0.2).toFixed(2)}, ${(r + 0.12).toFixed(2)}]`);
+      }
+    }
+  }
+  assert.ok(cyl >= 1, 'a cylinder tower exists');
+});
+
+test('10BC-Fix FIX-3 SLANT_CORP_TOWER crown: sides sealed against lateral entry, every stepped band snag-free under the ramp', () => {
+  const physics = new PhysicsWorld();
+  let slants = 0;
+  for (const L of ALL) {
+    physics.setLayout(L);
+    for (const b of L.buildings) {
+      if (b.massing !== 'SLANT_CORP_TOWER') continue;
+      slants++;
+      const sl = b.slant!;
+      const P = (a: number, y: number, l: number): THREE.Vector3 => (sl.axis === 'x' ? new THREE.Vector3(a, y, l) : new THREE.Vector3(l, y, a));
+      const a = sl.a0 + 0.65 * (sl.a1 - sl.a0);
+      const y = b.roofY + (b.slantH as number) * 0.25;
+      const inside = P(a, y, (sl.l0 + sl.l1) / 2);
+      assert.ok(!physics.lineOfSight(P(a, y, sl.l0 - 3), inside, 0), `S${L.sector.index} slant ${b.index}: l0 side sealed`);
+      assert.ok(!physics.lineOfSight(P(a, y, sl.l1 + 3), inside, 0), `S${L.sector.index} slant ${b.index}: l1 side sealed`);
+      const slope = sl.h / Math.abs(sl.a1 - sl.a0);
+      const lo = Math.min(sl.a0, sl.a1);
+      const hi = Math.max(sl.a0, sl.a1);
+      const bands = L.colliders.filter((cl) => {
+        if (cl.building !== b.index || cl.kind !== 'BUILDING' || Math.abs(cl.min.y - sl.y0) > 1e-6 || cl.max.y >= sl.y0 + sl.h - 1e-3) return false;
+        const [c0, c1] = sl.axis === 'x' ? [cl.min.x, cl.max.x] : [cl.min.z, cl.max.z];
+        return c0 >= lo - 1e-6 && c1 <= hi + 1e-6;
+      });
+      assert.ok(bands.length >= 5, `stepped interior bands (${bands.length})`);
+      for (const cl of bands) {
+        const [c0, c1] = sl.axis === 'x' ? [cl.min.x, cl.max.x] : [cl.min.z, cl.max.z];
+        // t0 = band end nearer the ramp foot (a0).
+        const t0 = Math.min(Math.abs(c0 - sl.a0), Math.abs(c1 - sl.a0)) / Math.abs(sl.a1 - sl.a0);
+        const limit = sl.y0 + sl.h * t0 - slope * PLAYER.RADIUS;
+        assert.ok(cl.max.y < limit, `band top ${cl.max.y.toFixed(3)} < ramp at t0 − slope · r ${limit.toFixed(3)} (snag-free)`);
+      }
+    }
+  }
+  assert.ok(slants >= 1, 'a slant tower exists');
+});
+
+test('10BC-Fix FIX-4 endless loops: every sector meets its megastructure quotas in loops 0, 1, 2', () => {
+  const city = new CityBuilder(mockTextures());
+  for (let loop = 0; loop <= 2; loop++) {
+    for (let s = 1; s <= SECTORS.length; s++) {
+      const L = loop === 0 ? ALL[s - 1] : city.buildSector(s, loop);
+      const id = SECTORS[s - 1].identity;
+      for (const [k, n] of Object.entries(id.megastructures)) {
+        assert.ok((L.stats.megastructures[k] ?? 0) >= (n as number), `loop ${loop} S${s}: ${k} ${L.stats.megastructures[k] ?? 0} / ${n}`);
+      }
+      for (const [k, n] of Object.entries(id.minMassings)) assert.ok((L.stats.massings[k] ?? 0) >= (n as number), `loop ${loop} S${s}: ≥ ${n} ${k}`);
+    }
+  }
 });

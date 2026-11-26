@@ -1,6 +1,6 @@
 # Phase 10 Implementation Progress Status
 
-最終更新: 2026-11-25
+最終更新: 2026-11-26
 対象ブランチ: `claude/loving-bohr-lb0uj2`
 
 ---
@@ -10,10 +10,11 @@
 | ステップ | 対象セクション | 状態 | 概要 |
 | --- | --- | --- | --- |
 | **Step 10A-1** | `10A-1`, `10A-2`, `10A-4` | **完了 (Committed: `0f09d4e`)** | 60fps 描画・物理パイプライン最適化（12m CSR 空間グリッド + 2D DDA）、ビジュアル＆構造バグ修正（看板浮遊ゼロ・飛行船18mクリアランス）、5種スクリーンフィルター＆動的シャドウ切替 |
-| **Step 10A-2** | `10A-3`, `10A-3b`, `10A-5`, `10A-6` | **完了 (今回実装・検証済み)** | 3Dマズルフラッシュ＆薬莢排出＆銃身蒸気、冷却弾痕デカール(48)、Sniper 4x ADS レンジファインダー、8の字ストライドヘッドボブ＆バネ・ダンパー反動キック、高所対応モバイル敵 `ALERT` 調査AI＆ボリューメトリックスキャナーコーン、左上 `136×136` 円形パルススキャン・ミニレーダー（Option C: 3D透視マーカー廃止） |
+| **Step 10A-2** | `10A-3`, `10A-3b`, `10A-5`, `10A-6` | **完了 (Committed: `bee4630`)** | 3Dマズルフラッシュ＆薬莢排出＆銃身蒸気、冷却弾痕デカール(48)、Sniper 4x ADS レンジファインダー、8の字ストライドヘッドボブ＆バネ・ダンパー反動キック、高所対応モバイル敵 `ALERT` 調査AI＆ボリューメトリックスキャナーコーン、左上 `136×136` 円形パルススキャン・ミニレーダー（Option C: 3D透視マーカー廃止） |
 | **Step 10B** | `10B-1` 〜 `10B-4` | **完了 (Committed: `22d45dd`)** | 全有効ロット 92% 以上に建物（空き区画は屋根付きサイバー屋台市場 1 か所のみ）、外周 36 m 以上のスカイライン・内周 farTowers (115–220 m)、14 m 以内のみ表示される LockdownBarrier、看板の 100% 英語化、0.35 m 3D AABB 非重複ガード、`MegaBillboards` (2048×1024 英語広告アトラス, cap 140, +1 call: 大通りスクリーン / 90° L 字コーナー / モノリスブレード / 円筒リング)、`lampHalos` 内のミストハロー (+0)、4 種メガストラクチャ (+0)、5 セクターの個性とパレット |
-| **Step 10B-2 修正** | レーダー / 1F ドア | **完了 (今回実装・検証済み)** | `PLAYING` 以外でミニレーダーを完全停止（スイープ・ブリップ・再描画・`radarPing` 停止、オーバーレイ背後で 22% に減光）。1F ドアをベイ中央に配置し部材全体をピアから 0.05 m 以上離す（狭いベイでは門柱・庇を縮小/省略）、外周壁 0.7 m 手前の面にはドアを置かない、ギャラリー柱の正面を避ける、自販機をドア前から排除、イータリーのカウンター棚を隣ベイ内に収める、ファサードアトラス 1 階行の 2D 描き込みドアを撤去（全幅の水平帯のみ） |
-| **Step 10C** | `10C-1` 〜 `10C-3` | **完了 (今回実装・検証済み)** | `src/world/CityVehicles.ts` (`loftSymHull`・3 ヒーロー車両: スーパーカー / ピックアップ / 装甲バン、7 本スポーク・ブレーキキャリパー付きホイール、濡れたクリアコート)、`src/world/CityFurniture.ts` (凹み表示窓付き自販機 + `512×512` 英語 `vendingAtlas`、ガチョウ首街灯、`StreetFurnishingsKit` cap 300 = **+1 call**: 提灯ストリング v0 / カフェパラソル v1、v2・v3 は 10D 予約)、縁石 LED ガイド、英語オープンフレーム看板足場 (`OPEN 24H` / `CYBER RAMEN` / `NIGHT BAR` / `MOTEL 09`)、波板小屋、赤ビーコン付き鉄骨ガントリー (+0 calls) |
+| **Step 10B-2 修正** | レーダー / 1F ドア | **完了 (Committed: `22dfddc`)** | `PLAYING` 以外でミニレーダーを完全停止（スイープ・ブリップ・再描画・`radarPing` 停止、オーバーレイ背後で 22% に減光）。1F ドアをベイ中央に配置し部材全体をピアから 0.05 m 以上離す（狭いベイでは門柱・庇を縮小/省略）、外周壁 0.7 m 手前の面にはドアを置かない、ギャラリー柱の正面を避ける、自販機をドア前から排除、イータリーのカウンター棚を隣ベイ内に収める、ファサードアトラス 1 階行の 2D 描き込みドアを撤去（全幅の水平帯のみ） |
+| **Step 10C** | `10C-1` 〜 `10C-3` | **完了 (Committed: `d9b1c11`)** | `src/world/CityVehicles.ts` (`loftSymHull`・3 ヒーロー車両: スーパーカー / ピックアップ / 装甲バン、7 本スポーク・ブレーキキャリパー付きホイール、濡れたクリアコート)、`src/world/CityFurniture.ts` (凹み表示窓付き自販機 + `512×512` 英語 `vendingAtlas`、ガチョウ首街灯、`StreetFurnishingsKit` cap 300 = **+1 call**: 提灯ストリング v0 / カフェパラソル v1、v2・v3 は 10D 予約)、縁石 LED ガイド、英語オープンフレーム看板足場 (`OPEN 24H` / `CYBER RAMEN` / `NIGHT BAR` / `MOTEL 09`)、波板小屋、赤ビーコン付き鉄骨ガントリー (+0 calls) |
+| **Step 10BC-Fix** | `PHASE10BC_AUDIT_FIX_SPEC.md` FIX-1 〜 FIX-13 | **完了 (本コミット, `d9b1c11` の次)** | 市場トレッスルの横つなぎ梁 + 通路柱 + 斜材（浮遊ゼロ）、円筒タワー屋上アンカー支柱を 12 角形パラペット中心線上へ、`SLANT_CORP_TOWER` 傾斜クラウン側面を段状ソリッドで封鎖（`slope·0.42` クリアランスで引っかかりなし）、ループ 1・2 でもメガストラクチャ割当を保証（不足時のみ A 型予約 + 再割当、ループ 0 は完全不変）、狭い `CAPSULE_HOTEL` / `ALLEY_INFRA` ソケット補正、イータリー提灯の 90° 回転修正、縁石 LED を縁石上端の車道側リップへ、ホイールバレル法線・ピックアップ/バンのガラス角度修正、奇数街灯のバナー部材を一括非表示、自販機ピッチ 1.20 m + 1.16 m 間隔ガード + 2.05 m コライダー、小屋 AC をフットプリント内へ、ガントリー間隔判定を通り単位に、街灯 `aAo` + 街灯/自販機へのシティライト (+0 calls) |
 | **Step 10D** | `10D-1` 〜 `10D-4` | **未着手** | 6B・7B・8A・9A・9B の統合ポリッシュおよび最終パフォーマンス・ビジュアル監査 |
 
 ---
@@ -70,10 +71,11 @@
 ## 検証結果 (`npm run build` & `npm test`)
 
 - `npm run build`: **成功** (`tsc --noEmit && vite build` エラーゼロ)
-- `npm test`: **全 61 テスト合格** (既存 54 テスト + [`tests/phase10a2.test.ts`](file:///home/antigravity/haruyashimadajp/3D-action/strand-protocol/tests/phase10a2.test.ts) の新規 7 テストすべてパス)
+- `npm test`: **全 94 テスト合格** (10C 時点の 86 テスト + 10BC-Fix 回帰テスト 8 件: `tests/phase10b.test.ts` 4 件・`tests/phase10b2.test.ts` 1 件・`tests/phase10c.test.ts` 3 件)
+- 描画コール: Sector 4 HIGH・全敵戦闘中で `renderer.info.render.calls` = 82（S1 80 / S5 79）（10C 比 +0、≤ 120）
 
 ---
 
 ## 次に再開する作業 (Next Steps)
 
-次回は [`PHASE10_OVERHAUL_PLAN.md`](PHASE10_OVERHAUL_PLAN.md) の **Step 10D（統合ポリッシュ・ラーメン屋台 / バス停 = `StreetFurnishingsKit` v2・v3）** から着手してください。Phase 10C の検証: `npm run build` 成功、`npm test` 86/86 合格（新規 `tests/phase10c.test.ts` 10 件、`HERO_3D_MODELING_SPEC.md` §6 の非ブリック輪郭・接地 `min.y≈0`・三角形予算を含む）、Sector 4 HIGH・全敵戦闘中で `renderer.info.render.calls` = 82（10B 比 +1、≤ 120）。Phase 10B の検証: `npm run build` 成功、`npm test` 69/69 合格（新規 `tests/phase10b.test.ts` 8 件）、Sector 4 HIGH・全敵戦闘中で `renderer.info.render.calls` = 81（≤ 120）。10B-2 修正パスの検証: `npm test` 76/76 合格（新規 `tests/phase10b2.test.ts` 7 件）。
+次回は [`PHASE10_OVERHAUL_PLAN.md`](PHASE10_OVERHAUL_PLAN.md) の **Step 10D（統合ポリッシュ・ラーメン屋台 / バス停 = `StreetFurnishingsKit` v2・v3）** から着手してください（10BC-Fix 完了済み）。Phase 10C の検証: `npm run build` 成功、`npm test` 86/86 合格（新規 `tests/phase10c.test.ts` 10 件、`HERO_3D_MODELING_SPEC.md` §6 の非ブリック輪郭・接地 `min.y≈0`・三角形予算を含む）、Sector 4 HIGH・全敵戦闘中で `renderer.info.render.calls` = 82（10B 比 +1、≤ 120）。Phase 10B の検証: `npm run build` 成功、`npm test` 69/69 合格（新規 `tests/phase10b.test.ts` 8 件）、Sector 4 HIGH・全敵戦闘中で `renderer.info.render.calls` = 81（≤ 120）。10B-2 修正パスの検証: `npm test` 76/76 合格（新規 `tests/phase10b2.test.ts` 7 件）。
