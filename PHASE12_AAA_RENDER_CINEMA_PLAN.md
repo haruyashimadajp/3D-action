@@ -232,6 +232,30 @@ Because Phase 13 will replace procedural hero assets (vehicles, street landmarks
 
 ---
 
+## Parallel Execution Plan (Disjoint File Ownership for `strand-worker` Fan-Out)
+
+Use `/implement-spec PHASE12_AAA_RENDER_CINEMA_PLAN.md` (separately for **12A**, then **12B**) with parallel `strand-worker` subagents on strictly non-overlapping files before lead integration:
+
+### Phase 12A Parallel Fan-Out
+> **Pre-Fan-Out Step (Lead, 1 min)**: Add optional `vehicleDetail?: { readonly normalMap: THREE.Texture; readonly roughnessMap: THREE.Texture }` to `ProceduralTextureLibrary` (`ProceduralTextures.ts:68`) before launching Workers A/B/C so Worker C's `CityBuilder.ts` compiles cleanly in parallel!
+
+| Agent | Exclusive Files Owned | Scope |
+| :--- | :--- | :--- |
+| **`strand-worker` A** | `src/engine/Renderer.ts`, `src/config/constants.ts`, `src/config/skills.ts`, `src/ui/HudManager.ts`, `index.html` | Per-sector `256` PMREM `buildEnvironment(palette, idx)`, `setSectorAtmosphere()`, `KineticPostFX` 5-tap Reinhard RCAS + 4-tap gated anamorphic streak, `SHADOW_FRUSTUM_HALF = 30`, persistent `sharpen` toggle |
+| **`strand-worker` B** | `src/engine/ProceduralTextures.ts` | Dedicated `512 × 512` 4-quadrant `vehicleDetail` (`normalMap`, `roughnessMap`) optional on `ProceduralTextureLibrary` |
+| **`strand-worker` C** | `src/world/CityBuilder.ts` | Nearest-8 Mega-Billboard road reflection ribbons (`uMegaReflPos[8]`, `uMegaReflEnabled`, `setLowLatency`), zero-UV `uDetailNormal` car shader, upgraded `strandInterior` + close glass rain streaks, `setSkyHorizon()`, `applyStrandMaterialHooks()` |
+| **Lead Integrator** *(sequential after A/B/C)* | `src/main.ts`, `tests/phase12a.test.ts` | Wire per-sector PMREM, `setSectorAtmosphere` + `setSkyHorizon`, `city.setLowLatency`, `sharpen` apply, tests + `strand-auditor` |
+
+### Phase 12B Parallel Fan-Out
+| Agent | Exclusive Files Owned | Scope |
+| :--- | :--- | :--- |
+| **`strand-worker` A** | `src/entities/EnemyManager.ts`, `src/config/constants.ts` | Recessed torso cavity + Endo-Core + `STRIP_*` roles in `BatchedMesh` (`setVisibleAt` + `detachPart` guards), coupled head flinch, `HITSTOP.BREACH_STUN`/`BOSS_KILL`, VALKYRIE wing-break/kill spectacle |
+| **`strand-worker` B** | `src/player/ViewModelKit.ts`, `src/player/ViewModelRenderer.ts`, `src/player/EquipmentManager.ts` | Valid-GLSL rain streaks + `kWetMat` + `uWetAmount` indoor drying, `-vLocalZ` K-90 wave, empty pistol `uAmmo = 0.22` pulse, grapple anchor `ShockRing` + `0.25 s` `drawRope()` whip wave |
+| **`strand-worker` C** | `src/engine/AudioEngine.ts` | Promoted `this.convolver`, `outdoorFilter`/`outdoorGain`, `roomReverb`/`roomSend`, `setIndoorAcoustics(indoor, openness)`, dystopian PA broadcasts, enriched `bossKill()` |
+| **Lead Integrator** *(sequential after A/B/C)* | `src/world/CityBuilder.ts`, `src/config/skills.ts`, `src/ui/HudManager.ts`, `index.html`, `src/main.ts`, `tests/phase12b.test.ts` | `SkyDome` `uLightningOverride` / `uRealTime`, `microHitstop` setting, `'PHOTO'` state free-cam / exact `ScreenFilterId`s / synchronous PNG capture, indoor query wiring + tests + `strand-auditor` |
+
+---
+
 ## Mandatory Verification & Unit Tests (`tests/phase12a.test.ts`, `tests/phase12b.test.ts`)
 
 ### Phase 12A Tests (`strand-protocol/tests/phase12a.test.ts`)

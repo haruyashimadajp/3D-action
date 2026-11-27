@@ -244,6 +244,29 @@ To keep all Phase 11 interior props, doors, and the first-person cyber-boot clea
 
 ---
 
+## Parallel Execution Plan (Disjoint File Ownership for `strand-worker` Fan-Out)
+
+Use `/implement-spec PHASE11_INTERIORS_DESTRUCTION_PLAN.md` (separately for **11A**, then **11B**) with parallel `strand-worker` subagents on strictly non-overlapping files before lead integration:
+
+### Phase 11A Parallel Fan-Out
+> **Pre-Fan-Out Step (Lead, 1 min)**: Add `'DOOR' | 'GLASS'` to `ColliderKind` (`CityBuilder.ts:110`) and `'LEDGE'` to `AnchorKind` (`CityBuilder.ts:149`) before launching Workers A/B/C so every worker's `tsc --noEmit` stays green!
+
+| Agent | Exclusive Files Owned | Scope |
+| :--- | :--- | :--- |
+| **`strand-worker` A** | `src/world/InteriorBuilder.ts` (new), `src/world/BuildingGrammar.ts` | Hollow room planning, dual `G.bodies` + collider splitting helpers, `InteriorPropsKit` (`v0..v7`), `INTERIOR_PROP_BOUNDS`, floor-grid sky-notch helpers |
+| **`strand-worker` B** | `src/entities/DestructibleManager.ts` (new), `src/entities/EffectsPool.ts` | `InteractiveDoors` (`DOOR_DIMS`, `aDissolve`), `DestructibleGlassPanes`, shared `DestructDebris` (`cap 200`, scanline dissolve), swept projectile `'GLASS'` pass-through & no-scorch on `'DOOR'`/`'GLASS'` |
+| **`strand-worker` C** | `src/player/ViewModelRenderer.ts`, `src/engine/InputManager.ts`, `src/engine/AudioEngine.ts`, `src/ui/HudManager.ts`, `index.html` | First-person `'BootKickRig'` (`'bootPivot'`), `[F/E]` `'INTERACT'` & unconditional `F11` `'FULLSCREEN'`, contextual breach/quiet prompt, `doorBreach`/`doorCreak`/`glassShatter` SE |
+| **Lead Integrator** *(sequential after A/B/C)* | `src/world/CityBuilder.ts`, `src/world/PhysicsWorld.ts`, `src/player/PlayerController.ts`, `src/main.ts`, `tests/phase11a.test.ts` | Hoist `assignPrograms()` + `planInteriors()`, `ColliderKind` `'DOOR'\|'GLASS'`, `AnchorKind` `'LEDGE'`, `findLedge`/`LOS_IGNORE`, pre-`movePlayer` glass/door crash-through, wiring + tests + `strand-auditor` |
+
+### Phase 11B Parallel Fan-Out
+| Agent | Exclusive Files Owned | Scope |
+| :--- | :--- | :--- |
+| **`strand-worker` A** | `src/world/CityPropMeshes.ts`, `src/engine/AudioEngine.ts` | Extend `commit()` to export destructible prop records (`propId`, `kitId`, `instanceIndex`, `shadowIndex`, `tint`); add 6-material `propBreak()` SE |
+| **`strand-worker` B** | `src/entities/DestructibleManager.ts` | `8 m` CSR spatial hash grid for street + interior destructible props, zero-alloc `_zeroMat` instance & shadow hiding, `raycastProp()`, `checkPlayerSlideBreak()`, impact-point stealth distraction |
+| **Lead Integrator** *(sequential after A/B)* | `src/world/CityBuilder.ts`, `src/entities/EffectsPool.ts`, `src/main.ts`, `tests/phase11b.test.ts` | `RoofMechKit` consolidation (`acUnits` + `ducts`, `-1` call), swept projectile `raycastProp()` hook, wiring + tests + `strand-auditor` |
+
+---
+
 ## Mandatory Verification & Unit Tests (`tests/phase11a.test.ts`, `tests/phase11b.test.ts`)
 
 ### Phase 11A Tests (`strand-protocol/tests/phase11a.test.ts`)

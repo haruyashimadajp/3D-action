@@ -1,6 +1,6 @@
 ---
 name: implement-spec
-description: Implement a STRAND // PROTOCOL English design spec end-to-end with mandatory build/test verification, independent strand-auditor subagent review (visual/screenshot + mouse-latency performance), remediation loop, and clean commit/push.
+description: Implement a STRAND // PROTOCOL English design spec end-to-end with parallel disjoint-file worker fan-out (when defined in the spec), mandatory build/test verification, independent strand-auditor subagent review, remediation loop, and clean commit/push.
 argument-hint: <SPEC_FILE.md>
 ---
 
@@ -8,12 +8,16 @@ Execute the target design specification `$ARGUMENTS` on the active git branch (`
 
 ## Stage 1 — Read Spec & Baseline
 1. Run `git status` and read `CLAUDE.md` plus the entire target spec `$ARGUMENTS` (and `HERO_3D_MODELING_SPEC.md` if referenced).
-2. Confirm the exact bounded file list, hard draw-call budget (`<= 120` in Sector 4), mouse-latency constraints, and required unit tests.
+2. Confirm the exact bounded file list, hard draw-call budget (`<= 120` in Sector 4), mouse-latency constraints, required unit tests, and whether `$ARGUMENTS` includes a **`Parallel Execution Plan`**.
 
-## Stage 2 — Implement & Add Regression Tests
-1. Implement every item in `$ARGUMENTS` cleanly within the bounded file list.
-2. Preserve zero per-frame heap allocations in update/render paths, 100% English in-world signage, and all existing comments unrelated to your changes.
-3. Add every unit/regression test mandated by `$ARGUMENTS`.
+## Stage 2 — Implement (Parallel Worker Fan-Out When Supported) & Add Tests
+1. **If `$ARGUMENTS` defines a `Parallel Execution Plan` with 2+ disjoint workers**:
+   - First agree on exact shared TypeScript interfaces (or create tiny shared types if needed).
+   - Launch all disjoint **`strand-worker`** subagents **in parallel in a single turn**, giving each worker ONLY its assigned files and exact spec sections (never overlapping file ownership!).
+   - Once all parallel workers return, perform the **Lead Integration** sequentially on shared hub files (`CityBuilder.ts`, `main.ts`, etc.) and add all mandated unit/regression tests.
+2. **If `$ARGUMENTS` is a small patch spec (no parallel table)**:
+   - Implement cleanly in the main session within the bounded file list and add all mandated unit/regression tests.
+3. Preserve zero per-frame heap allocations in update/render paths, 100% English in-world signage, and all existing comments unrelated to your changes.
 
 ## Stage 3 — Local Build & Test Gate
 1. Inside `strand-protocol/`, run `npm run build` and `npm test`.
