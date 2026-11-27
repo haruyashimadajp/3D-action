@@ -161,6 +161,15 @@ export function isOnFloorGrid(arch: number, y: number): boolean {
   return Math.abs(k - Math.round(k)) < 1e-6 && k >= 0;
 }
 
+/**
+ * 11A-1b: snaps a sky-notch / relief height to the archetype floor grid (nearest `floorTopY(arch, n)`, n ≥ 0), so a
+ * notch band [y, y + 4] never slices a window row in half (Type B: 2 + 4n). The result satisfies `isOnFloorGrid`.
+ */
+export function snapNotchY(arch: number, yTarget: number): number {
+  const n = Math.max(0, Math.round((yTarget - FACADE.FLOOR_BASE_M[arch]) / FACADE.FLOOR_H_M));
+  return floorTopY(arch, n);
+}
+
 /** Whole-floor counts n with floorTopY(arch, n) inside [lo, hi] (n ≥ 1). Empty range → [nMax, nMax]. */
 export function floorRange(arch: number, lo: number, hi: number): [number, number] {
   const base = FACADE.FLOOR_BASE_M[arch];
@@ -1109,6 +1118,23 @@ export function planGroundFace(
     }
   }
   return { program, piers, bays, doors };
+}
+
+/**
+ * 11A-1: the pier / bay grid `planGroundFace` lays over a ground face [a0, a1] (same formula, no rng): 0.48 m piers
+ * centred at `piers[k]`, clear bays [a0, a1] between them. Interior doorways / shopfront windows sit inside one bay
+ * (≥ DOOR_PIER_GAP_M clear of both piers) so the 1F piers frame them instead of crossing them.
+ */
+export function groundBayGrid(a0: number, a1: number): { piers: number[]; bays: Array<[number, number]> } {
+  const G = GRAMMAR;
+  const len = a1 - a0;
+  const nb = Math.max(1, Math.round((len - G.PIER_W_M) / G.BAY_M));
+  const bw = (len - G.PIER_W_M) / nb;
+  const piers: number[] = [];
+  for (let k = 0; k <= nb; k++) piers.push(a0 + G.PIER_W_M / 2 + k * bw);
+  const bays: Array<[number, number]> = [];
+  for (let k = 0; k < nb; k++) bays.push([piers[k] + G.PIER_W_M / 2, piers[k + 1] - G.PIER_W_M / 2]);
+  return { piers, bays };
 }
 
 /** Face frame: along `a`, height `y`, `d` metres out from the wall plane (negative = into the wall). */

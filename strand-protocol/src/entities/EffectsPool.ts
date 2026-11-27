@@ -30,7 +30,8 @@ import {
   createRayHit,
   createTargetHit,
 } from '../world/PhysicsWorld';
-import type { ColliderKind } from '../world/CityBuilder';
+import type { BoxCollider, ColliderKind } from '../world/CityBuilder';
+import type { CityLightInjector } from '../world/CityAtmosphere';
 
 const _relVel = new THREE.Vector3();
 const _a = new THREE.Vector3();
@@ -49,10 +50,28 @@ const _grazePt = new THREE.Vector3();
 /** A wall the round itself stopped on (≤ 5 cm short of the closest point) does not count as cover. */
 const GRAZE_LOS_TOLERANCE_M = 0.05;
 const _segEnd = new THREE.Vector3();
+const _vanishPt = new THREE.Vector3();
 const _ringN = new THREE.Vector3();
 const Y_UP = new THREE.Vector3(0, 1, 0);
+/** 11A-3: dedicated projectile sweep scratch (never touched by burst()/addScorch()/breakable hooks). */
+const _pA = new THREE.Vector3();
+const _pB = new THREE.Vector3();
+const _pD = new THREE.Vector3();
+/** 11A-3: max glass pass-through re-sweeps of one round inside one fixed step. */
+const MAX_GLASS_RESWEEPS = 4;
+/** 11A-3: a round passing through glass continues from 2 cm past the hit point. */
+const GLASS_PASS_ADVANCE_M = 0.02;
 
 export type ProjectileOwner = 'PLAYER' | 'ENEMY';
+
+/**
+ * 11A-2/11A-3: world objects a swept round can break ('GLASS' panes, 'DOOR' leaves). Called synchronously from
+ * `updateProjectiles()` when the world hit kind is 'GLASS' or 'DOOR'. Return true to let the round pass through
+ * (glass, 100 % damage preserved) or false to stop it (doors). `point` / `dir` are pool scratch: copy, never keep.
+ */
+export interface ProjectileBreakables {
+  onProjectileHit(collider: BoxCollider, point: THREE.Vector3, dir: THREE.Vector3, damage: number, sniper: boolean, owner: ProjectileOwner): boolean;
+}
 
 export interface ProjectileSpec {
   readonly owner: ProjectileOwner;
@@ -142,6 +161,8 @@ export const BURST = {
   BREAKER_SPARK: { count: 8, color: 0xbfe8ff, intensity: 3.2, speed: 6.5, spread: 0.55, life: 0.45, gravity: -14, size: 0.03, minor: true },
   /** 10D-4: rain dripping off a storefront canopy lip (falls straight down). */
   CANOPY_DRIP: { count: 1, color: 0xa8d8ff, intensity: 0.7, speed: 0.4, spread: 0.06, life: 0.42, gravity: -9.8, size: 0.022, minor: true },
+  /** 11A-3: one tiny rising spark when a DestructDebris chunk finishes its digital dissolve. */
+  DEBRIS_VANISH: { count: 1, color: 0x7ffcff, intensity: 2.2, speed: 1.1, spread: 0.25, life: 0.45, gravity: 2.6, size: 0.026, minor: true },
 } as const satisfies Record<string, ParticleBurst>;
 
 /** Telegraph-line style (§5.1). */
@@ -177,6 +198,8 @@ export class EffectsPool {
     uCyan: { value: THREE.Color };
     uMagenta: { value: THREE.Color };
     uFogDensity: { value: number };
+    uIndoor: { value: THREE.Vector3[] };
+    uIndoorN: { value: number };
   };
   private rainTime = 0;
 
@@ -305,6 +328,11 @@ export class EffectsPool {
   private readonly rColor = new Float32Array(R_CAP * 3);
   private rNext = 0;
 
+  /** 11A-3: shared tumbling digital-dissolve debris pool (ONE InstancedMesh 'DestructDebris', cap 200, +1 draw call). */
+  readonly debris: DestructDebris;
+  /** 11A-2/11A-3: breakable doors/glass handler for swept rounds (null = plain world stop, never scorched). */
+  private breakables: ProjectileBreakables | null = null;
+
   constructor(scene: THREE.Scene) {
     const count = LIMITS.RAIN_DROPS;
     const geo = new THREE.PlaneGeometry(1, 1);
@@ -319,6 +347,8 @@ export class EffectsPool {
       uCyan: { value: new THREE.Color(COLORS.WALLRUN_CYAN) },
       uMagenta: { value: new THREE.Color(COLORS.NEON_MAGENTA) },
       uFogDensity: { value: RENDER.FOG_DENSITY },
+      uIndoor: { value: Array.from({ length: 20 }, () => new THREE.Vector3()) },
+      uIndoorN: { value: 0 },
     };
     const mat = new THREE.ShaderMaterial({
       transparent: true,
@@ -333,6 +363,8 @@ export class EffectsPool {
         uniform vec3 uFall;
         uniform vec3 uRelVel;
         uniform float uStreakLen;
+        uniform vec3 uIndoor[20];
+        uniform int uIndoorN;
         varying vec2 vUv;
         varying float vDist;
         varying float vSeed;
@@ -343,6 +375,14 @@ export class EffectsPool {
           vec3 p = seed + uFall * uRainTime * speedVar;
           // Wrap into the box centred on the camera.
           p = mod(p - uCamPos + uBox * 0.5, uBox) - uBox * 0.5 + uCamPos;
+          // 11A: no rain inside carved interiors (outside rain stays visible through the glass).
+          for (int i = 0; i < 10; i++) {
+            if (i >= uIndoorN) break;
+            if (all(greaterThan(p, uIndoor[i * 2])) && all(lessThan(p, uIndoor[i * 2 + 1]))) {
+              gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+              return;
+            }
+          }
           float relSpeed = length(uRelVel);
           vec3 dir = relSpeed > 1e-3 ? uRelVel / relSpeed : vec3(0.0, -1.0, 0.0);
           float len = uStreakLen * (0.6 + relSpeed / 30.0);
@@ -712,6 +752,37 @@ export class EffectsPool {
     this.scorch.count = 0;
     this.scorch.renderOrder = 19;
     scene.add(this.scorch);
+
+    // ---- 11A-3 shared DestructDebris pool (one tiny rising spark on every vanish) ----
+    this.debris = new DestructDebris(scene, (x, y, z) => {
+      _vanishPt.set(x, y, z);
+      this.burst(_vanishPt, Y_UP, BURST.DEBRIS_VANISH);
+    });
+  }
+
+  /** 11A-2/11A-3: routes swept-round hits on 'GLASS' / 'DOOR' colliders to the destructible manager (null clears). */
+  /** 11A: interior AABBs (≤ 10) where rain streaks are dropped (call at every district build). */
+  setIndoorVolumes(boxes: ReadonlyArray<{ readonly minX: number; readonly minY: number; readonly minZ: number; readonly maxX: number; readonly maxY: number; readonly maxZ: number }>): void {
+    const u = this.rainUniforms;
+    const n = Math.min(boxes.length, 10);
+    for (let i = 0; i < n; i++) {
+      const b = boxes[i];
+      u.uIndoor.value[i * 2].set(b.minX - 0.3, b.minY - 0.3, b.minZ - 0.3);
+      u.uIndoor.value[i * 2 + 1].set(b.maxX + 0.3, b.maxY + 0.3, b.maxZ + 0.3);
+    }
+    u.uIndoorN.value = n;
+  }
+
+  setBreakables(b: ProjectileBreakables | null): void {
+    this.breakables = b;
+  }
+
+  /**
+   * 11A-3: lets the shared DestructDebris material take the 12 dynamic city lights (call once, ideally before the
+   * first render; a later call recompiles the debris material exactly once).
+   */
+  setCityLightInjector(inject: CityLightInjector | null): void {
+    this.debris.setCityLightInjector(inject);
   }
 
   /**
@@ -1075,7 +1146,8 @@ export class EffectsPool {
     onImpact: (impact: ProjectileImpact) => void,
     graze: GrazeProbe | null = null,
   ): void {
-    for (let i = 0; i < P_CAP; i++) {
+    const brk = this.breakables;
+    outer: for (let i = 0; i < P_CAP; i++) {
       if (!this.pActive[i]) continue;
       const o = i * 3;
       if (this.pSlowT[i] > 0) {
@@ -1089,79 +1161,105 @@ export class EffectsPool {
           this.pSlowK[i] = 1;
         }
       }
-      _a.set(this.pPos[o], this.pPos[o + 1], this.pPos[o + 2]);
-      _d.set(this.pVel[o], this.pVel[o + 1], this.pVel[o + 2]);
-      const speed = _d.length();
+      _pA.set(this.pPos[o], this.pPos[o + 1], this.pPos[o + 2]);
+      _pD.set(this.pVel[o], this.pVel[o + 1], this.pVel[o + 2]);
+      const speed = _pD.length();
       let step = speed * dt;
       const remaining = this.pRange[i] - this.pTravel[i];
       if (step > remaining) step = remaining;
-      _d.divideScalar(speed);
-      _b.copy(_d).multiplyScalar(step).add(_a);
-
-      physics.segmentCast(_a, _b, _worldHit);
+      _pD.divideScalar(speed);
       const owner: ProjectileOwner = this.pOwner[i] === 0 ? 'PLAYER' : 'ENEMY';
       const targets = targetsFor(owner);
-      let tHit = false;
-      if (targets.length) {
-        const pierce = this.pPierce[i] !== 0;
-        physics.raycastTargets(_a, _d, _worldHit.hit ? _worldHit.distance : step, targets, _targetHit, pierce ? this.pSkipGroup[i] : -1, this.pPierce[i] === 1);
-        tHit = _targetHit.hit;
-      }
-      // GRAZE: closest approach of this step's path (up to a world hit) to the player's body axis.
-      if (!tHit && graze && graze.active && !this.pGrazeDone[i]) {
-        _segEnd.copy(_worldHit.hit ? _worldHit.point : _b);
-        this.trackGraze(i, _a, _segEnd, _d, graze, physics);
-      }
-      if (_worldHit.hit || tHit) {
-        const im = this.impact;
-        im.owner = owner;
-        im.tag = this.pTag[i];
-        im.pierce = tHit && (this.pPierce[i] === 1 || (this.pPierce[i] === 2 && !_targetHit.target?.shield));
-        im.damage = this.pDamage[i];
-        im.headMultiplier = this.pHead[i];
-        im.shieldMultiplier = this.pShield[i];
-        im.direction.copy(_d);
-        if (tHit) {
-          im.point.copy(_targetHit.point);
-          im.normal.copy(_d).negate();
-          im.kind = null;
-          im.target = _targetHit.target;
-          im.region = _targetHit.region;
-          im.travelled = this.pTravel[i] + _targetHit.distance;
-        } else {
-          im.point.copy(_worldHit.point);
-          im.normal.copy(_worldHit.normal);
-          im.kind = _worldHit.kind;
-          im.target = null;
-          im.region = 'BODY';
-          im.travelled = this.pTravel[i] + _worldHit.distance;
-          this.burst(im.point, im.normal, im.kind === 'WATER' ? BURST.WATER : BURST.SPARK);
-          if (im.kind !== 'WATER' && im.kind !== 'BARRIER') {
-            this.addScorch(im.point, im.normal, owner === 'ENEMY', im.tag === 1 || im.damage >= 100);
+      // 11A-3: a round passing through glass re-sweeps the REMAINING distance of this step (≤ 4 times).
+      for (let sweep = 0; ; sweep++) {
+        _pB.copy(_pD).multiplyScalar(step).add(_pA);
+        physics.segmentCast(_pA, _pB, _worldHit);
+        let tHit = false;
+        if (targets.length) {
+          const pierce = this.pPierce[i] !== 0;
+          physics.raycastTargets(_pA, _pD, _worldHit.hit ? _worldHit.distance : step, targets, _targetHit, pierce ? this.pSkipGroup[i] : -1, this.pPierce[i] === 1);
+          tHit = _targetHit.hit;
+        }
+        // GRAZE: closest approach of this (sub-)step's path (up to a world hit) to the player's body axis.
+        if (!tHit && graze && graze.active && !this.pGrazeDone[i]) {
+          _segEnd.copy(_worldHit.hit ? _worldHit.point : _pB);
+          this.trackGraze(i, _pA, _segEnd, _pD, graze, physics);
+        }
+        const wk = _worldHit.hit && !tHit ? _worldHit.kind : null;
+        const breakable = wk === 'GLASS' || wk === 'DOOR';
+        if (breakable && brk && _worldHit.collider) {
+          const sniper = this.pTag[i] === 1 || this.pDamage[i] >= 100;
+          const pass = brk.onProjectileHit(_worldHit.collider, _worldHit.point, _pD, this.pDamage[i], sniper, owner);
+          // Hooks may run arbitrary pool code: re-derive the flight direction from the stored velocity.
+          _pD.set(this.pVel[o], this.pVel[o + 1], this.pVel[o + 2]).divideScalar(speed);
+          if (pass && wk === 'GLASS' && sweep < MAX_GLASS_RESWEEPS) {
+            const adv = Math.min(step, _worldHit.distance + GLASS_PASS_ADVANCE_M);
+            _pA.addScaledVector(_pD, adv);
+            this.pTravel[i] += adv;
+            step -= adv;
+            if (step <= 1e-4 || this.pTravel[i] >= this.pRange[i] - 1e-3) {
+              this.pPos[o] = _pA.x;
+              this.pPos[o + 1] = _pA.y;
+              this.pPos[o + 2] = _pA.z;
+              if (this.pTravel[i] >= this.pRange[i] - 1e-3) this.pActive[i] = 0;
+              continue outer;
+            }
+            continue; // full damage preserved: sweep the rest of this step (hitboxes included)
           }
         }
-        if (im.pierce && _targetHit.target) {
-          // Piercing round: keep flying from just past the hit, never re-hitting this body.
-          this.pSkipGroup[i] = _targetHit.target.group ?? _targetHit.target.id;
-          this.pPos[o] = _targetHit.point.x + _d.x * 0.02;
-          this.pPos[o + 1] = _targetHit.point.y + _d.y * 0.02;
-          this.pPos[o + 2] = _targetHit.point.z + _d.z * 0.02;
-          this.pTravel[i] += _targetHit.distance;
+        if (_worldHit.hit || tHit) {
+          const im = this.impact;
+          im.owner = owner;
+          im.tag = this.pTag[i];
+          im.pierce = tHit && (this.pPierce[i] === 1 || (this.pPierce[i] === 2 && !_targetHit.target?.shield));
+          im.damage = this.pDamage[i];
+          im.headMultiplier = this.pHead[i];
+          im.shieldMultiplier = this.pShield[i];
+          im.direction.copy(_pD);
+          if (tHit) {
+            im.point.copy(_targetHit.point);
+            im.normal.copy(_pD).negate();
+            im.kind = null;
+            im.target = _targetHit.target;
+            im.region = _targetHit.region;
+            im.travelled = this.pTravel[i] + _targetHit.distance;
+          } else {
+            im.point.copy(_worldHit.point);
+            im.normal.copy(_worldHit.normal);
+            im.kind = _worldHit.kind;
+            im.target = null;
+            im.region = 'BODY';
+            im.travelled = this.pTravel[i] + _worldHit.distance;
+            // 11A: glass gets no spark; doors spark but are never scorched (no decal hanging in mid-air after a breach).
+            if (im.kind !== 'GLASS') this.burst(im.point, im.normal, im.kind === 'WATER' ? BURST.WATER : BURST.SPARK);
+            if (im.kind !== 'WATER' && im.kind !== 'BARRIER' && im.kind !== 'DOOR' && im.kind !== 'GLASS') {
+              this.addScorch(im.point, im.normal, owner === 'ENEMY', im.tag === 1 || im.damage >= 100);
+            }
+          }
+          if (im.pierce && _targetHit.target) {
+            // Piercing round: keep flying from just past the hit, never re-hitting this body.
+            this.pSkipGroup[i] = _targetHit.target.group ?? _targetHit.target.id;
+            this.pPos[o] = _targetHit.point.x + _pD.x * 0.02;
+            this.pPos[o + 1] = _targetHit.point.y + _pD.y * 0.02;
+            this.pPos[o + 2] = _targetHit.point.z + _pD.z * 0.02;
+            this.pTravel[i] += _targetHit.distance;
+            onImpact(im);
+            if (this.pTravel[i] >= this.pRange[i] - 1e-3) this.pActive[i] = 0;
+            continue outer;
+          }
+          this.pActive[i] = 0;
+          this.pTravel[i] = im.travelled;
+          this.endSmoke(i);
           onImpact(im);
-          if (this.pTravel[i] >= this.pRange[i] - 1e-3) this.pActive[i] = 0;
-          continue;
+          continue outer;
         }
-        this.pActive[i] = 0;
-        this.pTravel[i] = im.travelled;
-        this.endSmoke(i);
-        onImpact(im);
-        continue;
+        this.pPos[o] = _pB.x;
+        this.pPos[o + 1] = _pB.y;
+        this.pPos[o + 2] = _pB.z;
+        this.pTravel[i] += step;
+        if (this.pTravel[i] >= this.pRange[i] - 1e-3) this.pActive[i] = 0;
+        continue outer;
       }
-      this.pPos[o] = _b.x;
-      this.pPos[o + 1] = _b.y;
-      this.pPos[o + 2] = _b.z;
-      this.pTravel[i] += step;
-      if (this.pTravel[i] >= this.pRange[i] - 1e-3) this.pActive[i] = 0;
     }
   }
 
@@ -1418,6 +1516,7 @@ export class EffectsPool {
     if (simDt > 0) this.updateSplashes(cameraPos);
     this.syncTracers(realDt);
     this.scorchTime.value += simDt;
+    this.debris.update(simDt, cameraPos);
     this.updateParticles(simDt);
     this.updateRings(simDt);
     this.syncLines(realTime, viewportH);
@@ -1483,4 +1582,402 @@ function segmentSegmentDistance(p1: THREE.Vector3, q1: THREE.Vector3, p2: THREE.
   const dy = c1y - c2y;
   const dz = c1z - c2z;
   return Math.sqrt(dx * dx + dy * dy + dz * dz);
+}
+
+// =================================================================================================
+// 11A-3 / 11B-2 shared DestructDebris pool
+// =================================================================================================
+/** 11A-3 / 11B-2 DestructDebris tuning (cap 200, simDt physics, scanline dissolve). */
+export const DEBRIS = {
+  CAP: 200,
+  GRAVITY: -22,
+  RESTITUTION: 0.35,
+  /** Horizontal velocity kept on each floor bounce. */
+  FRICTION: 0.62,
+  SLEEP_SPEED: 0.15,
+  TUMBLE_MIN: 6,
+  TUMBLE_MAX: 16,
+  /** Solid tumbling time before the dissolve (random in [MIN, MAX] unless spawn() passes `life`). */
+  LIFE_MIN: 1.4,
+  LIFE_MAX: 2.2,
+  DISSOLVE_S: 0.55,
+  /** Chunks beyond this camera distance freeze their physics (timers still run, so they still vanish). */
+  SKIP_DIST_M: RENDER.MINOR_PARTICLE_SKIP_DIST_M,
+} as const;
+
+/**
+ * 11A-3 signature digital scanline dissolve, shared by DestructDebris and InteractiveDoors so both disintegrate
+ * identically. `strandDissolve(worldPos, d)` with d = (progress 0..1, isGlass 0|1, seed, glowBoost) discards the
+ * dissolved world-grid cells (7 cm cells mixed with 2.8 cm scanline rows) and returns the HDR edge emission
+ * (cyan for glass, amber otherwise; 0.12-wide edge band, HDR 2.2). Requires derivatives-free GLSL ES 3.0 only.
+ */
+export const GLSL_DIGITAL_DISSOLVE = /* glsl */ `
+  float strandDisHash(vec3 p) {
+    p = fract(p * vec3(0.1031, 0.1030, 0.0973));
+    p += dot(p, p.yxz + 33.33);
+    return fract((p.x + p.y) * p.z);
+  }
+  vec3 strandDissolve(vec3 wp, vec4 d) {
+    if (d.x <= 0.0) return vec3(0.0);
+    float n = strandDisHash(floor(wp * 14.0) + d.z * 131.0);
+    float row = fract(floor(wp.y * 36.0) * 0.6180339 + d.z * 7.31);
+    float k = 0.6 * n + 0.4 * row;
+    float t = d.x * 1.12;
+    if (k < t - 0.12) discard;
+    float e = clamp((t - k) / 0.12, 0.0, 1.0);
+    vec3 col = d.y > 0.5 ? vec3(0.25, 0.95, 1.0) : vec3(1.0, 0.58, 0.16);
+    float scan = step(0.5, fract(wp.y * 36.0)) * 0.08 * d.x;
+    return col * (2.2 * e * e + scan) * (1.0 + d.w);
+  }
+`;
+
+/**
+ * Sculpted angular bevelled shard (exactly 20 triangles): an irregular pentagonal band (y ±0.25) capped by two
+ * off-centre shallow pyramids (apex y ±0.5), flat-shaded, all normals outward, bounds within [-0.5, 0.5]³.
+ * Local Y is the THIN axis (flat plates scale Y smallest).
+ */
+export function buildDebrisShardGeometry(): THREE.BufferGeometry {
+  const ring: Array<[number, number]> = [];
+  const radii = [0.5, 0.41, 0.49, 0.37, 0.46];
+  const jitter = [0.0, 0.21, -0.14, 0.18, -0.09];
+  for (let k = 0; k < 5; k++) {
+    const a = ((k + jitter[k]) / 5) * Math.PI * 2;
+    ring.push([Math.cos(a) * radii[k], Math.sin(a) * radii[k]]);
+  }
+  const top: [number, number, number] = [0.06, 0.5, -0.04];
+  const bot: [number, number, number] = [-0.05, -0.5, 0.05];
+  const pos: number[] = [];
+  const tri = (a: readonly number[], b: readonly number[], c: readonly number[]): void => {
+    // Outward winding: the shard is convex and star-shaped around the origin.
+    const ux = b[0] - a[0], uy = b[1] - a[1], uz = b[2] - a[2];
+    const vx = c[0] - a[0], vy = c[1] - a[1], vz = c[2] - a[2];
+    const nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
+    const cx = a[0] + b[0] + c[0], cy = a[1] + b[1] + c[1], cz = a[2] + b[2] + c[2];
+    if (nx * cx + ny * cy + nz * cz >= 0) pos.push(...a, ...b, ...c);
+    else pos.push(...a, ...c, ...b);
+  };
+  for (let k = 0; k < 5; k++) {
+    const p = ring[k];
+    const q = ring[(k + 1) % 5];
+    const ut = [p[0], 0.25, p[1]], vt = [q[0], 0.25, q[1]];
+    const ub = [p[0], -0.25, p[1]], vb = [q[0], -0.25, q[1]];
+    tri(top, ut, vt);
+    tri(bot, ub, vb);
+    tri(ub, vb, vt);
+    tri(ub, vt, ut);
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.computeVertexNormals();
+  return g;
+}
+
+const _dbP = new THREE.Vector3();
+const _dbS = new THREE.Vector3();
+const _dbAxis = new THREE.Vector3();
+const _dbQ = new THREE.Quaternion();
+const _dbQd = new THREE.Quaternion();
+const _dbQt = new THREE.Quaternion();
+const _dbQx = new THREE.Quaternion();
+const _dbM = new THREE.Matrix4();
+const _dbC = new THREE.Color();
+const _dbX = new THREE.Vector3(1, 0, 0);
+const _dbY = new THREE.Vector3(0, 1, 0);
+let _dbSeed = 0x2f6b1d;
+/** Tiny deterministic LCG (zero allocation). */
+function dbRand(): number {
+  _dbSeed = (Math.imul(_dbSeed, 1664525) + 1013904223) >>> 0;
+  return _dbSeed / 4294967296;
+}
+
+/**
+ * 11A-3 / 11B-2 shared debris pool: ONE persistent InstancedMesh 'DestructDebris' (cap 200, +1 draw call while any
+ * chunk lives), pre-allocated SoA ring buffer, simDt physics (Bullet-Time compatible), solid tumbling for 1.4–2.2 s
+ * then a 0.55 s digital scanline dissolve. Zero per-frame allocations. Driven by `EffectsPool.update()`.
+ */
+export class DestructDebris {
+  readonly mesh: THREE.InstancedMesh;
+  /** Chunks spawned so far (verification). */
+  spawned = 0;
+  /** Chunks that completed their dissolve (verification). */
+  vanished = 0;
+  private readonly disAttr: THREE.InstancedBufferAttribute;
+  private readonly mat: THREE.MeshStandardMaterial;
+  private inject: CityLightInjector | null = null;
+  private readonly onVanish: ((x: number, y: number, z: number, glass: boolean) => void) | null;
+  private readonly live = new Uint8Array(DEBRIS.CAP);
+  private readonly pos = new Float32Array(DEBRIS.CAP * 3);
+  private readonly vel = new Float32Array(DEBRIS.CAP * 3);
+  /** Orientation quaternion (x, y, z, w). */
+  private readonly rot = new Float32Array(DEBRIS.CAP * 4);
+  /** World angular velocity (rad/s). */
+  private readonly ang = new Float32Array(DEBRIS.CAP * 3);
+  private readonly scl = new Float32Array(DEBRIS.CAP * 3);
+  private readonly col = new Float32Array(DEBRIS.CAP * 3);
+  private readonly glass = new Uint8Array(DEBRIS.CAP);
+  private readonly floorY = new Float32Array(DEBRIS.CAP);
+  private readonly solid = new Float32Array(DEBRIS.CAP);
+  private readonly age = new Float32Array(DEBRIS.CAP);
+  private readonly seed = new Float32Array(DEBRIS.CAP);
+  private readonly glow = new Float32Array(DEBRIS.CAP);
+  private readonly sleep = new Uint8Array(DEBRIS.CAP);
+  private next = 0;
+  private liveN = 0;
+
+  constructor(scene: THREE.Scene, onVanish: ((x: number, y: number, z: number, glass: boolean) => void) | null = null) {
+    this.onVanish = onVanish;
+    const geo = buildDebrisShardGeometry();
+    this.disAttr = new THREE.InstancedBufferAttribute(new Float32Array(DEBRIS.CAP * 4), 4);
+    this.disAttr.setUsage(THREE.DynamicDrawUsage);
+    geo.setAttribute('aDissolve', this.disAttr);
+    const mat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.58, metalness: 0.45 });
+    mat.onBeforeCompile = (shader) => {
+      if (this.inject) this.inject(shader);
+      shader.vertexShader = shader.vertexShader
+        .replace('#include <common>', '#include <common>\nattribute vec4 aDissolve;\nvarying vec4 vDDis;\nvarying vec3 vDDWorld;')
+        .replace(
+          '#include <worldpos_vertex>',
+          '#include <worldpos_vertex>\nvDDis = aDissolve;\nvDDWorld = (modelMatrix * instanceMatrix * vec4(transformed, 1.0)).xyz;',
+        );
+      shader.fragmentShader = shader.fragmentShader
+        .replace('#include <common>', `#include <common>\nvarying vec4 vDDis;\nvarying vec3 vDDWorld;\n${GLSL_DIGITAL_DISSOLVE}`)
+        .replace(
+          '#include <color_fragment>',
+          `#include <color_fragment>
+          vec3 ddEdge = strandDissolve(vDDWorld, vDDis);
+          bool ddGlass = vDDis.y > 0.5;
+          if (ddGlass) diffuseColor.rgb = diffuseColor.rgb * 0.6 + 0.04;`,
+        )
+        .replace('#include <roughnessmap_fragment>', '#include <roughnessmap_fragment>\nroughnessFactor = ddGlass ? 0.06 : 0.58;')
+        .replace('#include <metalnessmap_fragment>', '#include <metalnessmap_fragment>\nmetalnessFactor = ddGlass ? 0.85 : 0.45;')
+        .replace(
+          '#include <emissivemap_fragment>',
+          `#include <emissivemap_fragment>
+          totalEmissiveRadiance = ddEdge;
+          if (ddGlass) {
+            float ddF = pow(1.0 - clamp(abs(dot(normal, normalize(vViewPosition))), 0.0, 1.0), 3.0);
+            totalEmissiveRadiance += vec3(0.55, 0.85, 1.0) * (0.05 + 0.7 * ddF);
+          }`,
+        );
+    };
+    mat.customProgramCacheKey = () => (this.inject ? 'strand-debris-v1-lit' : 'strand-debris-v1');
+    this.mat = mat;
+    this.mesh = new THREE.InstancedMesh(geo, mat, DEBRIS.CAP);
+    this.mesh.name = 'DestructDebris';
+    this.mesh.frustumCulled = false;
+    this.mesh.count = 0;
+    this.mesh.visible = false;
+    this.mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    this.mesh.setColorAt(0, _dbC.setRGB(1, 1, 1));
+    if (this.mesh.instanceColor) this.mesh.instanceColor.setUsage(THREE.DynamicDrawUsage);
+    scene.add(this.mesh);
+  }
+
+  /** Live chunk count. */
+  get count(): number {
+    return this.liveN;
+  }
+
+  /** Adds the 12 dynamic city lights to the debris material (recompiles it once). */
+  setCityLightInjector(inject: CityLightInjector | null): void {
+    if (this.inject === inject) return;
+    this.inject = inject;
+    this.mat.needsUpdate = true;
+  }
+
+  /** Clears every chunk (sector change / retry). */
+  clear(): void {
+    this.live.fill(0);
+    this.liveN = 0;
+    this.next = 0;
+    this.mesh.count = 0;
+    this.mesh.visible = false;
+  }
+
+  /**
+   * Spawns one chunk (zero allocation). Position / velocity in world metres; (sx, sy, sz) = chunk size in metres
+   * (the smallest component becomes the thin local Y axis); `color` sRGB hex; `floorY` = bounce plane; `life` =
+   * solid time before the dissolve (< 0 → random 1.4–2.2 s); `glowBoost` scales the dissolve edge emission.
+   * Recycles the oldest slot when all 200 are alive. Returns the slot.
+   */
+  spawn(px: number, py: number, pz: number, vx: number, vy: number, vz: number, sx: number, sy: number, sz: number, color: number, isGlass: boolean, floorY: number, life = -1, glowBoost = 0): number {
+    let i = this.next;
+    for (let k = 0; k < DEBRIS.CAP; k++) {
+      const j = (this.next + k) % DEBRIS.CAP;
+      if (!this.live[j]) {
+        i = j;
+        break;
+      }
+    }
+    this.next = (i + 1) % DEBRIS.CAP;
+    if (!this.live[i]) this.liveN++;
+    this.live[i] = 1;
+    // Thin axis → local Y (the settle pose lays the chunk flat on it).
+    if (sx < sy && sx <= sz) {
+      const t = sx;
+      sx = sy;
+      sy = t;
+    } else if (sz < sy && sz < sx) {
+      const t = sz;
+      sz = sy;
+      sy = t;
+    }
+    const o = i * 3;
+    this.pos[o] = px;
+    this.pos[o + 1] = Math.max(py, floorY + sy * 0.5);
+    this.pos[o + 2] = pz;
+    this.vel[o] = vx;
+    this.vel[o + 1] = vy;
+    this.vel[o + 2] = vz;
+    this.scl[o] = Math.max(sx, 1e-3);
+    this.scl[o + 1] = Math.max(sy, 1e-3);
+    this.scl[o + 2] = Math.max(sz, 1e-3);
+    _dbC.setHex(color);
+    this.col[o] = _dbC.r;
+    this.col[o + 1] = _dbC.g;
+    this.col[o + 2] = _dbC.b;
+    _dbAxis.set(dbRand() * 2 - 1, dbRand() * 2 - 1, dbRand() * 2 - 1);
+    if (_dbAxis.lengthSq() < 1e-4) _dbAxis.set(0.3, 1, 0.2);
+    _dbAxis.normalize();
+    _dbQ.setFromAxisAngle(_dbAxis, dbRand() * Math.PI * 2);
+    const r = i * 4;
+    this.rot[r] = _dbQ.x;
+    this.rot[r + 1] = _dbQ.y;
+    this.rot[r + 2] = _dbQ.z;
+    this.rot[r + 3] = _dbQ.w;
+    _dbAxis.set(dbRand() * 2 - 1, dbRand() * 2 - 1, dbRand() * 2 - 1);
+    if (_dbAxis.lengthSq() < 1e-4) _dbAxis.set(1, 0.2, 0.4);
+    _dbAxis.normalize().multiplyScalar(DEBRIS.TUMBLE_MIN + dbRand() * (DEBRIS.TUMBLE_MAX - DEBRIS.TUMBLE_MIN));
+    this.ang[o] = _dbAxis.x;
+    this.ang[o + 1] = _dbAxis.y;
+    this.ang[o + 2] = _dbAxis.z;
+    this.glass[i] = isGlass ? 1 : 0;
+    this.floorY[i] = floorY;
+    this.solid[i] = life >= 0 ? life : DEBRIS.LIFE_MIN + dbRand() * (DEBRIS.LIFE_MAX - DEBRIS.LIFE_MIN);
+    this.age[i] = 0;
+    this.seed[i] = dbRand();
+    this.glow[i] = glowBoost;
+    this.sleep[i] = 0;
+    this.spawned++;
+    return i;
+  }
+
+  /** Vector convenience wrapper of {@link spawn} (zero allocation). */
+  spawnV(pos: THREE.Vector3, vel: THREE.Vector3, scale: THREE.Vector3, color: number, isGlass: boolean, floorY: number, life = -1, glowBoost = 0): number {
+    return this.spawn(pos.x, pos.y, pos.z, vel.x, vel.y, vel.z, scale.x, scale.y, scale.z, color, isGlass, floorY, life, glowBoost);
+  }
+
+  /** Simulates (simDt) and uploads every live chunk. Called by EffectsPool.update(). */
+  update(simDt: number, camPos: THREE.Vector3): void {
+    if (this.liveN === 0) {
+      if (this.mesh.count !== 0) {
+        this.mesh.count = 0;
+        this.mesh.visible = false;
+      }
+      return;
+    }
+    const skip2 = DEBRIS.SKIP_DIST_M * DEBRIS.SKIP_DIST_M;
+    const settleK = 1 - Math.exp(-14 * simDt);
+    let n = 0;
+    for (let i = 0; i < DEBRIS.CAP; i++) {
+      if (!this.live[i]) continue;
+      const o = i * 3;
+      const r = i * 4;
+      this.age[i] += simDt;
+      const prog = (this.age[i] - this.solid[i]) / DEBRIS.DISSOLVE_S;
+      if (prog >= 1) {
+        this.live[i] = 0;
+        this.liveN--;
+        this.vanished++;
+        if (this.onVanish) this.onVanish(this.pos[o], this.pos[o + 1], this.pos[o + 2], this.glass[i] === 1);
+        continue;
+      }
+      _dbQ.set(this.rot[r], this.rot[r + 1], this.rot[r + 2], this.rot[r + 3]);
+      const dx = this.pos[o] - camPos.x;
+      const dy = this.pos[o + 1] - camPos.y;
+      const dz = this.pos[o + 2] - camPos.z;
+      if (simDt > 0 && !this.sleep[i] && dx * dx + dy * dy + dz * dz <= skip2) {
+        this.vel[o + 1] += DEBRIS.GRAVITY * simDt;
+        this.pos[o] += this.vel[o] * simDt;
+        this.pos[o + 1] += this.vel[o + 1] * simDt;
+        this.pos[o + 2] += this.vel[o + 2] * simDt;
+        const ax = this.ang[o], ay = this.ang[o + 1], az = this.ang[o + 2];
+        const w = Math.sqrt(ax * ax + ay * ay + az * az);
+        if (w > 1e-5) {
+          _dbAxis.set(ax / w, ay / w, az / w);
+          _dbQd.setFromAxisAngle(_dbAxis, w * simDt);
+          _dbQ.premultiply(_dbQd).normalize();
+        }
+        // Lowest point of the rotated chunk (row 1 of the rotation matrix · half extents).
+        const qx = _dbQ.x, qy = _dbQ.y, qz = _dbQ.z, qw = _dbQ.w;
+        const r10 = 2 * (qx * qy + qw * qz);
+        const r11 = 1 - 2 * (qx * qx + qz * qz);
+        const r12 = 2 * (qy * qz - qw * qx);
+        const low = 0.5 * (Math.abs(r10) * this.scl[o] + Math.abs(r11) * this.scl[o + 1] + Math.abs(r12) * this.scl[o + 2]);
+        const fy = this.floorY[i];
+        let grounded = false;
+        if (this.pos[o + 1] - low <= fy) {
+          this.pos[o + 1] = fy + low;
+          grounded = true;
+          if (this.vel[o + 1] < -0.8) {
+            // Real impact: bounce (restitution 0.35) and lose horizontal speed (friction 0.62).
+            this.vel[o + 1] = -this.vel[o + 1] * DEBRIS.RESTITUTION;
+            if (this.vel[o + 1] < 0.6) this.vel[o + 1] = 0;
+            // Glass shards bite on impact (no skating off a narrow deck / ledge past their probed floor).
+            const fr = this.glass[i] ? 0 : DEBRIS.FRICTION;
+            this.vel[o] *= fr;
+            this.vel[o + 2] *= fr;
+            this.ang[o] *= 0.55;
+            this.ang[o + 1] *= 0.55;
+            this.ang[o + 2] *= 0.55;
+          } else if (this.vel[o + 1] < 0) this.vel[o + 1] = 0; // resting contact
+        }
+        if (grounded) {
+          // Rolling friction while in contact + settle flat on the thin local Y axis (yaw preserved).
+          const fk = Math.exp(-5 * simDt);
+          this.vel[o] *= fk;
+          this.vel[o + 2] *= fk;
+          const sp = Math.sqrt(this.vel[o] * this.vel[o] + this.vel[o + 1] * this.vel[o + 1] + this.vel[o + 2] * this.vel[o + 2]);
+          if (sp < 1.5) {
+            const r00 = 1 - 2 * (qy * qy + qz * qz);
+            const r20 = 2 * (qx * qz - qw * qy);
+            _dbQt.setFromAxisAngle(_dbY, Math.atan2(-r20, r00));
+            if (r11 < 0) _dbQt.multiply(_dbQx.setFromAxisAngle(_dbX, Math.PI));
+            _dbQ.slerp(_dbQt, settleK);
+            const ak = Math.exp(-8 * simDt);
+            this.ang[o] *= ak;
+            this.ang[o + 1] *= ak;
+            this.ang[o + 2] *= ak;
+            if (sp < DEBRIS.SLEEP_SPEED && Math.abs(r11) > 0.995) {
+              // Asleep: lie exactly flat on the floor (|min.y − floorY| = 0).
+              this.sleep[i] = 1;
+              _dbQ.copy(_dbQt);
+              this.vel[o] = this.vel[o + 1] = this.vel[o + 2] = 0;
+              this.ang[o] = this.ang[o + 1] = this.ang[o + 2] = 0;
+              this.pos[o + 1] = fy + this.scl[o + 1] * 0.5;
+            }
+          }
+        }
+        this.rot[r] = _dbQ.x;
+        this.rot[r + 1] = _dbQ.y;
+        this.rot[r + 2] = _dbQ.z;
+        this.rot[r + 3] = _dbQ.w;
+      }
+      _dbP.set(this.pos[o], this.pos[o + 1], this.pos[o + 2]);
+      _dbS.set(this.scl[o], this.scl[o + 1], this.scl[o + 2]);
+      _dbM.compose(_dbP, _dbQ, _dbS);
+      this.mesh.setMatrixAt(n, _dbM);
+      _dbC.setRGB(this.col[o], this.col[o + 1], this.col[o + 2]);
+      this.mesh.setColorAt(n, _dbC);
+      this.disAttr.setXYZW(n, prog > 0 ? prog : 0, this.glass[i], this.seed[i], this.glow[i]);
+      n++;
+    }
+    this.mesh.count = n;
+    this.mesh.visible = n > 0;
+    if (n > 0) {
+      this.mesh.instanceMatrix.needsUpdate = true;
+      if (this.mesh.instanceColor) this.mesh.instanceColor.needsUpdate = true;
+      this.disAttr.needsUpdate = true;
+    }
+  }
 }

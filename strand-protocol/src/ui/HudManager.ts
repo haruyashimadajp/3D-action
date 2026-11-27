@@ -474,6 +474,14 @@ export class HudManager {
   private hitT = 0;
   private hitKind: HitMarkerKind = 'BODY';
   private readonly evadeEl = el('evade');
+  /** 11A-2 contextual door prompt below the reticle ("[F] OPEN QUIETLY" / "[F] BREACH KICK"). */
+  private readonly interactEl = el('interact-prompt');
+  private interactText: string | null = null;
+  /** 11A-2 short event callout ("BREACH STUN"). */
+  private readonly eventEl = el('hud-event');
+  private readonly pauseFullscreenBtn = el('pause-fullscreen');
+  /** 11A-2: Pause-menu FULLSCREEN button hook (main.ts wires it to `input.toggleFullscreen(false)`). */
+  onFullscreen: (() => void) | null = null;
   private readonly warns: SVGPathElement[] = [];
   private readonly dmgArcs: SVGPathElement[] = [];
   private readonly dmgT = new Float32Array(DAMAGE_ARCS);
@@ -551,6 +559,10 @@ export class HudManager {
     });
     el('result-endless').addEventListener('click', () => this.onEndless?.());
     el('result-title-btn').addEventListener('click', () => this.onTitle?.());
+    this.pauseFullscreenBtn.addEventListener('click', () => this.onFullscreen?.());
+    document.addEventListener('fullscreenchange', () => {
+      this.pauseFullscreenBtn.textContent = document.fullscreenElement ? 'EXIT FULLSCREEN [F11]' : 'FULLSCREEN [F11]';
+    });
     for (const b of Array.from(document.querySelectorAll<HTMLElement>('.drawer-close'))) {
       b.addEventListener('click', () => this.toggleDrawer(b.dataset.drawer === 'protocol' ? 'protocol' : 'settings'));
     }
@@ -957,6 +969,30 @@ export class HudManager {
     this.evadeEl.classList.remove('on');
     void this.evadeEl.offsetWidth;
     this.evadeEl.classList.add('on');
+  }
+
+  /**
+   * 11A-2: contextual interact prompt below the reticle; `null` hides it. Touches the DOM only when the text
+   * changes (call every frame freely — same string literal → zero DOM writes, zero allocations).
+   */
+  setInteractPrompt(text: string | null): void {
+    if (text === this.interactText) return;
+    this.interactText = text;
+    if (text === null) {
+      this.interactEl.classList.remove('on');
+      return;
+    }
+    this.interactEl.textContent = text;
+    this.interactEl.classList.toggle('breach', text.includes('BREACH'));
+    this.interactEl.classList.add('on');
+  }
+
+  /** 11A-2: short-lived centre event callout (e.g. "BREACH STUN", 1.1 s pop; restarts on repeat). */
+  flashEvent(text: string): void {
+    this.eventEl.textContent = text;
+    this.eventEl.classList.remove('on');
+    void this.eventEl.offsetWidth;
+    this.eventEl.classList.add('on');
   }
 
   /** Red arc toward where a hit came from (deg, clockwise from screen-up). */

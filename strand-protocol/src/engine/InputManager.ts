@@ -28,7 +28,9 @@ export type DiscreteAction =
   | 'SLOT_PREV'
   | 'RELOAD'
   | 'PAUSE'
-  | 'FULLSCREEN';
+  | 'FULLSCREEN'
+  /** Phase 11A-2: F / E — breach-kick a door (standing) or open it quietly (crouching). */
+  | 'INTERACT';
 
 const KEY_HELD: Readonly<Record<string, HeldAction>> = {
   KeyW: 'FORWARD',
@@ -40,7 +42,7 @@ const KEY_HELD: Readonly<Record<string, HeldAction>> = {
   KeyC: 'SLIDE',
 };
 
-const KEY_DISCRETE: Readonly<Record<string, DiscreteAction>> = {
+export const KEY_DISCRETE: Readonly<Record<string, DiscreteAction>> = {
   Digit1: 'SLOT1',
   Digit2: 'SLOT2',
   Digit3: 'SLOT3',
@@ -48,11 +50,13 @@ const KEY_DISCRETE: Readonly<Record<string, DiscreteAction>> = {
   KeyR: 'RELOAD',
   Escape: 'PAUSE',
   Tab: 'PAUSE',
-  KeyF: 'FULLSCREEN',
+  KeyF: 'INTERACT',
+  KeyE: 'INTERACT',
+  F11: 'FULLSCREEN',
 };
 
 /** Keys whose default browser behaviour must never fire during play. */
-const PREVENT = new Set(['Space', 'Tab', 'ControlLeft', 'KeyC', 'KeyQ', 'KeyW', 'KeyA', 'KeyS', 'KeyD', 'KeyR', 'KeyF', 'Digit1', 'Digit2', 'Digit3']);
+export const PREVENT = new Set(['Space', 'Tab', 'ControlLeft', 'KeyC', 'KeyQ', 'KeyW', 'KeyA', 'KeyS', 'KeyD', 'KeyR', 'KeyF', 'KeyE', 'F11', 'Digit1', 'Digit2', 'Digit3']);
 
 interface KeyboardLockApi {
   lock(keys?: string[]): Promise<void>;
@@ -259,8 +263,11 @@ export class InputManager {
   }
 
   private readonly onKeyDown = (e: KeyboardEvent): void => {
-    // Typing into a settings field (title / pause menu) must not trigger game bindings.
-    if (e.target instanceof HTMLInputElement) return;
+    // F11 is always swallowed: it drives our own toggleFullscreen() (with Keyboard Lock), so the browser's
+    // native F11 fullscreen must never race it — on the title / pause screens and in settings fields too.
+    if (e.code === 'F11') e.preventDefault();
+    // Typing into a settings field (title / pause menu) must not trigger game bindings (F11 excepted).
+    if (e.target instanceof HTMLInputElement && e.code !== 'F11') return;
     if (this.locked && PREVENT.has(e.code)) e.preventDefault();
     if (e.code === 'Tab') e.preventDefault();
     if (e.repeat) return;
@@ -273,7 +280,7 @@ export class InputManager {
     }
     const d = KEY_DISCRETE[e.code];
     // Title / pause / modal: discrete actions are never queued (no stale SLOT / RELOAD / PAUSE on resume).
-    // F still toggles fullscreen there, immediately (the key press is the required user gesture).
+    // F11 still toggles fullscreen there, immediately (the key press is the required user gesture).
     if (d && this.gameplayEnabled) {
       if (d.startsWith('SLOT') && this.clicksLocked) return;
       this.queue.push(d);

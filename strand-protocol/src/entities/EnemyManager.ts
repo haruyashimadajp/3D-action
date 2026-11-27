@@ -2579,6 +2579,30 @@ export class EnemyManager {
     return n;
   }
 
+  /**
+   * 11A-2 breach payoff: every living ground enemy within `range` behind a kicked / shot door (inside a ~60°
+   * cone around `inward`) takes `dmg`, is stunned for `stunS` and knocked inward at `knock` m/s. Returns the
+   * number of enemies hit. Zero allocations.
+   */
+  breachBlast(pos: THREE.Vector3, inward: THREE.Vector3, range: number, dmg: number, stunS: number, knock: number): number {
+    let n = 0;
+    for (const e of this.enemies) {
+      if (!e.active || !e.alive || e.kind === 'DRONE' || e.isBoss) continue;
+      const dx = e.pos.x - pos.x;
+      const dz = e.pos.z - pos.z;
+      const d = Math.hypot(dx, dz);
+      if (d > range || Math.abs(e.pos.y - pos.y) > 2.2) continue;
+      if (d > 0.3 && (dx * inward.x + dz * inward.z) / d < 0.5) continue;
+      _v1.set(e.pos.x, e.pos.y + 1.2, e.pos.z);
+      this.applyDamage(e, dmg, false, _v1, inward, 0);
+      e.stun = Math.max(e.stun, stunS);
+      e.vel.x += inward.x * knock;
+      e.vel.z += inward.z * knock;
+      n++;
+    }
+    return n;
+  }
+
   /** Highest awareness state in the sector (HUD tag / BGM). */
   get highestAlert(): AlertState {
     return this.stealth.highest;

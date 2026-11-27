@@ -263,7 +263,7 @@
       #pause-run { font-family: var(--mono-font); font-size: 11px; letter-spacing: 0.18em; color: rgba(232, 246, 255, 0.75); text-align: center; }
       #pause-skills { margin-top: 10px; display: flex; flex-wrap: wrap; gap: 6px; justify-content: center; font-family: var(--mono-font); font-size: 10px; letter-spacing: 0.1em; }
       #pause-skills span { padding: 3px 6px; border: 1px solid rgba(0, 240, 255, 0.4); color: #cffbff; }
-      #pause-quit { display: block; margin: 14px auto 0; }
+      #pause-btns { display: flex; justify-content: center; gap: 10px; margin-top: 14px; }
 
       /* ---------------- HUD ---------------- */
       #hud { position: fixed; inset: 0; pointer-events: none; z-index: 20; display: none; font-family: var(--mono-font); }
@@ -419,6 +419,22 @@
         opacity: 0; white-space: nowrap;
       }
       #evade.on { animation: evadepop 0.9s ease-out forwards; }
+      /* 11A-2 contextual door prompt (below the reticle, between the aim-HP bar and the EVADE pop-up). */
+      #interact-prompt {
+        position: absolute; left: 50%; top: calc(50% + 58px); transform: translateX(-50%); display: none;
+        padding: 2px 7px; font-size: 10px; letter-spacing: 0.22em; white-space: nowrap;
+        color: #38f8ff; border: 1px solid currentColor; background: rgba(5, 7, 14, 0.45);
+        text-shadow: 0 0 6px rgba(0, 240, 255, 0.8);
+      }
+      #interact-prompt.on { display: block; }
+      #interact-prompt.breach { color: #ffb02e; text-shadow: 0 0 6px rgba(255, 150, 30, 0.85); }
+      /* 11A-2 short event callout ("BREACH STUN"), above the threat arcs. */
+      #hud-event {
+        position: absolute; left: 50%; top: calc(50% - 128px); transform: translateX(-50%);
+        font-size: 15px; font-weight: 700; letter-spacing: 0.34em; color: #ffb02e; white-space: nowrap; opacity: 0;
+        text-shadow: 0 0 10px rgba(255, 138, 30, 0.95), 0 0 2px #fff;
+      }
+      #hud-event.on { animation: evadepop 1.1s ease-out forwards; }
       @keyframes evadepop {
         0% { opacity: 0; transform: translateX(-50%) translateY(6px) scale(1.25); }
         12% { opacity: 1; transform: translateX(-50%) translateY(0) scale(1); }
@@ -596,18 +612,22 @@
       </div>
       <div class="controls">
         <b>WASD</b> MOVE · <b>SPACE</b> JUMP / KICK · <b>CTRL / C</b> SLIDE · CROUCH · <b>LMB</b> FIRE / STRAND · <b>RMB</b> ZOOM (+ AIR BULLET-TIME)<br />
-        <b>Q</b> GUN ⇄ STRAND · <b>1-3</b> SELECT · <b>R</b> RELOAD · <b>ESC</b> PAUSE · <b>F</b> FULLSCREEN
+        <b>Q</b> GUN ⇄ STRAND · <b>1-3</b> SELECT · <b>R</b> RELOAD · <b>ESC</b> PAUSE<br />
+        <b>[F / E]</b> BREACH / OPEN (CROUCH = QUIET) · <b>[F11]</b> FULLSCREEN
       </div>
     </div>
     <div id="pause">
       <div class="mini-msg">PROTOCOL INSTALLED — <b>CLICK TO DEPLOY</b></div>
       <div class="big">PAUSED</div>
       <div class="hint">CLICK TO RESUME</div>
-      <div class="controls">F: FULLSCREEN + KEYBOARD LOCK — L-CTRL CANNOT CLOSE THE TAB IN FULLSCREEN</div>
+      <div class="controls">[F / E] BREACH / OPEN · [F11] FULLSCREEN + KEYBOARD LOCK — L-CTRL CANNOT CLOSE THE TAB IN FULLSCREEN</div>
       <div id="pause-panel">
         <div id="pause-run"></div>
         <div id="pause-skills"></div>
-        <button id="pause-quit" class="btn" type="button">ABANDON RUN → TITLE</button>
+        <div id="pause-btns">
+          <button id="pause-fullscreen" class="btn" type="button">FULLSCREEN [F11]</button>
+          <button id="pause-quit" class="btn" type="button">ABANDON RUN → TITLE</button>
+        </div>
       </div>
     </div>
     <div id="settings" class="panel">
@@ -713,6 +733,8 @@
       <div id="xh-range"></div>
       <canvas id="radar-canvas" width="136" height="136"></canvas>
       <div id="evade">EVADE +90</div>
+      <div id="interact-prompt"></div>
+      <div id="hud-event"></div>
       <div id="hud-alert"><b>ARMORED</b> — DESTROY WINGS</div>
       <div id="buffs"><span id="buff-pierce">PIERCE ×3</span><span id="buff-zero">ZERO-TIME</span><span id="buff-adren">ADRENALINE</span></div>
       <div id="trk-layer">

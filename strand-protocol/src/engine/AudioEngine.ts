@@ -915,6 +915,106 @@ export class AudioEngine {
     this.fm(c, 100, 50, 6, 0.22, 0.05, p, t, 'square');
   }
 
+  // =============================================================================================
+  // 11A-2 / 11A-3 breach doors & tempered glass (every source → panner → seBus: reverb + BT lowpass apply)
+  // =============================================================================================
+  private lastCreakT = -10;
+  private lastShatterT = -10;
+
+  /**
+   * 11A-2: breach kick — heavy steel door slam: sub thud 120 → 38 Hz through the hard shaper, a clangy FM
+   * steel-panel ring, a broadband lowpassed impact body, then a sharp latch / strike-plate snap 18 ms later
+   * and a short rattling frame buzz. Player-driven, so a priority voice (never culled).
+   */
+  doorBreach(pos: THREE.Vector3): void {
+    const c = this.can(true);
+    if (!c) return;
+    const t = c.currentTime;
+    const p = this.panner(c, pos, true, this.seBus);
+    p.refDistance = 6;
+    p.rolloffFactor = 0.9;
+    // Low body thud (felt more than heard).
+    this.tone(c, 'sine', 120, 38, 0.42, 0.62, p, t, 0.002, this.hardCurve);
+    // Broadband slam body.
+    this.noise(c, 'lowpass', 2600, 240, 0.8, 0.34, 0.5, p, t, 0.002, this.softCurve);
+    // Steel leaf ring (inharmonic FM pair) — the "metallic" in the slam.
+    this.fm(c, 182, 257, 3.2, 0.62, 0.12, p, t + 0.004);
+    this.fm(c, 311, 437, 2.4, 0.48, 0.07, p, t + 0.006, 'triangle');
+    // Latch bolt / strike plate snapping out of the frame.
+    this.noise(c, 'highpass', 3600, 2200, 1.2, 0.035, 0.34, p, t + 0.018, 0.001);
+    this.tone(c, 'square', 2100, 900, 0.04, 0.07, p, t + 0.018, 0.001);
+    // Hinge / frame rattle tail.
+    for (let k = 0; k < 3; k++) this.noise(c, 'bandpass', 1300 - k * 260, 700, 3.5, 0.05, 0.11 - k * 0.025, p, t + 0.07 + k * 0.055, 0.002);
+  }
+
+  /** 11A-2: silent stealth open — quiet oiled-hinge creak (detuned glide through a resonant band), soft latch tick. */
+  doorCreak(pos: THREE.Vector3): void {
+    const c = this.can();
+    if (!c) return;
+    const t = c.currentTime;
+    if (t - this.lastCreakT < 0.2) return;
+    this.lastCreakT = t;
+    const p = this.panner(c, pos, true, this.seBus);
+    p.refDistance = 2.5;
+    p.rolloffFactor = 1.6;
+    // Soft latch release.
+    this.noise(c, 'bandpass', 2600, 2600, 4, 0.016, 0.035, p, t, 0.001);
+    // Hinge creak: a slow, slightly wavering sawtooth glide filtered into a narrow wooden-metal formant.
+    const t0 = t + 0.03;
+    const dur = 0.36;
+    const o = c.createOscillator();
+    o.type = 'sawtooth';
+    o.frequency.setValueAtTime(96, t0);
+    o.frequency.linearRampToValueAtTime(128, t0 + dur * 0.35);
+    o.frequency.linearRampToValueAtTime(112, t0 + dur * 0.6);
+    o.frequency.linearRampToValueAtTime(141, t0 + dur);
+    const bp = c.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.setValueAtTime(1150, t0);
+    bp.frequency.linearRampToValueAtTime(1500, t0 + dur);
+    bp.Q.value = 9;
+    const g = c.createGain();
+    g.gain.setValueAtTime(0.0001, t0);
+    g.gain.exponentialRampToValueAtTime(0.05, t0 + 0.06);
+    g.gain.setValueAtTime(0.05, t0 + dur * 0.7);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    o.connect(bp).connect(g).connect(p);
+    o.start(t0);
+    o.stop(t0 + dur + 0.03);
+    this.track(o);
+    // Faint air movement as the leaf swings.
+    this.noise(c, 'lowpass', 600, 300, 0.7, 0.32, 0.025, p, t0 + 0.04, 0.08);
+  }
+
+  /**
+   * 11A-3: tempered glass crash — highpass 4800 Hz noise burst over a short mid crunch, then 6 staggered
+   * sine / triangle crystalline chimes (2800–6400 Hz) tinkling down as the shards fall. Priority voice.
+   */
+  glassShatter(pos: THREE.Vector3): void {
+    const c = this.can(true);
+    if (!c) return;
+    const t = c.currentTime;
+    if (t - this.lastShatterT < 0.05) return;
+    this.lastShatterT = t;
+    const p = this.panner(c, pos, true, this.seBus);
+    p.refDistance = 6;
+    p.rolloffFactor = 0.9;
+    this.noise(c, 'highpass', 4800, 4800, 0.7, 0.26, 0.42, p, t, 0.001);
+    this.noise(c, 'bandpass', 1800, 900, 1.1, 0.12, 0.2, p, t, 0.001, this.softCurve);
+    for (let k = 0; k < 6; k++) {
+      const hz = 2800 + Math.random() * 3600;
+      const dt = 0.03 + k * 0.045 + Math.random() * 0.03;
+      this.tone(c, k % 2 === 0 ? 'sine' : 'triangle', hz, hz * 0.985, 0.16 + Math.random() * 0.12, 0.05 - k * 0.005, p, t + dt, 0.001);
+    }
+  }
+
+  /** 11A-2: 2D leg swish as the breach kick extends (non-spatial: it is the player's own leg). */
+  kickWhoosh(): void {
+    const c = this.can();
+    if (!c) return;
+    this.noise(c, 'bandpass', 420, 1500, 1.1, 0.14, 0.13, this.seBus, c.currentTime, 0.03);
+  }
+
   /** 10A-6: Faint subtle sonar ping SE every 3.5 s pulse-radar sweep while enemies remain alive. */
   radarPing(): void {
     const c = this.can();

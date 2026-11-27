@@ -171,6 +171,11 @@ export class PlayerController {
   zoomAbsBlend = 0;
   /** A gun zoom is engaged: the −7° bullet-time FOV offset is not added on top. */
   gunZoom = false;
+  /**
+   * 11A-3 pre-movement crash-through probe (set by main: DestructibleManager.crashThrough). Called with the
+   * position, this step's displacement, capsule radius / height and whether closed doors may be rammed.
+   */
+  crashProbe: ((pos: THREE.Vector3, delta: THREE.Vector3, radius: number, height: number, breakDoors: boolean) => number) | null = null;
 
   // ---- rope ----
   ropeAttached = false;
@@ -646,6 +651,13 @@ export class PlayerController {
     this.fallSpeedBeforeLanding = -this.velocity.y;
     _delta.copy(this.velocity).multiplyScalar(dt);
     this.prevPos.copy(this.position);
+    // 11A-3 / 11A-2: high-speed dive, slide or grapple swing bursts through glass (and slide / sprint ≥ 9 m/s
+    // through closed doors) BEFORE the collision sweep, so the player keeps 100 % of their velocity.
+    if (this.crashProbe) {
+      const hs = Math.hypot(this.velocity.x, this.velocity.z);
+      const ram = hs >= 9.0 || this.state === 'SLIDING';
+      if (ram || this.state === 'GRAPPLE_SWING' || this.state === 'GRAPPLE_PULL') this.crashProbe(this.position, _delta, PLAYER.RADIUS, this.colliderHeight, ram);
+    }
     this.physics.movePlayer(this.position, PLAYER.RADIUS, this.colliderHeight, _delta, wasGrounded, this.move);
     this.resolveVelocity(dt);
 

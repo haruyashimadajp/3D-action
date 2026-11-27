@@ -722,7 +722,8 @@ export class PhysicsWorld {
       if (!_hit.hit) continue;
       if (_hit.normal.y < 0.7) return null;
       const kind = _hit.kind;
-      if (kind === 'WATER' || kind === 'BARRIER') return null;
+      // 11A-2: never auto-mantle thin interactive doors or glass panes.
+      if (kind === 'WATER' || kind === 'BARRIER' || kind === 'DOOR' || kind === 'GLASS') return null;
       const ly = _hit.point.y;
       // Headroom above us at ledge height (the pull-up path), then the standing spot on top.
       _ledgeP.set(pos.x, ly + 0.05, pos.z);
@@ -1239,7 +1240,8 @@ export class PhysicsWorld {
   }
 }
 
-const LOS_IGNORE: ReadonlySet<ColliderKind> = new Set<ColliderKind>(['WATER', 'BARRIER']);
+/** 11A-2: enemies see players through intact glass (projectiles / grapple still hit active GLASS colliders). */
+const LOS_IGNORE: ReadonlySet<ColliderKind> = new Set<ColliderKind>(['WATER', 'BARRIER', 'GLASS']);
 
 /** Ray vs sphere: distance or −1. */
 function raySphere(o: THREE.Vector3, d: THREE.Vector3, c: THREE.Vector3, r: number): number {

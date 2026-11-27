@@ -97,7 +97,25 @@ import {
   type PropInstance,
 } from './CityProps';
 import { CityPropMeshes, type ContactShadowDesc } from './CityPropMeshes';
-import { AnimatedEnvKit, ENV_CAP, ENV_DIMS, ENV_VARIANT, ElevatedTraffic, buildTrafficLanes, inTrafficLane, type EnvInstance, type TrafficLane } from './CityAtmosphere';
+import { AnimatedEnvKit, ENV_CAP, ENV_DIMS, ENV_VARIANT, ElevatedTraffic, buildTrafficLanes, inTrafficLane, type CityLightInjector, type EnvInstance, type TrafficLane } from './CityAtmosphere';
+import { doorSafeOpenRad, type DoorSpec, type GlassSpec } from '../entities/DestructibleManager';
+import {
+  InteriorPropsKit,
+  interiorPropRecord,
+  interiorVolumeOf,
+  planInteriors,
+  planSkyNotch,
+  bayPodPieces,
+  SKY_NOTCH,
+  splitMassBox,
+  type InteriorHost,
+  type InteriorHostFace,
+  type InteriorOpening,
+  type InteriorPlan,
+  type InteriorPropRecord,
+  type InteriorVolume,
+  type ShellPiece,
+} from './InteriorBuilder';
 
 /** 10BC-Fix FIX-4: megastructure reservation order (rarest eligibility first, as in assignMassings). */
 const MEGA_ORDER: readonly MegaStructureKind[] = ['TWIN_ARCH_GATE', 'CYLINDER_RING_TOWER', 'SLANT_CORP_TOWER', 'X_TRUSS_TOWER'];
@@ -118,7 +136,11 @@ export type ColliderKind =
   | 'WATER'
   | 'TOWPATH'
   | 'SKYBRIDGE'
-  | 'BARRIER';
+  | 'BARRIER'
+  /** 11A-2 interactive breach door leaf (dynamic: setColliderActive). */
+  | 'DOOR'
+  /** 11A-3 destructible glass pane (dynamic: setColliderActive). */
+  | 'GLASS';
 
 export interface BoxCollider {
   readonly min: THREE.Vector3;
@@ -146,7 +168,7 @@ export interface RampCollider {
   readonly steel?: boolean;
 }
 
-export type AnchorKind = 'HIGHWAY_EDGE' | 'BRIDGE_TRUSS' | 'BUILDING_CORNER' | 'SKYBRIDGE' | 'SIGN';
+export type AnchorKind = 'HIGHWAY_EDGE' | 'BRIDGE_TRUSS' | 'BUILDING_CORNER' | 'SKYBRIDGE' | 'SIGN' | 'LEDGE';
 export interface GrappleAnchor {
   readonly position: THREE.Vector3;
   readonly kind: AnchorKind;
@@ -291,6 +313,20 @@ export interface SectorLayout {
   readonly highwaySpawns: readonly SpawnPoint[];
   /** 10D-Fix FIX-4: the elevated traffic lanes (spawn / patrol / enemy clearance). */
   readonly trafficLanes: readonly TrafficLane[];
+  /** 11A-1 enterable hollow interiors (≤ 10). */
+  readonly interiors: readonly InteriorVolume[];
+  /** 11A-1c InteriorPropsKit placements (11B destructible registry). */
+  readonly interiorProps: readonly InteriorPropRecord[];
+  /** 11A-2 kickable breach doors (DestructibleManager.setLevel). */
+  readonly breachDoors: readonly DoorSpec[];
+  /** 11A-3 destructible glass panes. */
+  readonly glassPanes: readonly GlassSpec[];
+  /** 11A-1b cantilevered bay-window / HVAC pods placed (towers carrying ≥ 1 pod). */
+  readonly reliefPods: { readonly pods: number; readonly towers: number; readonly eligible: number };
+  /** 11A-1 every carved opening (door / window / arcade) on its wall plane (QA). */
+  readonly interiorOpenings: ReadonlyArray<InteriorOpening & { readonly building: number; readonly interior: number }>;
+  /** 11A-1b mid-tower refuge sky-notches (floor-grid aligned). */
+  readonly skyNotches: ReadonlyArray<{ readonly building: number; readonly yNotch: number; readonly inset: number }>;
   /** Layer 0: canal truss-bridge decks (connected street battlefield, 5A-5). */
   readonly bridgeSpawns: readonly SpawnPoint[];
   /** Layer 2: sky-bridge roofs. */
@@ -1085,12 +1121,26 @@ const GLSL_CITY_LIGHTS_APPLY = /* glsl */ `
   #include <opaque_fragment>
 `;
 
+/** 11A: ≤ 10 interior AABBs (min, max pairs): rooms stay dry (no puddle ripples / gloss, no rain). */
+export const INDOOR_MAX = 10;
+export const GLSL_INDOOR = /* glsl */ `
+  uniform vec3 uIndoor[${INDOOR_MAX * 2}];
+  uniform int uIndoorN;
+  bool strandIndoor(vec3 p) {
+    for (int i = 0; i < ${INDOOR_MAX}; i++) {
+      if (i >= uIndoorN) break;
+      if (all(greaterThan(p, uIndoor[i * 2])) && all(lessThan(p, uIndoor[i * 2 + 1]))) return true;
+    }
+    return false;
+  }
+  #define STRAND_INDOOR_TEST strandIndoor(vCityWorld)
+`;
 /** 10A-2 puddle micro-ripple normals: flat rain-soaked asphalt with crisp high-frequency raindrop micro-rings. */
 const GLSL_PUDDLE_RIPPLES = /* glsl */ `
   {
     float strandPuddle = 1.0 - smoothstep(0.13, 0.26, roughnessFactor);
     vec3 strandNwUp = transformNormalByInverseViewMatrix(normal, viewMatrix);
-    if (strandPuddle > 0.001 && strandNwUp.y > 0.5) {
+    if (strandPuddle > 0.001 && strandNwUp.y > 0.5 && !(STRAND_INDOOR_TEST)) {
       vec2 g = strandRipples(vCityWorld.xz * 4.5, uTime) * 0.055 + strandRipples(vCityWorld.xz * 7.8 + 11.0, uTime * 1.18) * 0.035;
       normal = normalize(normal + mat3(viewMatrix) * (vec3(g.x, 0.0, g.y) * strandPuddle));
     }
@@ -1212,6 +1262,11 @@ export class CityBuilder {
   readonly traffic: ElevatedTraffic;
   /** 10D-2 GPU-animated micro-environment kit (persistent, +1 call). */
   readonly envKit: AnimatedEnvKit;
+  /** 11A-1c close-up interior props (one persistent instanced draw, cap 260). */
+  readonly interiorKit: InteriorPropsKit;
+  /** 11A dry-interior mask shared by the wet concrete shader (min / max pairs, count). */
+  readonly uIndoor = { value: Array.from({ length: INDOOR_MAX * 2 }, () => new THREE.Vector3()) };
+  readonly uIndoorN = { value: 0 };
   private readonly uNeonBoost = { value: 1.0 };
   private readonly uSearchPulse = { value: 0.0 };
   private readonly uGateOpen = { value: 0.0 };
@@ -1389,7 +1444,8 @@ export class CityBuilder {
     );
     this.traffic = new ElevatedTraffic((shader, apply) => this.injectCityLights(shader, apply));
     this.envKit = new AnimatedEnvKit((shader, apply) => this.injectCityLights(shader, apply), this.uTime);
-    this.persistent.add(this.traffic.mesh, this.envKit.mesh);
+    this.interiorKit = new InteriorPropsKit((shader, apply) => this.injectCityLights(shader, apply));
+    this.persistent.add(this.traffic.mesh, this.envKit.mesh, this.interiorKit.mesh);
   }
 
   get currentLayout(): SectorLayout | null {
@@ -1441,6 +1497,9 @@ export class CityBuilder {
    * The world position honours instancing (parked cars, far towers) as well as plain meshes (5B-2).
    * `apply` replaces the default lighting add-on (walls use a height-limited variant).
    */
+  /** 11A: shared city-light injector for runtime pools outside the builder (doors, glass, debris). */
+  readonly cityLightInjector: CityLightInjector = (shader, apply) => this.injectCityLights(shader, apply);
+
   private injectCityLights(shader: THREE.WebGLProgramParametersWithUniforms, apply: string = GLSL_CITY_LIGHTS_APPLY): void {
     shader.uniforms.uCityLightPos = this.uCityLightPos;
     shader.uniforms.uStreakGain = this.fxDebug.streak;
@@ -1755,13 +1814,16 @@ export class CityBuilder {
     });
     mat.onBeforeCompile = (shader) => {
       shader.uniforms.uTime = this.uTime;
+      shader.uniforms.uIndoor = this.uIndoor;
+      shader.uniforms.uIndoorN = this.uIndoorN;
       this.injectCityLights(shader);
       shader.fragmentShader = shader.fragmentShader
-        .replace('#include <common>', `#include <common>\nuniform float uTime;\n${GLSL_HASH}\n${GLSL_RIPPLES}`)
+        .replace('#include <common>', `#include <common>\nuniform float uTime;\n${GLSL_HASH}\n${GLSL_RIPPLES}\n${GLSL_INDOOR}`)
+        .replace('#include <roughnessmap_fragment>', '#include <roughnessmap_fragment>\n  if (strandIndoor(vCityWorld)) roughnessFactor = max(roughnessFactor, 0.62);')
         .replace('#include <normal_fragment_maps>', `#include <normal_fragment_maps>\n${GLSL_PUDDLE_RIPPLES}`);
       injectVertexAo(shader);
     };
-    mat.customProgramCacheKey = () => 'strand-concrete-v13';
+    mat.customProgramCacheKey = () => 'strand-concrete-v14';
     return mat;
   }
 
@@ -1847,7 +1909,7 @@ export class CityBuilder {
         .replace('#include <common>', '#include <common>\nattribute vec4 aAtlas;\nvarying vec4 vAtlas;\nvarying vec2 vTileUv;')
         .replace('#include <uv_vertex>', '#include <uv_vertex>\nvAtlas = aAtlas;\nvTileUv = uv;');
       shader.fragmentShader = shader.fragmentShader
-        .replace('#include <common>', `#include <common>\nuniform float uTime;\nvarying vec4 vAtlas;\nvarying vec2 vTileUv;\n${GLSL_HASH}\n${GLSL_RIPPLES}`)
+        .replace('#include <common>', `#include <common>\nuniform float uTime;\nvarying vec4 vAtlas;\nvarying vec2 vTileUv;\n${GLSL_HASH}\n${GLSL_RIPPLES}\n#define STRAND_INDOOR_TEST false`)
         .replace('#include <map_fragment>', `
           vec2 sRSize = vAtlas.zw - vAtlas.xy;
           vec2 sRUv = vAtlas.xy + sRSize * fract(vTileUv);
@@ -1879,7 +1941,7 @@ export class CityBuilder {
             reflectedLight.directSpecular *= mix(vec3(1.0), sFilm * 1.7, sK);
           }`);
     };
-    mat.customProgramCacheKey = () => 'strand-road-v13';
+    mat.customProgramCacheKey = () => 'strand-road-v14';
     return mat;
   }
 
@@ -4978,15 +5040,79 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
     /** Tower body box: aSeed + aArch. */
     const bodyBox = (w: number, h: number, d: number, x: number, y: number, z: number, seed: number, arch: number): THREE.BufferGeometry =>
       withAttr1(withAttr1(boxAt(w, h, d, x, y, z), 'aSeed', seed), 'aArch', arch);
+    /** 11A: world-AABB shell piece → the matching static bucket (+0 draw calls). */
+    const shellGeo = (pc: ShellPiece): void => {
+      const w = Math.max(pc.x1 - pc.x0, 0.005);
+      const h = Math.max(pc.y1 - pc.y0, 0.005);
+      const d = Math.max(pc.z1 - pc.z0, 0.005);
+      const x = (pc.x0 + pc.x1) / 2;
+      const y = (pc.y0 + pc.y1) / 2;
+      const z = (pc.z0 + pc.z1) / 2;
+      if (pc.bucket === 'concrete') G.concrete.push(...aoBox(w, h, d, x, y, z, { all: pc.ao ?? 1, tile: RENDER.ROOF_TILE_M }));
+      else if (pc.bucket === 'steel') G.steel.push(...aoBox(w, h, d, x, y, z, { all: pc.ao ?? 1 }));
+      else if (pc.bucket === 'archPaint') G.archPaint.push(...aoBox(w, h, d, x, y, z, { tile: 1.6, all: pc.ao ?? 1 }).map((g) => withTint(g, pc.color ?? 0x3a3d42)));
+      else G.strips.push(withColor(boxAt(w, h, d, x, y, z), pc.color ?? 0xffffff, pc.emissive ?? 1));
+    };
+    // 11A-1b mid-tower refuge sky-notches (own RNG stream): ≤ 4 per district on tall non-megastructure towers
+    // without balconies / fire escapes / ducts / spines / galleries, on the floor grid, clear of terrace seams ± 4 m.
+    const nrng = createRng(0x11b1 + sector.index * 71 + loop * 433);
+    const notched = new Set<number>();
+    const skyNotches: Array<{ building: number; yNotch: number; inset: number }> = [];
+    let notchCount = 0;
+    const notchOk = (b: Building): boolean =>
+      !isMegaKind(b.massing) && b.massing !== 'GALLERY_DANCHI' && b.massing !== 'PENCIL_TOWER' &&
+      !FACES.some(([ax, sg]) => {
+        const k = fkey(b, ax, sg);
+        return balconyFaces.has(k) || escapeFaces.has(k) || ductFaces.has(k) || spineFaces.has(k) || galleryFaces.has(k) || partialFaces.has(k);
+      });
     const TERRACE_NEON = PAL;
+    /** 11A-1: G.bodies / colliders slot of every massing box (carved interiors replace them in place). */
+    const bodySlot: Array<Array<{ body: number; coll: number }>> = buildings.map(() => []);
     buildings.forEach((b) => {
       // 9A-2: one tower-material body + one BUILDING collider per massing box (L wings, podium + offset tower,
       // stepped tiers); every box top is a floor-grid roof / terrace with a wet concrete cap.
       for (const bx of b.plan.boxes) {
         const top = bx.y1 - 0.45;
         const y0 = bx.y0 > 0 ? bx.y0 - 0.05 : 0;
-        G.bodies.push(bodyBox(bx.x1 - bx.x0, top - y0, bx.z1 - bx.z0, (bx.x0 + bx.x1) / 2, (y0 + top) / 2, (bx.z0 + bx.z1) / 2, b.seed, b.arch));
-        colliders.push({ min: new THREE.Vector3(bx.x0, bx.y0, bx.z0), max: new THREE.Vector3(bx.x1, bx.y1, bx.z1), kind: 'BUILDING', building: b.index });
+        bodySlot[b.index].push({ body: G.bodies.length, coll: colliders.length });
+        const roll = nrng();
+        const seams: Array<[number, number]> = b.plan.boxes.filter((o) => o !== bx).map((o) => [o.y1 - 4, o.y1 + 4]);
+        if (b.plan.setbackY > 0) seams.push([b.plan.setbackY - 4, b.plan.setbackY + 4]);
+        const notch = notchCount < 4 && roll < 0.55 && !notched.has(b.index) && notchOk(b) ? planSkyNotch(bx, b.arch, nrng, { blockedBands: seams }) : null;
+        if (!notch) {
+          G.bodies.push(bodyBox(bx.x1 - bx.x0, top - y0, bx.z1 - bx.z0, (bx.x0 + bx.x1) / 2, (y0 + top) / 2, (bx.z0 + bx.z1) / 2, b.seed, b.arch));
+          colliders.push({ min: new THREE.Vector3(bx.x0, bx.y0, bx.z0), max: new THREE.Vector3(bx.x1, bx.y1, bx.z1), kind: 'BUILDING', building: b.index });
+          continue;
+        }
+        // Lower shaft · recessed mechanical core · upper shaft (bodies + BUILDING colliders), steel columns, refuge
+        // ledge, rail, 'LEDGE' grapple anchors; the facade spans split around the 4 m band before any sign is placed.
+        notched.add(b.index);
+        notchCount++;
+        for (const pc of notch.solids) {
+          const t = pc.y1 >= bx.y1 - 1e-6 ? pc.y1 - 0.45 : pc.y1;
+          const yb = pc.y0 > 0 ? (pc.y0 <= bx.y0 + 1e-6 ? pc.y0 - 0.05 : pc.y0) : 0;
+          G.bodies.push(bodyBox(pc.x1 - pc.x0, t - yb, pc.z1 - pc.z0, (pc.x0 + pc.x1) / 2, (yb + t) / 2, (pc.z0 + pc.z1) / 2, b.seed, b.arch));
+          colliders.push({ min: new THREE.Vector3(pc.x0, pc.y0, pc.z0), max: new THREE.Vector3(pc.x1, pc.y1, pc.z1), kind: 'BUILDING', building: b.index });
+        }
+        for (const pc of notch.shell) shellGeo(pc);
+        for (const l of notch.ledges) colliders.push({ min: new THREE.Vector3(l.x0, l.y0, l.z0), max: new THREE.Vector3(l.x1, l.y1, l.z1), kind: 'BUILDING', building: b.index });
+        for (const l of notch.rails) colliders.push({ min: new THREE.Vector3(l.x0, l.y0, l.z0), max: new THREE.Vector3(l.x1, l.y1, l.z1), kind: 'STEEL', building: b.index });
+        for (const p of notch.anchors) anchors.push({ position: p.clone(), kind: 'LEDGE', enabled: true });
+        const n0 = notch.yNotch;
+        const n1 = notch.yNotch + SKY_NOTCH.H_M;
+        const onBox = (sp: FaceSpan): boolean => Math.abs(sp.plane - (sp.ax === 'x' ? (sp.sg > 0 ? bx.x1 : bx.x0) : sp.sg > 0 ? bx.z1 : bx.z0)) < 1e-6;
+        const split: FaceSpan[] = [];
+        for (const sp of b.plan.faces) {
+          if (!onBox(sp) || sp.y1 <= n0 || sp.y0 >= n1) {
+            split.push(sp);
+            continue;
+          }
+          if (n0 - sp.y0 >= 1) split.push({ ...sp, y1: n0 });
+          if (sp.y1 - n1 >= 1) split.push({ ...sp, y0: n1 });
+        }
+        b.plan.faces.length = 0;
+        b.plan.faces.push(...split);
+        skyNotches.push({ building: b.index, yNotch: n0, inset: notch.inset });
       }
       for (const pl of b.plan.plates) {
         if (pl.round) continue;
@@ -5837,6 +5963,8 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
         // Apartment doors every 4 m: frame surround, recessed painted steel door, barred corridor window.
         for (const a of lv.doors) {
           const y = lv.y;
+          // 11A-1: a carved apartment's real InteractiveDoor replaces the fake corridor door + barred window.
+          if (openingsAt(b.index, ax, sg, f0.face, a - 0.65, a + 2.2, y, y + 2.3).length) continue;
           G.concrete.push(
             ...f.bx(a - 0.65, a - 0.51, y, y + 2.3, 0, 0.18, { all: 0.8, tile: RENDER.ROOF_TILE_M }),
             ...f.bx(a + 0.51, a + 0.65, y, y + 2.3, 0, 0.18, { all: 0.8, tile: RENDER.ROOF_TILE_M }),
@@ -5939,6 +6067,136 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
       spineCount++;
     };
 
+
+    // ---------------------------------------------------------------- 11A-1 enterable hollow interiors (+0 static)
+    // Rooms are planned in two phases on their own RNG stream (layouts elsewhere stay put): GALLERY_DANCHI
+    // apartments before the corridors are dressed, shops / arcades once the 1F programs are known. Each carved
+    // massing box replaces its body + BUILDING collider IN PLACE with splitMassBox() pieces (dual split), and the
+    // room shell / props / doors / glass are emitted into the existing buckets and pools.
+    const irng = createRng(0x11a1 + sector.index * 71 + loop * 433);
+    const iRing = !!plan.plaza && plan.highways.length === 4;
+    const breachDoors: DoorSpec[] = [];
+    const glassPanes: GlassSpec[] = [];
+    const interiors: InteriorVolume[] = [];
+    const interiorProps: InteriorPropRecord[] = [];
+    const interiorPlans: InteriorPlan[] = [];
+    const interiorOpenings: Array<InteriorOpening & { building: number; interior: number }> = [];
+    const carvedBuildings = new Set<number>();
+    /** Openings on exterior planes: key `${building}:${ax}:${sg}:${plane}` → along / height ranges. */
+    const openingMap = new Map<string, Array<{ a0: number; a1: number; y0: number; y1: number; kind: string }>>();
+    const planeKeyOf = (bi: number, ax: Axis, sg: number, plane: number): string => `${bi}:${ax}:${sg > 0 ? 1 : -1}:${plane.toFixed(3)}`;
+    /** Openings of building `bi` on the face plane overlapping the along range [a0, a1] (and optionally y). */
+    const openingsAt = (bi: number, ax: Axis, sg: number, plane: number, a0: number, a1: number, y0 = -1e9, y1 = 1e9, pad = 0.05) =>
+      (openingMap.get(planeKeyOf(bi, ax, sg, plane)) ?? []).filter((o) => a0 < o.a1 + pad && a1 > o.a0 - pad && y0 < o.y1 && y1 > o.y0);
+    const ikit = this.interiorKit;
+    ikit.begin();
+    const emitInterior = (ip: InteriorPlan): void => {
+      const b = buildings[ip.building];
+      const B = b.plan.boxes[ip.boxIndex];
+      const slot = bodySlot[b.index][ip.boxIndex];
+      interiorPlans.push(ip);
+      carvedBuildings.add(b.index);
+      // Dual split: tower body + BUILDING collider become the solid remainder around the hollow room.
+      splitMassBox(B, ip.room).forEach((pc, k) => {
+        const top = pc.y1 >= B.y1 - 1e-6 ? pc.y1 - 0.45 : pc.y1;
+        const y0 = pc.y0 > 0 ? (pc.y0 <= B.y0 + 1e-6 ? pc.y0 - 0.05 : pc.y0) : 0;
+        const geo = bodyBox(pc.x1 - pc.x0, top - y0, pc.z1 - pc.z0, (pc.x0 + pc.x1) / 2, (y0 + top) / 2, (pc.z0 + pc.z1) / 2, b.seed, b.arch);
+        const col: BoxCollider = { min: new THREE.Vector3(pc.x0, pc.y0, pc.z0), max: new THREE.Vector3(pc.x1, pc.y1, pc.z1), kind: 'BUILDING', building: b.index };
+        if (k === 0) {
+          G.bodies[slot.body] = geo;
+          colliders[slot.coll] = col;
+        } else {
+          G.bodies.push(geo);
+          colliders.push(col);
+        }
+      });
+      for (const a of ip.structure) colliders.push({ min: new THREE.Vector3(a.minX, a.minY, a.minZ), max: new THREE.Vector3(a.maxX, a.maxY, a.maxZ), kind: 'BUILDING', building: b.index });
+      for (const a of ip.solids) colliders.push({ min: new THREE.Vector3(a.minX, a.minY, a.minZ), max: new THREE.Vector3(a.maxX, a.maxY, a.maxZ), kind: 'PROP', building: b.index });
+      for (const pc of ip.shell) shellGeo(pc);
+      for (const l of ip.lights) addLight(l.x, l.y, l.z, l.color, l.intensity);
+      const doorIds: number[] = [];
+      const glassIds: number[] = [];
+      for (const op of ip.openings) {
+        interiorOpenings.push({ ...op, building: b.index, interior: ip.id });
+        const f = sf(op.ax, op.sg, op.plane);
+        const key = planeKeyOf(b.index, op.ax, op.sg, op.plane);
+        const list = openingMap.get(key) ?? [];
+        list.push({ a0: op.a0, a1: op.a1, y0: op.y0, y1: op.y1, kind: op.kind });
+        openingMap.set(key, list);
+        const yaw = op.ax === 'x' ? (op.sg * Math.PI) / 2 : op.sg > 0 ? 0 : Math.PI;
+        const am = (op.a0 + op.a1) / 2;
+        if (op.kind === 'DOOR') {
+          // Recessed in the wall reveal (d −0.10 … −0.02): never intrudes into the street clearance band.
+          const ci = colliders.length;
+          f.coll(op.a0, op.a1, op.y0, op.y1, -0.1, -0.02, b.index, 'DOOR');
+          const c = f.P3(am, op.y0, -0.06);
+          doorIds.push(breachDoors.length);
+          breachDoors.push({ x: c.x, y: op.y0, z: c.z, yaw, width: op.a1 - op.a0, height: op.y1 - op.y0, colliderIndex: ci, interiorId: ip.id, tint: PAINT.DOORS[(ip.id * 3 + doorIds.length) % PAINT.DOORS.length], openRad: doorSafeOpenRad(0.2) });
+        } else if (op.kind === 'WINDOW') {
+          const ci = colliders.length;
+          f.coll(op.a0, op.a1, op.y0, op.y1, -0.06, -0.02, b.index, 'GLASS');
+          const c = f.P3(am, op.y0, -0.04);
+          glassIds.push(glassPanes.length);
+          glassPanes.push({ x: c.x, y: op.y0, z: c.z, yaw, width: op.a1 - op.a0, height: op.y1 - op.y0, colliderIndex: ci, interiorId: ip.id });
+        }
+        // Keep the doorway / arcade mouth clear of later street dressing, and every opening clear of signs.
+        if (op.kind !== 'WINDOW') {
+          const p0 = f.P3(op.a0 - 0.2, 0, 0);
+          const p1 = f.P3(op.a1 + 0.2, 0, GR.DOOR_CLEAR_M);
+          doorClearZones.push({ x0: Math.min(p0.x, p1.x), z0: Math.min(p0.z, p1.z), x1: Math.max(p0.x, p1.x), z1: Math.max(p0.z, p1.z), y: op.y0 });
+        }
+        const q0 = f.P3(op.a0 - 0.3, op.y0, -0.3);
+        const q1 = f.P3(op.a1 + 0.3, op.y1 + 0.3, 1.4);
+        signBoxes.push({ x0: Math.min(q0.x, q1.x), y0: op.y0, z0: Math.min(q0.z, q1.z), x1: Math.max(q0.x, q1.x), y1: op.y1 + 0.3, z1: Math.max(q0.z, q1.z), group: -77 });
+      }
+      interiors.push(interiorVolumeOf(ip, doorIds, glassIds));
+      for (const pr of ip.props) {
+        const idx = ikit.add(pr.variant, pr.x, pr.y, pr.z, pr.yaw, pr.tint);
+        if (idx >= 0) interiorProps.push(interiorPropRecord(idx, pr.variant, pr.x, pr.y, pr.z, pr.yaw, pr.tint, ip.floorY));
+      }
+    };
+    /** Ground FaceSpans of a building as interior host faces (feature / signature faces are never opened). */
+    const hostFaces = (b: Building, programOf: (span: FaceSpan, key: string, alley: boolean) => GroundProgram | null): InteriorHostFace[] => {
+      const out: InteriorHostFace[] = [];
+      b.plan.faces.forEach((span, id) => {
+        if (span.y0 > 0.01 || span.a1 - span.a0 < 3) return;
+        const key = fkey(b, span.ax, span.sg);
+        // Escape flights, ducts, docks and spines are passed on as `blocked` along-ranges; balconies start at 6 m;
+        // only a Mega-Billboard reaching below 4.5 m closes the face.
+        if (megaRects.some((m) => m.b === b.index && m.ax === span.ax && m.sg === span.sg && m.y0 < 4.5)) return;
+        const alley = span.lot && alleyFaces.has(key);
+        const program = programOf(span, key, alley);
+        if (!program) return;
+        out.push({ id, ax: span.ax, sg: span.sg, plane: span.plane, a0: span.a0, a1: span.a1, y1: span.y1, program, alley, run: span.lot && runFaces.has(key), clear: alley ? alleyWidth.get(key) ?? 3 : span.court ? 3 : 6, blocked: blockedRanges.get(key) ?? [] });
+      });
+      return out;
+    };
+    const runKeysOf = (b: Building): Set<string> => new Set(FACES.filter(([ax, sg]) => runFaces.has(fkey(b, ax, sg))).map(([ax, sg]) => faceKeyOf(ax, sg)));
+    // Phase 1: GALLERY_DANCHI apartments at the real 2F / 3F deck elevations.
+    {
+      const hosts: InteriorHost[] = [];
+      for (const b of buildings) {
+        if (b.massing !== 'GALLERY_DANCHI' || megaBuilding.has(b.index) || notched.has(b.index)) continue;
+        const gk = FACES.find(([ax, sg]) => galleryFaces.has(fkey(b, ax, sg)));
+        if (!gk) continue;
+        const f0 = faceFrame(b, gk[0], gk[1]);
+        const gp = planGallery(b.arch, f0.a0, f0.a1);
+        const deckYs = gp.levels.map((lv) => lv.y).filter((y) => y > 2 && y < 12).slice(0, 2);
+        if (!deckYs.length) continue;
+        hosts.push({
+          building: b.index,
+          massing: b.massing,
+          arch: b.arch,
+          boxes: b.plan.boxes,
+          lot: b.rect,
+          faces: hostFaces(b, (_sp, _k, alley) => (alley ? 'ALLEY_INFRA' : 'CYBER_APARTMENT')),
+          gallery: { faceKey: faceKeyOf(gk[0], gk[1]), deckYs, depth: GR.GALLERY_DEPTH_M, a0: f0.a0, a1: f0.a1 },
+          runKeys: runKeysOf(b),
+        });
+      }
+      for (const ip of planInteriors(hosts, sector.index, irng, { halfExtent: H, isRing: iRing, templates: ['APARTMENT'], idBase: 0 })) emitInterior(ip);
+    }
+
     buildings.forEach((b) => {
       for (const [ax, sg] of FACES) {
         if (galleryFaces.has(fkey(b, ax, sg))) gallery(b, ax, sg);
@@ -5962,6 +6220,28 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
       groundFaces.map((g, i) => ({ id: i, arch: g.b.arch, alley: g.alley, massing: g.b.massing, len: g.span.a1 - g.span.a0 })),
       grng,
     );
+    // 11A-1 phase 2: eateries, tech shops and pass-through arcades on the assigned 1F programs.
+    {
+      const progOf = new Map<FaceSpan, GroundProgram>();
+      groundFaces.forEach((g, i) => progOf.set(g.span, programs[i]));
+      const hosts: InteriorHost[] = [];
+      for (const b of buildings) {
+        // GALLERY_DANCHI 1F faces carry the corridor columns / stair: only the 2F–3F apartments are carved there.
+        if (megaBuilding.has(b.index) || carvedBuildings.has(b.index) || notched.has(b.index) || isMegaKind(b.massing) || b.massing === 'GALLERY_DANCHI') continue;
+        const faces = hostFaces(b, (span) => progOf.get(span) ?? null);
+        if (!faces.length) continue;
+        hosts.push({ building: b.index, massing: b.massing, arch: b.arch, boxes: b.plan.boxes, lot: b.rect, faces, runKeys: runKeysOf(b) });
+      }
+      const n1 = interiorPlans.length;
+      const target = iRing ? { min: Math.max(0, 4 - n1), max: Math.max(0, 6 - n1) } : { min: Math.max(0, 6 - n1), max: Math.max(0, 10 - n1) };
+      for (const ip of planInteriors(hosts, sector.index, irng, { halfExtent: H, isRing: iRing, templates: ['EATERY', 'TECH_SHOP', 'PASS_ARCADE'], target, idBase: n1 })) emitInterior(ip);
+    }
+    ikit.end();
+    interiors.slice(0, INDOOR_MAX).forEach((iv, i) => {
+      this.uIndoor.value[i * 2].set(iv.aabb.minX - 0.35, iv.aabb.minY - 0.3, iv.aabb.minZ - 0.35);
+      this.uIndoor.value[i * 2 + 1].set(iv.aabb.maxX + 0.35, iv.aabb.maxY + 0.3, iv.aabb.maxZ + 0.35);
+    });
+    this.uIndoorN.value = Math.min(interiors.length, INDOOR_MAX);
     const NEON_SHOP = [0x38d8f0, 0xe048b8];
     const groundFace = (g: GroundFace, program: GroundProgram): { piers: number[] } => {
       const { b, span, run } = g;
@@ -5969,7 +6249,10 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
       // 10B-2: an outward perimeter face closer than the 1.8 m door clear zone to the lockdown wall's inner face
       // (±(H − 0.5)) has no street in front of it — no doorway opens into the 0.7 m crack.
       const toWall = span.sg * span.plane > 0 ? LEVEL.HALF_EXTENT_M - 0.5 - Math.abs(span.plane) : Infinity;
-      const plan = planGroundFace(program, span.a0, span.a1, grng, span.lot ? blockedRanges.get(g.key) ?? [] : [], toWall >= GR.DOOR_CLEAR_M, noDoorRanges.get(g.key) ?? []);
+      // 11A-1: grammar doors never land in a carved doorway / shopfront / arcade opening.
+      const carved = openingsAt(b.index, span.ax, span.sg, span.plane, span.a0, span.a1, 0, 4.2).map((o): [number, number] => [o.a0 - 0.3, o.a1 + 0.3]);
+      const plan = planGroundFace(program, span.a0, span.a1, grng, span.lot ? blockedRanges.get(g.key) ?? [] : [], toWall >= GR.DOOR_CLEAR_M, [...(noDoorRanges.get(g.key) ?? []), ...carved]);
+      const cut = (a0: number, a1: number): boolean => carved.length > 0 && openingsAt(b.index, span.ax, span.sg, span.plane, a0, a1, 0, 4.2, 0.02).length > 0;
       programCounts[program]++;
       const gTop = Math.min(span.y1, floorTopY(b.arch, 1));
       const sTop = Math.min(gTop, GR.GROUND_TOP_M);
@@ -5978,6 +6261,7 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
       const feature = !run && !g.alley;
       // Shared grammar: weathered stone piers every ~4 m with dark steel kick plates.
       for (const a of plan.piers) {
+        if (cut(a - GR.PIER_W_M / 2, a + GR.PIER_W_M / 2)) continue;
         if ((g.alley || program === 'ALLEY_INFRA') && gTop > 3.4) {
           decalSurfaces.push({ kind: 'PIER', nAx: span.ax, sg: span.sg, plane: span.plane + span.sg * (run ? GR.PIER_D_RUN_M : GR.PIER_D_M), a0: a - 0.2, a1: a + 0.2, y0: 0.7, y1: Math.min(3.3, gTop - 0.5), seed: p9Rng() });
         }
@@ -6001,6 +6285,8 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
       for (const bay of plan.bays) {
         const { a0, a1 } = bay;
         const m = (a0 + a1) / 2;
+        // 11A-1: bays opened by a carved interior keep no solid fill, socket props or decals.
+        if (cut(a0, a1)) continue;
         groundBays.push({ building: b.index, ax: span.ax, sg: span.sg, plane: span.plane, a0, a1, use: bay.use, oT });
         if (!service && (bay.use === 'PANEL' || bay.use === 'VITRINE' || bay.use === 'SHUTTER' || bay.use === 'GRILLE')) {
           const bs = baySocket(f.ref, a0 + 0.45, a1 - 0.45, 0.36, floorReach - 0.36, 0, sockGroup, b.index, lowProps, p9Rng);
@@ -6155,12 +6441,14 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
           G.strips.push(f.glow(0xffa848, 0.75, ca0 + 0.3, ca1 - 0.3, 3.66, 3.95, 0.02, 0.1));
           f.coll(ca0, ca1, 3.12, 3.22, 0, 1.35, b.index);
           addDripEdge(f, ca0, ca1, 1.35, 3.15);
+          // 11A-1b: 45° steel tension tie-rods from the awning lip back up into the facade.
+          for (const ta of [ca0 + 0.35, ca1 - 0.35]) G.steel.push(aoPipe(f.P3(ta, 3.2, 1.28), f.P3(ta, 4.46, 0.02), 0.032, null));
           const lp = f.P3((ca0 + ca1) / 2, 2.8, 1.0);
           addLight(lp.x, lp.y, lp.z, 0xffa860, 1.3);
           // 10B-2: counter shelf centred in the bay right of the entrance (never across a pier); skipped when that
           // bay is a door / too narrow for the 1.8 m shelf + 0.05 m pier gap.
           const di = door0 ? plan.bays.findIndex((bb) => door0.a > bb.a0 && door0.a < bb.a1) : -1;
-          const shelfBay = [plan.bays[di + 1], plan.bays[di - 1]].find((bb) => di >= 0 && bb && bb.use === 'PANEL' && bb.a1 - bb.a0 >= 1.8 + 2 * DOOR_PIER_GAP_M);
+          const shelfBay = [plan.bays[di + 1], plan.bays[di - 1]].find((bb) => di >= 0 && bb && bb.use === 'PANEL' && bb.a1 - bb.a0 >= 1.8 + 2 * DOOR_PIER_GAP_M && !cut(bb.a0, bb.a1));
           if (shelfBay) {
             const sa = (shelfBay.a0 + shelfBay.a1) / 2;
             G.steel.push(...f.bx(sa - 0.9, sa + 0.9, 1.03, 1.08, 0, 0.35), ...f.bx(sa - 0.85, sa - 0.8, 0.7, 1.03, 0, 0.3), ...f.bx(sa + 0.8, sa + 0.85, 0.7, 1.03, 0, 0.3));
@@ -6182,6 +6470,7 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
           G.steel.push(...f.bx(ca0, ca1, 3.29, 3.41, 0, 1.45, { bottom: GR.AO_UNDERSIDE }));
           G.strips.push(f.glow(tint(0), 1.35, ca0, ca1, 3.29, 3.33, 1.43, 1.47), f.glow(0xe8f4ff, 0.85, ca0 + 0.3, ca1 - 0.3, 3.26, 3.29, 0.3, 0.36));
           f.coll(ca0, ca1, 3.29, 3.41, 0, 1.45, b.index);
+          for (const ta of [ca0 + 0.35, ca1 - 0.35]) G.steel.push(aoPipe(f.P3(ta, 3.41, 1.38), f.P3(ta, 4.77, 0.02), 0.032, null));
           addDripEdge(f, ca0, ca1, 1.45, 3.29);
           const ba = Math.min(span.a1 - 0.3, Math.max(span.a0 + 0.3, ca1 - 0.6));
           const maxH = span.y1 - 0.4 - Math.max(span.y0 + 0.4, 3.9);
@@ -6275,6 +6564,7 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
     });
 
     // ---------------------------------------------------------------- 9A-3 slab drip bands + aligned piers
+    let finCount = 0;
     buildings.forEach((b) => {
       for (const span of b.plan.faces) {
         const key = fkey(b, span.ax, span.sg);
@@ -6298,17 +6588,60 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
         const y1 = span.y1 - 0.45;
         if (y1 - y0 < 3) continue;
         const lines = roomLines(b, span.ax, span.sg, span.a0, span.a1, b.arch === ARCH_D ? 2 : 1, 0.7);
-        const rel = run ? 0.14 : 0.22;
+        // 11A-1b: non-run lot feature faces get deep 0.48 m structural reveal piers (run faces stay ≤ 0.22 m flush).
+        const deep = !run && span.lot && !span.court && b.arch !== ARCH_C && !balconyFaces.has(key) && !escapeFaces.has(key) && !megaFaces.has(key);
+        const rel = run ? 0.14 : deep ? 0.48 : 0.22;
+        const w = b.arch === ARCH_D ? 0.42 : 0.32;
+        /** Vertical [y0, y1] pieces of a pier at `a` clear of carved openings and (deep piers) of every sign box. */
+        const pierRuns = (a: number, hw: number, d: number): Array<[number, number]> => {
+          const cuts: Array<[number, number]> = openingsAt(b.index, span.ax, span.sg, span.plane, a - hw, a + hw, y0, y1).map((o) => [o.y0 - 0.1, o.y1 + 0.1]);
+          if (d > 0.3) {
+            const q0 = f.P3(a - hw, y0, 0);
+            const q1 = f.P3(a + hw, y1, d);
+            const lx = Math.min(q0.x, q1.x);
+            const hx = Math.max(q0.x, q1.x);
+            const lz = Math.min(q0.z, q1.z);
+            const hz = Math.max(q0.z, q1.z);
+            for (const o of signBoxes) if (o.x0 < hx && o.x1 > lx && o.z0 < hz && o.z1 > lz && o.y0 < y1 && o.y1 > y0) cuts.push([o.y0 - 0.05, o.y1 + 0.05]);
+          }
+          return subtractIntervals(y0, y1, cuts).filter(([c0, c1]) => c1 - c0 >= 1.2);
+        };
         for (const a of lines) {
           if (b.arch === ARCH_C) {
-            G.steel.push(...f.bx(a - 0.06, a + 0.06, y0, y1, 0, rel - 0.05), ...f.bx(a - 0.18, a + 0.18, y0, y1, rel - 0.05, rel));
+            for (const [c0, c1] of pierRuns(a, 0.18, rel)) G.steel.push(...f.bx(a - 0.06, a + 0.06, c0, c1, 0, rel - 0.05), ...f.bx(a - 0.18, a + 0.18, c0, c1, rel - 0.05, rel));
           } else {
-            const w = b.arch === ARCH_D ? 0.42 : 0.32;
-            const p0 = f.P3(a - w / 2, y0, 0);
-            const p1 = f.P3(a + w / 2, y1, rel);
-            G.bodies.push(plainBody(boxAt(Math.abs(p1.x - p0.x), y1 - y0, Math.abs(p1.z - p0.z), (p0.x + p1.x) / 2, (y0 + y1) / 2, (p0.z + p1.z) / 2), b.seed, b.arch));
+            for (const [c0, c1] of pierRuns(a, w / 2, rel)) {
+              const p0 = f.P3(a - w / 2, c0, 0);
+              const p1 = f.P3(a + w / 2, c1, rel);
+              G.bodies.push(plainBody(boxAt(Math.abs(p1.x - p0.x), c1 - c0, Math.abs(p1.z - p0.z), (p0.x + p1.x) / 2, (c0 + c1) / 2, (p0.z + p1.z) / 2), b.seed, b.arch));
+              // 11A-1b: deep (0.48 m > player radius) reveal piers are solid, so the camera never enters one.
+              if (deep) f.coll(a - w / 2, a + w / 2, c0, c1, 0, rel, b.index);
+            }
           }
           pierCount++;
+        }
+        // 11A-1b: 0.38 m dark-steel sun-breaker fins above each 2F–8F window head between the deep piers.
+        if (deep) {
+          for (let k = 0; k + 1 < lines.length; k++) {
+            // Bolted to the wall (d 0) and butted into both deep piers: a full load path, nothing floats.
+            const f0 = lines[k] + w / 2;
+            const f1 = lines[k + 1] - w / 2;
+            if (f1 - f0 < 1) continue;
+            for (let n = 2; n <= 8; n++) {
+              const yf = floorTopY(b.arch, n) - 0.6;
+              if (yf < y0 + 2 || yf + 0.6 > Math.min(y1, GR.BAND_MAX_Y_M)) continue;
+              if (openingsAt(b.index, span.ax, span.sg, span.plane, f0, f1, yf - 0.1, yf + 0.15).length) continue;
+              const q0 = f.P3(f0, yf, 0);
+              const q1 = f.P3(f1, yf + 0.05, 0.38);
+              const lx = Math.min(q0.x, q1.x);
+              const hx = Math.max(q0.x, q1.x);
+              const lz = Math.min(q0.z, q1.z);
+              const hz = Math.max(q0.z, q1.z);
+              if (signBoxes.some((o) => o.x0 < hx + 0.05 && o.x1 > lx - 0.05 && o.z0 < hz + 0.05 && o.z1 > lz - 0.05 && o.y0 < yf + 0.1 && o.y1 > yf - 0.05)) continue;
+              G.steel.push(...f.bx(f0, f1, yf, yf + 0.05, 0, 0.38, { bottom: GR.AO_UNDERSIDE }));
+              finCount++;
+            }
+          }
         }
       }
     });
@@ -7653,6 +7986,69 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
       stat.lanternStrings++;
     }
 
+    // ------------------------------------------------------------------ 11A-1b cantilevered bay-window / HVAC pods
+    // 35–50 % of the non-megastructure towers carry 1–2 staggered pods (8–32 m) centred between the room piers of a
+    // non-run lot feature face, ≥ 2.4 m street / alley clearance in front, clear of signs, colliders, props, openings.
+    const podRng = createRng(0x11b3 + sector.index * 71 + loop * 433);
+    let podCount = 0;
+    let podTowers = 0;
+    let podEligible = 0;
+    for (const b of buildings) {
+      if (isMegaKind(b.massing) || !b.plan.faces.some((sp) => sp.y1 >= 14 && !sp.court && sp.a1 - sp.a0 >= 6)) continue;
+      podEligible++;
+      if (podRng() > 0.85) continue;
+      let placed = 0;
+      for (const span of b.plan.faces) {
+        if (placed >= 2) break;
+        const key = fkey(b, span.ax, span.sg);
+        // Never on a wall-run side (lot or set-back wall of that side); signature faces only matter on lot faces.
+        if (span.court || runFaces.has(key)) continue;
+        if (span.lot && ( balconyFaces.has(key) || escapeFaces.has(key) || ductFaces.has(key) || spineFaces.has(key) || galleryFaces.has(key) || megaFaces.has(key) || partialFaces.has(key))) continue;
+        if (span.y1 < 14 || span.a1 - span.a0 < 6) continue;
+        const hvac = podRng() < 0.35;
+        const [pw, pd, ph] = hvac ? [2.4, 1.2, 2.4] : [3.2, 0.95, 2.8];
+        if ((alleyFaces.has(key) ? alleyWidth.get(key) ?? 0 : 8) < 2.4 + pd) continue;
+        // Faces looking at the lockdown barrier: the gap to its inner face is the clearance.
+        if (span.sg * span.plane > 0 && H - 0.5 - Math.abs(span.plane) < 2.4 + pd) continue;
+        const lines = roomLines(b, span.ax, span.sg, span.a0, span.a1, b.arch === ARCH_D ? 2 : 1, 0.7);
+        // Centred in a wide bay between two room piers, or hung across one pier (the pier runs through the pod).
+        const cands: number[] = [];
+        for (let k = 0; k + 1 < lines.length; k++) if (lines[k + 1] - lines[k] - 0.42 >= pw + 0.1) cands.push((lines[k] + lines[k + 1]) / 2);
+        for (const ln of lines) cands.push(ln);
+        if (!lines.length) cands.push((span.a0 + span.a1) / 2);
+        let a = 0;
+        let yBase = 0;
+        let bb: [number, number, number, number, number, number] | null = null;
+        const f = sf(span.ax, span.sg, span.plane);
+        // Up to 4 (position, storey) tries; own-building colliders are skipped (deep reveal piers pass through pods).
+        for (let t = 0; t < 4 && !bb; t++) {
+          a = cands[Math.floor(podRng() * cands.length)];
+          yBase = floorTopY(b.arch, 2 + Math.floor(podRng() * 5)) + 0.15;
+          if (yBase < 8 || yBase + ph > Math.min(32, span.y1 - 1.2)) continue;
+          // The whole pod incl. its 45° brackets (down to yBase − depth) hangs on THIS wall span, never inside a
+          // lower tier / terrace, and clear of the tower's sky-notch band.
+          if (yBase - pd - 0.2 < span.y0 + 0.05) continue;
+          if (skyNotches.some((sn) => sn.building === b.index && yBase - pd - 0.5 < sn.yNotch + SKY_NOTCH.H_M + 0.5 && yBase + ph + 0.5 > sn.yNotch - 0.5)) continue;
+          if (a - pw / 2 < span.a0 + 0.5 || a + pw / 2 > span.a1 - 0.5) continue;
+          if (openingsAt(b.index, span.ax, span.sg, span.plane, a - pw / 2 - 0.3, a + pw / 2 + 0.3, yBase - 1.2, yBase + ph + 0.3).length) continue;
+          const q0 = f.P3(a - pw / 2 - 0.1, yBase - 1.1, 0.02);
+          const q1 = f.P3(a + pw / 2 + 0.1, yBase + ph + 0.1, pd + 0.1);
+          const box: [number, number, number, number, number, number] = [Math.min(q0.x, q1.x), yBase - 1.1, Math.min(q0.z, q1.z), Math.max(q0.x, q1.x), yBase + ph + 0.1, Math.max(q0.z, q1.z)];
+          if (hitsSign(...box) || hitsCollider(...box, b.index) || [...footprints, ...propObstacles].some((o) => box[0] < o.maxX && box[3] > o.minX && box[1] < o.maxY && box[4] > o.minY && box[2] < o.maxZ && box[5] > o.minZ)) continue;
+          bb = box;
+        }
+        if (!bb) continue;
+        const pod = bayPodPieces({ ax: span.ax, sg: span.sg, plane: span.plane, a0: span.a0, a1: span.a1 }, a, yBase, pw, pd, ph, hvac);
+        for (const pc of pod.shell) shellGeo(pc);
+        for (const sd of pod.solids) colliders.push({ min: new THREE.Vector3(sd.x0, sd.y0, sd.z0), max: new THREE.Vector3(sd.x1, sd.y1, sd.z1), kind: 'BUILDING', building: b.index });
+        for (const bm of pod.beams) G.steel.push(aoPipe(bm.a, bm.b, bm.w / 2, null));
+        propObstacles.push({ minX: bb[0], minY: bb[1], minZ: bb[2], maxX: bb[3], maxY: bb[4], maxZ: bb[5] });
+        placed++;
+        podCount++;
+        if (placed === 1) podTowers++;
+      }
+    }
+
     // ------------------------------------------------------------------ 15c. 10D-2 AnimatedEnvKit (+1 call)
     // Spinning exhaust fans on solid facade spans + machine-room flanks, noren curtains under eatery awning lips and
     // in door-free alley bays, counter-rotating wireframe holograms on tall flat roofs. Own RNG stream.
@@ -7809,6 +8205,7 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
         if (envStat.bayNoren >= 24 || env.count >= 212) break;
         if (a - 0.86 < span.a0 + 0.1 || a + 0.86 > span.a1 - 0.1) continue;
         if (!solidAt(b, span.ax, span.sg, span.plane, a, 0.86, 2.7, 0.4)) continue;
+        if (openingsAt(b.index, span.ax, span.sg, span.plane, a - 0.9, a + 0.9, 2.2, 3.4).length) continue;
         if (doors.some((d) => a + 0.85 > d.bay.a0 && a - 0.85 < d.bay.a1)) continue;
         if (piersHere.some((gp) => a + 0.86 > gp.a0 - 0.02 && a - 0.86 < gp.a1 + 0.02)) continue;
         const [x0, y0, z0, x1, y1, z1] = faceBox(f, a - 0.86, a + 0.86, yRod - 0.7, yRod + 0.06, 0.02, dRod + 0.14);
@@ -7849,6 +8246,7 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
         if (b1 - b0 < ENV_DIMS.NOREN_W + 0.1) continue;
         const a = (b0 + b1) / 2;
         if (a - 0.85 < span.a0 + 0.5 || a + 0.85 > span.a1 - 0.5 || !underCanopy(a)) continue;
+        if (openingsAt(b.index, span.ax, span.sg, span.plane, a - 0.9, a + 0.9, 2.2, 3.6).length) continue;
         const [x0, y0, z0, x1, y1, z1] = faceBox(f, a - 0.86, a + 0.86, yRod - 0.7, yRod + 0.02, dRod - 0.12, dRod + 0.14);
         if (hitsSign(x0, y0, z0, x1, y1, z1) || hitsCollider(x0, y0, z0, x1, y1, z1) || hitsFootprint(x0, y0, z0, x1, y1, z1)) continue;
         const c = f.P3(a, yRod, dRod - 0.06);
@@ -8193,6 +8591,13 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
       groundSpawns,
       highwaySpawns,
       trafficLanes,
+      interiors,
+      interiorProps,
+      breachDoors,
+      glassPanes,
+      skyNotches,
+      interiorOpenings,
+      reliefPods: { pods: podCount, towers: podTowers, eligible: podEligible },
       bridgeSpawns,
       skybridgeSpawns,
       roofSpawns,

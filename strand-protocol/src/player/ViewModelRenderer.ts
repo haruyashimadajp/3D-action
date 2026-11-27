@@ -18,7 +18,9 @@
  *    or an ultra-fine crosshair with mil ticks (sniper) that sits exactly on the aim point in ADS; blowback,
  *    ejection sparks, diegetic ammo bar recessed in a bevelled housing
  *  - lighting: tuned environment reflections + a 60 ms muzzle point light on every shot
- * Draw calls: ≤ 11 per frame for the whole view-model (one material per static body, one per moving part).
+ * Draw calls: ≤ 11 per frame for the whole view-model (one material per static body, one per moving part);
+ * the 11A-2 breach-kick boot (`BootKickRig`, one shared-hardMat mesh) is invisible — 0 calls — except during
+ * the 0.22 s kick (+1).
  */
 import * as THREE from 'three';
 import { CAMERA, COLORS, MATERIALS, clamp, lerpFactor } from '../config/constants';
@@ -420,6 +422,158 @@ export function buildMuzzleFlashGeometry(length: number, radius: number, lateral
   return out;
 }
 
+// =============================================================================================
+// 11A-2 first-person cyber-boot breach kick (HERO_3D_MODELING_SPEC §5.1, Phase 13 swap-ready §7)
+// =============================================================================================
+/** §7 locked node names: a rigged Blender `.glb` boot drops in under `ViewModelRenderer.root`. */
+export const BOOT_KICK_RIG_NAME = 'BootKickRig';
+export const BOOT_PIVOT_NAME = 'bootPivot';
+
+/**
+ * §5.1 canonical boot envelope (metres, boot-local frame: origin = ankle joint, +Y up the shin, −Z toward the
+ * toe, sole underside at `soleBottomY`). A `.glb` replacement keeps this pivot so the kick arc needs no rework.
+ */
+export const BOOT_DIMS = {
+  soleW: 0.125,
+  soleH: 0.042,
+  soleL: 0.31,
+  soleBottomY: -0.095,
+  heelZ: 0.082,
+  toeZ: -0.228,
+  shinGuard: { w: 0.11, h: 0.34, d: 0.12 },
+  pistonR: 0.01,
+  cleats: 5,
+} as const;
+
+/** 0.22 s kick arc timing (real seconds), poses (view space) and camera punch. */
+export const BOOT_KICK = {
+  DURATION_S: 0.22,
+  CHAMBER_END_S: 0.05,
+  EXTEND_END_S: 0.12,
+  /** One-shot impact (`consumeKickImpact()`): the sole is at ~98 % extension. */
+  IMPACT_S: 0.1,
+  /** The camera punch keeps easing back after the leg has left the frame. */
+  PUNCH_END_S: 0.3,
+  PUNCH_PITCH_RAD: (-1.2 * Math.PI) / 180,
+  PUNCH_Z: 0.06,
+  /** Suggested camera trauma at impact (applied by the caller). */
+  TRAUMA: 0.28,
+  X: -0.045,
+  Y_START: -0.75,
+  Y_CHAMBER: -0.22,
+  Y_EXTEND: -0.14,
+  Z_CHAMBER: -0.25,
+  Z_EXTEND: -0.74,
+  Z_RETRACT: -0.3,
+  /** Boot pitch about X: 90° + 24° at impact = the sole faces the door, tilted 24° upward. */
+  PITCH_START: (150 * Math.PI) / 180,
+  PITCH_CHAMBER: (140 * Math.PI) / 180,
+  PITCH_IMPACT: ((90 + 24) * Math.PI) / 180,
+  /** Toe turned out / leg rolled in: the camera reads the boot's outer flank, pistons and sole edge. */
+  YAW: 0.38,
+  ROLL: 0.22,
+  WEAPON_DIP_Y: -0.14,
+  WEAPON_DIP_RX: -0.28,
+} as const;
+
+/** Dark tactical synthetic for the boot upper (gun-set polymer zone). */
+const BOOT_UPPER = 0x555b66;
+
+/** Side-profile (f = −z, y) extrusion across x with a single-segment chamfer (cheaper than `profile`). */
+function chamferSide(pts: ReadonlyArray<readonly [number, number]>, width: number, b: number): THREE.BufferGeometry {
+  const sh = new THREE.Shape(pts.map(([f, y]) => new THREE.Vector2(f, y)));
+  const depth = Math.max(1e-4, width - 2 * b);
+  const g = new THREE.ExtrudeGeometry(sh, { depth, bevelEnabled: true, bevelThickness: b, bevelSize: b * 0.8, bevelSegments: 1, curveSegments: 1 });
+  g.rotateY(Math.PI / 2);
+  g.translate(-depth / 2, 0, 0);
+  return g;
+}
+
+/** Faceted (6-sided) tapered elliptical sleeve along +Y: y0 → y1, half-axes (rx, rz) at the top, `taper` at y0. */
+function facetSleeve(y0: number, y1: number, rx: number, rz: number, taper: number, zc: number, closed = false): THREE.BufferGeometry {
+  const g = new THREE.CylinderGeometry(1, taper, y1 - y0, 6, 1, !closed);
+  g.scale(rx, 1, rz);
+  g.translate(0, (y0 + y1) / 2, zc);
+  return g;
+}
+
+/**
+ * §5.1 first-person cyber-boot kick rig (one merged geometry for the shared `hardMat`, ~300 tris): lugged
+ * rubber sole with 5 saw-tooth tread cleats, chamfered synthetic upper with a laced vamp, faceted carbon toe
+ * cap, brushed-metal heel counter with a thin energy-cyan accent fibre, faceted dark ballistic shin guard
+ * (0.11 × 0.34 × 0.12) with two buckled calf straps, twin matte-chrome exo-ankle hydraulic pistons (rod r 0.010)
+ * and the under-suit leg above the guard. Pure factory — Phase 13 swaps it for a `.glb` with the same pivot.
+ */
+export function buildBootKickGeometry(): THREE.BufferGeometry {
+  const kit = new MeshKit();
+  const D = BOOT_DIMS;
+  const soleTop = D.soleBottomY + D.soleH;
+  // ---- Lugged sole: plan outline (x, f) with a rounded toe, extruded 0.042 m vertically ----
+  const plan: Array<[number, number]> = [
+    [-0.05, -D.heelZ], [0.05, -D.heelZ], [0.058, -0.04], [0.0625, 0.12], [0.054, 0.195], [0.028, -D.toeZ],
+    [-0.028, -D.toeZ], [-0.054, 0.195], [-0.0625, 0.12], [-0.058, -0.04],
+  ];
+  const sole = frontPlate(plan, D.soleH, 0);
+  // Shape (x, f) in XY extruded along Z → rotate −90° about X: shape y (= f) → −z, extrusion → +y.
+  sole.rotateX(-Math.PI / 2);
+  sole.translate(0, D.soleBottomY + D.soleH / 2, 0);
+  kit.add(sole, { tint: T.RUBBER, zone: 2, rough: 1.5, metal: 0, tile: 0.05 });
+  // 5 saw-tooth tread cleats under the sole (heel pair + forefoot trio), 11 mm deep.
+  const cleats: Array<[number, number]> = [[-0.052, 0.094], [0.0, 0.1], [0.07, 0.114], [0.125, 0.112], [0.178, 0.094]];
+  for (const [f, w] of cleats) {
+    const y0 = D.soleBottomY + 0.001;
+    kit.add(profile([[f - 0.015, y0], [f + 0.015, y0], [f - 0.004, y0 - 0.012]], w, 0), { tint: T.RUBBER, zone: 2, rough: 1.6, metal: 0, tile: 0.05 });
+  }
+  // ---- Upper: heel → ankle collar → instep slope → low vamp (toe box is the carbon cap) ----
+  kit.add(chamferSide([[-0.068, soleTop - 0.002], [-0.06, 0.075], [0.035, 0.075], [0.1, 0.02], [0.13, 0.004], [0.13, soleTop - 0.002]], 0.1, 0.006), {
+    tint: BOOT_UPPER,
+    zone: 2,
+    rough: 1.15,
+    tile: 0.06,
+  });
+  // Laced vamp: three lace bars across the 45° instep slope (seated on the chamfered face, 0.6 mm embedded).
+  const slope = Math.atan2(0.075 - 0.02, 0.1 - 0.035);
+  for (let k = 0; k < 3; k++) {
+    const f = 0.048 + k * 0.019;
+    const y = 0.075 - (f - 0.035) * Math.tan(slope);
+    kit.add(new THREE.BoxGeometry(0.074, 0.004, 0.006), { tint: 0x30343a, zone: 1, rough: 1.3, tile: 0.02 }, at(0, y + 0.0058 * Math.cos(slope), -f - 0.0058 * Math.sin(slope), -slope));
+  }
+  // Faceted carbon toe cap (8 × 2 dome) = the toe box, flush with the vamp end and seated on the sole.
+  const toe = new THREE.SphereGeometry(1, 8, 2, 0, Math.PI * 2, 0, Math.PI / 2);
+  toe.scale(0.054, 0.062, 0.093);
+  toe.translate(0, soleTop - 0.001, D.toeZ + 0.093);
+  kit.add(toe, { tint: T.CARBON, zone: 2, rough: 0.8, metal: 2 });
+  // Brushed-metal heel counter wrapping the heel + thin energy-cyan accent fibre along its top edge.
+  kit.add(new THREE.BoxGeometry(0.108, 0.05, 0.011), { tint: T.GUNMETAL, zone: 0 }, at(0, soleTop + 0.024, 0.0745));
+  kit.add(new THREE.BoxGeometry(0.11, 0.004, 0.004), { tint: 0x0a0c10, zone: 0, glow: [1.3, 0, 0] }, at(0, soleTop + 0.05, 0.079));
+  // ---- Faceted dark ballistic shin guard (front ridge on the −z facet vertex), straps, under-suit leg ----
+  const gY0 = 0.03;
+  const gY1 = gY0 + D.shinGuard.h;
+  const gRx = D.shinGuard.w / 2;
+  const gRz = D.shinGuard.d / 2;
+  const gTaper = 0.87;
+  const gZ = 0.01;
+  kit.add(facetSleeve(gY0, gY1, gRx, gRz, gTaper, gZ), { tint: T.BLACK, zone: 0, rough: 1.25, metal: 0.7, tile: 0.14 });
+  kit.add(facetSleeve(gY1 - 0.04, gY1 + 0.26, gRx * 1.16, gRz * 1.14, 0.98, gZ + 0.004), { tint: T.NYLON, zone: 2, rough: 1.2, tile: 0.12 });
+  const scaleAt = (y: number): number => gTaper + (1 - gTaper) * ((y - gY0) / (gY1 - gY0));
+  // Straps ride above the piston bodies (y > 0.175) so nothing interpenetrates.
+  for (const sy of [0.205, 0.315]) {
+    const s = scaleAt(sy) * 1.07;
+    kit.add(facetSleeve(sy - 0.011, sy + 0.011, gRx * s, gRz * s, 0.985, gZ), { tint: T.NYLON, zone: 1, tile: 0.04 });
+    // Buckle on the inner-side (+x) flat facet (6-gon side facet at 0.866 r).
+    kit.add(new THREE.BoxGeometry(0.008, 0.028, 0.024), { tint: T.GUNMETAL, zone: 0, rough: 0.7 }, at(gRx * s * 0.866 + 0.003, sy, gZ));
+  }
+  // ---- Twin matte-chrome exo-ankle hydraulic pistons: rod (r 0.010) from the boot flank into a body on the guard ----
+  // Rod foot is sunk into the boot flank (its open end faces the door side, never the camera); the closed
+  // body sits flush on the guard's flat side facet.
+  for (const sx of [-1, 1]) {
+    const x = sx * 0.055;
+    kit.add(cylinder(V(x, -0.028, 0.034), V(x, 0.08, 0.026), D.pistonR, D.pistonR, 5, true), { tint: T.CHROME, zone: 0, rough: 0.6 });
+    kit.add(cylinder(V(x, 0.07, 0.027), V(x, 0.175, 0.02), 0.0135, 0.0125, 5), { tint: T.DARK, zone: 0, rough: 0.9 });
+  }
+  return kit.build();
+}
+
 export class ViewModelRenderer {
   readonly root = new THREE.Group();
   private readonly weaponPivot = new THREE.Group();
@@ -483,6 +637,20 @@ export class ViewModelRenderer {
   private rimLight!: THREE.DirectionalLight;
   private energyHex: number = COLORS.PLAYER_STRAND;
   private plasma = false;
+  // 11A-2 breach-kick rig (child of `root`, so `root.visible` hides it on the title / photo mode)
+  private readonly bootRig = new THREE.Group();
+  private readonly bootPivot = new THREE.Group();
+  /** Real seconds since `startKick()` (−1 = idle). Runs on to `PUNCH_END_S` for the camera punch tail. */
+  private kickT = -1;
+  private kickImpactPending = false;
+  private kickImpactDone = false;
+  /** 0..1 weapon dip while the leg is up. */
+  private kickDip = 0;
+  /**
+   * 11A-2 camera punch for the caller to add to the main camera every frame (no allocation): `pitch` in rad
+   * (peaks at −1.2° on impact) and `z` in metres along the camera's local +Z (peaks at +0.06 m), eased back to 0.
+   */
+  readonly kickPunch: { pitch: number; z: number } = { pitch: 0, z: 0 };
 
   constructor(
     private readonly scene: THREE.Scene,
@@ -538,6 +706,106 @@ export class ViewModelRenderer {
     this.spark.renderOrder = 10;
     this.weaponPivot.add(this.flash, this.spark);
     this.weaponPivot.position.set(0.21, -0.2, -0.42);
+
+    // ---------------- 11A-2 breach-kick boot (one hardMat draw, rendered only during the 0.22 s kick) ----------------
+    this.bootRig.name = BOOT_KICK_RIG_NAME;
+    this.bootPivot.name = BOOT_PIVOT_NAME;
+    const boot = new THREE.Mesh(buildBootKickGeometry(), this.hardMat);
+    boot.name = 'BootKick';
+    boot.frustumCulled = false;
+    this.bootPivot.add(boot);
+    this.bootRig.add(this.bootPivot);
+    this.bootRig.visible = false;
+    this.root.add(this.bootRig);
+  }
+
+  // =============================================================================================
+  // 11A-2 breach kick
+  // =============================================================================================
+  /** Starts the 0.22 s boot kick; false if one is already running (the caller should not breach twice). */
+  startKick(): boolean {
+    if (this.kicking) return false;
+    this.kickT = 0;
+    this.kickImpactPending = false;
+    this.kickImpactDone = false;
+    return true;
+  }
+
+  /** True while the leg is in the 0.22 s arc. */
+  get kicking(): boolean {
+    return this.kickT >= 0 && this.kickT < BOOT_KICK.DURATION_S;
+  }
+
+  /** One-shot: true exactly once per kick, on the first frame past the extension impact (0.10 s). */
+  consumeKickImpact(): boolean {
+    if (!this.kickImpactPending) return false;
+    this.kickImpactPending = false;
+    return true;
+  }
+
+  /** Advances the kick arc on real time (bullet time / hitstop never slow it). Allocation-free. */
+  private updateKick(realDt: number): void {
+    if (this.kickT < 0) {
+      this.bootRig.visible = false;
+      this.kickDip = 0;
+      this.kickPunch.pitch = 0;
+      this.kickPunch.z = 0;
+      return;
+    }
+    const K = BOOT_KICK;
+    const t = (this.kickT += realDt);
+    if (t >= K.PUNCH_END_S) {
+      this.kickT = -1;
+      this.bootRig.visible = false;
+      this.kickDip = 0;
+      this.kickPunch.pitch = 0;
+      this.kickPunch.z = 0;
+      return;
+    }
+    if (!this.kickImpactDone && t >= K.IMPACT_S) {
+      this.kickImpactDone = true;
+      this.kickImpactPending = true;
+    }
+    // Camera punch: 20 ms attack from the impact, smooth ease back to 0 by PUNCH_END_S.
+    const tp = t - K.IMPACT_S;
+    const punch = tp <= 0 ? 0 : tp < 0.02 ? sstep(0, 0.02, tp) : 1 - sstep(0.02, K.PUNCH_END_S - K.IMPACT_S, tp);
+    this.kickPunch.pitch = K.PUNCH_PITCH_RAD * punch;
+    this.kickPunch.z = K.PUNCH_Z * punch;
+    // Weapon dips while the leg is up and returns during the retraction.
+    this.kickDip = t < K.CHAMBER_END_S ? sstep(0, K.CHAMBER_END_S, t) : t < K.EXTEND_END_S ? 1 : 1 - sstep(K.EXTEND_END_S, K.DURATION_S, t);
+    if (t >= K.DURATION_S) {
+      this.bootRig.visible = false;
+      return;
+    }
+    let y: number;
+    let z: number;
+    let pitch: number;
+    if (t < K.CHAMBER_END_S) {
+      // Chamber: knee snaps up from below the frame (ease-out).
+      const u = t / K.CHAMBER_END_S;
+      const e = 1 - (1 - u) * (1 - u);
+      y = K.Y_START + (K.Y_CHAMBER - K.Y_START) * e;
+      z = K.Z_CHAMBER;
+      pitch = K.PITCH_START + (K.PITCH_CHAMBER - K.PITCH_START) * e;
+    } else if (t < K.EXTEND_END_S) {
+      // Explosive extension: cubic ease-out drive into the door, sole pitched 24° up at impact.
+      const u = (t - K.CHAMBER_END_S) / (K.EXTEND_END_S - K.CHAMBER_END_S);
+      const e = 1 - (1 - u) * (1 - u) * (1 - u);
+      y = K.Y_CHAMBER + (K.Y_EXTEND - K.Y_CHAMBER) * e;
+      z = K.Z_CHAMBER + (K.Z_EXTEND - K.Z_CHAMBER) * e;
+      pitch = K.PITCH_CHAMBER + (K.PITCH_IMPACT - K.PITCH_CHAMBER) * e;
+    } else {
+      // Snap retraction back down below the frame (ease-in).
+      const u = (t - K.EXTEND_END_S) / (K.DURATION_S - K.EXTEND_END_S);
+      const e = u * u;
+      y = K.Y_EXTEND + (K.Y_START - K.Y_EXTEND) * e;
+      z = K.Z_EXTEND + (K.Z_RETRACT - K.Z_EXTEND) * e;
+      pitch = K.PITCH_IMPACT + (K.PITCH_START - K.PITCH_IMPACT) * e;
+    }
+    this.bootRig.visible = true;
+    this.bootPivot.position.set(K.X, y, z);
+    // Slight inward yaw / roll so the leg reads as coming from the left hip, not dead centre.
+    this.bootPivot.rotation.set(pitch, K.YAW, K.ROLL, 'XYZ');
   }
 
   // =============================================================================================
@@ -1291,6 +1559,7 @@ export class ViewModelRenderer {
   // =============================================================================================
   update(realDt: number, f: ViewModelFrame): void {
     this.time += realDt;
+    this.updateKick(realDt);
     this.hardU.uWetTime.value = this.time;
     this.gearU.uWetTime.value = this.time;
     for (const id of SLOT_KEYS) this.rigs[id].group.visible = id === f.slot;
@@ -1431,10 +1700,10 @@ export class ViewModelRenderer {
     const p = this.weaponPivot;
     p.position.set(
       0.21 + (adsX - 0.21) * z + (this.swayX + bobX) * calm + R.shift,
-      -0.2 + (adsY + 0.2) * z + (this.swayY + bobY) * calm - ease * 0.32 + R.lift + this.jolt - this.lower - this.mantleDip,
+      -0.2 + (adsY + 0.2) * z + (this.swayY + bobY) * calm - ease * 0.32 + R.lift + this.jolt - this.lower - this.mantleDip + BOOT_KICK.WEAPON_DIP_Y * this.kickDip,
       -0.42 + (adsZ + 0.42) * z + this.kickZ + ease * 0.05,
     );
-    p.rotation.set(this.kickP + ease * 0.95 + this.swayY * 2 * calm + R.pitch, this.swayX * 2.5 * calm, (-this.tilt - ease * 0.35 + R.roll) * (1 - 0.6 * z), 'XYZ');
+    p.rotation.set(this.kickP + ease * 0.95 + this.swayY * 2 * calm + R.pitch + BOOT_KICK.WEAPON_DIP_RX * this.kickDip, this.swayX * 2.5 * calm, (-this.tilt - ease * 0.35 + R.roll) * (1 - 0.6 * z), 'XYZ');
     p.updateMatrix();
 
     // Left arm: supports the sniper fore-end, thrusts the winch forward while the strand is out,

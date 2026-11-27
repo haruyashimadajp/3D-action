@@ -24,6 +24,7 @@ import {
   SHAKE,
   DEG2RAD,
   type HitstopDef,
+  type ShakeDef,
   type QualityPreset,
   QUALITY_PRESETS,
   clamp,
@@ -71,7 +72,8 @@ import { EffectsPool, BURST, type ProjectileImpact, type ProjectileOwner, type P
 import { EnemyManager, RICOCHET_TAG, type HitMarkerKind, type KillInfo, type RadarEnemySample } from './entities/EnemyManager';
 import { PlayerController } from './player/PlayerController';
 import { EquipmentManager } from './player/EquipmentManager';
-import { ViewModelRenderer } from './player/ViewModelRenderer';
+import { BOOT_KICK, ViewModelRenderer } from './player/ViewModelRenderer';
+import { DestructibleManager } from './entities/DestructibleManager';
 import { HUD_MAX_AWARE, HUD_MAX_RADAR, HUD_MAX_TRACKS, HUD_MAX_WARNINGS, HudManager, SaveStore, formatTime, type HudFrame } from './ui/HudManager';
 
 // ---------------------------------------------------------------------------
@@ -301,6 +303,9 @@ const _sparkDir = new THREE.Vector3();
 const _dripPos = new THREE.Vector3();
 const DOWN = new THREE.Vector3(0, -1, 0);
 const _lateLookDelta = { yaw: 0, pitch: 0 };
+/** 11A-2 interact scratch (zero per-frame allocations). */
+const _iFwd = new THREE.Vector3();
+const KICK_SHAKE: ShakeDef = { trauma: BOOT_KICK.TRAUMA, maxPitchYawDeg: 1.6, maxRollDeg: 1.2 };
 const _camRight = new THREE.Vector3();
 const _camUp = new THREE.Vector3();
 const _camBack = new THREE.Vector3();
@@ -363,6 +368,10 @@ class App {
   private readonly renderer: Renderer;
   private readonly city: CityBuilder;
   private readonly effects: EffectsPool;
+  /** 11A-2 / 11A-3 breach doors + destructible glass (+2 calls; debris lives in EffectsPool). */
+  private readonly destructibles: DestructibleManager;
+  /** Door targeted by the running boot kick (−1 none). */
+  private kickDoor = -1;
   private readonly physics = new PhysicsWorld();
   private readonly input: InputManager;
   private readonly viewModel: ViewModelRenderer;
@@ -455,8 +464,20 @@ class App {
     if (this.qualityOverride) this.city.setQuality(q as QualityPreset);
     this.renderer.scene.add(this.city.root);
     this.effects = new EffectsPool(this.renderer.scene);
+    this.effects.setCityLightInjector(this.city.cityLightInjector);
+    this.destructibles = new DestructibleManager(this.renderer.scene, this.effects, this.city.cityLightInjector);
+    if (this.qualityOverride) this.destructibles.setQuality(q as QualityPreset);
+    this.effects.setBreakables(this.destructibles);
     // 7B-7: rain splashes land on the first surface under their spot (street, deck, roof, puddle).
-    this.effects.setGroundQuery((x, y, z) => this.physics.probeGround(_groundQ.set(x, y, z), 0.05, 6.5));
+    this.effects.setGroundQuery((x, y, z) => {
+      // 11A: no rain splashes on carved interior floors.
+      const iv = this.layout?.interiors;
+      if (iv) for (let i = 0; i < iv.length; i++) {
+        const a = iv[i].aabb;
+        if (x > a.minX - 0.3 && x < a.maxX + 0.3 && z > a.minZ - 0.3 && z < a.maxZ + 0.3 && y > a.minY - 0.5) return null;
+      }
+      return this.physics.probeGround(_groundQ.set(x, y, z), 0.05, 6.5);
+    });
 
     this.input = new InputManager(this.renderer.renderer.domElement);
     this.viewModel = new ViewModelRenderer(this.renderer.viewModelScene, this.renderer.viewModelCamera, textures);
@@ -552,6 +573,20 @@ class App {
         else if (kind === 'DEESCALATE') this.hud.flowLog('SEARCH ABANDONED — ALERT', 0, 'skill');
       },
     });
+    // 11A-2 / 11A-3 breach doors + destructible glass: audio, stealth noise, behind-door stun payoff.
+    const dm = this.destructibles;
+    dm.onDoorBreach = (_door, pos, inward) => {
+      audio.doorBreach(pos);
+      this.enemies.onPlayerGunshot(pos, 22);
+      if (this.enemies.breachBlast(pos, inward, 2.4, 40, 1.5, 8.5) > 0) this.hud.flashEvent('BREACH STUN');
+    };
+    dm.onDoorQuietOpen = (_door, pos) => audio.doorCreak(pos);
+    dm.onGlassShatter = (_pane, pos) => {
+      audio.glassShatter(pos);
+      this.enemies.onPlayerGunshot(pos, 26);
+    };
+    this.player.crashProbe = (pos, delta, r, h, doors) => dm.crashThrough(pos, delta, r, h, doors);
+    this.hud.onFullscreen = () => this.input.toggleFullscreen(false);
     // The strand can bite straight into humanoids / drones / the boss (15 dmg + stagger, anchor follows).
     this.equipment.combat = {
       targets: () => this.enemies.grappleTargets,
@@ -739,6 +774,7 @@ class App {
         if (!this.qualityOverride) {
           this.renderer.setQuality(s.quality);
           this.city.setQuality(s.quality);
+          this.destructibles.setQuality(s.quality);
         }
         break;
       case 'volume':
@@ -821,6 +857,9 @@ class App {
   private buildSector(index: number): SectorLayout {
     const layout = this.city.buildSector(index, this.loop);
     this.physics.setLayout(layout);
+    this.destructibles.setLevel(this.physics, layout.colliders, layout.breachDoors, layout.glassPanes);
+    this.effects.setIndoorVolumes(layout.interiors.map((iv) => iv.aabb));
+    this.kickDoor = -1;
     this.attract.rebuild(layout);
     this.layout = layout;
     // 10D-4: re-arm breaker sparks (staggered), forget pending thunder; 10D-5: no rain smear on the jump.
@@ -915,12 +954,53 @@ class App {
     this.renderer.postFx.fade = 0;
     this.renderer.postFx.critical = 0;
     if (!restartSector) return;
+    // 11A: a restarted district gets its doors and glass back.
+    this.destructibles.setLevel(this.physics, this.layout.colliders, this.layout.breachDoors, this.layout.glassPanes);
+    this.kickDoor = -1;
     this.setGateOpen(this.debugGate);
     this.enemies.startSector(this.layout, this.loop);
     this.clearTimer = -1;
     this.clearAction = null;
     this.gateReady = this.debugGate;
     this.audio.setCalm(false);
+  }
+
+  /** 11A-2 [F] / [E]: crouched → silent open, otherwise a boot breach kick at the nearest door in view. */
+  private interact(): void {
+    const p = this.player;
+    _iFwd.set(-Math.sin(p.yaw), 0, -Math.cos(p.yaw));
+    const i = this.destructibles.nearestDoor(p.position, _iFwd);
+    if (i < 0) return;
+    if (p.state === 'CROUCHING') {
+      this.destructibles.openDoorQuietly(i);
+      return;
+    }
+    if (this.viewModel.startKick()) {
+      this.audio.kickWhoosh();
+      this.kickDoor = i;
+    }
+  }
+
+  /** Per frame: contextual prompt + the kick's impact moment (breach the targeted door). */
+  private updateInteract(frozen: boolean): void {
+    if (this.viewModel.consumeKickImpact() && this.kickDoor >= 0) {
+      const p = this.player;
+      _iFwd.set(-Math.sin(p.yaw), 0, -Math.cos(p.yaw));
+      // Still in reach of the boot at the impact frame (the player may have stepped away during the 0.1 s windup).
+      if (this.destructibles.doorState(this.kickDoor) === 'CLOSED' && this.destructibles.nearestDoor(p.position, _iFwd, 2.6, 0.3) === this.kickDoor) {
+        this.destructibles.breachDoor(this.kickDoor, _iFwd);
+        p.addTrauma(KICK_SHAKE);
+      }
+      this.kickDoor = -1;
+    }
+    if (frozen || this.state !== 'PLAYING' || this.player.state === 'DEAD') {
+      this.hud.setInteractPrompt(null);
+      return;
+    }
+    const p = this.player;
+    _iFwd.set(-Math.sin(p.yaw), 0, -Math.cos(p.yaw));
+    const near = this.destructibles.nearestDoor(p.position, _iFwd) >= 0;
+    this.hud.setInteractPrompt(near ? (p.state === 'CROUCHING' ? '[F] OPEN QUIETLY' : '[F] BREACH KICK') : null);
   }
 
   private showSectorBanner(): void {
@@ -1302,6 +1382,7 @@ class App {
       for (const a of this.equipment.handleActions()) {
         if (a === 'PAUSE') this.input.exitPointerLock();
         else if (a === 'FULLSCREEN') this.input.toggleFullscreen();
+        else if (a === 'INTERACT') this.interact();
         else if (a === 'RELOAD' && this.deathTimer >= 0 && this.deathTimer < this.deathDuration - PLAYER.MANUAL_RETRY_MS / 1000) {
           // Manual instant retry from the death screen (150 ms).
           this.deathTimer = this.deathDuration - PLAYER.MANUAL_RETRY_MS / 1000;
@@ -1390,9 +1471,16 @@ class App {
         }
       }
       this.player.updateCamera(frozen ? 0 : realDt, alpha, cam);
+      // 11A-2 boot-kick camera punch (after the late look sync; never delays the look path).
+      const kp = this.viewModel.kickPunch;
+      if (kp.pitch !== 0 || kp.z !== 0) {
+        cam.rotateX(kp.pitch);
+        cam.translateZ(kp.z);
+      }
       cam.updateMatrixWorld();
       this.viewModel.syncEnvironment(this.player.cameraEuler);
       this.equipment.frameUpdate(frozen ? 0 : realDt, cam, _lookDelta.yaw, _lookDelta.pitch);
+      this.updateInteract(frozen);
       this.enemies.frameUpdate(realDt, simDt, alpha);
       this.camVel.copy(this.player.velocity);
       if (this.camSnapped || cam.position.distanceToSquared(this.prevCamPos) > 25) {
@@ -1455,6 +1543,7 @@ class App {
     this.city.update(this.clock.simTime, cam.position);
     this.updateAmbientFx(playing, simDt, cam.position);
     this.effects.update(simDt, realDt, cam.position, this.camVel, this.clock.realTime, this.renderer.viewportHeight);
+    this.destructibles.update(simDt, cam.position);
     this.renderer.update(realDt);
     this.renderer.updateShadowFocus(cam.position);
     this.renderer.render();
