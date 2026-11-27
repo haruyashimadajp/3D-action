@@ -146,6 +146,76 @@ export function buildTrafficLanes(highways: ReadonlyArray<{ readonly axis: Axis;
   return lanes;
 }
 
+/**
+ * 10D-Fix FIX-4: true when (x, z) lies within `margin` of a lane's car envelope (half width TRAFFIC_BOUNDS.w / 2).
+ * Pure and allocation-free (spawn filtering, patrol legs, per-frame enemy clamp).
+ */
+export function inTrafficLane(lanes: readonly TrafficLane[], x: number, z: number, margin = 0.85): boolean {
+  const hw = TRAFFIC_BOUNDS.w / 2 + margin;
+  for (let i = 0; i < lanes.length; i++) {
+    const ln = lanes[i];
+    if (!ln.ring) {
+      if (Math.abs((ln.axis === 'x' ? z : x) - ln.lat) < hw) return true;
+    } else if (Math.abs(ringOffset(ln, x, z)) < hw) return true;
+  }
+  return false;
+}
+
+/** Signed distance of (x, z) from a ring lane's rounded-square centreline (+ outward). */
+function ringOffset(ln: TrafficLane, x: number, z: number): number {
+  const dx = Math.max(0, Math.abs(x) - (ln.R - ln.r));
+  const dz = Math.max(0, Math.abs(z) - (ln.R - ln.r));
+  return dx > 0 && dz > 0 ? Math.hypot(dx, dz) - ln.r : Math.max(Math.abs(x), Math.abs(z)) - ln.R;
+}
+
+/**
+ * 10D-Fix FIX-4: pushes a highway-deck point out of every traffic lane it stands in, inward toward the highway
+ * centreline (straight lanes) or toward the ring median between the two Sector 5 lanes. Mutates `pos.x / pos.z`
+ * only; zero allocations. Returns true when the point was moved.
+ */
+export function clampOutOfTrafficLanes(lanes: readonly TrafficLane[], pos: THREE.Vector3, margin = 0.85): boolean {
+  const hw = TRAFFIC_BOUNDS.w / 2 + margin + 0.02;
+  let moved = false;
+  for (let i = 0; i < lanes.length; i++) {
+    const ln = lanes[i];
+    if (!ln.ring) {
+      const lat = ln.axis === 'x' ? pos.z : pos.x;
+      if (Math.abs(lat - ln.lat) >= hw - 0.02) continue;
+      const toCentre = Math.sign(ln.centre - ln.lat) || 1;
+      const v = ln.lat + toCentre * hw;
+      if (ln.axis === 'x') pos.z = v;
+      else pos.x = v;
+      moved = true;
+      continue;
+    }
+    const off = ringOffset(ln, pos.x, pos.z);
+    if (Math.abs(off) >= hw - 0.02) continue;
+    // Outward normal of the rounded square at the point (corner fillet or dominant straight side).
+    const k = ln.R - ln.r;
+    const dx = Math.max(0, Math.abs(pos.x) - k);
+    const dz = Math.max(0, Math.abs(pos.z) - k);
+    let nx: number;
+    let nz: number;
+    if (dx > 0 && dz > 0) {
+      const l = Math.hypot(dx, dz);
+      nx = (Math.sign(pos.x) * dx) / l;
+      nz = (Math.sign(pos.z) * dz) / l;
+    } else if (Math.abs(pos.x) >= Math.abs(pos.z)) {
+      nx = Math.sign(pos.x) || 1;
+      nz = 0;
+    } else {
+      nx = 0;
+      nz = Math.sign(pos.z) || 1;
+    }
+    // pushSign −1 (outer lane) → inward, +1 (inner lane) → outward: both land on the median side.
+    const shift = ln.pushSign * hw - off;
+    pos.x += nx * shift;
+    pos.z += nz * shift;
+    moved = true;
+  }
+  return moved;
+}
+
 /** Car state at simulation time `t` (pure; used by the runtime and the tests). */
 export interface TrafficCarState {
   x: number;
@@ -421,7 +491,8 @@ export const ENV_VARIANT = { FAN: 0, NOREN: 1, HOLO: 2 } as const;
 export const ENV_DIMS = { FAN_R: 0.44, FAN_DEPTH: 0.26, NOREN_W: 1.64, NOREN_DROP: 0.68, HOLO_R: 3.4, HOLO_SWEEP: 3.6, HOLO_TOP: 8.4 } as const;
 /**
  * aAnim.x modes: 0 static · 1 fan blades (spin xy about local +Z) · 2 noren cloth (wind sway, aAnim.y = drop 0…1) ·
- * 3 hologram outer ring (+uTime · 0.45 about Y) · 4 hologram gyro ring + crystal (−uTime · 0.85 about Y + bob).
+ * 3 hologram outer ring (+uTime · 0.45 about Y) · 4 hologram gyro ring + crystal (−uTime · 0.85 about Y + bob) ·
+ * 5 noren awning hanger (static, collapsed in alley bays) · 6 noren wall standoff (static, collapsed under awnings).
  * aPart: 0 dark steel · 2 backlit vent core · 3 emitter pad glow · 4 neon hologram strut · 5 dyed cloth · 6 fan blade.
  */
 function tagEnv(list: THREE.BufferGeometry[], g: THREE.BufferGeometry, variant: number, part: number, mode: number, ao = 1): void {
@@ -472,8 +543,9 @@ function envNoren(L: THREE.BufferGeometry[]): void {
   const hw = ENV_DIMS.NOREN_W / 2;
   tagEnv(L, rod(new THREE.Vector3(-hw, 0, 0.06), new THREE.Vector3(hw, 0, 0.06), 0.018, 6), V, 0, 0);
   for (const sx of [-1, 1]) {
-    tagEnv(L, rod(new THREE.Vector3(sx * 0.7, 0, 0.06), new THREE.Vector3(sx * 0.7, 0.14, 0.06), 0.012, 4), V, 0, 0);
-    tagEnv(L, rod(new THREE.Vector3(sx * 0.7, 0, 0.06), new THREE.Vector3(sx * 0.7, 0, -0.22), 0.012, 4), V, 0, 0);
+    // 10D-Fix FIX-3: hangers (mode 5) only under awnings, wall standoffs (mode 6) only in alley bays (aEnv.w = 1).
+    tagEnv(L, rod(new THREE.Vector3(sx * 0.7, 0, 0.06), new THREE.Vector3(sx * 0.7, 0.14, 0.06), 0.012, 4), V, 0, 5);
+    tagEnv(L, rod(new THREE.Vector3(sx * 0.7, 0, 0.06), new THREE.Vector3(sx * 0.7, 0, -0.22), 0.012, 4), V, 0, 6);
   }
   const fw = 0.385;
   for (let k = 0; k < 4; k++) {
@@ -536,6 +608,8 @@ export interface EnvInstance {
   readonly yaw: number;
   /** Host: WALL / ROOM (machine-room flank) / AWNING / BAY (alley bay) / ROOF. */
   readonly host: 'WALL' | 'ROOM' | 'AWNING' | 'BAY' | 'ROOF';
+  /** Host building index (−1 when not on a building facade). */
+  readonly building: number;
 }
 
 const _col = new THREE.Color();
@@ -570,14 +644,14 @@ export class AnimatedEnvKit {
           float eAng = eMode == 1.0 ? uTime * aEnv.y + aEnv.z : (eMode == 3.0 ? uTime * 0.45 + aEnv.z : (eMode == 4.0 ? -uTime * 0.85 + aEnv.z : 0.0));
           mat2 eRot = mat2(cos(eAng), sin(eAng), -sin(eAng), cos(eAng));
           if (eMode == 1.0) objectNormal.xy = eRot * objectNormal.xy;
-          else if (eMode > 2.5) objectNormal.xz = eRot * objectNormal.xz;`,
+          else if (eMode == 3.0 || eMode == 4.0) objectNormal.xz = eRot * objectNormal.xz;`,
         )
         .replace(
           '#include <begin_vertex>',
           `#include <begin_vertex>
           vELocal = position;
           if (eMode == 1.0) transformed.xy = eRot * transformed.xy;
-          else if (eMode > 2.5) {
+          else if (eMode == 3.0 || eMode == 4.0) {
             transformed.xz = eRot * transformed.xz;
             if (eMode == 4.0) transformed.y += sin(uTime * 1.4 + aEnv.z) * 0.22;
           } else if (eMode == 2.0) {
@@ -586,7 +660,7 @@ export class AnimatedEnvKit {
             transformed.z += wave * bend;
             transformed.y += abs(wave) * 0.08 * bend;
           }
-          if (abs(aVar - aEnv.x) > 0.5) transformed = vec3(0.0);
+          if (abs(aVar - aEnv.x) > 0.5 || (eMode == 5.0 && aEnv.w > 0.5) || (eMode == 6.0 && aEnv.w < 0.5)) transformed = vec3(0.0);
           vEPart = aPart;
           vEAo = aAo;
           vECol = aEnvCol;`,
@@ -625,7 +699,7 @@ export class AnimatedEnvKit {
           else if (ep == 5.0) totalEmissiveRadiance = vECol * 0.12;`,
         );
     };
-    mat.customProgramCacheKey = () => 'strand-envkit-v1';
+    mat.customProgramCacheKey = () => 'strand-envkit-v2';
     this.mesh = new THREE.InstancedMesh(geo, mat, ENV_CAP);
     this.mesh.name = 'AnimatedEnvKit';
     this.mesh.count = 0;
@@ -643,17 +717,17 @@ export class AnimatedEnvKit {
   }
 
   /** Adds one instance (local +Z faces outward at `yaw`). `speed` rad/s, `phase` rad, `hex` sRGB colour. */
-  add(variant: number, x: number, y: number, z: number, yaw: number, speed: number, phase: number, hex: number, host: EnvInstance['host']): boolean {
+  add(variant: number, x: number, y: number, z: number, yaw: number, speed: number, phase: number, hex: number, host: EnvInstance['host'], building = -1): boolean {
     const i = this.mesh.count;
     if (i >= ENV_CAP) return false;
     _q.setFromAxisAngle(_yAxis, yaw);
     _m4.compose(_p.set(x, y, z), _q, _s1);
     this.mesh.setMatrixAt(i, _m4);
-    this.env.setXYZW(i, variant, speed, phase, 0);
+    this.env.setXYZW(i, variant, speed, phase, host === 'BAY' ? 1 : 0);
     _col.setHex(hex);
     this.envCol.setXYZ(i, _col.r, _col.g, _col.b);
     this.mesh.count = i + 1;
-    this.instances.push({ variant, x, y, z, yaw, host });
+    this.instances.push({ variant, x, y, z, yaw, host, building });
     return true;
   }
 

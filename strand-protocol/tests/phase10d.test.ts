@@ -5,7 +5,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import * as THREE from 'three';
-import { CITY_FX, LEVEL } from '../src/config/constants';
+import { CITY_FX, FACADE, LEVEL } from '../src/config/constants';
 import { SECTORS } from '../src/config/skills';
 import { readFileSync } from 'node:fs';
 import { FURNISHINGS_ATLAS, type PbrTextureSet, type ProceduralTextureLibrary } from '../src/engine/ProceduralTextures';
@@ -16,6 +16,8 @@ import {
   RING_INNER,
   ThunderScheduler,
   buildAnimatedEnvKit,
+  clampOutOfTrafficLanes,
+  inTrafficLane,
   envVariantTris,
   thunderPanRaw,
   RING_OUTER,
@@ -28,6 +30,7 @@ import {
   trafficCarAt,
   type TrafficCarState,
 } from '../src/world/CityAtmosphere';
+import { facadeFloor, facadeFloorY, isMachineFloor, seedInt } from '../src/world/FacadeLighting';
 import { CityBuilder, blimpPose, lightningAt, type SectorLayout } from '../src/world/CityBuilder';
 import { FURNITURE_BOUNDS, FURNITURE_SOCKETS, KIT_VARIANT, buildFurnishingsKit, kitVariantTris } from '../src/world/CityFurniture';
 import { CAR_TRI_BUDGET, buildCarVariant, triCount as carTris } from '../src/world/CityVehicles';
@@ -293,7 +296,8 @@ test('10D-2 placement: fans flush on solid FaceSpans / machine-room flanks, nore
               if (sp.ax !== ax || sp.sg !== sg) return false;
               const d = Math.abs((ax === 'x' ? e.x : e.z) - sp.plane);
               const al = ax === 'x' ? e.z : e.x;
-              return d <= 0.06 && al - ENV_DIMS.FAN_R >= sp.a0 - 1e-6 && al + ENV_DIMS.FAN_R <= sp.a1 + 1e-6 && e.y - ENV_DIMS.FAN_R >= sp.y0 - 1e-6 && e.y + ENV_DIMS.FAN_R <= sp.y1 + 1e-6;
+              // 10D-Fix: 1F fans sit flush on the bay relief (grille / shutter / blocked panel, ≤ 0.125 m proud).
+              return d <= 0.14 && al - ENV_DIMS.FAN_R >= sp.a0 - 1e-6 && al + ENV_DIMS.FAN_R <= sp.a1 + 1e-6 && e.y - ENV_DIMS.FAN_R >= sp.y0 - 1e-6 && e.y + ENV_DIMS.FAN_R <= sp.y1 + 1e-6;
             }),
           );
           assert.ok(ok, `${tag}: wall fan at (${e.x.toFixed(2)}, ${e.y.toFixed(2)}, ${e.z.toFixed(2)}) flush on a solid FaceSpan`);
@@ -353,7 +357,7 @@ test('10D-3 street landmarks: v2 / v3 ≤ 380 tris, grounded, English-only furni
   // The material samples the atlas through its own uniform (never mat.map) and keeps 4 explicit variant branches.
   const mat = CITY.root.getObjectByName('StreetFurnishingsKit') as THREE.Mesh;
   assert.ok(!(mat.material as THREE.MeshStandardMaterial).map, 'no mat.map');
-  assert.equal((mat.material as THREE.MeshStandardMaterial).customProgramCacheKey(), 'strand-furnishings-v2');
+  assert.equal((mat.material as THREE.MeshStandardMaterial).customProgramCacheKey(), 'strand-furnishings-v3');
 });
 
 test('10D-3 placement: carts / shelters on the sidewalk, zero road overhang, clear of doors, lamps, cars, kiosks, buildings; anchored steam', () => {
@@ -476,5 +480,121 @@ test('10D-4 breaker spark nodes (8–12, outward normals, alley-side first) and 
     }
     assert.ok(L.canopyDripEdges.length >= 1 && L.canopyDripEdges.length <= 48, `${tag}: ${L.canopyDripEdges.length} drip lips`);
     for (const e of L.canopyDripEdges) assert.ok(e.y > 2.8 && e.y < 3.4 && Math.hypot(e.x1 - e.x0, e.z1 - e.z0) >= 1, `${tag}: lip at ${e.y.toFixed(2)} m`);
+  }
+});
+
+// =============================================================================================
+// 10D-Fix regression tests
+// =============================================================================================
+test('10D-Fix FIX-1 ramen cart: no opaque sneeze-guard plane (aPart 5), v2 / v3 ≤ 380 tris, |min.y| ≤ 0.02', () => {
+  const cart = buildFurnishingsKit([KIT_VARIANT.RAMEN_CART]);
+  const part = cart.getAttribute('aPart');
+  let p5 = 0;
+  for (let i = 0; i < part.count; i++) if (part.getX(i) === 5) p5++;
+  assert.equal(p5, 0, 'zero aPart 5 vertices on the ramen cart');
+  for (const v of [KIT_VARIANT.RAMEN_CART, KIT_VARIANT.BUS_SHELTER]) {
+    const n = kitVariantTris(v);
+    assert.ok(n > 0 && n <= 380, `variant ${v}: ${n} tris ≤ 380`);
+    const bb = bbox(buildFurnishingsKit([v]));
+    assert.ok(Math.abs(bb.min.y) <= 0.02, `variant ${v}: |min.y| ${bb.min.y.toFixed(4)} ≤ 0.02`);
+  }
+});
+
+test('10D-Fix FIX-2: every wall fan above 4 m sits wholly inside an opaque mechanical storey', () => {
+  let upper = 0;
+  let low = 0;
+  for (const { L, loop } of BUILT) {
+    const tag = `loop ${loop} S${L.sector.index}`;
+    for (const e of L.animatedEnv) {
+      if (e.variant !== ENV_VARIANT.FAN || e.host !== 'WALL') continue;
+      if (e.y < 4.0) {
+        low++;
+        assert.ok(e.y >= 2.65 - 1e-6 && e.y <= 3.35 + 1e-6, `${tag}: 1F fan y ${e.y.toFixed(2)} in 2.65–3.35 m`);
+        continue;
+      }
+      upper++;
+      const b = L.buildings[e.building];
+      assert.ok(b && b.index === e.building, `${tag}: fan carries its host building`);
+      const f = facadeFloor(b.arch, e.y);
+      assert.ok(f >= 3 && f <= 9, `${tag}: fan floor ${f} in 3..9`);
+      assert.ok(isMachineFloor(seedInt(b.seed), f), `${tag}: fan at y ${e.y.toFixed(2)} on mechanical floor ${f}`);
+      const y0 = facadeFloorY(b.arch, f);
+      assert.ok(e.y - 0.55 >= y0 - 1e-6 && e.y + 0.55 <= y0 + FACADE.FLOOR_H_M + 1e-6, `${tag}: housing inside floor ${f} band`);
+    }
+  }
+  assert.ok(upper > 0 && low > 0, `upper ${upper} · 1F ${low}`);
+});
+
+test('10D-Fix FIX-3: ≥ 4 alley noren in S3–S4 every loop (S1–S2 where service alleys exist), aEnv.w host flag, hanger / standoff collapse guards', () => {
+  // Alley noren hang only on alley service sides / spare run faces: every tower keeps its ≥ 2 clean wall-run faces
+  // (CLAUDE.md pillar). S3–S4 always have ≥ 2 service-side alley walls; S1–S2 have 0–2 per loop, so they reach
+  // ≥ 4 only in the districts that have them.
+  let s12Full = 0;
+  for (const { L, loop } of BUILT) {
+    if (L.sector.index > 4) continue;
+    const bay = L.animatedEnv.filter((e) => e.variant === ENV_VARIANT.NOREN && e.host === 'BAY').length;
+    if (L.sector.index >= 3) assert.ok(bay >= 4, `loop ${loop} S${L.sector.index}: ${bay} alley noren ≥ 4`);
+    else if (bay >= 4) s12Full++;
+  }
+  assert.ok(s12Full >= 2, `S1–S2 districts with ≥ 4 alley noren: ${s12Full}`);
+  // aEnv.w written per host on the live kit (last built district).
+  const aEnv = CITY.envKit.mesh.geometry.getAttribute('aEnv') as THREE.InstancedBufferAttribute;
+  const inst = CITY.envKit.instances;
+  assert.ok(inst.some((e) => e.host === 'AWNING') && inst.some((e) => e.host === 'BAY'), 'both noren hosts present');
+  inst.forEach((e, i) => {
+    if (e.host === 'AWNING') assert.equal(aEnv.getW(i), 0, 'awning noren aEnv.w = 0');
+    if (e.host === 'BAY') assert.equal(aEnv.getW(i), 1, 'alley noren aEnv.w = 1');
+  });
+  // Noren geometry: hangers tagged mode 5 (rise above the rod), standoffs mode 6 (reach back behind it).
+  const g = buildAnimatedEnvKit([ENV_VARIANT.NOREN]);
+  const pos = g.getAttribute('position');
+  const anim = g.getAttribute('aAnim');
+  let m5 = 0;
+  let m6 = 0;
+  for (let i = 0; i < pos.count; i++) {
+    if (anim.getX(i) === 5) m5++;
+    if (anim.getX(i) === 6) m6++;
+    if (pos.getY(i) > 0.05) assert.equal(anim.getX(i), 5, 'only hangers rise above the rod');
+    if (pos.getZ(i) < -0.05) assert.equal(anim.getX(i), 6, 'only standoffs reach back to the wall');
+  }
+  assert.ok(m5 > 0 && m6 > 0, 'hangers + standoffs tagged');
+  const mat = CITY.envKit.mesh.material as THREE.MeshStandardMaterial;
+  const shader = { uniforms: {}, vertexShader: THREE.ShaderLib.standard.vertexShader, fragmentShader: THREE.ShaderLib.standard.fragmentShader } as unknown as THREE.WebGLProgramParametersWithUniforms;
+  mat.onBeforeCompile(shader, {} as THREE.WebGLRenderer);
+  const vs = shader.vertexShader;
+  assert.ok(!vs.includes('eMode > 2.5'), 'no open-ended hologram guard');
+  assert.equal(vs.split('eMode == 3.0 || eMode == 4.0').length - 1, 2, 'both hologram rotation guards are exact');
+  assert.ok(vs.includes('(eMode == 5.0 && aEnv.w > 0.5)') && vs.includes('(eMode == 6.0 && aEnv.w < 0.5)'), 'hanger / standoff collapse');
+});
+
+test('10D-Fix FIX-4: no highway spawn in a traffic lane; clampOutOfTrafficLanes lands beside the lanes toward the median', () => {
+  for (const { L, loop } of BUILT) {
+    assert.ok(L.trafficLanes.length > 0, `loop ${loop} S${L.sector.index}: lanes exported`);
+    for (const sp of L.highwaySpawns) {
+      assert.ok(!inTrafficLane(L.trafficLanes, sp.position.x, sp.position.z, 0.85), `loop ${loop} S${L.sector.index}: spawn (${sp.position.x.toFixed(1)}, ${sp.position.z.toFixed(1)}) clear of lanes`);
+    }
+    // Sweep a grid of deck points through the clamp.
+    const p = new THREE.Vector3();
+    for (let x = -60; x <= 60; x += 1.3) {
+      for (let z = -60; z <= 60; z += 1.7) {
+        p.set(x, DECK, z);
+        if (!inTrafficLane(L.trafficLanes, x, z, 0.85)) continue;
+        const r0 = Math.max(Math.abs(x), Math.abs(z));
+        clampOutOfTrafficLanes(L.trafficLanes, p, 0.85);
+        assert.ok(!inTrafficLane(L.trafficLanes, p.x, p.z, 0.85), `loop ${loop} S${L.sector.index}: (${x.toFixed(1)}, ${z.toFixed(1)}) → (${p.x.toFixed(2)}, ${p.z.toFixed(2)}) out of lanes`);
+        assert.equal(p.y, DECK, 'height untouched');
+        for (const ln of L.trafficLanes) {
+          if (ln.ring) {
+            // Ring: lands in the median band between the two lanes (27 m centreline).
+            const r1 = Math.max(Math.abs(p.x), Math.abs(p.z));
+            if (Math.min(Math.abs(p.x), Math.abs(p.z)) < 17) assert.ok(r1 > 24.7 && r1 < 29.1, `ring: (${x.toFixed(1)}, ${z.toFixed(1)}) r ${r0.toFixed(2)} → ${r1.toFixed(2)} in the 27 m median band`);
+          } else {
+            const lat0 = ln.axis === 'x' ? z : x;
+            const lat1 = ln.axis === 'x' ? p.z : p.x;
+            if (Math.abs(lat0 - ln.lat) < TRAFFIC_BOUNDS.w / 2 + 0.85) assert.ok(Math.abs(lat1 - ln.centre) < Math.abs(ln.lat - ln.centre), 'pushed toward the highway centreline');
+          }
+        }
+      }
+    }
   }
 });

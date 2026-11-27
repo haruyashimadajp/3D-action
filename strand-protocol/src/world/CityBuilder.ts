@@ -97,7 +97,7 @@ import {
   type PropInstance,
 } from './CityProps';
 import { CityPropMeshes, type ContactShadowDesc } from './CityPropMeshes';
-import { AnimatedEnvKit, ENV_CAP, ENV_DIMS, ENV_VARIANT, ElevatedTraffic, buildTrafficLanes, type EnvInstance } from './CityAtmosphere';
+import { AnimatedEnvKit, ENV_CAP, ENV_DIMS, ENV_VARIANT, ElevatedTraffic, buildTrafficLanes, inTrafficLane, type EnvInstance, type TrafficLane } from './CityAtmosphere';
 
 /** 10BC-Fix FIX-4: megastructure reservation order (rarest eligibility first, as in assignMassings). */
 const MEGA_ORDER: readonly MegaStructureKind[] = ['TWIN_ARCH_GATE', 'CYLINDER_RING_TOWER', 'SLANT_CORP_TOWER', 'X_TRUSS_TOWER'];
@@ -176,6 +176,8 @@ export interface BuildingInfo {
   readonly roofY: number;
   /** 6A-2 archetype: 0 A glass tower · 1 B residential · 2 C industrial · 3 D commercial. */
   readonly arch: number;
+  /** Facade seed (0..1): `isMachineFloor(seedInt(seed), floor)` picks the opaque mechanical storeys (10D-Fix FIX-2). */
+  readonly seed: number;
 }
 
 export type CityLayer = 0 | 1 | 2 | 3;
@@ -285,8 +287,10 @@ export interface SectorLayout {
   readonly playerSpawnYaw: number;
   /** Layer 0: street / plaza positions near cover. */
   readonly groundSpawns: readonly SpawnPoint[];
-  /** Layer 1: expressway deck positions. */
+  /** Layer 1: expressway deck positions (10D-Fix: never inside a traffic lane). */
   readonly highwaySpawns: readonly SpawnPoint[];
+  /** 10D-Fix FIX-4: the elevated traffic lanes (spawn / patrol / enemy clearance). */
+  readonly trafficLanes: readonly TrafficLane[];
   /** Layer 0: canal truss-bridge decks (connected street battlefield, 5A-5). */
   readonly bridgeSpawns: readonly SpawnPoint[];
   /** Layer 2: sky-bridge roofs. */
@@ -1173,7 +1177,6 @@ export interface MegaBillboardRecord {
  */
 interface Building extends BuildingInfo {
   readonly rect: RectXZ;
-  readonly seed: number;
   readonly lotHalfW: number;
   readonly lotHalfD: number;
   /** Lot centre (street faces); `cx` / `cz` are the ROOF centre (offset tower, larger L wing). */
@@ -2255,6 +2258,11 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
             else if (kp == 2.0) totalEmissiveRadiance = vec3(1.0, 0.52, 0.14) * 1.35;
           } else if (kv == 1.0) {
             if (kp == 3.0) totalEmissiveRadiance = vec3(1.0, 0.7, 0.38) * 1.3;
+            else if (kp == 1.0) {
+              // 10D-Fix FIX-5: rain-wet canopy Fresnel sheen (restored from v1).
+              float fr = pow(1.0 - clamp(dot(normalize(normal), normalize(vViewPosition)), 0.0, 1.0), 4.0);
+              totalEmissiveRadiance = vec3(0.22, 0.26, 0.34) * fr * 0.5;
+            }
           } else if (kv == 2.0) {
             if (kp == 3.0) totalEmissiveRadiance = vec3(1.0, 0.62, 0.3) * 1.3;
             else if (kp == 4.0) totalEmissiveRadiance = fAtl * 1.05;
@@ -2263,7 +2271,7 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
             else if (kp == 4.0) totalEmissiveRadiance = fAtl * 0.95;
           }`);
     };
-    mat.customProgramCacheKey = () => 'strand-furnishings-v2';
+    mat.customProgramCacheKey = () => 'strand-furnishings-v3';
     return mat;
   }
 
@@ -5741,6 +5749,15 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
     const doorSizes: Array<[number, number]> = [];
     const groundDoors: GroundDoorRecord[] = [];
     const groundPiers: GroundPierRecord[] = [];
+    /** 10D-Fix FIX-2: 1F storefront bays (face-local) — 1F wall fans mount only on opaque bay relief. */
+    const groundBays: Array<{ building: number; ax: Axis; sg: number; plane: number; a0: number; a1: number; use: string; oT: number }> = [];
+    /** 10D-Fix FIX-2/3: collider-less wall fixtures (infra transformer boxes, 1F conduits + junction boxes), world AABBs. */
+    const wallFixtures: Aabb3[] = [];
+    const fixtureBox = (f: { P3: (a: number, y: number, d: number) => THREE.Vector3 }, a0: number, a1: number, y0: number, y1: number, d0: number, d1: number): void => {
+      const p = f.P3(a0, y0, d0);
+      const q = f.P3(a1, y1, d1);
+      wallFixtures.push({ minX: Math.min(p.x, q.x), minY: y0, minZ: Math.min(p.z, q.z), maxX: Math.max(p.x, q.x), maxY: y1, maxZ: Math.max(p.z, q.z) });
+    };
     let doorId = 0;
     let galleryDoors = 0;
     let galleryLevels = 0;
@@ -5984,6 +6001,7 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
       for (const bay of plan.bays) {
         const { a0, a1 } = bay;
         const m = (a0 + a1) / 2;
+        groundBays.push({ building: b.index, ax: span.ax, sg: span.sg, plane: span.plane, a0, a1, use: bay.use, oT });
         if (!service && (bay.use === 'PANEL' || bay.use === 'VITRINE' || bay.use === 'SHUTTER' || bay.use === 'GRILLE')) {
           const bs = baySocket(f.ref, a0 + 0.45, a1 - 0.45, 0.36, floorReach - 0.36, 0, sockGroup, b.index, lowProps, p9Rng);
           if (bs) propSockets.push(bs);
@@ -6217,6 +6235,7 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
           if (sb) {
             const m = (sb.a0 + sb.a1) / 2;
             G.steel.push(...f.bx(m - 0.5, m + 0.5, 1.2, 2.6, 0.06, 0.5));
+            fixtureBox(f, m - 0.5, m + 0.5, 1.2, 2.6, 0, 0.58);
             for (let k = 0; k < 6; k++) G.steel.push(...f.bx(m - 0.45 + k * 0.18 - 0.02, m - 0.45 + k * 0.18 + 0.02, 1.3, 2.5, 0.5, 0.58));
             G.strips.push(f.glow(0xff3030, 1.3, m + 0.3, m + 0.36, 2.42, 2.48, 0.5, 0.52), f.glow(0xffb020, 1.2, m + 0.18, m + 0.24, 2.42, 2.48, 0.5, 0.52));
           }
@@ -6348,10 +6367,12 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
       if (program === 'ALLEY_INFRA' || program === 'CYBER_EATERY') {
         const cy = 3.85 + grng() * 0.5;
         G.steel.push(aoPipe(f.P3(span.a0 + 0.6, cy, 0.09), f.P3(span.a1 - 0.6, cy, 0.09), 0.045, wallN));
+        fixtureBox(f, span.a0 + 0.6, span.a1 - 0.6, cy - 0.06, cy + 0.06, 0, 0.15);
         const jn = span.a1 - span.a0 > 12 ? 2 : 1;
         for (let k = 0; k < jn; k++) {
           const ja = span.a0 + (span.a1 - span.a0) * (k + 1) / (jn + 1);
           G.steel.push(...f.bx(ja - 0.18, ja + 0.18, cy - 0.3, cy + 0.15, 0, 0.15));
+          fixtureBox(f, ja - 0.18, ja + 0.18, cy - 0.3, cy + 0.15, 0, 0.15);
           G.strips.push(f.glow([0xff3030, 0xffb020, 0x30e8ff][(k + Math.floor(b.seed * 5)) % 3], 1.2, ja + 0.08, ja + 0.12, cy + 0.02, cy + 0.06, 0.15, 0.165));
         }
       }
@@ -6851,7 +6872,7 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
           G.archPaint.push(...f.paint(PAINT.FRAME_DARK, b0 + 0.15, b1 - 0.15, 0, 0.95, front - 0.6, front, { ground: true }));
           f.coll(b0, b1, 0, 2.3, back0, back1, -1);
           f.coll(b0 + 0.15, b1 - 0.15, 0, 0.95, front - 0.6, front, -1);
-          G.strips.push(f.glow(PAL[(k + (sg > 0 ? 0 : 1)) % PAL.length], 1.6, b0 + 0.3, b1 - 0.3, 2.45, 2.75, back1 - 0.02, back1 + 0.04));
+          G.strips.push(f.glow(PAL[(k + (sg > 0 ? 0 : 1)) % PAL.length], 1.15, b0 + 0.3, b1 - 0.3, 2.45, 2.75, back1 - 0.02, back1 + 0.04));
           G.strips.push(f.glow(0xffd8a0, 0.9, b0 + 0.4, b1 - 0.4, 0.95, 1.0, front - 0.55, front - 0.05));
           marketStalls++;
         }
@@ -7145,12 +7166,16 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
         perchSpawns.push({ position: new THREE.Vector3(px, b.roofY, pz), layer: 3, building: b.index });
       }
     });
+    // 10D-Fix FIX-4: traffic lanes are built here (same own RNG stream, consumed again by setLanes below) so no
+    // highway spawn ever lands inside a moving lane.
+    const trafficRng = createRng(0x10d1 + sector.index * 71 + loop * 433);
+    const trafficLanes = buildTrafficLanes(plan.highways, !!plan.plaza && plan.highways.length === 4, trafficRng);
     decks.forEach((d) => {
       for (let a = Math.max(d.a0, -H + 10); a < Math.min(d.a1, H - 10); a += 18) {
         // 10D-1: Sector 5's ring lanes run 3.8 / 4.0 m off the centreline — its deck spawns stay nearer the median.
         const spawnLat = plan.plaza && plan.highways.length === 4 ? 1.8 : 2.5;
         const p = pt(d.axis, a, DECK, d.coord + (rng() < 0.5 ? -spawnLat : spawnLat));
-        if (Math.hypot(p.x - playerSpawn.x, p.z - playerSpawn.z) > 25) highwaySpawns.push({ position: p, layer: 1, building: -1 });
+        if (Math.hypot(p.x - playerSpawn.x, p.z - playerSpawn.z) > 25 && !inTrafficLane(trafficLanes, p.x, p.z, 0.85)) highwaySpawns.push({ position: p, layer: 1, building: -1 });
       }
     });
     const airCandidates: Array<[number, number]> = intersectionSquares.map((r) => [(r.x0 + r.x1) / 2, (r.z0 + r.z1) / 2]);
@@ -7648,10 +7673,13 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
     const solidAt = (b: Building, ax: Axis, sg: number, plane: number, a: number, ha: number, y: number, hy: number): boolean =>
       b.plan.faces.some((sp) => sp.ax === ax && sp.sg === sg && Math.abs(sp.plane - plane) < 1e-6 && a - ha >= sp.a0 && a + ha <= sp.a1 && y - hy >= sp.y0 && y + hy <= sp.y1);
     const envStat = { wallFans: 0, roomFans: 0, awningNoren: 0, bayNoren: 0, holos: 0 };
-    // (1) Wall fans on non-run lot faces (wall-run faces stay clean). Ground band: 4.95–5.5 m on programs whose 1F
-    // carries awnings / canopies / conduits / transformer boxes (eatery, apparel, hotel, alley infra), 2.6–3.4 m on
-    // apartment fronts; upper band: mid-floor of storeys 1–2. Door bays, piers, slab drip bands, signs, pipe risers,
-    // exhaust ducts, socket props and every collider stay clear.
+    // (1) Wall fans on non-run lot faces (wall-run faces stay clean). 10D-Fix FIX-2:
+    //  · 1F band (2.65–3.35 m, capped under each bay's top trim / the lintel): only on opaque bay relief — apartment
+    //    grilles, infra shutters, blocked bays — mounted flush on the relief depth, never on glazed vitrines / frosted
+    //    eatery panels / doors, and ≥ 0.55 m clear of infra transformer boxes and 1F conduits.
+    //  · Upper band (y ≥ 4 m): only on the opaque mechanical storey (floor 3..9, isMachineFloor) with the whole ±0.55 m
+    //    housing inside that storey — never over glazed office / residential windows.
+    // Door bays, piers, slab drip bands, signs, pipe risers, exhaust ducts, socket props and every collider stay clear.
     const bandClear = (b: Building, y: number): boolean => {
       for (let n = 1; floorTopY(b.arch, n) <= GR.BAND_MAX_Y_M; n++) {
         const by = floorTopY(b.arch, n);
@@ -7659,32 +7687,66 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
       }
       return true;
     };
+    const wallFixtureHit = (x0: number, y0: number, z0: number, x1: number, y1: number, z1: number, m: number): boolean =>
+      wallFixtures.some((o) => x0 - m < o.maxX && x1 + m > o.minX && y0 - m < o.maxY && y1 + m > o.minY && z0 - m < o.maxZ && z1 + m > o.minZ);
+    /** Opaque 1F bay relief: mount depth `d` and the top trim height `top` below oT that the housing must clear. */
+    const BAY_RELIEF: Readonly<Record<string, { d: number; top: number }>> = { GRILLE: { d: 0.125, top: 0.2 }, SHUTTER: { d: 0.09, top: 0.3 }, BLOCKED: { d: 0.05, top: 0 } };
     for (const g of groundFaces) {
       if (env.count >= 150 || envStat.wallFans >= 72) break;
       const { b, span } = g;
-      if (g.run || span.court || megaBuilding.has(b.index)) continue;
+      // Alley service sides (bins / dumpsters) are not clean run strips: they may carry fans too.
+      if ((g.run && !serviceFaces.has(g.key)) || span.court || megaBuilding.has(b.index)) continue;
       const k = g.key;
       if (escapeFaces.has(k) || balconyFaces.has(k) || galleryFaces.has(k) || megaFaces.has(k) || spineFaces.has(k) || ductFaces.has(k)) continue;
       const program = faceProgram.get(g);
-      const low = program === 'CYBER_APARTMENT';
       const f = sf(span.ax, span.sg, span.plane);
-      const doors = groundDoors.filter((d) => d.building === b.index && d.ax === span.ax && d.sg === span.sg && Math.abs(d.plane - span.plane) < 1e-6);
-      const piersHere = groundPiers.filter((gp) => gp.building === b.index && gp.ax === span.ax && gp.sg === span.sg && Math.abs(gp.plane - span.plane) < 1e-6);
+      const onFace = <T extends { building: number; ax: Axis; sg: number; plane: number }>(r: T): boolean => r.building === b.index && r.ax === span.ax && r.sg === span.sg && Math.abs(r.plane - span.plane) < 1e-6;
+      const doors = groundDoors.filter(onFace);
+      const piersHere = groundPiers.filter(onFace);
+      const bays = groundBays.filter(onFace);
       const ducts = program === 'CYBER_EATERY' ? eateryVents.filter((v) => Math.abs((span.ax === 'x' ? v.x : v.z) - (span.plane + span.sg * 0.3)) < 0.05).map((v) => (span.ax === 'x' ? v.z : v.x)) : [];
+      // The face's opaque mechanical storey (floors 1–2 are never mechanical: MACHINE_EVERY_MIN = 7).
+      const si = seedInt(b.seed);
+      const topLim = Math.min(span.y1, b.roofY) - 0.55;
+      let machineFloor = -1;
+      for (let fl = 3; fl <= 9 && facadeFloorY(b.arch, fl) + FACADE.FLOOR_H_M <= topLim; fl++) {
+        if (isMachineFloor(si, fl)) {
+          machineFloor = fl;
+          break;
+        }
+      }
       let placedHere = 0;
-      for (let a = span.a0 + 0.65 + p10dRng() * 1.5; a <= span.a1 - 0.65 && placedHere < 3; a += 2.4 + p10dRng() * 2) {
+      for (let a0 = span.a0 + 0.65 + p10dRng() * 1.5; a0 <= span.a1 - 0.65 && placedHere < 3; a0 += 2.4 + p10dRng() * 2) {
         const band = p10dRng();
-        const y = band < 0.45 ? (low ? 2.6 + p10dRng() * 0.8 : 4.95 + p10dRng() * 0.55) : floorTopY(b.arch, band < 0.75 ? 1 : 2) + 1.7 + p10dRng() * 0.6;
+        const yr = p10dRng();
+        let a = a0;
+        let y: number;
+        let d = 0;
+        if (band < 0.45) {
+          // Centred in the bay under the sample point.
+          const bay = bays.find((q) => a0 >= q.a0 && a0 <= q.a1 && q.a1 - q.a0 >= 1.3);
+          const rel = bay ? BAY_RELIEF[bay.use] : undefined;
+          if (!bay || !rel) continue;
+          a = (bay.a0 + bay.a1) / 2;
+          const yMax = Math.min(3.35, bay.oT - rel.top - 0.57);
+          if (yMax < 2.65) continue;
+          y = 2.65 + yr * Math.min(0.7, yMax - 2.65);
+          d = rel.d;
+        } else {
+          if (machineFloor < 0) continue;
+          y = facadeFloorY(b.arch, machineFloor) + 1.2 + yr * (FACADE.FLOOR_H_M - 2.4);
+        }
         if (!solidAt(b, span.ax, span.sg, span.plane, a, 0.65, y, 0.55) || !bandClear(b, y)) continue;
-        if (y < 6 && doors.some((d) => a + 0.55 > d.bay.a0 - 0.3 && a - 0.55 < d.bay.a1 + 0.3)) continue;
+        if (y < 6 && doors.some((dr) => a + 0.55 > dr.bay.a0 - 0.3 && a - 0.55 < dr.bay.a1 + 0.3)) continue;
         if (piersHere.some((gp) => a + 0.55 > gp.a0 - 0.05 && a - 0.55 < gp.a1 + 0.05 && y - 0.55 < gp.top)) continue;
         if (ducts.some((da) => Math.abs(da - a) < 1.25)) continue;
-        const [x0, y0, z0, x1, y1, z1] = faceBox(f, a - 0.55, a + 0.55, y - 0.55, y + 0.55, 0.03, 0.32);
+        const [x0, y0, z0, x1, y1, z1] = faceBox(f, a - 0.55, a + 0.55, y - 0.55, y + 0.55, d + 0.03, d + 0.32);
         if (hitsSign(x0, y0, z0, x1, y1, z1) || hitsCollider(x0, y0, z0, x1, y1, z1) || hitsFootprint(x0, y0, z0, x1, y1, z1)) continue;
-        const c = f.P3(a, y, 0);
+        if (wallFixtureHit(x0, y0, z0, x1, y1, z1, 0.55)) continue;
+        const c = f.P3(a, y, d);
         if (fanAt.some(([fx, fy, fz]) => Math.hypot(fx - c.x, fy - c.y, fz - c.z) < 2.2)) continue;
         if (!inArea(c.x, c.z, 2)) continue;
-        if (!env.add(ENV_VARIANT.FAN, c.x, c.y, c.z, faceYaw(span.ax, span.sg), (4.5 + p10dRng() * 4.5) * (p10dRng() < 0.5 ? 1 : -1), p10dRng() * 6.28, FAN_COLS[Math.floor(p10dRng() * 3)], 'WALL')) break;
+        if (!env.add(ENV_VARIANT.FAN, c.x, c.y, c.z, faceYaw(span.ax, span.sg), (4.5 + p10dRng() * 4.5) * (p10dRng() < 0.5 ? 1 : -1), p10dRng() * 6.28, FAN_COLS[Math.floor(p10dRng() * 3)], 'WALL', b.index)) break;
         fanAt.push([c.x, c.y, c.z]);
         envStat.wallFans++;
         placedHere++;
@@ -7710,25 +7772,71 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
         envStat.roomFans++;
       }
     }
-    // (3) Noren: under eatery awning lips (rod d 1.18 / y 3.08 → lowest 2.40 m) one per bay, and in door-free alley
-    // bays (rod d 0.28 / y 3.05, standoffs back to the wall), never on run faces or infra transformer walls.
+    // (3) Noren. 10D-Fix FIX-3: the alley-bay pass runs FIRST (≤ 24 / district, so awning noren can never starve it),
+    // then the canopy pass. Alley bays: rod d 0.28 / y 3.05 (cloth bottom 2.37 m), wall standoffs back to d = 0, one per
+    // pier bay or every 4 m on pier-less spans (infra included, clear of transformer boxes, doors, door clear zones,
+    // signs, colliders, props and lamps). Canopies (eatery awning y 3.08 / d 1.18, apparel 3.22 / 1.3, hotel 3.4 / 1.7):
+    // hangers reach up into the canopy collider. Never on wall-run faces.
     const norenNearLamp = (x: number, z: number): boolean => lampPoles.some(([lx, lz]) => Math.hypot(lx - x, lz - z) < 1.6);
+    /** Alley run faces already dressed with noren (a dressed face no longer counts as a clean run face). */
+    const dressedRuns = new Set<string>();
+    /** A tower may dress a spare alley run face only if it keeps ≥ 2 other clean run faces (wall-run pillar). */
+    const spareRun = (b: Building, key: string): boolean => {
+      const clean = FACES.filter(([ax, sg]) => {
+        const k = fkey(b, ax, sg);
+        return k !== key && runFaces.has(k) && !serviceFaces.has(k) && !dressedRuns.has(k);
+      });
+      return clean.length >= 2;
+    };
+    for (const g of groundFaces) {
+      if (env.count >= 212 || envStat.bayNoren >= 24) break;
+      const { b, span } = g;
+      if (!g.alley || span.court) continue;
+      if (g.run && !serviceFaces.has(g.key) && !spareRun(b, g.key)) continue;
+      const f = sf(span.ax, span.sg, span.plane);
+      const onFace = <T extends { building: number; ax: Axis; sg: number; plane: number }>(r: T): boolean => r.building === b.index && r.ax === span.ax && r.sg === span.sg && Math.abs(r.plane - span.plane) < 1e-6;
+      const piersHere = groundPiers.filter(onFace).sort((p, q) => p.a0 - q.a0);
+      const doors = groundDoors.filter(onFace);
+      const yRod = 3.05;
+      const dRod = 0.28;
+      const centres: number[] = [];
+      if (piersHere.length >= 2) {
+        for (let i = 0; i + 1 < piersHere.length; i++) if (piersHere[i + 1].a0 - piersHere[i].a1 >= ENV_DIMS.NOREN_W + 0.1) centres.push((piersHere[i].a1 + piersHere[i + 1].a0) / 2);
+      } else if (span.a1 - span.a0 >= 3.2) {
+        for (let a = span.a0 + 1.6; a <= span.a1 - 1.6 + 1e-6; a += 4.0) centres.push(a);
+      }
+      for (const a of centres) {
+        if (envStat.bayNoren >= 24 || env.count >= 212) break;
+        if (a - 0.86 < span.a0 + 0.1 || a + 0.86 > span.a1 - 0.1) continue;
+        if (!solidAt(b, span.ax, span.sg, span.plane, a, 0.86, 2.7, 0.4)) continue;
+        if (doors.some((d) => a + 0.85 > d.bay.a0 && a - 0.85 < d.bay.a1)) continue;
+        if (piersHere.some((gp) => a + 0.86 > gp.a0 - 0.02 && a - 0.86 < gp.a1 + 0.02)) continue;
+        const [x0, y0, z0, x1, y1, z1] = faceBox(f, a - 0.86, a + 0.86, yRod - 0.7, yRod + 0.06, 0.02, dRod + 0.14);
+        if (hitsSign(x0, y0, z0, x1, y1, z1) || hitsCollider(x0, y0, z0, x1, y1, z1) || hitsFootprint(x0, y0, z0, x1, y1, z1)) continue;
+        if (wallFixtureHit(x0, y0, z0, x1, y1, z1, 0.1)) continue;
+        const c = f.P3(a, yRod, dRod - 0.06);
+        if (!inArea(c.x, c.z, 2) || norenNearLamp(c.x, c.z)) continue;
+        // Never in a bay that already carries a 1F wall fan (fan housing 2.1–3.9 m, ±0.55 m).
+        if (fanAt.some(([fx, fy, fz]) => Math.hypot(fx - c.x, fz - c.z) < 1.6 && fy < 4.2)) continue;
+        if (doorClearZones.some((r) => c.x + 0.9 > r.x0 && c.x - 0.9 < r.x1 && c.z + 0.9 > r.z0 && c.z - 0.9 < r.z1)) continue;
+        if (!env.add(ENV_VARIANT.NOREN, c.x, c.y, c.z, faceYaw(span.ax, span.sg), 1.5 + p10dRng() * 0.9, p10dRng() * 6.28, NOREN_COLS[Math.floor(p10dRng() * NOREN_COLS.length)], 'BAY', b.index)) break;
+        if (g.run && !serviceFaces.has(g.key)) dressedRuns.add(g.key);
+        envStat.bayNoren++;
+      }
+    }
     for (const g of groundFaces) {
       if (env.count >= 212) break;
       const { b, span } = g;
-      if (g.run || span.court) continue;
+      if (g.alley || g.run || span.court) continue;
       const program = faceProgram.get(g);
-      // Under shop canopies (eatery awning / apparel canopy / hotel entry canopy) or in door-free alley bays.
-      const canopy = g.alley ? null : program === 'CYBER_EATERY' ? { y: 3.08, d: 1.18 } : program === 'TECH_APPAREL' ? { y: 3.22, d: 1.3 } : program === 'CAPSULE_HOTEL' ? { y: 3.4, d: 1.7 } : null;
-      const awning = canopy !== null && span.a1 - span.a0 - 0.8 > 2;
-      if (!awning && !(g.alley && program !== 'ALLEY_INFRA')) continue;
+      const canopy = program === 'CYBER_EATERY' ? { y: 3.08, d: 1.18 } : program === 'TECH_APPAREL' ? { y: 3.22, d: 1.3 } : program === 'CAPSULE_HOTEL' ? { y: 3.4, d: 1.7 } : null;
+      if (!canopy || span.a1 - span.a0 - 0.8 <= 2) continue;
       const f = sf(span.ax, span.sg, span.plane);
       const piersHere = groundPiers
         .filter((gp) => gp.building === b.index && gp.ax === span.ax && gp.sg === span.sg && Math.abs(gp.plane - span.plane) < 1e-6)
         .sort((p, q) => p.a0 - q.a0);
-      const doors = groundDoors.filter((d) => d.building === b.index && d.ax === span.ax && d.sg === span.sg && Math.abs(d.plane - span.plane) < 1e-6);
-      const yRod = awning && canopy ? canopy.y : 3.05;
-      const dRod = awning && canopy ? canopy.d : 0.28;
+      const yRod = canopy.y;
+      const dRod = canopy.d;
       /** The rod must hang directly under a canopy collider at both ends (hangers reach ≤ 0.2 m up into it). */
       const underCanopy = (a: number): boolean =>
         [a - 0.75, a + 0.75].every((ae) => {
@@ -7740,16 +7848,13 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
         const b1 = piersHere[i + 1].a0;
         if (b1 - b0 < ENV_DIMS.NOREN_W + 0.1) continue;
         const a = (b0 + b1) / 2;
-        if (awning && (a - 0.85 < span.a0 + 0.5 || a + 0.85 > span.a1 - 0.5 || !underCanopy(a))) continue;
-        if (!awning && doors.some((d) => a + 0.85 > d.bay.a0 && a - 0.85 < d.bay.a1)) continue;
-        const [x0, y0, z0, x1, y1, z1] = faceBox(f, a - 0.86, a + 0.86, yRod - 0.7, yRod + (awning ? 0.02 : 0.16), awning ? dRod - 0.12 : 0.02, dRod + 0.14);
+        if (a - 0.85 < span.a0 + 0.5 || a + 0.85 > span.a1 - 0.5 || !underCanopy(a)) continue;
+        const [x0, y0, z0, x1, y1, z1] = faceBox(f, a - 0.86, a + 0.86, yRod - 0.7, yRod + 0.02, dRod - 0.12, dRod + 0.14);
         if (hitsSign(x0, y0, z0, x1, y1, z1) || hitsCollider(x0, y0, z0, x1, y1, z1) || hitsFootprint(x0, y0, z0, x1, y1, z1)) continue;
         const c = f.P3(a, yRod, dRod - 0.06);
         if (!inArea(c.x, c.z, 2) || norenNearLamp(c.x, c.z)) continue;
-        if (!awning && doorClearZones.some((r) => c.x + 0.9 > r.x0 && c.x - 0.9 < r.x1 && c.z + 0.9 > r.z0 && c.z - 0.9 < r.z1)) continue;
-        if (!env.add(ENV_VARIANT.NOREN, c.x, c.y, c.z, faceYaw(span.ax, span.sg), 1.5 + p10dRng() * 0.9, p10dRng() * 6.28, NOREN_COLS[Math.floor(p10dRng() * NOREN_COLS.length)], awning ? 'AWNING' : 'BAY')) break;
-        if (awning) envStat.awningNoren++;
-        else envStat.bayNoren++;
+        if (!env.add(ENV_VARIANT.NOREN, c.x, c.y, c.z, faceYaw(span.ax, span.sg), 1.5 + p10dRng() * 0.9, p10dRng() * 6.28, NOREN_COLS[Math.floor(p10dRng() * NOREN_COLS.length)], 'AWNING', b.index)) break;
+        envStat.awningNoren++;
       }
     }
     // (4) Rooftop wireframe holograms on the reserved tall flat roofs (full 3.6 m sweep already clear of roofRects and
@@ -8013,9 +8118,10 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
     // 10D-3: delicate anchored noodle-boiler steam over every ramen cart's vat (before the canal mist fills up).
     for (const [x, y, z] of ramenSteam) {
       const ph = srng();
-      // Small puffs, short rise: the visible column (base + rise + size · 0.35 + size / 2) stays under the awning (≤ 1.95 m).
-      addSteam(x, y, z, 0.25 + srng() * 0.05, 0.6 + srng() * 0.1, ph);
-      addSteam(x, y, z, 0.25 + srng() * 0.05, 0.6 + srng() * 0.1, ph + 0.5);
+      // 10D-Fix FIX-5: fuller boiler mist, short rise — top(0.9) = base + 0.9 · rise + 0.85 · size · 1.87 ≤ 2.20 m, under
+      // the 2.245 m awning underside.
+      addSteam(x, y, z, 0.3 + srng() * 0.035, 0.62 + srng() * 0.06, ph);
+      addSteam(x, y, z, 0.3 + srng() * 0.035, 0.62 + srng() * 0.06, ph + 0.5);
     }
     const canalSteam = canalWater.length ? 24 : 0;
     for (let k = 0; k < canalSteam * 4 && steamN < CAP.STEAM && k < 400; k++) {
@@ -8072,14 +8178,11 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
     center.divideScalar(Math.max(1, buildings.length));
 
     // 10D-1 expressway traffic lanes (own RNG stream: layouts stay where they were).
-    {
-      const trng = createRng(0x10d1 + sector.index * 71 + loop * 433);
-      this.traffic.setLanes(buildTrafficLanes(plan.highways, !!plan.plaza && plan.highways.length === 4, trng), trng);
-    }
+    this.traffic.setLanes(trafficLanes, trafficRng);
     this.layout = {
       sector,
       loop,
-      buildings: buildings.map(({ index, cx, cz, halfW, halfD, roofY, arch, massing, setbackY, cylR, cylC, voidBox, slantH, slant }) => ({ index, cx, cz, halfW, halfD, roofY, arch, massing, setbackY, cylR, cylC, voidBox, slantH, slant })),
+      buildings: buildings.map(({ index, cx, cz, halfW, halfD, roofY, arch, massing, setbackY, cylR, cylC, voidBox, slantH, slant, seed }) => ({ index, cx, cz, halfW, halfD, roofY, arch, massing, setbackY, cylR, cylC, voidBox, slantH, slant, seed })),
       colliders,
       ramps: rampColliders,
       anchors,
@@ -8089,6 +8192,7 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
       playerSpawnYaw,
       groundSpawns,
       highwaySpawns,
+      trafficLanes,
       bridgeSpawns,
       skybridgeSpawns,
       roofSpawns,

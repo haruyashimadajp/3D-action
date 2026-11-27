@@ -196,22 +196,25 @@ const ATLAS_TRANSIT_BOARD = [0.5, 0, 1, 0.5] as const;
 
 /**
  * v2 steaming ramen street-vendor cart (2.20 × 2.35 × 1.15 m, counter facing +Z, casters on y = 0). aPart: 0 dark
- * steel · 1 stainless · 2 slatted timber · 3 warm glow (boiler vat, lanterns) · 4 marquee (atlas top half) · 5 glass ·
+ * steel · 1 stainless · 2 slatted timber · 3 warm glow (boiler vat, lanterns) · 4 marquee (atlas top half) · 5 unused ·
  * 6 ceramic bowls / bottles · 7 awning fabric.
  */
 function ramenCart(L: PartList): void {
   const V = KIT_VARIANT.RAMEN_CART;
-  for (const sx of [-1, 1]) for (const sz of [-1, 1]) tag(L, cyl(0.09, 0.09, 0.05, 6, sx * 0.8, 0.09 * Math.cos(Math.PI / 6), sz * 0.3, [0, Math.PI / 6, Math.PI / 2], true), 0, 0.8, undefined, V); // solid casters
+  for (const sx of [-1, 1]) for (const sz of [-1, 1]) tag(L, cyl(0.09, 0.09, 0.05, 5, sx * 0.8, 0.09 * Math.cos(Math.PI / 5), sz * 0.3, [(3 * Math.PI) / 10, 0, Math.PI / 2], true), 0, 0.8, undefined, V); // solid 5-sided casters (flat side down on y = 0)
   tag(L, box(1.85, 0.79, 0.84, 0, 0.545, 0), 1, 1, undefined, V); // stainless chassis (y 0.15–0.94, resting on the casters)
   tag(L, plane(1.8, 0.6, 0, 0.52, 0.425), 2, 0.9, undefined, V); // slatted timber skirt
-  for (let k = 0; k < 4; k++) tag(L, plane(1.8, 0.018, 0, 0.3 + k * 0.14, 0.428), 0, 1, undefined, V);
-  tag(L, box(1.95, 0.05, 0.22, 0, 0.965, 0.46), 1, 1, undefined, V); // cantilevered counter lip
+  for (let k = 0; k < 2; k++) tag(L, plane(1.8, 0.018, 0, 0.37 + k * 0.28, 0.428), 0, 1, undefined, V);
+  tag(L, box(1.95, 0.05, 0.22, 0, 0.965, 0.46, [0, 0, 0], true), 1, 1, undefined, V); // cantilevered counter lip (closed underside)
   tag(L, cyl(0.18, 0.18, 0.08, 6, FURNITURE_SOCKETS.RAMEN_STEAM[0], 0.92, FURNITURE_SOCKETS.RAMEN_STEAM[2]), 1, 0.8, undefined, V);
   const vat = new THREE.CircleGeometry(0.17, 6);
   vat.rotateX(-Math.PI / 2);
   vat.translate(FURNITURE_SOCKETS.RAMEN_STEAM[0], 0.945, FURNITURE_SOCKETS.RAMEN_STEAM[2]);
   tag(L, vat, 3, 1, undefined, V); // recessed boiler vat (warm glow)
-  tag(L, plane(1.0, 0.35, 0.38, 1.16, 0.36, [-0.3, 0, 0]), 5, 1, undefined, V); // glass sneeze-guard hood
+  // 10D-Fix FIX-1: grounded open-frame stainless sneeze-guard rail (two uprights standing on the counter, angled hood
+  // bar on top) instead of the floating opaque plane — bowls and bottles stay visible from both sides.
+  for (const x of [-0.05, 0.85]) tag(L, rod(new THREE.Vector3(x, 0.94, 0.34), new THREE.Vector3(x, 1.24, 0.34), 0.012, 3), 1, 1, undefined, V);
+  tag(L, box(0.94, 0.025, 0.14, 0.4, 1.24, 0.28, [0.22, 0, 0], true), 1, 1, undefined, V);
   for (let k = 0; k < 3; k++) {
     tag(L, cyl(0.08, 0.055, 0.05, 5, 0.25 + k * 0.17, 0.94 + 0.025, -0.2), 6, 1, undefined, V); // bowls on the counter
     const soup = new THREE.CircleGeometry(0.075, 5, -Math.PI / 10); // corners aligned with the 5-sided bowl wall
@@ -219,15 +222,21 @@ function ramenCart(L: PartList): void {
     soup.translate(0.25 + k * 0.17, 0.98, -0.2);
     tag(L, soup, 6, 0.7, undefined, V); // filled (never see-through from above)
   }
-  for (let k = 0; k < 3; k++) tag(L, cyl(0.03, 0.03, 0.2, 4, 0.72 - k * 0.08, 1.04, -0.3), 6, 1, undefined, V);
+  for (let k = 0; k < 3; k++) {
+    tag(L, cyl(0.03, 0.03, 0.2, 4, 0.72 - k * 0.08, 1.04, -0.3), 6, 1, undefined, V); // condiment bottles
+    const lid = new THREE.CircleGeometry(0.03, 4); // top-only cap, corners aligned with the 4-sided bottle wall
+    lid.rotateX(-Math.PI / 2);
+    lid.translate(0.72 - k * 0.08, 1.14, -0.3);
+    tag(L, lid, 6, 1, undefined, V);
+  }
   // Roof posts end inside the slanted awning slab (it drops toward the front: +0.09 rad about X).
-  for (const sx of [-1, 1]) for (const sz of [-1, 1]) tag(L, rod(new THREE.Vector3(sx * 0.9, 0.94, sz * 0.38), new THREE.Vector3(sx * 0.9, 2.26 - sz * 0.38 * Math.sin(0.09), sz * 0.38), 0.025, 4), 0, 1, undefined, V);
+  for (const sx of [-1, 1]) for (const sz of [-1, 1]) tag(L, rod(new THREE.Vector3(sx * 0.9, 0.94, sz * 0.38), new THREE.Vector3(sx * 0.9, 2.26 - sz * 0.38 * Math.sin(0.09), sz * 0.38), 0.025, 3), 0, 1, undefined, V);
   tag(L, box(2.2, 0.04, 1.15, 0, 2.26, 0, [0.09, 0, 0], true), 7, 1, undefined, V); // slanted corrugated awning
-  for (let k = 0; k < 5; k++) {
-    const x = -0.88 + k * 0.44;
+  for (let k = 0; k < 3; k++) {
+    const x = -0.76 + k * 0.76;
     tag(L, rod(new THREE.Vector3(x, 2.338, -0.56), new THREE.Vector3(x, 2.238, 0.56), 0.018, 3), 0, 1, undefined, V); // ribs on the top face
   }
-  tag(L, box(1.86, 0.36, 0.05, 0, 2.03, 0.39), 0, 1, undefined, V); // marquee backing
+  tag(L, box(1.86, 0.36, 0.05, 0, 2.03, 0.39, [0, 0, 0], true), 0, 1, undefined, V); // marquee backing (closed underside)
   tag(L, plane(1.8, 0.32, 0, 2.03, 0.425), 4, 1, ATLAS_RAMEN, V); // backlit English marquee (1 cm proud)
   for (let k = 0; k < 3; k++) {
     for (const back of [false, true]) tag(L, plane(0.58, 0.2, -0.62 + k * 0.62, 1.77, 0.42, [0, back ? Math.PI : 0, 0]), 7, 1, undefined, V); // hangs from the backing
@@ -240,8 +249,8 @@ function ramenCart(L: PartList): void {
     tag(L, cap, 3, 1, undefined, V); // lantern bottom
     tag(L, rod(new THREE.Vector3(sx * 1.0, 2.04, 0.5), new THREE.Vector3(sx * 1.0, 2.23, 0.5), 0.012, 3), 0, 1, undefined, V); // hanger into the awning
   }
-  tag(L, rod(new THREE.Vector3(-1.02, 1.0, -0.32), new THREE.Vector3(-1.02, 1.0, 0.32), 0.02, 4), 1, 1, undefined, V); // push handle
-  for (const sz of [-0.32, 0.32]) tag(L, rod(new THREE.Vector3(-0.92, 0.9, sz), new THREE.Vector3(-1.02, 1.0, sz), 0.018, 4), 1, 1, undefined, V);
+  tag(L, rod(new THREE.Vector3(-1.02, 1.0, -0.32), new THREE.Vector3(-1.02, 1.0, 0.32), 0.02, 3), 1, 1, undefined, V); // push handle
+  for (const sz of [-0.32, 0.32]) tag(L, rod(new THREE.Vector3(-0.92, 0.9, sz), new THREE.Vector3(-1.02, 1.0, sz), 0.018, 3), 1, 1, undefined, V);
 }
 
 /**
@@ -267,7 +276,7 @@ function busShelter(L: PartList): void {
     tag(L, plane(1.15, 0.575, 1.72 + sx * 0.095, 1.8, 0, [0, sx * (Math.PI / 2), 0]), 4, 1, ATLAS_TRANSIT_MAP, V);
     tag(L, plane(1.15, 0.575, 1.72 + sx * 0.095, 1.2, 0, [0, sx * (Math.PI / 2), 0]), 4, 1, ATLAS_TRANSIT_BOARD, V);
   }
-  tag(L, box(1.85, 0.05, 0.4, -0.35, 0.46, -0.38), 2, 1, undefined, V); // slatted bench
+  tag(L, box(1.85, 0.05, 0.4, -0.35, 0.46, -0.38, [0, 0, 0], true), 2, 1, undefined, V); // slatted bench (closed underside)
   for (let k = 0; k < 3; k++) tag(L, box(1.85, 0.012, 0.03, -0.35, 0.49, -0.52 + k * 0.14), 0, 1, undefined, V);
   tag(L, box(1.85, 0.22, 0.04, -0.35, 0.84, -0.6), 2, 1, undefined, V);
   for (const x of [-1.25, -0.35, 0.55]) tag(L, box(0.05, 0.22, 0.4, x, 0.6, -0.38), 0, 1, undefined, V);

@@ -63,6 +63,7 @@ import { ENDLESS, type EnemyKind, type SectorDef } from '../config/skills';
 import type { Renderer } from '../engine/Renderer';
 import type { PlayerController } from '../player/PlayerController';
 import type { SectorLayout, SpawnPoint } from '../world/CityBuilder';
+import { clampOutOfTrafficLanes, inTrafficLane } from '../world/CityAtmosphere';
 import {
   type HitboxTarget,
   type PhysicsWorld,
@@ -2020,6 +2021,15 @@ export class EnemyManager {
           grounded = g2 !== null && Math.abs(g2 - _v5.y) < 0.6;
         }
         if (!grounded) continue;
+        // 10D-Fix FIX-4: expressway patrols never stand in or cross a moving traffic lane.
+        const lanes = this.layout?.trafficLanes;
+        if (lanes && lanes.length && Math.abs(_v5.y - LEVEL.HIGHWAY_DECK_Y) < 2.0) {
+          let blocked = inTrafficLane(lanes, _v3.x, _v3.z, 0.85);
+          // Leg samples ≤ 1.5 m apart (a lane band is 3.7 m wide), so no leg skips across a lane.
+          const ns = Math.max(4, Math.ceil(Math.hypot(_v3.x - _v5.x, _v3.z - _v5.z) / 1.5));
+          for (let k = 1; k < ns && !blocked; k++) blocked = inTrafficLane(lanes, _v5.x + (_v3.x - _v5.x) * (k / ns), _v5.z + (_v3.z - _v5.z) * (k / ns), 0.85);
+          if (blocked) continue;
+        }
         _v3.y = gy;
         writeV(e.patrol, e.patrolCount++, _v3);
         heading = a + (this.rng() < 0.5 ? 1 : -1) * (0.9 + this.rng() * 0.9);
@@ -2632,6 +2642,11 @@ export class EnemyManager {
     e.vel.y = e.grounded ? -2 : e.vel.y + GRAVITY * dt;
     _v2.set(e.vel.x * dt, e.vel.y * dt, e.vel.z * dt);
     this.physics.movePlayer(e.pos, HUMANOID.RADIUS * e.scale, HUMANOID.HEIGHT * e.scale, _v2, e.grounded, _move);
+    // 10D-Fix FIX-4: every ground move (goal seeking, combat strafe / retreat / lunge / orbit) stays out of the
+    // expressway traffic lanes.
+    const lanes = this.layout?.trafficLanes;
+    // A clamped enemy drops its goal so it never keeps pushing against the lane edge.
+    if (lanes && lanes.length && Math.abs(e.pos.y - LEVEL.HIGHWAY_DECK_Y) < 2.0 && clampOutOfTrafficLanes(lanes, e.pos, 0.85)) e.hasGoal = false;
     e.grounded = _move.grounded;
     if (e.grounded) e.vel.y = 0;
     if (_move.hitWall) e.hasGoal = false;
