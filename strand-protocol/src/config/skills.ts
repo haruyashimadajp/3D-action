@@ -551,6 +551,8 @@ export interface SaveSettings {
   showPerf: boolean;
   /** 10A-4 selectable atmospheric screen filter (default CYBER_NOIR). */
   filter: ScreenFilterId;
+  /** 12A-4 RCAS contrast-adaptive sharpening inside KineticPostFX (default true; compiled out on LOW). */
+  sharpen: boolean;
 }
 
 export interface SaveData {
@@ -591,6 +593,7 @@ export function defaultSave(): SaveData {
       shadows: false,
       showPerf: false,
       filter: 'CYBER_NOIR',
+      sharpen: true,
     },
   };
 }
@@ -643,6 +646,8 @@ export function sanitizeSave(raw: unknown): SaveData {
       shadows: st.shadows === true,
       showPerf: st.showPerf === true,
       filter: pick(st.filter, SCREEN_FILTER_IDS, 'CYBER_NOIR'),
+      // 12A-4: older saves predate the toggle — anything but an explicit boolean falls back to ON.
+      sharpen: typeof st.sharpen === 'boolean' ? st.sharpen : d.settings.sharpen,
     },
   };
 }

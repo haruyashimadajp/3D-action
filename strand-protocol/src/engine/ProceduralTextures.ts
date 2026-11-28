@@ -15,6 +15,8 @@
  *  - 6B-1 view-model sets (512², 4 zones each): glove & wear (leather grain + stitching + knuckle creases,
  *    ballistic nylon, rubber grip, jacket twill) and gun hard-surface (brushed gunmetal with scratches / edge
  *    wear / screws, checkering, polymer stipple, anodised heat slits)
+ *  - 12A-3 close-up automotive detail set (512², 4 quadrants, DataTexture — no Canvas2D): carbon twill,
+ *    honeycomb grille, radial brushed metal, clearcoat rain beading (see VEHICLE_DETAIL)
  */
 import * as THREE from 'three';
 import {
@@ -68,6 +70,12 @@ export interface ProceduralTextureLibrary {
   vendingAtlas: THREE.Texture;
   /** 10D-3 street-landmark atlas (512 × 256, 100 % English): top half ramen-cart marquee, bottom half transit map. */
   furnishingsAtlas?: THREE.Texture;
+  /**
+   * 12A-3 close-up automotive detail set (512², 4 quadrants of 256²: Q0 carbon twill · Q1 honeycomb grille ·
+   * Q2 brushed radial metal · Q3 clearcoat rain-beading). Sampled by the zero-UV car shader via custom
+   * uniforms (cars carry no `uv`), never assigned to `mat.normalMap`. Optional so headless mocks stay valid.
+   */
+  vehicleDetail?: { readonly normalMap: THREE.Texture; readonly roughnessMap: THREE.Texture };
   /** 6B-1 tactical glove & wear set (512², four zones; roughnessMap packs G roughness · B metalness). */
   glove: PbrTextureSet;
   /** 6B-1 gun micro hard-surface set (512², four zones; roughnessMap packs G roughness · B metalness). */
@@ -3037,6 +3045,294 @@ function generateGraffitiAtlas(anisotropy: number): THREE.Texture {
 }
 
 // ---------------------------------------------------------------------------
+// 12A-3. Close-up automotive detail set (512 × 512, 4 quadrants of 256²) — generated straight into
+//        Uint8Array RGBA buffers (THREE.DataTexture, no Canvas2D) so it also builds in headless Node.
+// ---------------------------------------------------------------------------
+/**
+ * 12A-3 vehicle detail layout. DataTexture row 0 is v = 0, so quadrant origins are given in UV space
+ * (`[u0, v0]`, each quadrant spans 0.5 × 0.5). Every quadrant tiles seamlessly on its own; sample it with
+ * `origin + QUAD_INSET + fract(uv) * QUAD_SPAN` and `textureGrad(..., dFdx(uv) * QUAD_SPAN, dFdy(uv) * QUAD_SPAN)`.
+ *
+ * Channel packing (both maps linear, `NoColorSpace`):
+ *  - `normalMap`:    RGB = tangent-space normal, OpenGL convention (+X = +u, +Y = +v up), flat = (128, 128, 255); A = 255.
+ *  - `roughnessMap`: R = cavity / AO (255 = open, darker in tow gaps / honeycomb cells / grooves),
+ *                    G = absolute roughness (0..255 => 0..1), B = metalness hint (0..255 => 0..1), A = 255.
+ *
+ *  - Q0 carbon fibre: 45° 2×2 twill, 8 weave repeats (32 tows of 8 px); roughness 0.22 warp / 0.34 weft, metal 0.1.
+ *  - Q1 honeycomb grille: 7 × 8 sharp hex cells, raised 2 px walls, deep dark cells; roughness 0.55 / 0.8, metal 0.3.
+ *  - Q2 brushed metal: radial grooves around the quadrant centre + faint concentric lathe rings; roughness
+ *    0.25–0.35, metal 0.9 (mirror-folded about the quadrant axes so the radial field tiles).
+ *  - Q3 clearcoat rain beading: sparse hemispherical micro droplets (r 2–7 px) over faint orange peel;
+ *    roughness 0.12 drops / 0.18 paint, metal 0.
+ */
+export const VEHICLE_DETAIL = {
+  SIZE: 512,
+  QUAD: 256,
+  Q0_CARBON: [0, 0],
+  Q1_HONEYCOMB: [0.5, 0],
+  Q2_BRUSHED: [0, 0.5],
+  Q3_CLEARCOAT: [0.5, 0.5],
+  /** UV inset applied inside each quadrant before sampling (anti-mip-bleed). */
+  QUAD_INSET: 0.008,
+  /** UV span used inside each quadrant (`0.5 - 2 × QUAD_INSET`). */
+  QUAD_SPAN: 0.484,
+} as const;
+
+const VD_Q = 256;
+const VD_MASK = VD_Q - 1;
+
+function vdSmooth(e0: number, e1: number, x: number): number {
+  const t = clamp((x - e0) / (e1 - e0), 0, 1);
+  return t * t * (3 - 2 * t);
+}
+
+/** 1-D value noise over a pre-filled table (no wrap; caller keeps `t` inside [0, tab.length - 1]). */
+function vdNoise1(tab: Float32Array, t: number): number {
+  const n = tab.length - 1;
+  let i = Math.floor(t);
+  if (i < 0) i = 0;
+  else if (i >= n) i = n - 1;
+  const f = clamp(t - i, 0, 1);
+  const s = f * f * (3 - 2 * f);
+  return tab[i] + (tab[i + 1] - tab[i]) * s;
+}
+
+/** 2-D periodic value noise on an `n × n` table (`n` a power of two), `x`/`y` in lattice units. */
+function vdNoise2(tab: Float32Array, n: number, x: number, y: number): number {
+  const m = n - 1;
+  const xi = Math.floor(x);
+  const yi = Math.floor(y);
+  const fx = x - xi;
+  const fy = y - yi;
+  const sx = fx * fx * (3 - 2 * fx);
+  const sy = fy * fy * (3 - 2 * fy);
+  const x0 = xi & m;
+  const x1 = (xi + 1) & m;
+  const y0 = (yi & m) * n;
+  const y1 = ((yi + 1) & m) * n;
+  const a = tab[y0 + x0] + (tab[y0 + x1] - tab[y0 + x0]) * sx;
+  const b = tab[y1 + x0] + (tab[y1 + x1] - tab[y1 + x0]) * sx;
+  return a + (b - a) * sy;
+}
+
+function vdTable(len: number, rng: () => number): Float32Array {
+  const t = new Float32Array(len);
+  for (let i = 0; i < len; i++) t[i] = rng();
+  return t;
+}
+
+/** Twill over-state of tow cell (i, j): true = warp (runs along v) on top, false = weft (runs along u) on top. */
+function vdWarpOver(i: number, j: number): boolean {
+  return ((i + j) & 3) < 2;
+}
+
+/** Q0 — 45° 2×2 twill carbon weave. Heights in pixels. */
+function vdPaintCarbon(h: Float32Array, rg: Float32Array, mt: Float32Array, cv: Float32Array, rng: () => number): void {
+  const TOW = 8; // 32 tows across, 8 twill repeats per quadrant
+  const peel = vdTable(64 * 64, rng);
+  for (let y = 0; y < VD_Q; y++) {
+    const j = (y / TOW) | 0;
+    const fy = ((y % TOW) + 0.5) / TOW;
+    for (let x = 0; x < VD_Q; x++) {
+      const i = (x / TOW) | 0;
+      const fx = ((x % TOW) + 0.5) / TOW;
+      const warp = vdWarpOver(i, j);
+      // across = coordinate across the top tow, along = coordinate along it
+      const across = warp ? fx : fy;
+      const along = warp ? fy : fx;
+      const prevOver = warp ? vdWarpOver(i, j - 1) : !vdWarpOver(i - 1, j);
+      const nextOver = warp ? vdWarpOver(i, j + 1) : !vdWarpOver(i + 1, j);
+      const cross = Math.sqrt(Math.max(0, Math.sin(Math.PI * across)));
+      const tPrev = prevOver ? 1 : 0.5 + 0.5 * vdSmooth(0, 0.42, along);
+      const tNext = nextOver ? 1 : 0.5 + 0.5 * vdSmooth(0, 0.42, 1 - along);
+      const taper = Math.min(tPrev, tNext);
+      const fibre = 0.05 * Math.cos(Math.PI * 4 * across); // 2 filament ridges per tow (4 px period)
+      const micro = (vdNoise2(peel, 64, x * 0.25, y * 0.25) - 0.5) * 0.06;
+      const k = y * VD_Q + x;
+      h[k] = (cross * taper + fibre * cross + micro) * 1.25;
+      rg[k] = (warp ? 0.22 : 0.34) + 0.07 * (1 - cross);
+      mt[k] = 0.1;
+      cv[k] = (0.5 + 0.5 * Math.min(1, cross * 1.5)) * (0.86 + 0.14 * taper);
+    }
+  }
+}
+
+/** Q1 — sharp hexagonal honeycomb grille (7 cells across, 8 rows, periodic). Heights in pixels. */
+function vdPaintHoneycomb(h: Float32Array, rg: Float32Array, mt: Float32Array, cv: Float32Array): void {
+  const SQ3 = Math.sqrt(3);
+  const CX = 7; // hex columns across the quadrant (lattice units of 1 = centre spacing)
+  const CY = 4 * SQ3; // 8 staggered rows (lattice period √3 per 2 rows), ≈ 1 % vertical stretch
+  const WALL = 0.055; // half wall thickness ≈ 2 px
+  const BEVEL = 0.05; // ≈ 1.8 px bevel into the cell
+  for (let y = 0; y < VD_Q; y++) {
+    const v = ((y + 0.5) * CY) / VD_Q;
+    for (let x = 0; x < VD_Q; x++) {
+      const u = ((x + 0.5) * CX) / VD_Q;
+      // nearest centre among the two rectangular sub-lattices of the triangular lattice
+      const ax = Math.round(u);
+      const ay = Math.round(v / SQ3) * SQ3;
+      const bx = Math.round(u - 0.5) + 0.5;
+      const by = Math.round((v - SQ3 * 0.5) / SQ3) * SQ3 + SQ3 * 0.5;
+      const da = (u - ax) * (u - ax) + (v - ay) * (v - ay);
+      const db = (u - bx) * (u - bx) + (v - by) * (v - by);
+      const qx = Math.abs(da <= db ? u - ax : u - bx);
+      const qy = Math.abs(da <= db ? v - ay : v - by);
+      const e = 0.5 - Math.max(qx, qx * 0.5 + qy * SQ3 * 0.5); // distance to the hex edge (0.5 at centre)
+      const wall = 1 - vdSmooth(WALL, WALL + BEVEL, e);
+      const deep = vdSmooth(WALL + BEVEL, 0.5, e);
+      const k = y * VD_Q + x;
+      h[k] = (wall - (1 - wall) * 0.45 * deep) * 3.0;
+      rg[k] = 0.55 + 0.25 * (1 - wall);
+      mt[k] = 0.3;
+      cv[k] = wall + (1 - wall) * (0.45 - 0.33 * deep);
+    }
+  }
+}
+
+/** Q2 — brushed metal: radial grooves + faint concentric lathe rings (D2-folded so it tiles). Heights in pixels. */
+function vdPaintBrushed(h: Float32Array, rg: Float32Array, mt: Float32Array, cv: Float32Array, rng: () => number): void {
+  const HALF_PI = Math.PI * 0.5;
+  // Angular bands (cells per quarter turn); each fades in only where its arc spacing is >= ~2 px.
+  const N0 = 24;
+  const N1 = 56;
+  const N2 = 110;
+  const b0 = vdTable(N0 + 1, rng);
+  const b1 = vdTable(N1 + 1, rng);
+  const b2 = vdTable(N2 + 1, rng);
+  const ringTab = vdTable(96, rng);
+  const ringPhase = vdTable(40, rng);
+  const C = VD_Q * 0.5;
+  for (let y = 0; y < VD_Q; y++) {
+    const py = Math.abs(y + 0.5 - C);
+    for (let x = 0; x < VD_Q; x++) {
+      const px = Math.abs(x + 0.5 - C);
+      const r = Math.sqrt(px * px + py * py);
+      const a = Math.atan2(py, px) / HALF_PI; // 0..1 over the folded quarter
+      const g0 = vdNoise1(b0, a * N0) * vdSmooth(31, 50, r);
+      const g1 = vdNoise1(b1, a * N1) * vdSmooth(71, 115, r);
+      const g2 = vdNoise1(b2, a * N2) * vdSmooth(140, 175, r);
+      const wSum = vdSmooth(31, 50, r) + vdSmooth(71, 115, r) + vdSmooth(140, 175, r);
+      const groove = wSum > 0 ? (g0 + g1 + g2) / wSum : 0.5;
+      const radialAmt = Math.min(1, wSum);
+      // concentric lathe rings: 3.4 px period with slow phase wander + per-ring tone
+      const ring = 0.5 + 0.5 * Math.sin((r * Math.PI * 2) / 3.4 + vdNoise1(ringPhase, r / 6) * 2.5);
+      const ringTone = vdNoise1(ringTab, r / 2.5);
+      const hub = 1 - vdSmooth(4, 14, r);
+      const k = y * VD_Q + x;
+      h[k] = (groove - 0.5) * 1.1 * radialAmt + (ring - 0.5) * 0.05 + (ringTone - 0.5) * 0.08 - hub * 0.6;
+      rg[k] = clamp(0.3 + (groove - 0.5) * 0.1 * radialAmt + (ringTone - 0.5) * 0.04, 0.25, 0.35);
+      mt[k] = 0.9;
+      cv[k] = 0.94 + 0.06 * (groove * radialAmt + (1 - radialAmt) * 0.6) - hub * 0.1;
+    }
+  }
+}
+
+/** Q3 — clearcoat rain beading: sparse hemispherical droplets (toroidally wrapped) over faint orange peel. */
+function vdPaintClearcoat(h: Float32Array, rg: Float32Array, mt: Float32Array, cv: Float32Array, rng: () => number): void {
+  const peelA = vdTable(16 * 16, rng);
+  const peelB = vdTable(32 * 32, rng);
+  for (let y = 0; y < VD_Q; y++) {
+    for (let x = 0; x < VD_Q; x++) {
+      const k = y * VD_Q + x;
+      h[k] = (vdNoise2(peelA, 16, x / 16, y / 16) - 0.5) * 0.35 + (vdNoise2(peelB, 32, x / 8, y / 8) - 0.5) * 0.12;
+      rg[k] = 0.18;
+      mt[k] = 0;
+      cv[k] = 1;
+    }
+  }
+  const DROPS = 85;
+  for (let d = 0; d < DROPS; d++) {
+    const cx = rng() * VD_Q;
+    const cy = rng() * VD_Q;
+    const s = rng();
+    const R = 2 + s * s * 5; // mostly small beads, a few 7 px ones
+    const hR = R * 0.5;
+    const ext = Math.ceil(R) + 1;
+    const x0 = Math.floor(cx) - ext;
+    const y0 = Math.floor(cy) - ext;
+    for (let yy = y0; yy <= y0 + 2 * ext; yy++) {
+      const dy = yy + 0.5 - cy;
+      for (let xx = x0; xx <= x0 + 2 * ext; xx++) {
+        const dx = xx + 0.5 - cx;
+        const t = (dx * dx + dy * dy) / (R * R);
+        if (t >= 1) continue;
+        const k = (yy & VD_MASK) * VD_Q + (xx & VD_MASK);
+        const hd = hR * Math.sqrt(1 - t);
+        if (hd > h[k]) h[k] = hd;
+        const m = 1 - vdSmooth(0.75, 1, t);
+        rg[k] = Math.min(rg[k], 0.18 - 0.06 * m);
+        cv[k] = Math.min(cv[k], 1 - 0.06 * vdSmooth(0.7, 1, t) * (1 - vdSmooth(0.98, 1, t)));
+      }
+    }
+  }
+}
+
+function vdTexture(data: Uint8Array, size: number, anisotropy: number): THREE.DataTexture {
+  const tex = new THREE.DataTexture(data, size, size, THREE.RGBAFormat, THREE.UnsignedByteType);
+  tex.colorSpace = THREE.NoColorSpace;
+  tex.wrapS = THREE.ClampToEdgeWrapping;
+  tex.wrapT = THREE.ClampToEdgeWrapping;
+  tex.generateMipmaps = true;
+  tex.minFilter = THREE.LinearMipmapLinearFilter;
+  tex.magFilter = THREE.LinearFilter;
+  tex.anisotropy = anisotropy;
+  tex.flipY = false;
+  tex.needsUpdate = true;
+  return tex;
+}
+
+/**
+ * 12A-3: builds the 512 × 512 close-up automotive detail set (see {@link VEHICLE_DETAIL} for the quadrant
+ * layout and channel packing). Pure & deterministic (seeded RNG), Canvas-free, safe in headless Node.
+ */
+export function generateVehicleDetailSet(anisotropy = 1): { normalMap: THREE.DataTexture; roughnessMap: THREE.DataTexture } {
+  const S = VEHICLE_DETAIL.SIZE;
+  const QQ = VD_Q * VD_Q;
+  const nrm = new Uint8Array(S * S * 4);
+  const rgh = new Uint8Array(S * S * 4);
+  const h = new Float32Array(QQ);
+  const rg = new Float32Array(QQ);
+  const mt = new Float32Array(QQ);
+  const cv = new Float32Array(QQ);
+  const rng = createRng(0x12a3c4);
+  // normal strength per quadrant (heights are already in pixel units)
+  const STRENGTH = [1.0, 1.0, 1.0, 0.9];
+  for (let q = 0; q < 4; q++) {
+    if (q === 0) vdPaintCarbon(h, rg, mt, cv, rng);
+    else if (q === 1) vdPaintHoneycomb(h, rg, mt, cv);
+    else if (q === 2) vdPaintBrushed(h, rg, mt, cv, rng);
+    else vdPaintClearcoat(h, rg, mt, cv, rng);
+    const ox = (q & 1) * VD_Q;
+    const oy = (q >> 1) * VD_Q;
+    const str = STRENGTH[q];
+    for (let y = 0; y < VD_Q; y++) {
+      const rowU = ((y + 1) & VD_MASK) * VD_Q;
+      const rowD = ((y - 1) & VD_MASK) * VD_Q;
+      const row = y * VD_Q;
+      for (let x = 0; x < VD_Q; x++) {
+        // central differences, wrapped inside the quadrant (row index grows with +v)
+        const dhx = (h[row + ((x + 1) & VD_MASK)] - h[row + ((x - 1) & VD_MASK)]) * 0.5;
+        const dhy = (h[rowU + x] - h[rowD + x]) * 0.5;
+        const nx = -dhx * str;
+        const ny = -dhy * str;
+        const inv = 1 / Math.sqrt(nx * nx + ny * ny + 1);
+        const k = row + x;
+        const o = ((oy + y) * S + ox + x) * 4;
+        nrm[o] = Math.round((nx * inv * 0.5 + 0.5) * 255);
+        nrm[o + 1] = Math.round((ny * inv * 0.5 + 0.5) * 255);
+        nrm[o + 2] = Math.round((inv * 0.5 + 0.5) * 255);
+        nrm[o + 3] = 255;
+        rgh[o] = Math.round(clamp(cv[k], 0, 1) * 255);
+        rgh[o + 1] = Math.round(clamp(rg[k], 0, 1) * 255);
+        rgh[o + 2] = Math.round(clamp(mt[k], 0, 1) * 255);
+        rgh[o + 3] = 255;
+      }
+    }
+  }
+  return { normalMap: vdTexture(nrm, S, anisotropy), roughnessMap: vdTexture(rgh, S, anisotropy) };
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 let cache: ProceduralTextureLibrary | null = null;
@@ -3069,6 +3365,7 @@ export function getProceduralTextures(renderer: THREE.WebGLRenderer): Procedural
       furnishingsAtlas: new THREE.Texture(),
       glove: pbr(),
       gun: pbr(),
+      vehicleDetail: generateVehicleDetailSet(1),
     };
     return cache;
   }
@@ -3091,6 +3388,7 @@ export function getProceduralTextures(renderer: THREE.WebGLRenderer): Procedural
     furnishingsAtlas: generateFurnishingsAtlas(aniso),
     glove: generateGloveSet(aniso),
     gun: generateGunSet(aniso),
+    vehicleDetail: generateVehicleDetailSet(aniso),
   };
   return cache;
 }

@@ -7,8 +7,9 @@
  *    Pass 2  ViewModelPass     — clearDepth() then first-person scene with dedicated FOV 68°
  *            HdrSanitize       — NaN → 0, Inf/fireflies capped (protects the bloom chain)
  *    Pass 3  UnrealBloomPass   — threshold 0.92 / strength 0.65 (SSS 0.95) / radius 0.48
- *    Pass 4  KineticPostFX     — RGB aberration · BT colour shift · speed lines · raindrop
- *                                 vignette · critical/damage vignette · overdrive border · glitch
+ *    Pass 4  KineticPostFX     — RGB aberration · 12A RCAS sharpen · 12A anamorphic streak · BT colour
+ *                                 shift · speed lines · raindrop vignette · critical/damage vignette ·
+ *                                 overdrive border · glitch
  *    Pass 5  OutputPass        — ACES tone mapping + sRGB
  *  Lights: 1 DirectionalLight (moon, no shadows) + 1 HemisphereLight + 4 pooled PointLights.
  */
@@ -42,6 +43,46 @@ export function computeEffectiveDpr(
   if (lowLatency || preset !== 'HIGH') return 1.0;
   const pxCapDpr = Math.sqrt(RENDER.MAX_RENDER_PIXELS / Math.max(1, width * height));
   return Math.min(Math.max(devicePixelRatio || 1, 1), QUALITY_PRESETS.HIGH.dpr, RENDER.DPR_CAP, pxCapDpr);
+}
+
+/**
+ * 12A-4 pure gate for the anamorphic neon streak: 0 on LOW (lite PostFX) and whenever lowLatency is on,
+ * otherwise RENDER.ANAMORPHIC. Node-testable (no WebGL).
+ */
+export function anamorphicStrength(preset: QualityPreset, lowLatency: boolean): number {
+  if (lowLatency || preset === 'LOW' || QUALITY_PRESETS[preset]?.litePostFx) return 0;
+  return RENDER.ANAMORPHIC;
+}
+
+/** 12A-4 aerial perspective: share of `palette[0]` blended into COLORS.FOG_ABYSS (linear working space). */
+export const SECTOR_FOG_TINT = 0.12;
+const _sectorTint = new THREE.Color();
+
+/**
+ * 12A-4 pure helper: writes COLORS.FOG_ABYSS lerped 12 % toward `palette[0]` (linear-space THREE.Color lerp)
+ * into `out` and returns it. Missing / invalid palette entries leave the plain abyss colour. Zero allocations.
+ */
+export function sectorFogColor(palette: readonly number[], out: THREE.Color): THREE.Color {
+  out.setHex(COLORS.FOG_ABYSS);
+  const p0 = palette.length > 0 ? palette[0] : undefined;
+  if (typeof p0 !== 'number' || !Number.isFinite(p0)) return out;
+  // Perceptual (sRGB-space) blend: a linear-space 12 % lerp from the near-black abyss toward a saturated neon
+  // swamps the far skyline (e.g. 0d1628 → 0c5e68 for cyan); in sRGB it stays a subtle district cast (→ 0b3042).
+  out.convertLinearToSRGB();
+  _sectorTint.setHex(p0).convertLinearToSRGB();
+  return out.lerp(_sectorTint, SECTOR_FOG_TINT).convertSRGBToLinear();
+}
+
+/** 12A-1 default (Sector 1 / no palette) neon signature baked into the PMREM environment. */
+const DEFAULT_ENV_NEON: readonly number[] = [COLORS.WALLRUN_CYAN, COLORS.NEON_MAGENTA, COLORS.NEON_AMBER];
+const _envMixA = new THREE.Color();
+const _envMixB = new THREE.Color();
+
+/** sRGB hex `a` → `b` mixed by `t` perceptually (in sRGB space, like a hex colour picker), written into `out` (linear). */
+function mixHexInto(out: THREE.Color, a: number, b: number, t: number): THREE.Color {
+  _envMixA.setHex(a).convertLinearToSRGB();
+  _envMixB.setHex(b).convertLinearToSRGB();
+  return out.copy(_envMixA).lerp(_envMixB, t).convertSRGBToLinear();
 }
 
 /** 10A-4 grade parameters executed inside KineticPostFX (+0 extra draw calls). */
@@ -183,7 +224,7 @@ const HdrSanitizeShader = {
 // ---------------------------------------------------------------------------
 const DEF_GRADE = FILTER_GRADES.CYBER_NOIR;
 
-const KineticPostFXShader = {
+export const KineticPostFXShader = {
   name: 'KineticPostFX',
   defines: {} as Record<string, string | number>,
   uniforms: {
@@ -222,6 +263,10 @@ const KineticPostFXShader = {
     uGradeWarmKeep: { value: DEF_GRADE.warmKeep },
     /** 7B-2 film grain strength (display-referred). */
     uGrain: { value: DEF_GRADE.grain },
+    /** 12A-4 RCAS sharpen strength (RENDER.RCAS_SHARPEN when enabled, 0 = off; compiled out under LITE). */
+    uSharpen: { value: RENDER.RCAS_SHARPEN as number },
+    /** 12A-4 anamorphic neon streak gain (0 on LOW / lowLatency, see anamorphicStrength()). */
+    uAnamorphic: { value: RENDER.ANAMORPHIC as number },
   },
   vertexShader: /* glsl */ `
     varying vec2 vUv;
@@ -264,6 +309,8 @@ const KineticPostFXShader = {
     uniform float uGradeVig;
     uniform float uGradeWarmKeep;
     uniform float uGrain;
+    uniform float uSharpen;
+    uniform float uAnamorphic;
     varying vec2 vUv;
 
     float hash12(vec2 p) {
@@ -298,6 +345,17 @@ const KineticPostFXShader = {
       float len = length(d);
       float m = smoothstep(r, r * 0.35, len) * alive * step(0.35, n);
       return vec3(d * m * 0.9 / scale, m);
+    }
+
+    // 12A RCAS helpers: invertible Reinhard so HDR neon pixels do not dominate the sharpen weights.
+    vec3 rcasCompress(vec3 c) {
+      c = max(c, vec3(0.0));
+      return c / (1.0 + max(c.r, max(c.g, c.b)));
+    }
+    vec3 rcasExpand(vec3 c) {
+      // Compressed values live in [0, 1); clamp the peak so the inverse never divides by zero.
+      float m = min(max(c.r, max(c.g, c.b)), 0.9990);
+      return c / (1.0 - m);
     }
 
     void main() {
@@ -335,6 +393,42 @@ const KineticPostFXShader = {
       col.r = texture2D(tDiffuse, uv + caOff).r;
       col.g = base.g;
       col.b = texture2D(tDiffuse, uv - caOff).b;
+
+      #ifndef LITE
+      // 12A RCAS — AMD FidelityFX-style robust contrast-adaptive sharpening on raw tDiffuse (5 taps incl. the
+      // centre fetch above), before bullet-time / vignettes / grading / grain. +0 passes.
+      if (uSharpen > 0.0) {
+        vec2 rpx = 1.0 / uResolution;
+        vec3 rN = rcasCompress(texture2D(tDiffuse, uv + vec2(0.0, rpx.y)).rgb);
+        vec3 rS = rcasCompress(texture2D(tDiffuse, uv - vec2(0.0, rpx.y)).rgb);
+        vec3 rE = rcasCompress(texture2D(tDiffuse, uv + vec2(rpx.x, 0.0)).rgb);
+        vec3 rW = rcasCompress(texture2D(tDiffuse, uv - vec2(rpx.x, 0.0)).rgb);
+        vec3 rC = rcasCompress(col);
+        vec3 min4 = min(min(rN, rS), min(rE, rW));
+        vec3 max4 = max(max(rN, rS), max(rE, rW));
+        // Per-channel lobe limits that keep the result inside the local range (RCAS anti-ringing).
+        vec3 hitMin = min(min4, rC) / max(4.0 * max4, vec3(1e-4));
+        vec3 hitMax = (vec3(1.0) - max(max4, rC)) / min(4.0 * min4 - 4.0, vec3(-1e-4));
+        vec3 lobeRGB = max(-hitMin, hitMax);
+        float lobe = max(-0.1875, min(max(lobeRGB.r, max(lobeRGB.g, lobeRGB.b)), 0.0)) * uSharpen;
+        vec3 sharp = (lobe * (rN + rS + rE + rW) + rC) / (4.0 * lobe + 1.0);
+        // Strict anti-ringing clamp to [min4, max4] (widened by the centre tap so 1-px neon detail survives).
+        sharp = clamp(sharp, min(min4, rC), max(max4, rC));
+        col = rcasExpand(sharp);
+      }
+
+      // 12A ANAMORPHIC — subtle horizontal cinema streak from bright HDR neon / headlights only (4 taps).
+      if (uAnamorphic > 0.0) {
+        const vec3 aLum = vec3(0.2126, 0.7152, 0.0722);
+        float asx = 1.0 / uResolution.x;
+        float aIn = max(0.0, dot(texture2D(tDiffuse, uv + vec2(3.0 * asx, 0.0)).rgb, aLum) - 1.45)
+                  + max(0.0, dot(texture2D(tDiffuse, uv - vec2(3.0 * asx, 0.0)).rgb, aLum) - 1.45);
+        float aOut = max(0.0, dot(texture2D(tDiffuse, uv + vec2(7.0 * asx, 0.0)).rgb, aLum) - 1.45)
+                   + max(0.0, dot(texture2D(tDiffuse, uv - vec2(7.0 * asx, 0.0)).rgb, aLum) - 1.45);
+        vec3 streak = vec3(0.75, 0.92, 1.15) * (aIn * 0.3 + aOut * 0.2);
+        col += streak * uAnamorphic;
+      }
+      #endif
 
       // Drops slightly brighten & blur-tint what's behind them.
       col *= 1.0 + dropCoverage * 0.18;
@@ -487,6 +581,8 @@ export class Renderer {
   readonly postFxPass: ShaderPass;
   readonly moonLight: THREE.DirectionalLight;
   readonly hemiLight: THREE.HemisphereLight;
+  /** Scene fog (FogExp2); colour re-tinted per sector by setSectorAtmosphere (12A-4). */
+  readonly fog: THREE.FogExp2;
   readonly postFx: PostFxState = {
     speed: 0,
     bulletTime: 0,
@@ -503,6 +599,10 @@ export class Renderer {
   };
 
   private envTarget: THREE.WebGLRenderTarget | null = null;
+  /** 12A-1 persistent PMREM generator (lazy): per-sector bakes reuse its compiled shaders + source cube. */
+  private pmrem: THREE.PMREMGenerator | null = null;
+  /** 12A-4 RCAS sharpen setting (default ON; LOW compiles it out via the LITE define). */
+  private sharpenOn = true;
   private readonly lights: PooledLight[] = [];
   private quality: QualityPreset = 'HIGH';
   private lowLatency = false;
@@ -539,7 +639,8 @@ export class Renderer {
 
     // --- Scenes & cameras ------------------------------------------------------------------
     this.scene = new THREE.Scene();
-    this.scene.fog = new THREE.FogExp2(COLORS.FOG_ABYSS, RENDER.FOG_DENSITY);
+    this.fog = new THREE.FogExp2(COLORS.FOG_ABYSS, RENDER.FOG_DENSITY);
+    this.scene.fog = this.fog;
     this.camera = new THREE.PerspectiveCamera(CAMERA.BASE_FOV, 1, CAMERA.NEAR, CAMERA.FAR);
     this.camera.rotation.order = 'YXZ';
 
@@ -551,7 +652,7 @@ export class Renderer {
     this.moonLight = new THREE.DirectionalLight(COLORS.MOON, 0.72);
     this.moonLight.position.copy(this.moonDir).multiplyScalar(120);
     this.moonLight.castShadow = false;
-    // 10A-1 optional lightweight player-centered shadow map (1024×1024, ±36 m texel-snapped frustum).
+    // 10A-1 optional lightweight player-centered shadow map (1024×1024, ±30 m texel-snapped frustum — 12A-4).
     const sh = RENDER.SHADOW_FRUSTUM_HALF;
     this.moonLight.shadow.mapSize.set(RENDER.SHADOW_MAP_SIZE, RENDER.SHADOW_MAP_SIZE);
     this.moonLight.shadow.camera.left = -sh;
@@ -580,7 +681,7 @@ export class Renderer {
     const vmFill = new THREE.HemisphereLight(0x3a5a8a, 0x120c1c, 0.6);
     this.viewModelScene.add(vmKey, vmFill);
 
-    // --- Environment (PMREM, generated once) ----------------------------------------------
+    // --- Environment (PMREM; default Sector 1 look, re-baked one-shot per sector — 12A-1) ----
     this.buildEnvironment();
 
     // --- Composer --------------------------------------------------------------------------
@@ -621,8 +722,14 @@ export class Renderer {
 
   // -------------------------------------------------------------------------------------------
   // Procedural environment cube (night neon points, moonlight, lower blue-violet glow)
+  // 12A-1: one-shot per-sector bake (never per frame). No palette = the original Sector 1 look.
   // -------------------------------------------------------------------------------------------
-  private buildEnvironment(): void {
+  public buildEnvironment(sectorPalette?: readonly number[], sectorIndex = 1): void {
+    const hasPalette = !!sectorPalette && sectorPalette.length > 0;
+    const pal = (i: number): number => {
+      const v = hasPalette ? sectorPalette![i] : undefined;
+      return typeof v === 'number' && Number.isFinite(v) ? v : (hasPalette && i > 0 ? pal(i - 1) : DEFAULT_ENV_NEON[i]);
+    };
     const env = new THREE.Scene();
     const disposables: Array<{ dispose(): void }> = [];
 
@@ -633,9 +740,10 @@ export class Renderer {
       depthWrite: false,
       uniforms: {
         zenith: { value: new THREE.Color(COLORS.SKY_ZENITH) },
-        horizon: { value: new THREE.Color(0x1a2444) },
-        below: { value: new THREE.Color(0x2a1a55) },
-        abyss: { value: new THREE.Color(COLORS.FOG_ABYSS) },
+        horizon: { value: hasPalette ? mixHexInto(new THREE.Color(), 0x1a2444, pal(0), 0.16) : new THREE.Color(0x1a2444) },
+        below: { value: hasPalette ? mixHexInto(new THREE.Color(), 0x2a1a55, pal(1), 0.2) : new THREE.Color(0x2a1a55) },
+        // Same sector-tinted abyss as the runtime fog (setSectorAtmosphere) so reflections match the haze.
+        abyss: { value: hasPalette ? sectorFogColor(sectorPalette!, new THREE.Color()) : new THREE.Color(COLORS.FOG_ABYSS) },
       },
       vertexShader: /* glsl */ `
         varying vec3 vDir;
@@ -677,7 +785,10 @@ export class Renderer {
     disposables.push(towerGeo, towerMat);
     const neonGeo = new THREE.BoxGeometry(1, 1, 1);
     disposables.push(neonGeo);
-    const neonColors = [COLORS.WALLRUN_CYAN, COLORS.NEON_MAGENTA, COLORS.NEON_AMBER, COLORS.WINDOW_COOL];
+    // 12A-1: sector palette [p0, p1, p2] + cool window white; index 3 must stay WINDOW_COOL (searchlights).
+    const neonColors = [pal(0), pal(1), pal(2), COLORS.WINDOW_COOL];
+    // With a palette p0 / p1 are picked 3× as often as p2 / cool so each district has its own reflective signature.
+    const neonPick: readonly number[] = hasPalette ? [0, 0, 0, 1, 1, 1, 2, 3] : [0, 1, 2, 3];
     const neonMats = neonColors.map((c, i) => {
       const m = new THREE.MeshBasicMaterial({ color: new THREE.Color(c).multiplyScalar(i === 3 ? 1.2 : 2.6) });
       disposables.push(m);
@@ -689,7 +800,7 @@ export class Renderer {
     const coolWin = new THREE.MeshBasicMaterial({ color: new THREE.Color(COLORS.WINDOW_COOL).multiplyScalar(0.8), side: THREE.DoubleSide });
     disposables.push(warmWin, coolWin);
 
-    let seed = 1337;
+    let seed = hasPalette ? 1337 + sectorIndex * 7919 : 1337;
     const rnd = (): number => {
       seed = (seed * 16807) % 2147483647;
       return (seed - 1) / 2147483646;
@@ -720,7 +831,7 @@ export class Renderer {
       // Neon strips and points.
       const strips = 1 + Math.floor(rnd() * 3);
       for (let s = 0; s < strips; s++) {
-        const neon = new THREE.Mesh(neonGeo, neonMats[Math.floor(rnd() * neonMats.length)]);
+        const neon = new THREE.Mesh(neonGeo, neonMats[neonPick[Math.floor(rnd() * neonPick.length)]]);
         const vertical = rnd() < 0.5;
         const ny = baseY + h * (0.5 + rnd() * 0.48);
         neon.scale.set(vertical ? 2.5 : w * 0.8, vertical ? 30 + rnd() * 50 : 2.5, 1);
@@ -740,13 +851,15 @@ export class Renderer {
       env.add(beam);
     }
 
-    const pmrem = new THREE.PMREMGenerator(this.renderer);
-    this.envTarget = pmrem.fromScene(env, 0.02, 0.5, 2000, { size: RENDER.ENV_CUBE_SIZE });
-    this.scene.environment = this.envTarget.texture;
+    if (!this.pmrem) this.pmrem = new THREE.PMREMGenerator(this.renderer);
+    const baked = this.pmrem.fromScene(env, 0.02, 0.5, 2000, { size: RENDER.ENV_CUBE_SIZE });
+    // 12A-1 leak-free: release the previous sector's PMREM BEFORE the scenes switch to the new texture.
+    if (this.envTarget) this.envTarget.dispose();
+    this.envTarget = baked;
+    this.scene.environment = baked.texture;
     this.scene.environmentIntensity = 1.0;
-    this.viewModelScene.environment = this.envTarget.texture;
+    this.viewModelScene.environment = baked.texture;
     this.viewModelScene.environmentIntensity = 1.35; // 6B-1: neon / sky glints run along the bevelled edges
-    pmrem.dispose();
     for (const d of disposables) d.dispose();
   }
 
@@ -772,6 +885,9 @@ export class Renderer {
     if (def.litePostFx) mat.defines.LITE = 1;
     else delete mat.defines.LITE;
     mat.needsUpdate = true;
+    // 12A-4: anamorphic streak is off on LOW and in lowLatency; RCAS follows the user toggle.
+    mat.uniforms.uAnamorphic.value = anamorphicStrength(preset, this.lowLatency);
+    mat.uniforms.uSharpen.value = this.sharpenOn ? RENDER.RCAS_SHARPEN : 0;
     this.resize();
   }
 
@@ -782,7 +898,26 @@ export class Renderer {
   setLowLatency(on: boolean): void {
     this.lowLatency = on;
     this.syncComposerSamples();
+    (this.postFxPass.material as THREE.ShaderMaterial).uniforms.uAnamorphic.value = anamorphicStrength(this.quality, on);
     this.setQuality(this.quality);
+  }
+
+  /** 12A-4 RCAS sharpening toggle (uSharpen = RENDER.RCAS_SHARPEN or 0; LOW compiles it out via LITE). */
+  setSharpen(on: boolean): void {
+    this.sharpenOn = on;
+    (this.postFxPass.material as THREE.ShaderMaterial).uniforms.uSharpen.value = on ? RENDER.RCAS_SHARPEN : 0;
+  }
+
+  get sharpenEnabled(): boolean {
+    return this.sharpenOn;
+  }
+
+  /**
+   * 12A-4 sector-tinted aerial perspective: scene fog = COLORS.FOG_ABYSS lerped 12 % toward `palette[0]`.
+   * Returns the live fog colour object (pass it to CityBuilder.setSkyHorizon). Zero allocations.
+   */
+  setSectorAtmosphere(palette: readonly number[]): THREE.Color {
+    return sectorFogColor(palette, this.fog.color);
   }
 
   get isLowLatency(): boolean {
@@ -816,7 +951,7 @@ export class Renderer {
     return this.shadowsEnabled;
   }
 
-  /** Snaps the ±36 m shadow frustum to shadow-map texels around `focus` to eliminate shimmer (zero alloc). */
+  /** Snaps the ±30 m (12A-4) shadow frustum to shadow-map texels around `focus` to eliminate shimmer (zero alloc). */
   updateShadowFocus(focus: THREE.Vector3): void {
     if (!this.shadowsEnabled) return;
     const texel = (RENDER.SHADOW_FRUSTUM_HALF * 2) / RENDER.SHADOW_MAP_SIZE;

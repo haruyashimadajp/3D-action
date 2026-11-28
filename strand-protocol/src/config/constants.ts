@@ -445,7 +445,8 @@ export const RENDER = {
   MAX_RENDER_PIXELS: 2_200_000,
   /** 10A-1: optional lightweight player-centered shadow map. */
   SHADOW_MAP_SIZE: 1024,
-  SHADOW_FRUSTUM_HALF: 36,
+  /** 12A-4: ±30 m (was ±36 m) → 60 m / 1024 px ≈ 5.9 cm per texel for crisper close-up shadows. */
+  SHADOW_FRUSTUM_HALF: 30,
   /** 10A-1: skip non-essential minor sparks/splashes beyond this distance from camera. */
   MINOR_PARTICLE_SKIP_DIST_M: 52,
   ROOF_TEX_SIZE: 512,
@@ -472,6 +473,16 @@ export const RENDER = {
   GRADE_HIGHLIGHT_TINT: [0.012, 0.004, -0.006] as readonly number[],
   GRADE_S_CURVE: 0.12,
   FILM_GRAIN: 0.016,
+  /**
+   * 12A-4 RCAS (AMD FidelityFX-style robust contrast-adaptive sharpening) strength inside KineticPostFX
+   * (+0 passes; 4 neighbour taps, Reinhard-compressed HDR, anti-ringing clamp). 0 = off; compiled out on LOW.
+   */
+  RCAS_SHARPEN: 0.28,
+  /**
+   * 12A-4 subtle horizontal anamorphic neon streak inside KineticPostFX (4 taps, HDR luminance > 1.45 only,
+   * cool cyan tint). Forced to 0 on LOW and whenever lowLatency is on.
+   */
+  ANAMORPHIC: 0.14,
   AVIATION_BLINK_HZ: 1.2,
 } as const;
 

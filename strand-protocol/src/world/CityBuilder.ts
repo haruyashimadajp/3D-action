@@ -971,7 +971,12 @@ const GLSL_FOG_FADE = /* glsl */ `
  * 7B-2 height fog (after the regular exp² fog): low street haze that thickens toward Y ≤ 26 m and clears above
  * 50 m — tower feet sink into the wet neon mist, the tops pierce the night sky.
  */
-const HFOG = new THREE.Color(RENDER.HEIGHT_FOG_COLOR);
+/**
+ * 12A-4: the street haze keeps its designed offset from the abyss fog (HEIGHT_FOG_COLOR − FOG_ABYSS, linear) but
+ * rides on the scene's live `fogColor` uniform, so a sector-tinted fog (Renderer.setSectorAtmosphere) tints the
+ * haze too. Identical output while the fog colour is the default FOG_ABYSS.
+ */
+const HFOG_DELTA = new THREE.Color(RENDER.HEIGHT_FOG_COLOR).sub(new THREE.Color(COLORS.FOG_ABYSS));
 const GLSL_HEIGHT_FOG = /* glsl */ `
   #ifdef USE_FOG
   {
@@ -980,7 +985,7 @@ const GLSL_HEIGHT_FOG = /* glsl */ `
     float hfH = hfY <= ${RENDER.HEIGHT_FOG_FULL_Y.toFixed(1)} ? 1.0
       : exp(-(hfY - ${RENDER.HEIGHT_FOG_FULL_Y.toFixed(1)}) / 9.0) * (1.0 - smoothstep(${(RENDER.HEIGHT_FOG_CLEAR_Y - 10).toFixed(1)}, ${RENDER.HEIGHT_FOG_CLEAR_Y.toFixed(1)}, hfY));
     float hfA = ${RENDER.HEIGHT_FOG_MAX.toFixed(3)} * uHeightFog * hfH * smoothstep(${RENDER.HEIGHT_FOG_NEAR_M.toFixed(1)}, ${RENDER.HEIGHT_FOG_FAR_M.toFixed(1)}, hfD);
-    gl_FragColor.rgb = mix(gl_FragColor.rgb, vec3(${HFOG.r.toFixed(5)}, ${HFOG.g.toFixed(5)}, ${HFOG.b.toFixed(5)}), hfA);
+    gl_FragColor.rgb = mix(gl_FragColor.rgb, max(fogColor + vec3(${HFOG_DELTA.r.toFixed(5)}, ${HFOG_DELTA.g.toFixed(5)}, ${HFOG_DELTA.b.toFixed(5)}), vec3(0.0)), hfA);
   }
   #endif
 `;
@@ -1149,6 +1154,59 @@ const GLSL_PUDDLE_RIPPLES = /* glsl */ `
   }
 `;
 
+/** 12A-2 Mega-Billboard wet-street reflection ribbons: nearest-8 selector limits (tests read these). */
+/** Phase 13: materials already hooked by `CityBuilder.applyStrandMaterialHooks` (identity, survives clones). */
+const STRAND_GLB_HOOKED = new WeakSet<THREE.Material>();
+
+export const MEGA_REFL = {
+  /** Uniform slots (GLSL array size). */
+  MAX: 8,
+  /** Selection radius (3D distance from the camera). */
+  RANGE_M: 90,
+  /** Screens whose centre sits above this height (and every RING) never reflect in the street. */
+  MAX_Y_M: 42,
+  /**
+   * Linear AD_HUES[cell] colour multiplier written to uMegaReflCol.rgb. Lead tune 1.5 → 3.0: after the puddle
+   * wet mask, grazing Fresnel and the spec's 0.65 factor, 1.5 only lifted the asphalt by a barely visible wash.
+   */
+  INTENSITY: 3.0,
+} as const;
+
+/** 12A-2 anisotropic wet-ribbon reflections of the nearest Mega-Billboards (road material, `lights_fragment_end`). */
+const GLSL_MEGA_REFL_PARS = /* glsl */ `
+  uniform vec4 uMegaReflPos[${MEGA_REFL.MAX}];
+  uniform vec4 uMegaReflCol[${MEGA_REFL.MAX}];
+  uniform vec4 uMegaReflNrm[${MEGA_REFL.MAX}];
+  uniform int uMegaReflCount;
+  uniform float uMegaReflEnabled;
+`;
+
+/**
+ * 12A-3.1 cotangent frame from screen derivatives (no uv / tangent attributes): view-space position + any planar
+ * uv → TBN whose columns follow d(uv). Used by the zero-UV parked-car detail normals.
+ */
+const GLSL_COTANGENT = /* glsl */ `
+  mat3 strandCotangentFrame(vec3 N, vec3 dp1, vec3 dp2, vec2 duv1, vec2 duv2) {
+    vec3 dp2perp = cross(dp2, N);
+    vec3 dp1perp = cross(N, dp1);
+    vec3 T = dp2perp * duv1.x + dp1perp * duv2.x;
+    vec3 B = dp2perp * duv1.y + dp1perp * duv2.y;
+    float invmax = inversesqrt(max(max(dot(T, T), dot(B, B)), 1e-20));
+    return mat3(T * invmax, B * invmax, N);
+  }
+`;
+
+/**
+ * Phase 13 `.glb` hook: rain-wet clearcoat Fresnel sheen (same tint as the parked-car clearcoat), injected after
+ * `#include <emissivemap_fragment>`; glossier surfaces catch more of it.
+ */
+const GLSL_GLB_WET_CLEARCOAT = /* glsl */ `
+  {
+    float strandWetFr = pow(1.0 - clamp(dot(normalize(normal), normalize(vViewPosition)), 0.0, 1.0), 4.0);
+    totalEmissiveRadiance += vec3(0.20, 0.26, 0.36) * strandWetFr * 0.5 * (1.0 - 0.6 * clamp(roughnessFactor, 0.0, 1.0));
+  }
+`;
+
 // =============================================================================================
 // Capacities (pre-allocated once; counts set per sector)
 // =============================================================================================
@@ -1278,6 +1336,34 @@ export class CityBuilder {
   private readonly uCityLightCount = { value: 0 };
   /** 1 = tower walls receive the city lights (HIGH / MEDIUM), 0 = off (LOW). */
   private readonly uWallLights = { value: 1 };
+  /** 12A-2 nearest Mega-Billboards reflected by the wet road (xyz centre, w half-width m). */
+  readonly uMegaReflPos = { value: Array.from({ length: MEGA_REFL.MAX }, () => new THREE.Vector4()) };
+  /** 12A-2 linear AD_HUES[cell] × MEGA_REFL.INTENSITY (rgb), w = half-height m. */
+  readonly uMegaReflCol = { value: Array.from({ length: MEGA_REFL.MAX }, () => new THREE.Vector4()) };
+  /** 12A-2 active slots (GLSL `int`; always an integer 0 … 8). */
+  readonly uMegaReflCount = { value: 0 };
+  /** 12A-2 uniform toggle (no recompiles): 0 in LOW quality or lowLatency mode, 1 otherwise. */
+  readonly uMegaReflEnabled = { value: 1 };
+  /** 12A-2 slot k → index into `currentLayout.megaBillboards` (-1 = unused slot). */
+  readonly megaReflSrc = new Int32Array(MEGA_REFL.MAX).fill(-1);
+  // 12A-2 per-sector Mega-Billboard reflection pool (fixed capacity, filled in buildSector, read in update).
+  private readonly megaPos = new Float32Array(CAP.MEGA * 3);
+  private readonly megaCol = new Float32Array(CAP.MEGA * 3);
+  /** Half-width, half-height (m). */
+  private readonly megaSize = new Float32Array(CAP.MEGA * 2);
+  private readonly megaDist = new Float32Array(CAP.MEGA);
+  private readonly megaSrcIdx = new Int32Array(CAP.MEGA);
+  /** Screen plane normal (x, z) + two-sided flag (BLADE screens read from both sides). */
+  private readonly megaNrm = new Float32Array(CAP.MEGA * 3);
+  private megaCount = 0;
+  /** 12A-2 audit fix: per-slot screen normal (xy = normal x/z, z = 1 two-sided) for the per-fragment front test. */
+  readonly uMegaReflNrm = { value: Array.from({ length: MEGA_REFL.MAX }, () => new THREE.Vector4()) };
+  private qualityLow = false;
+  private lowLatency = false;
+  /** 12A-4 sky-dome horizon = scene fog colour (shared with the blimp hull's fog tint). */
+  private readonly uSkyHorizon = { value: new THREE.Color(COLORS.FOG_ABYSS) };
+  /** 12A-3.1 1 × 1 flat placeholder so the car detail samplers are always valid (headless / tests). */
+  private static placeholderTex: THREE.DataTexture | null = null;
 
   // City light pool (per sector)
   private readonly lightPos = new Float32Array(CAP.CITY_LIGHTS * 3);
@@ -1412,6 +1498,8 @@ export class CityBuilder {
     const kitGeo = buildFurnishingsKit();
     kitGeo.setAttribute('aKit', new THREE.InstancedBufferAttribute(new Float32Array(KIT_CAP * 4), 4));
     this.furnishings = this.makeInstanced(kitGeo, this.createFurnishingsMaterial(), KIT_CAP, 'StreetFurnishingsKit');
+    // 12A-4: the tightened player shadow frustum lands crisp shadows on the street furnishings (no extra draws).
+    this.furnishings.receiveShadow = true;
     const steelFixGeo = this.createSteelFixturesGeometry();
     steelFixGeo.setAttribute('aInstVar', new THREE.InstancedBufferAttribute(new Float32Array(CAP.STEEL_FIXTURES), 1));
     this.steelFixtures = this.makeInstanced(steelFixGeo, this.createSteelMaterial(true), CAP.STEEL_FIXTURES, 'SteelFixturesInstanced');
@@ -1537,12 +1625,66 @@ export class CityBuilder {
   setQuality(preset: 'HIGH' | 'MEDIUM' | 'LOW'): void {
     this.uWallLights.value = preset === 'LOW' ? 0 : 1;
     const lite = preset === 'LOW';
+    this.qualityLow = lite;
+    this.uMegaReflEnabled.value = this.qualityLow || this.lowLatency ? 0 : 1;
     const defs = this.buildingMat.defines as Record<string, string>;
     if (lite !== ('STRAND_LITE' in defs)) {
       if (lite) defs.STRAND_LITE = '';
       else delete defs.STRAND_LITE;
       this.buildingMat.needsUpdate = true;
     }
+  }
+
+  /** 12A-2 lowLatency mode drops the Mega-Billboard road ribbons (uniform toggle, no shader recompile). */
+  setLowLatency(on: boolean): void {
+    this.lowLatency = on;
+    this.uMegaReflEnabled.value = this.qualityLow || this.lowLatency ? 0 : 1;
+  }
+
+  /**
+   * 12A-4 sector atmosphere: the sky dome's horizon (and the blimp hull's fog tint) take the EXACT scene fog colour
+   * so fogged towers dissolve into the sky with zero seam. Call once per sector load (no allocation).
+   */
+  setSkyHorizon(fogColor: THREE.Color): void {
+    this.uSkyHorizon.value.copy(fogColor);
+  }
+
+  /** 12A-4 live sky-dome `uHorizon` colour (verification: equals scene.fog.color after setSkyHorizon). */
+  get skyHorizon(): THREE.Color {
+    return this.uSkyHorizon.value;
+  }
+
+  /**
+   * Phase 13 Blender `.glb` swap hook: gives a STANDARD UV-mapped `MeshStandardMaterial` / `MeshPhysicalMaterial`
+   * (e.g. emitted by GLTFLoader) the 12 dynamic city lights + street height fog, and optionally a rain-wet
+   * clearcoat Fresnel sheen (`opts.wetClearcoat`, after `#include <emissivemap_fragment>`). Needs no custom
+   * attributes (no `aPart` / `aAo`). Chains any previous `onBeforeCompile`, appends `-strand-glb[-wet]` to the
+   * previous program cache key and is idempotent (second calls are no-ops).
+   *
+   * ONLY for plain standard materials of imported assets. NEVER call it on the builder's own custom-shader
+   * materials (towers, roads, cars, concrete, RoofMechKit `strand-roofmech-v1`, CityPropMeshes kits,
+   * InteriorPropsKit, DestructDebris, breach doors / glass, …): those already inject the city lights and would
+   * receive them twice.
+   */
+  applyStrandMaterialHooks(mat: THREE.MeshStandardMaterial, opts?: { wetClearcoat?: boolean }): THREE.MeshStandardMaterial {
+    // Identity guard (audit fix): a userData flag would be copied by Material.clone() while the own-property hook
+    // is not, leaving a clone flagged but unhooked forever (GLTFLoader clones in assignFinalMaterial).
+    if (STRAND_GLB_HOOKED.has(mat)) return mat;
+    STRAND_GLB_HOOKED.add(mat);
+    const prev = mat.onBeforeCompile;
+    const prevKey = mat.customProgramCacheKey();
+    const wet = opts?.wetClearcoat === true;
+    mat.onBeforeCompile = (shader, renderer) => {
+      prev.call(mat, shader, renderer);
+      this.injectCityLights(shader);
+      if (wet) {
+        shader.fragmentShader = shader.fragmentShader.replace('#include <emissivemap_fragment>', `#include <emissivemap_fragment>\n${GLSL_GLB_WET_CLEARCOAT}`);
+      }
+    };
+    const key = `${prevKey}-strand-glb${wet ? '-wet' : ''}`;
+    mat.customProgramCacheKey = () => key;
+    mat.needsUpdate = true;
+    return mat;
   }
 
   /**
@@ -1625,6 +1767,19 @@ export class CityBuilder {
         if (st == 2 && h > 0.985) target *= 0.72 + 0.28 * step(0.22, fract(uTime * 3.7 + h * 91.0));
         return c * (target / max(dot(c, vec3(0.2126, 0.7152, 0.0722)), 1e-4));
       }
+      // 12A-3.2 camera distance of the current interior lookup (LOD of the fine LED / blind detail).
+      float strandIntDist;
+      // 12A-3.2 room profile from the archetype column + the per-room drift hash (the lighting-state hash is
+      // untouched): 0 corporate office · 1 cyber residential · 2 server vault / data floor · 3 neon loft / workshop.
+      // A glass → office (72 %) / server vault (28 %) · B residential → residential · C industrial → server vault
+      // (60 %) / loft (40 %) · D commercial → loft (66 %) / office (34 %).
+      int strandRoomProfile(int col, float h) {
+        float hp = fract(h * 5.917 + 0.31);
+        if (col == 0) return hp > 0.72 ? 2 : 0;
+        if (col == 2) return hp > 0.6 ? 3 : 2;
+        if (col == 3) return hp > 0.66 ? 0 : 3;
+        return 1;
+      }
       // Interior mapping: room box x∈[0,1] (room width), y∈[0,1] (floor height), z∈[-D,0] behind the glass.
       vec3 strandInterior(vec2 cell, vec3 d, vec3 light, float h, int col) {
         float D = ${D};
@@ -1635,38 +1790,102 @@ export class CityBuilder {
         vec3 q = p + d * min(min(tx, ty), tz);
         float depth = clamp(-q.z / D, 0.0, 1.0);
         float h2 = fract(h * 13.7);
+        int prof = strandRoomProfile(col, h);
+        float lum = dot(light, vec3(0.2126, 0.7152, 0.0722));
+        // Fine detail (LED dots, blind slats) resolves only up close; far rooms get the averaged tone.
+        float sNear = 1.0 - smoothstep(30.0, 70.0, strandIntDist);
+        vec3 emit = vec3(0.0);
         float k;
         if (tz <= tx && tz <= ty) {
           k = 0.62 - 0.22 * abs(q.x - 0.5) + 0.12 * q.y;
-          if (col == 0) {
+          if (prof == 0) {
+            // Corporate office: desk band, teal / cyan monitors, whiteboard, dark filing cabinets.
             k *= 1.0 - 0.7 * step(q.y, 0.29) * step(0.16, fract(q.x * 2.0 + h));
-            k += 1.4 * step(abs(q.y - 0.36), 0.05) * step(abs(fract(q.x * 2.0 + h) - 0.55), 0.12);
+            float mon = step(abs(q.y - 0.36), 0.05) * step(abs(fract(q.x * 2.0 + h) - 0.55), 0.12);
+            k += 0.5 * mon;
+            emit += mix(vec3(0.25, 0.95, 1.0), vec3(0.12, 0.85, 0.7), h2) * (mon * lum * 1.3);
             k += 0.5 * step(abs(q.x - 0.25 - 0.5 * h2), 0.14) * step(abs(q.y - 0.55), 0.09);
-          } else if (col == 1) {
+            k *= 1.0 - 0.65 * step(abs(q.x - (h2 < 0.5 ? 0.08 : 0.92)), 0.06) * step(q.y, 0.48);
+          } else if (prof == 1) {
+            // Cyber residential: sofa, warm tungsten pendant cone, bookshelf silhouette.
             k *= 1.0 - 0.6 * step(q.y, 0.2) * step(abs(q.x - 0.5), 0.32);
-            k *= 1.0 - 0.45 * step(abs(q.x - 0.3 - 0.4 * h2), 0.09) * step(abs(q.y - 0.5), 0.07);
-            vec2 lp = q.xy - vec2(0.12 + 0.76 * step(0.5, h2), 0.3);
-            k += 0.9 * exp(-dot(lp, lp) * 60.0);
-          } else if (col == 2) {
-            float rack = step(0.82, fract(q.x * 4.0 + h)) + step(abs(fract(q.y * 3.0) - 0.5), 0.04) * step(q.y, 0.75);
-            k *= 1.0 - 0.55 * clamp(rack, 0.0, 1.0);
+            float px = 0.3 + 0.4 * h2;
+            float cw = (0.8 - q.y) * 0.42 + 0.03;
+            float cone = step(q.y, 0.8) * (1.0 - smoothstep(cw * 0.55, cw, abs(q.x - px)));
+            vec2 bp = q.xy - vec2(px, 0.8);
+            float bulb = exp(-dot(bp, bp) * 700.0);
+            k *= 1.0 - 0.5 * step(abs(q.x - px), 0.006) * step(0.8, q.y);
+            emit += vec3(1.0, 0.68, 0.36) * (lum * (cone * 0.5 + bulb * 1.2));
+            float shelf = step(abs(q.x - (h2 < 0.5 ? 0.86 : 0.14)), 0.1) * step(q.y, 0.74);
+            float books = mix(0.78, 0.55 + 0.45 * step(0.35, fract(q.x * 38.0 + floor(q.y * 5.0) * 0.37)), sNear);
+            float plank = step(fract(q.y * 5.0), 0.12);
+            k *= 1.0 - shelf * mix(0.8 * books, 0.35, plank);
+          } else if (prof == 2) {
+            // Server vault: tall dark racks with slow-blinking vertical rows of cyan / emerald / red LEDs.
+            float rx = fract(q.x * 4.0 + h);
+            float rack = step(rx, 0.8) * step(q.y, 0.88);
+            k *= 1.0 - 0.78 * rack;
+            vec2 sv = vec2((q.x * 4.0 + h) * 0.625, q.y * 3.0);
+            int lx = int(floor(sv.x * 8.0));
+            int ly = int(floor(sv.y * 8.0));
+            vec2 lf = fract(sv * 8.0) - 0.5;
+            float pick = strandHash(lx, ly, 991);
+            vec3 ledC = pick < 0.5 ? vec3(0.2, 0.95, 1.0) : (pick < 0.88 ? vec3(0.15, 1.0, 0.45) : vec3(1.0, 0.15, 0.12));
+            // Audit fix: the per-LED blink hashes only run while the dots are resolvable (sNear > 0).
+            if (sNear > 0.0) {
+              float dotM = step(abs(lf.x), 0.16) * step(abs(lf.y), 0.2) * step(0.06, q.y) * step(q.y, 0.84);
+              float ph = strandHash(lx, ly, 77) * 6.0;
+              float on = step(0.42, strandHash(lx, ly, int(floor(uTime * 2.0 + ph))));
+              emit += ledC * (dotM * on * rack * sNear * (0.035 + lum * 2.2));
+            }
+            // Averaged far-field glow of the LED columns (no shimmer once the dots go sub-pixel).
+            emit += ledC * (rack * (1.0 - sNear) * 0.06 * (0.035 + lum * 2.2));
           } else {
+            // Neon loft / workshop: workbench band, angled cyan / magenta strip, industrial ceiling beam.
             k *= 1.0 - 0.6 * step(q.y, 0.24);
-            k += 1.6 * step(abs(q.y - 0.7), 0.012);
+            float diag = q.y - 0.55 - (q.x - 0.5) * (h2 < 0.5 ? 0.35 : -0.35);
+            float strip = step(abs(diag), 0.012) * step(abs(q.x - 0.5), 0.38);
+            emit += (h2 < 0.5 ? vec3(0.2, 0.95, 1.0) : vec3(1.0, 0.25, 0.85)) * (strip * lum * 2.2);
+            k *= 1.0 - 0.75 * step(abs(q.y - 0.9), 0.045);
           }
         } else if (ty <= tx) {
           if (d.y > 0.0) {
             float panel = step(abs(q.x - 0.5), 0.3) * step(abs(fract(depth * 1.6 + 0.2) - 0.5), 0.2);
-            k = 0.2 + panel * (col == 1 ? 0.6 : 1.55);
+            if (prof == 0) {
+              // Suspended ceiling grid.
+              float grid = max(step(0.93, fract(q.x * 5.0)), step(0.9, fract(depth * 4.0)));
+              k = (0.2 + panel * 1.55) * (1.0 - 0.5 * grid);
+            } else if (prof == 1) {
+              vec2 cp = vec2(q.x - 0.3 - 0.4 * h2, depth - 0.45);
+              k = 0.2 + 0.35 * exp(-dot(cp, cp) * 30.0);
+            } else if (prof == 2) {
+              // Cable trays over the rack rows.
+              k = (0.14 + panel * 0.9) * (1.0 - 0.6 * step(abs(fract(q.x * 4.0 + h) - 0.4), 0.08));
+            } else {
+              // Exposed industrial beams.
+              k = (0.18 + panel * 1.2) * (1.0 - 0.7 * step(0.82, fract(depth * 2.5)));
+            }
           } else {
             k = 0.34 * (1.0 - 0.35 * depth);
             k *= 1.0 - 0.45 * step(0.45, depth) * step(0.35, fract(q.x * 2.0 + h));
+            // Raised data-floor tiles.
+            if (prof == 2) k *= 1.0 - 0.3 * max(step(0.92, fract(q.x * 6.0)), step(0.9, fract(depth * 4.0)));
           }
         } else {
           k = 0.44 * (1.0 - 0.4 * depth) + 0.1 * q.y;
           k *= 1.0 - 0.35 * step(q.y, 0.5) * step(0.55, depth) * step(0.5, fract(h * 5.3));
+          if (prof == 0) k *= 1.0 - 0.5 * step(q.y, 0.42) * step(depth, 0.35);
+          else if (prof == 1) k *= 1.0 - 0.45 * step(q.y, 0.7) * step(0.6, depth) * (0.6 + 0.4 * step(0.12, fract(q.y * 5.0)));
+          else if (prof == 2) k *= 1.0 - 0.7 * step(q.y, 0.88) * step(fract(depth * 3.0), 0.8);
         }
-        return vec3(0.0035, 0.0045, 0.007) * (1.6 - depth) + light * k;
+        vec3 room = vec3(0.0035, 0.0045, 0.007) * (1.6 - depth) + light * k + emit;
+        // Residential venetian blinds across the upper pane (on the glass plane, ~60 % of homes).
+        if (prof == 1 && fract(h * 3.1) > 0.4) {
+          float blindM = smoothstep(0.6, 0.62, cell.y);
+          float slat = mix(0.62, 0.35 + 0.65 * smoothstep(0.32, 0.45, abs(fract(cell.y * 30.0) - 0.5)), sNear);
+          room *= mix(1.0, slat, blindM);
+        }
+        return room;
       }
     `;
     mat.onBeforeCompile = (shader) => {
@@ -1745,6 +1964,8 @@ export class CityBuilder {
           vec2 sWGY = dFdy(vStrandUv) * vec2(${(1 / F.COLUMNS).toFixed(4)}, 1.0);
           float sRoomW = ${TW} / float(strandRoomsPerTile(sCol));
           float sAlongM = vStrandUv.x * ${TW};
+          // 12A-3.2 rain-streak lane footprint (lanes per pixel), taken in uniform control flow for valid derivatives.
+          float sStreakPx = fwidth(sAlongM * 9.0);
           int sRoomI = int(floor(sAlongM / sRoomW));
           vec2 sCell = vec2(fract(sAlongM / sRoomW), sLocal);
           int sFace = int(dot(step(vec2(0.5), vFaceN.xz), vec2(1.0, 2.0)) + dot(step(vec2(0.5), -vFaceN.xz), vec2(3.0, 5.0)));
@@ -1789,7 +2010,28 @@ export class CityBuilder {
                   vec3 sT = normalize(cross(vec3(0.0, 1.0, 0.0), sN));
                   vec3 sV = (vCityWorld - cameraPosition) / max(sDist, 1e-3);
                   vec3 sD = vec3(dot(sV, sT) / sRoomW, sV.y / ${FH}, dot(sV, sN) / ${FH});
+                  // 12A-3.2 close-range raindrop streaks on the glass (< 22 m, fading 18 → 22 m): running drops
+                  // refract the room behind them and catch a faint highlight.
+                  float sStreak = 0.0;
+                  if (sMask > 0.5 && sDist < 22.0) {
+                    // Audit fix: fade the ~1 cm lanes out once they go sub-pixel (no shimmer in motion), AA the edges.
+                    float sRf = (1.0 - smoothstep(18.0, 22.0, sDist)) * (1.0 - smoothstep(0.06, 0.14, sStreakPx));
+                    float sGx = sAlongM * 9.0;
+                    int sColI = int(floor(sGx));
+                    float sHc = strandHash(sColI, sSeedI, 4242);
+                    float sYy = vStrandY * 1.6 + uTime * (0.35 + sHc * 0.5) + sHc * 17.0;
+                    float sSeg = fract(sYy);
+                    float sLive = step(0.45, sHc) * step(0.35, strandHash(sColI, int(floor(sYy)), sSeedI));
+                    float sLane = 1.0 - smoothstep(0.05, 0.14 + sStreakPx, abs(fract(sGx) - 0.5 - (sHc - 0.5) * 0.3));
+                    // Bright drop head at the bottom of each segment, thin trail above it.
+                    float sHead = smoothstep(0.0, 0.03, sSeg) * (1.0 - smoothstep(0.03, 0.09, sSeg));
+                    float sTrail = (1.0 - smoothstep(0.03, 0.6, sSeg)) * 0.45;
+                    sStreak = sLane * sLive * max(sHead, sTrail) * sRf;
+                    sD.xy += vec2(0.06, 0.03) * sStreak;
+                  }
+                  strandIntDist = sDist;
                   vec3 sInt = strandInterior(sCell, sD, sRoomLight, sDrift, sCol);
+                  sInt += vec3(0.022, 0.026, 0.032) * sStreak;
                   sInt *= 0.3 + 0.7 * smoothstep(0.04, 0.5, abs(dot(sV, sN)));
                   sOut = mix(sOut, sInt, sMask * (1.0 - smoothstep(${PMAX} * 0.7, ${PMAX}, sDist)));
                 }
@@ -1798,7 +2040,7 @@ export class CityBuilder {
             totalEmissiveRadiance = sOut * (1.0 - vTop) * mix(0.72, 1.0, strandAO);
           }`);
     };
-    mat.customProgramCacheKey = () => 'strand-building-v17';
+    mat.customProgramCacheKey = () => 'strand-building-v18';
     return mat;
   }
 
@@ -1892,6 +2134,39 @@ export class CityBuilder {
   /** Wet road atlas: per-vertex atlas rect + continuous tile UV, sampled with textureGrad(fract()). */
   private createRoadMaterial(): THREE.MeshStandardMaterial {
     const r = this.tex.roads;
+    // 12A-2 anisotropic wet-ribbon reflections of the nearest Mega-Billboards (inside lights_fragment_end).
+    const megaRefl = /* glsl */ `
+        // Audit fix: street-level effect — fades out as the camera rises 3 → 8 m above the asphalt (the 0.35 vertical
+        // squash would otherwise align almost any steep reflection and flood the street seen from decks / roofs).
+        float sMegaH = 1.0 - smoothstep(3.0, 8.0, cameraPosition.y - vCityWorld.y);
+        float sRibR = min(roughnessFactor, sGutterR);
+        if (uMegaReflEnabled > 0.5 && uMegaReflCount > 0 && sRibR < 0.42 && sMegaH > 0.0) {
+          float wetMask = (1.0 - smoothstep(0.14, 0.42, sRibR)) * sMegaH;
+          vec3 sV = normalize(cameraPosition - vCityWorld);
+          // World normal = road normal map + puddle ripples (both already folded into the view-space normal).
+          vec3 sWorldN = normalize(transformNormalByInverseViewMatrix(normal, viewMatrix));
+          vec3 sR = reflect(-sV, sWorldN);
+          float fres = 0.04 + 0.96 * pow(1.0 - clamp(dot(sWorldN, sV), 0.0, 1.0), 4.0);
+          vec3 sRs = normalize(vec3(sR.x, sR.y * 0.35, sR.z));
+          vec3 ribbonSum = vec3(0.0);
+          for (int i = 0; i < ${MEGA_REFL.MAX}; i++) {
+            if (i >= uMegaReflCount) break;
+            vec3 toB = uMegaReflPos[i].xyz - vCityWorld;
+            // Only asphalt in front of a one-sided screen can mirror it (no light through the host wall).
+            if (uMegaReflNrm[i].z < 0.5 && dot(toB.xz, uMegaReflNrm[i].xy) > 0.0) continue;
+            float dist = length(toB);
+            if (dist > 85.0) continue;
+            vec3 Ldir = toB / max(dist, 1e-3);
+            // Anisotropic stretch: tight horizontally (screen width), elongated vertically along the wet asphalt.
+            float alignY = max(dot(sRs, normalize(vec3(Ldir.x, Ldir.y * 0.35, Ldir.z))), 0.0);
+            float spread = mix(42.0, 10.0, clamp(uMegaReflPos[i].w / 8.0, 0.0, 1.0));
+            float lobe = pow(alignY, spread * mix(1.2, 0.45, sRibR));
+            float atten = 1.0 / (1.0 + dist * dist * 0.0018);
+            ribbonSum += uMegaReflCol[i].rgb * lobe * atten;
+          }
+          reflectedLight.indirectSpecular += ribbonSum * wetMask * fres * 0.65;
+        }
+    `;
     const mat = new THREE.MeshStandardMaterial({
       color: 0xffffff,
       map: r.map,
@@ -1906,12 +2181,18 @@ export class CityBuilder {
     });
     mat.onBeforeCompile = (shader) => {
       shader.uniforms.uTime = this.uTime;
+      // 12A-2 Mega-Billboard ribbons (nearest 8, selected allocation-free in update()).
+      shader.uniforms.uMegaReflPos = this.uMegaReflPos;
+      shader.uniforms.uMegaReflCol = this.uMegaReflCol;
+      shader.uniforms.uMegaReflNrm = this.uMegaReflNrm;
+      shader.uniforms.uMegaReflCount = this.uMegaReflCount;
+      shader.uniforms.uMegaReflEnabled = this.uMegaReflEnabled;
       this.injectCityLights(shader);
       shader.vertexShader = shader.vertexShader
         .replace('#include <common>', '#include <common>\nattribute vec4 aAtlas;\nvarying vec4 vAtlas;\nvarying vec2 vTileUv;')
         .replace('#include <uv_vertex>', '#include <uv_vertex>\nvAtlas = aAtlas;\nvTileUv = uv;');
       shader.fragmentShader = shader.fragmentShader
-        .replace('#include <common>', `#include <common>\nuniform float uTime;\nvarying vec4 vAtlas;\nvarying vec2 vTileUv;\n${GLSL_HASH}\n${GLSL_RIPPLES}\n#define STRAND_INDOOR_TEST false`)
+        .replace('#include <common>', `#include <common>\nuniform float uTime;\nvarying vec4 vAtlas;\nvarying vec2 vTileUv;\n${GLSL_HASH}\n${GLSL_RIPPLES}\n${GLSL_MEGA_REFL_PARS}\n#define STRAND_INDOOR_TEST false`)
         .replace('#include <map_fragment>', `
           vec2 sRSize = vAtlas.zw - vAtlas.xy;
           vec2 sRUv = vAtlas.xy + sRSize * fract(vTileUv);
@@ -1923,7 +2204,29 @@ export class CityBuilder {
           // 9A-6: low-frequency gutter / alley grime patches (albedo 0.72–1.0).
           float sGrime = smoothstep(0.42, 0.78, sNoise(vCityWorld.xz * 0.045) * 0.65 + sNoise(vCityWorld.xz * 0.19 + 3.1) * 0.35);
           diffuseColor.rgb *= mix(1.0, 0.72, sGrime);
-          roughnessFactor = mix(roughnessFactor, min(1.0, roughnessFactor + 0.1), sGrime * 0.6);`)
+          roughnessFactor = mix(roughnessFactor, min(1.0, roughnessFactor + 0.1), sGrime * 0.6);
+          // 12A-2 tyre-track wear + curb gutter puddles. Across-road coordinate: ONLY the lane atlas tiles
+          // (LANES4 u0 = 0 / LANES2 u0 = 0.5, both v0 = 0 → vAtlas.x < 0.7 && vAtlas.y < 0.25) carry
+          // vTileUv.x = 0 … 1 from curb to curb (uAcross = width / tileAcross = 14/14, 10/10; expressway decks
+          // pass 1). Crosswalks (u = 2 m bar tiles), plain asphalt (world-planar u = x / 6 m: junctions, plaza,
+          // ramps) and zebras never get strips.
+          // Gutter gloss seen by the billboard ribbons only (1 = none); direct lamp light keeps roughness ≥ 0.30 there.
+          float sGutterR = 1.0;
+          if (vAtlas.x < 0.7 && vAtlas.y < 0.25) {
+            float sAcross = clamp(vTileUv.x, 0.0, 1.0);
+            float sLanes = vAtlas.x < 0.25 ? 4.0 : 2.0;
+            // Tyre-polished wheel paths (two per lane, at 1/4 and 3/4 of each lane width): slightly glossier.
+            float sTrack = 0.5 - 0.5 * cos(fract(sAcross * sLanes) * 6.2832 * 2.0);
+            sTrack *= sTrack * sTrack;
+            roughnessFactor *= 1.0 - 0.12 * sTrack * (0.6 + 0.4 * sNoise(vCityWorld.xz * 0.21 + 5.3));
+            // Glossy gutter puddles hugging both curbs (|u − 0.5| > 0.38), broken along the kerb. Audit fix: a 0.08–0.14
+            // mirror under the kerb-side street lamps blew the bloom into a full-frame wash (+54 % frame mean), so the
+            // lit material only drops to 0.30 there while the billboard ribbons see the 0.18–0.24 wet gloss (sGutterR).
+            float sEdge = abs(sAcross - 0.5) + (sNoise(vCityWorld.xz * 0.8 + 1.3) - 0.5) * 0.04;
+            float sGutter = smoothstep(0.38, 0.465, sEdge) * smoothstep(0.22, 0.5, sNoise(vCityWorld.xz * 0.33 + 9.1));
+            roughnessFactor = mix(roughnessFactor, min(roughnessFactor, 0.30), sGutter);
+            sGutterR = mix(1.0, mix(0.18, 0.24, sNoise(vCityWorld.xz * 0.9)), sGutter);
+          }`)
         .replace('#include <normal_fragment_maps>', `
           {
             vec3 mapN = textureGrad(normalMap, sRUv, sRGX, sRGY).xyz * 2.0 - 1.0;
@@ -1933,6 +2236,7 @@ export class CityBuilder {
           ${GLSL_PUDDLE_RIPPLES}`)
         // … and a thin-film oil-slick tint on the glossiest puddle regions (subtle: 0.08–0.13).
         .replace('#include <lights_fragment_end>', `#include <lights_fragment_end>
+          ${megaRefl}
           {
             float sSlick = (1.0 - smoothstep(0.13, 0.22, roughnessFactor)) * smoothstep(0.35, 0.75, sNoise(vCityWorld.xz * 0.11 + 7.7));
             vec3 sV = normalize(cameraPosition - vCityWorld);
@@ -1943,7 +2247,7 @@ export class CityBuilder {
             reflectedLight.directSpecular *= mix(vec3(1.0), sFilm * 1.7, sK);
           }`);
     };
-    mat.customProgramCacheKey = () => 'strand-road-v14';
+    mat.customProgramCacheKey = () => 'strand-road-v15';
     return mat;
   }
 
@@ -2091,6 +2395,16 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
     return mat;
   }
 
+  /** 12A-3.1 shared 1 × 1 flat-normal placeholder (keeps optional samplers valid when a texture is missing). */
+  private static placeholder(): THREE.DataTexture {
+    if (!CityBuilder.placeholderTex) {
+      const t = new THREE.DataTexture(new Uint8Array([128, 128, 255, 255]), 1, 1, THREE.RGBAFormat);
+      t.needsUpdate = true;
+      CityBuilder.placeholderTex = t;
+    }
+    return CityBuilder.placeholderTex;
+  }
+
   /**
    * 10C-1 hero parked-car material (#171D28 base, R 0.22, M 0.78). Per-vertex aPart: 0 painted clearcoat body ·
    * 1 glass · 2 front LED · 3 rear LED · 4 carbon / rubber / dark mesh · 5 taxi roof sign · 6 brushed alloy ·
@@ -2109,13 +2423,22 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
       const c = new THREE.Color(hex);
       return `vec3(${c.r.toFixed(4)}, ${c.g.toFixed(4)}, ${c.b.toFixed(4)})`;
     };
+    // 12A-3.1 zero-UV close-up detail (cars carry NO uv attribute: mat.normalMap / roughnessMap stay null).
+    const vd = this.tex.vehicleDetail;
+    const ph = CityBuilder.placeholder();
+    const uDetailNormal = { value: vd?.normalMap ?? ph };
+    const uDetailRough = { value: vd?.roughnessMap ?? ph };
+    const uHasVehicleDetail = { value: vd ? 1 : 0 };
     mat.onBeforeCompile = (shader) => {
       shader.uniforms.uTime = this.uTime;
+      shader.uniforms.uDetailNormal = uDetailNormal;
+      shader.uniforms.uDetailRough = uDetailRough;
+      shader.uniforms.uHasVehicleDetail = uHasVehicleDetail;
       // 5B-2: lamps and neon light up the bodywork (instanced world position).
       this.injectCityLights(shader);
       shader.vertexShader = shader.vertexShader
-        .replace('#include <common>', '#include <common>\nattribute float aPart;\nattribute float aAo;\nattribute vec4 aCar;\nattribute float aPaint;\nvarying float vPart;\nvarying float vCarAo;\nvarying vec3 vLocal;\nvarying vec4 vCar;\nvarying float vPaint;')
-        .replace('#include <uv_vertex>', '#include <uv_vertex>\nvPart = aPart;\nvCarAo = aAo;\nvLocal = position;\nvCar = aCar;\nvPaint = aPaint;')
+        .replace('#include <common>', '#include <common>\nattribute float aPart;\nattribute float aAo;\nattribute vec4 aCar;\nattribute float aPaint;\nvarying float vPart;\nvarying float vCarAo;\nvarying vec3 vLocal;\nvarying vec3 vLocalN;\nvarying vec4 vCar;\nvarying float vPaint;')
+        .replace('#include <uv_vertex>', '#include <uv_vertex>\nvPart = aPart;\nvCarAo = aAo;\nvLocal = position;\nvLocalN = normal;\nvCar = aCar;\nvPaint = aPaint;')
         // 7B-4: the taxi roof sign (aPart 5) only exists on cyber-taxi paint.
         .replace('#include <begin_vertex>', `#include <begin_vertex>
           if (abs(aPart - 5.0) < 0.5 && aPaint < ${(CITY_FX.CAR_TAXI - 0.5).toFixed(1)}) transformed = vec3(0.0);`);
@@ -2125,8 +2448,13 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
           varying float vPart;
           varying float vCarAo;
           varying vec3 vLocal;
+          varying vec3 vLocalN;
           varying vec4 vCar;
           varying float vPaint;
+          uniform sampler2D uDetailNormal;
+          uniform sampler2D uDetailRough;
+          uniform float uHasVehicleDetail;
+          ${GLSL_COTANGENT}
           vec3 strandPaint(float k) {
             ${CITY_FX.CAR_PAINTS.map((h, i) => { const c = new THREE.Color(h); return `if (k < ${i + 0.5}) return vec3(${c.r.toFixed(4)}, ${c.g.toFixed(4)}, ${c.b.toFixed(4)});`; }).join('\n            ')}
             return vec3(0.02);
@@ -2145,7 +2473,49 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
           else if (sPart == 6.0) diffuseColor.rgb = vec3(0.30, 0.32, 0.35);
           else if (sPart == 7.0) diffuseColor.rgb = vec3(0.30, 0.012, 0.02);
           else if (sPart >= 2.0) diffuseColor.rgb = vec3(0.05);
-          diffuseColor.rgb *= vCarAo;`)
+          diffuseColor.rgb *= vCarAo;
+          // 12A-3.1 close-up detail quadrant per part (local planar uv, metres per tile per quadrant):
+          // 4 carbon (Q0) except front-facing intakes / grilles → honeycomb (Q1, aPart untouched) · 6 brushed alloy
+          // (Q2) · 0 paint / 1 glass → clearcoat rain beading (Q3, subtle). Tyres (part 4 inside the wheel zone)
+          // stay plain rubber. Fades out 18 → 25 m (no shimmer, zero cost beyond).
+          vec3 sAn = abs(vLocalN);
+          vec2 sPlanar = sAn.y > 0.5 ? vLocal.xz : (sAn.z > 0.5 ? vLocal.xy : vLocal.zy);
+          bool sTyreZone = abs(vLocal.x) > 0.62 && vLocal.y < 0.88 && abs(abs(vLocal.z) - 1.49) < 0.54;
+          vec2 sQ = vec2(-1.0);
+          float sTileM = 0.35;
+          float sNStr = 0.0;
+          float sRW = 0.0;
+          float sCav = 0.5;
+          if (sPart == 4.0 && !sTyreZone) {
+            bool sGrille = sAn.z > 0.7 && vLocal.z > 0.5 && vLocalN.z > 0.0;
+            sQ = sGrille ? vec2(0.5, 0.0) : vec2(0.0, 0.0);
+            // Audit fix: carbon at 0.30 m / 0.8 aliased into running-bond "brickwork" at 2–4 m; 0.12 m tiles
+            // (≈ 4 mm tows) mip into a fine diagonal twill sheen, with softer normals and cavity.
+            sTileM = sGrille ? 0.25 : 0.12;
+            sNStr = sGrille ? 1.0 : 0.35;
+            sCav = sGrille ? 0.5 : 0.2;
+            sRW = 0.8;
+          } else if (sPart == 6.0) {
+            sQ = vec2(0.0, 0.5); sTileM = 0.16; sNStr = 0.6; sRW = 0.55;
+          } else if (sPart < 1.5) {
+            // Lead tune: beads stay a subtle wet sparkle (0.35 read as hail pocks on pale paint at 3 m).
+            sQ = vec2(0.5, 0.5); sTileM = 0.35; sNStr = sPart == 0.0 ? 0.18 : 0.14; sRW = sPart == 0.0 ? 0.35 : 0.0;
+          }
+          vec2 sUvDet = sPlanar / sTileM;
+          vec2 sDuv1 = dFdx(sUvDet);
+          vec2 sDuv2 = dFdy(sUvDet);
+          vec3 sDp1 = dFdx(-vViewPosition);
+          vec3 sDp2 = dFdy(-vViewPosition);
+          float sDetW = uHasVehicleDetail * step(0.0, sQ.x) * (1.0 - smoothstep(18.0, 25.0, length(vViewPosition)));
+          vec3 sDetN = vec3(0.0, 0.0, 1.0);
+          vec4 sDetRM = vec4(1.0);
+          if (sDetW > 0.001) {
+            vec2 sDUv = sQ + 0.008 + fract(sUvDet) * 0.484;
+            sDetN = textureGrad(uDetailNormal, sDUv, sDuv1 * 0.484, sDuv2 * 0.484).xyz * 2.0 - 1.0;
+            sDetRM = textureGrad(uDetailRough, sDUv, sDuv1 * 0.484, sDuv2 * 0.484);
+            // Cavity / AO (R, 1 = open) darkens the tow gaps, honeycomb cells and grooves a little.
+            diffuseColor.rgb *= mix(1.0, sDetRM.r, sCav * sDetW);
+          }`)
         .replace('#include <roughnessmap_fragment>', `#include <roughnessmap_fragment>
           if (sPart == 1.0) roughnessFactor = 0.05;
           else if (sPart == 4.0) roughnessFactor = 0.72;
@@ -2155,11 +2525,20 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
             // Wet clearcoat: glossy upper panels, duller dirty sills; the pearl paint stays dusty.
             roughnessFactor = mix(0.16, 0.52, 1.0 - smoothstep(0.12, 0.38, vLocal.y));
             if (abs(vPaint - 3.0) < 0.5) roughnessFactor = min(1.0, roughnessFactor + 0.22);
-          }`)
+          }
+          // 12A-3.1 detail roughness (G = absolute roughness) blended over the per-part value.
+          roughnessFactor = mix(roughnessFactor, sDetRM.g, sRW * sDetW);`)
         .replace('#include <metalnessmap_fragment>', `#include <metalnessmap_fragment>
           if (sPart == 1.0 || sPart == 6.0) metalnessFactor = 0.92;
           else if (sPart == 4.0) metalnessFactor = 0.15;
           else if (sPart == 7.0) metalnessFactor = 0.4;`)
+        .replace('#include <normal_fragment_maps>', `#include <normal_fragment_maps>
+          // 12A-3.1 detail normal through a derivative-based tangent frame (view space, no uv / tangents).
+          if (sDetW > 0.001) {
+            mat3 sTbn = strandCotangentFrame(normal, sDp1, sDp2, sDuv1, sDuv2);
+            vec3 sMapN = vec3(sDetN.xy * (sNStr * sDetW), 1.0);
+            normal = normalize(sTbn * sMapN);
+          }`)
         .replace('#include <emissivemap_fragment>', `#include <emissivemap_fragment>
           {
             float blink = step(0.5, fract(uTime * 1.5 + vCar.w));
@@ -2178,7 +2557,7 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
             }
           }`);
     };
-    mat.customProgramCacheKey = () => 'strand-car-v14-hero';
+    mat.customProgramCacheKey = () => 'strand-car-v15-detail';
     return mat;
   }
 
@@ -2433,7 +2812,8 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
       fog: false,
       uniforms: {
         uZenith: { value: new THREE.Color(COLORS.SKY_ZENITH) },
-        uHorizon: { value: new THREE.Color(COLORS.FOG_ABYSS) },
+        // 12A-4: shared with setSkyHorizon() (exact scene fog colour, per sector).
+        uHorizon: this.uSkyHorizon,
         uMoonDir: { value: moonDir },
         uMoonColor: { value: new THREE.Color(COLORS.MOON) },
         uTime: this.uTime,
@@ -3178,7 +3558,7 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
     const hullMat = new THREE.ShaderMaterial({
       transparent: true,
       depthWrite: true,
-      uniforms: { uTime: this.uTime, uFogDensity: this.uFogDensity, uFogColor: { value: new THREE.Color(COLORS.FOG_ABYSS) } },
+      uniforms: { uTime: this.uTime, uFogDensity: this.uFogDensity, uFogColor: this.uSkyHorizon },
       vertexShader: /* glsl */ `
         attribute float aPart;
         varying vec3 vWorld; varying vec3 vN; varying float vPart; varying float vConeT;
@@ -8623,6 +9003,65 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
 
     // 10D-1 expressway traffic lanes (own RNG stream: layouts stay where they were).
     this.traffic.setLanes(trafficLanes, trafficRng);
+    // 12A-2 reflection pool of the street-level Mega-Billboards (RING segments and screens above 42 m skipped).
+    // Audit fix: pieces sharing a `group` (L-corner halves) are ONE screen → one pool entry (area-weighted centre,
+    // summed normal, extent covering every piece), so a single screen can never fill several slots.
+    this.megaCount = 0;
+    const megaGroupSlot = new Map<number, number>();
+    const megaArea = new Float32Array(CAP.MEGA);
+    for (let i = 0; i < megaRecords.length; i++) {
+      const r = megaRecords[i];
+      if (r.kind === 'RING' || r.y > MEGA_REFL.MAX_Y_M) continue;
+      const a = Math.max(1e-3, r.w * r.h);
+      const g = r.group >= 0 ? megaGroupSlot.get(r.group) : undefined;
+      if (g !== undefined) {
+        const t = megaArea[g] + a;
+        for (let c = 0; c < 3; c++) this.megaPos[g * 3 + c] = (this.megaPos[g * 3 + c] * megaArea[g] + (c === 0 ? r.x : c === 1 ? r.y : r.z) * a) / t;
+        megaArea[g] = t;
+        this.megaNrm[g * 3] += r.nx;
+        this.megaNrm[g * 3 + 1] += r.nz;
+        // BLADEs read from both sides; so does an L-corner (arms > 45° apart): its merged diagonal normal would cut
+        // the ribbon along a straight line near the outer arm ends (the only blind quadrant is inside the building).
+        const r0 = megaRecords[this.megaSrcIdx[g]];
+        if (r.kind === 'BLADE' || r.nx * r0.nx + r.nz * r0.nz < Math.SQRT1_2) this.megaNrm[g * 3 + 2] = 1;
+        continue;
+      }
+      if (this.megaCount >= CAP.MEGA) continue;
+      const j = this.megaCount++;
+      if (r.group >= 0) megaGroupSlot.set(r.group, j);
+      megaArea[j] = a;
+      _col.setHex(AD_HUES[r.cell]);
+      this.megaPos[j * 3] = r.x;
+      this.megaPos[j * 3 + 1] = r.y;
+      this.megaPos[j * 3 + 2] = r.z;
+      this.megaCol[j * 3] = _col.r * MEGA_REFL.INTENSITY;
+      this.megaCol[j * 3 + 1] = _col.g * MEGA_REFL.INTENSITY;
+      this.megaCol[j * 3 + 2] = _col.b * MEGA_REFL.INTENSITY;
+      this.megaNrm[j * 3] = r.nx;
+      this.megaNrm[j * 3 + 1] = r.nz;
+      this.megaNrm[j * 3 + 2] = r.kind === 'BLADE' ? 1 : 0;
+      this.megaSrcIdx[j] = i;
+    }
+    // Second pass: normalise merged normals; half extents cover every piece of the screen.
+    for (let j = 0; j < this.megaCount; j++) {
+      const nl = Math.hypot(this.megaNrm[j * 3], this.megaNrm[j * 3 + 1]) || 1;
+      this.megaNrm[j * 3] /= nl;
+      this.megaNrm[j * 3 + 1] /= nl;
+      this.megaSize[j * 2] = 0;
+      this.megaSize[j * 2 + 1] = 0;
+    }
+    for (let i = 0; i < megaRecords.length; i++) {
+      const r = megaRecords[i];
+      if (r.kind === 'RING' || r.y > MEGA_REFL.MAX_Y_M) continue;
+      let j = r.group >= 0 ? (megaGroupSlot.get(r.group) ?? -1) : -1;
+      if (j < 0) for (let k = 0; k < this.megaCount; k++) if (this.megaSrcIdx[k] === i) { j = k; break; }
+      if (j < 0) continue;
+      const off = Math.hypot(r.x - this.megaPos[j * 3], r.z - this.megaPos[j * 3 + 2]);
+      this.megaSize[j * 2] = Math.max(this.megaSize[j * 2], off + r.w / 2);
+      this.megaSize[j * 2 + 1] = Math.max(this.megaSize[j * 2 + 1], Math.abs(r.y - this.megaPos[j * 3 + 1]) + r.h / 2);
+    }
+    this.uMegaReflCount.value = 0;
+    this.megaReflSrc.fill(-1);
     this.layout = {
       sector,
       loop,
@@ -8951,14 +9390,15 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
     this.traffic.update(simTime);
     this.sky.position.copy(cameraPos);
     // 7B-5: the two blimps cruise slow circles over the far skyline (heading along the orbit tangent).
-    CITY_FX.BLIMPS.forEach((b, i) => {
-      blimpPose(b, simTime, _bp);
+    // 12A: indexed loop (a per-frame forEach closure would allocate).
+    for (let i = 0; i < CITY_FX.BLIMPS.length; i++) {
+      blimpPose(CITY_FX.BLIMPS[i], simTime, _bp);
       _euler.set(0, _bp.yaw, Math.sin(simTime * 0.11 + i) * 0.02);
       _quat.setFromEuler(_euler);
       _m4.compose(_pos.set(_bp.x, _bp.y, _bp.z), _quat, _scl.set(1, 1, 1));
       this.blimpHull.setMatrixAt(i, _m4);
       this.blimpBanner.setMatrixAt(i, _m4);
-    });
+    }
     this.blimpHull.instanceMatrix.needsUpdate = true;
     this.blimpBanner.instanceMatrix.needsUpdate = true;
 
@@ -8988,5 +9428,41 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
       colU[k].set(this.lightCol[best * 3], this.lightCol[best * 3 + 1], this.lightCol[best * 3 + 2]);
     }
     this.uCityLightCount.value = take;
+
+    // 12A-2 nearest-8 Mega-Billboards within 90 m (same allocation-free partial selection).
+    const mn = this.megaCount;
+    const R2 = MEGA_REFL.RANGE_M * MEGA_REFL.RANGE_M;
+    for (let i = 0; i < mn; i++) {
+      const dx = this.megaPos[i * 3] - cameraPos.x;
+      const dy = this.megaPos[i * 3 + 1] - cameraPos.y;
+      const dz = this.megaPos[i * 3 + 2] - cameraPos.z;
+      const d2 = dx * dx + dy * dy + dz * dz;
+      // Audit fix: a one-sided screen facing away from the camera can never be seen in a reflection.
+      const facing = this.megaNrm[i * 3 + 2] > 0.5 || -dx * this.megaNrm[i * 3] - dz * this.megaNrm[i * 3 + 1] >= 0;
+      this.megaDist[i] = d2 < R2 && facing ? d2 : Infinity;
+    }
+    const mPos = this.uMegaReflPos.value;
+    const mCol = this.uMegaReflCol.value;
+    const mNrm = this.uMegaReflNrm.value;
+    let mTake = 0;
+    for (let k = 0; k < MEGA_REFL.MAX; k++) {
+      let best = -1;
+      let bestD = Infinity;
+      for (let i = 0; i < mn; i++) {
+        if (this.megaDist[i] < bestD) {
+          bestD = this.megaDist[i];
+          best = i;
+        }
+      }
+      if (best < 0) break;
+      this.megaDist[best] = Infinity;
+      mPos[k].set(this.megaPos[best * 3], this.megaPos[best * 3 + 1], this.megaPos[best * 3 + 2], this.megaSize[best * 2]);
+      mCol[k].set(this.megaCol[best * 3], this.megaCol[best * 3 + 1], this.megaCol[best * 3 + 2], this.megaSize[best * 2 + 1]);
+      mNrm[k].set(this.megaNrm[best * 3], this.megaNrm[best * 3 + 1], this.megaNrm[best * 3 + 2], 0);
+      this.megaReflSrc[k] = this.megaSrcIdx[best];
+      mTake++;
+    }
+    for (let k = mTake; k < MEGA_REFL.MAX; k++) this.megaReflSrc[k] = -1;
+    this.uMegaReflCount.value = mTake;
   }
 }

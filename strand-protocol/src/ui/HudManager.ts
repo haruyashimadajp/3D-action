@@ -851,6 +851,11 @@ export class HudManager {
       s.shadows = v === '1';
       onChange('shadows');
     });
+    // 12A-4 RCAS sharpening toggle (KineticPostFX; compiled out on LOW via the LITE define).
+    seg('set-sharpen', s.sharpen ? '1' : '0', (v) => {
+      s.sharpen = v === '1';
+      onChange('sharpen');
+    });
     seg('set-perf', s.showPerf ? '1' : '0', (v) => {
       s.showPerf = v === '1';
       onChange('showPerf');

@@ -403,6 +403,8 @@ class App {
   private readonly prevCamPos = new THREE.Vector3();
   /** 10D-5: the camera teleported (sector build / spawn / title / fixed view) — skip one frame of rain-smear velocity. */
   private camSnapped = true;
+  /** 12A-1: sector whose palette the PMREM environment was last baked for (0 = constructor default). */
+  private envSector = 0;
   /** 10D-4 breaker spark cadence (sim time of each node's next burst), canopy-drip cursor, thunder scheduler. */
   private readonly sparkNext = new Float32Array(16);
   private dripCursor = 0;
@@ -790,6 +792,11 @@ class App {
         break;
       case 'lowLatency':
         this.renderer.setLowLatency(s.lowLatency);
+        // 12A-2: the billboard road-reflection ribbons are a uniform toggle (no shader recompile).
+        this.city.setLowLatency(s.lowLatency);
+        break;
+      case 'sharpen':
+        this.renderer.setSharpen(s.sharpen);
         break;
       case 'shadows':
         this.renderer.setShadows(s.shadows);
@@ -806,7 +813,7 @@ class App {
   }
 
   private applyAllSettings(): void {
-    for (const k of ['sensitivity', 'shake', 'roll', 'centerDot', 'fov', 'quality', 'volume', 'lowLatency', 'shadows', 'showPerf', 'filter'] as const) this.applySetting(k);
+    for (const k of ['sensitivity', 'shake', 'roll', 'centerDot', 'fov', 'quality', 'volume', 'lowLatency', 'shadows', 'showPerf', 'filter', 'sharpen'] as const) this.applySetting(k);
   }
 
   private onSettingChanged(key: keyof SaveSettings): void {
@@ -868,6 +875,14 @@ class App {
     this.destructibles.setLevel(this.physics, layout.colliders, layout.breachDoors, layout.glassPanes);
     this.destructibles.setProps(layout.destructibleProps, layout.interiorProps, (k) => this.city.propMeshes.kitMesh(k), this.city.propMeshes.shadowMesh, this.city.interiorKit.mesh);
     this.effects.setIndoorVolumes(layout.interiors.map((iv) => iv.aabb));
+    // 12A-1 / 12A-4: one-shot per-sector PMREM bake (only when the district changes) and the sector-tinted
+    // fog, mirrored exactly into the SkyDome horizon so towers fade into the sky with no seam.
+    const palette = layout.stats.palette;
+    if (index !== this.envSector) {
+      this.renderer.buildEnvironment(palette, index);
+      this.envSector = index;
+    }
+    this.city.setSkyHorizon(this.renderer.setSectorAtmosphere(palette));
     this.kickDoor = -1;
     this.attract.rebuild(layout);
     this.layout = layout;
