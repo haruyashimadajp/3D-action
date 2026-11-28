@@ -29,6 +29,7 @@ import * as THREE from 'three';
 import { AUDIO, clamp } from '../config/constants';
 import type { EnemyKind } from '../config/skills';
 import type { GunId, ReloadCue, SlotId } from '../config/weapons';
+import type { PropBreakMaterial } from '../world/CityPropMeshes';
 
 type Curve = Float32Array<ArrayBuffer>;
 
@@ -46,6 +47,16 @@ const LEAD_PHRASE: readonly (readonly [number, number, number])[] = [
 /** Arp step pattern (indices into the pentatonic table) — offset by the bar's chord. */
 const ARP_PATTERN: readonly number[] = [0, 2, 4, 5, 2, 4, 5, 7, 4, 5, 7, 9, 5, 4, 2, 1];
 const ARP_CHORD_OFFSET: readonly number[] = [0, 1, 2, 1];
+/** 11B-2 propBreak: material → debounce slot index, and each timbre's total length (s, voice-slot hold time). */
+const PROP_BREAK_MAT_INDEX: Readonly<Record<PropBreakMaterial, number>> = {
+  CARDBOARD: 0, CERAMIC: 1, WOOD: 2, PLASTIC: 3, METAL: 4, ELECTRONIC: 5,
+};
+const PROP_BREAK_DUR: readonly number[] = [0.42, 0.5, 0.36, 0.4, 0.6, 0.42];
+/** 11B-2: at most 6 overlapping prop-break sounds; a 7th break while all are ringing is dropped. */
+const PROP_BREAK_VOICES = 6;
+/** 11B-2: same-material breaks closer than this (s) collapse into one sound (shotgun / slide multi-breaks). */
+const PROP_BREAK_DEBOUNCE_S = 0.03;
+
 /** Layer output levels (Deep Pulse, Cyber Drums, Neon Arp, Breakbeat Perc, Overdrive Lead). */
 const LAYER_LEVEL: readonly number[] = [0.5, 0.78, 0.2, 0.3, 0.24];
 const BASS_PUMP: readonly number[] = [0.42, 0.72, 0.9, 1.0];
@@ -1005,6 +1016,127 @@ export class AudioEngine {
       const hz = 2800 + Math.random() * 3600;
       const dt = 0.03 + k * 0.045 + Math.random() * 0.03;
       this.tone(c, k % 2 === 0 ? 'sine' : 'triangle', hz, hz * 0.985, 0.16 + Math.random() * 0.12, 0.05 - k * 0.005, p, t + dt, 0.001);
+    }
+  }
+
+  // =============================================================================================
+  // 11B-2 destructible props — material-matched break SE (every source → panner → seBus)
+  // =============================================================================================
+  /** End time (AudioContext s) of each of the 6 prop-break voice slots (0 = free). */
+  private readonly propVoiceEnd = new Float64Array(PROP_BREAK_VOICES);
+  /** Last trigger time per material (same-material debounce). */
+  private readonly propMatLast = new Float64Array(6).fill(-10);
+
+  /**
+   * 11B-2: a small prop breaking at `pos` (≤ 0.6 s, 3D HRTF-panned). Six procedural timbres:
+   *  - CARDBOARD: dull papery thump + low-passed crumple bursts.
+   *  - CERAMIC: bright clink + inharmonic high pings + gritty shard skitter (terracotta pots, bowls).
+   *  - WOOD: dry crack + hollow knock + splinter snaps (pallets, crates, stools).
+   *  - PLASTIC: hollow bonk + rattly mid clatter (bins, cones, totes).
+   *  - METAL: sub thud + inharmonic FM clang ring + bent-steel scrape tail (drums, racks, canisters).
+   *  - ELECTRONIC: glass / plastic pop + electric zap + fizz crackle + descending chirp (A-frames, monitors).
+   * Voice policy: max 6 overlapping break sounds tracked in a fixed Float64Array of end times — when all 6 are
+   * still ringing the NEW break is dropped (never steals, so a ringing clang is never cut off). Same-material
+   * breaks within 30 ms are also dropped. Pitch is randomised ±6 % per call. Player-driven → priority voice.
+   */
+  propBreak(pos: THREE.Vector3, mat: PropBreakMaterial): void {
+    const c = this.can(true);
+    if (!c) return;
+    const t = c.currentTime;
+    const mi = PROP_BREAK_MAT_INDEX[mat];
+    // (Stamps from a disposed / re-created AudioContext lie in the "future" — treat them as stale, never blocking.)
+    const sinceLast = t - this.propMatLast[mi];
+    if (sinceLast >= 0 && sinceLast < PROP_BREAK_DEBOUNCE_S) return;
+    let slot = -1;
+    for (let k = 0; k < PROP_BREAK_VOICES; k++) {
+      const end = this.propVoiceEnd[k];
+      if (end <= t || end - t > 1) {
+        slot = k;
+        break;
+      }
+    }
+    if (slot < 0) return;
+    this.propMatLast[mi] = t;
+    this.propVoiceEnd[slot] = t + PROP_BREAK_DUR[mi];
+    const r = 1 + (Math.random() * 2 - 1) * 0.06;
+    const p = this.panner(c, pos, true, this.seBus);
+    p.refDistance = 5;
+    p.rolloffFactor = 1.0;
+    switch (mat) {
+      case 'CARDBOARD':
+        // Dull papery thump.
+        this.tone(c, 'sine', 150 * r, 68 * r, 0.14, 0.4, p, t, 0.002, this.softCurve);
+        this.noise(c, 'lowpass', 900 * r, 260, 0.7, 0.12, 0.3, p, t, 0.002);
+        // Crumple: low-passed, irregular paper bursts.
+        for (let k = 0; k < 4; k++) {
+          const dt = 0.03 + k * 0.07 + Math.random() * 0.03;
+          this.noise(c, 'lowpass', (2600 - k * 300) * r, 1100, 1.1, 0.035 + Math.random() * 0.02, 0.16 - k * 0.03, p, t + dt, 0.003);
+        }
+        break;
+      case 'CERAMIC': {
+        // Short terracotta body + bright clink.
+        this.tone(c, 'sine', 320 * r, 150 * r, 0.08, 0.22, p, t, 0.001);
+        this.tone(c, 'triangle', 2450 * r, 2380 * r, 0.12, 0.13, p, t, 0.001);
+        this.noise(c, 'highpass', 3000, 3000, 0.8, 0.06, 0.26, p, t, 0.001);
+        // Inharmonic high pings (bell-like partials of a broken shell).
+        const base = 1900 * r;
+        for (let k = 0; k < 4; k++) {
+          const hz = base * (k === 0 ? 1.47 : k === 1 ? 2.09 : k === 2 ? 2.76 : 3.31);
+          this.tone(c, 'sine', hz, hz * 0.99, 0.09 + Math.random() * 0.1, 0.06 - k * 0.01, p, t + 0.01 + k * 0.025, 0.001);
+        }
+        // Gritty shard skitter across the ground.
+        for (let k = 0; k < 5; k++) {
+          const hz = (3500 + Math.random() * 2000) * r;
+          this.noise(c, 'bandpass', hz, hz * 0.8, 3, 0.022, 0.09 - k * 0.012, p, t + 0.08 + k * 0.06 + Math.random() * 0.03, 0.001);
+        }
+        break;
+      }
+      case 'WOOD':
+        // Dry crack.
+        this.noise(c, 'bandpass', 2200 * r, 1200 * r, 1.5, 0.045, 0.42, p, t, 0.001, this.hardCurve);
+        this.tone(c, 'square', 900 * r, 380 * r, 0.03, 0.06, p, t, 0.001);
+        // Hollow knock (plank resonance).
+        this.tone(c, 'sine', 260 * r, 178 * r, 0.18, 0.34, p, t + 0.004, 0.002);
+        this.tone(c, 'triangle', 520 * r, 350 * r, 0.1, 0.1, p, t + 0.004, 0.002);
+        // Splinter snaps.
+        for (let k = 0; k < 3; k++) {
+          const dt = 0.04 + k * 0.06 + Math.random() * 0.03;
+          this.noise(c, 'highpass', (2800 + k * 500) * r, 2400, 1.2, 0.015 + Math.random() * 0.012, 0.2 - k * 0.04, p, t + dt, 0.001);
+        }
+        break;
+      case 'PLASTIC':
+        // Hollow bonk.
+        this.tone(c, 'sine', 420 * r, 236 * r, 0.16, 0.32, p, t, 0.002);
+        this.tone(c, 'triangle', 840 * r, 510 * r, 0.08, 0.1, p, t, 0.002);
+        this.noise(c, 'bandpass', 900 * r, 700, 2, 0.08, 0.2, p, t, 0.001);
+        // Rattly mid clatter of loose plastic pieces.
+        for (let k = 0; k < 5; k++) {
+          const hz = (1200 + Math.random() * 600) * r;
+          this.noise(c, 'bandpass', hz, hz, 4, 0.025, 0.12 - k * 0.018, p, t + 0.06 + k * 0.045 + Math.random() * 0.02, 0.001);
+        }
+        break;
+      case 'METAL':
+        // Sub thud + inharmonic FM clang.
+        this.tone(c, 'sine', 140 * r, 55 * r, 0.25, 0.42, p, t, 0.002, this.softCurve);
+        this.fm(c, 340 * r, 487 * r, 3.5, 0.55, 0.14, p, t + 0.002);
+        this.fm(c, 613 * r, 871 * r, 2, 0.4, 0.07, p, t + 0.004, 'triangle');
+        this.noise(c, 'highpass', 2600, 1800, 0.9, 0.05, 0.24, p, t, 0.001);
+        // Bent-steel scrape tail (resonant band sweeping down).
+        this.noise(c, 'bandpass', 2400 * r, 900 * r, 6, 0.32, 0.09, p, t + 0.08, 0.03);
+        break;
+      case 'ELECTRONIC':
+        // Glass / plastic housing pop.
+        this.noise(c, 'highpass', 3800, 3800, 0.7, 0.05, 0.34, p, t, 0.001);
+        this.tone(c, 'sine', 1600 * r, 600 * r, 0.04, 0.16, p, t, 0.001);
+        // Electric zap (mains-ish FM buzz).
+        this.fm(c, 120 * r, 60 * r, 8, 0.18, 0.06, p, t + 0.01, 'square');
+        // Fizz crackle.
+        for (let k = 0; k < 5; k++) {
+          this.noise(c, 'highpass', 4500, 2800, 0.7, 0.02, 0.1 - k * 0.012, p, t + 0.02 + Math.random() * 0.25, 0.001);
+        }
+        // Short descending chirp (dying circuit).
+        this.tone(c, 'square', 2400 * r, 300 * r, 0.16, 0.05, p, t + 0.05, 0.002);
+        break;
     }
   }
 

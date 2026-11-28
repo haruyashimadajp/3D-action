@@ -11,11 +11,47 @@
  * Parts are shaded from baked vertex colour × per-instance tint × baked vertex AO × world-space archDetail,
  * with per-class roughness / metalness / emission, city lights within 28 m, and a strict ≤ 0.86 Bloom guard on
  * non-emissive surfaces. Nothing here runs per frame.
+ *
+ * Phase 11B-1: `commit()` also returns a flat `DestructiblePropRecord[]` (kit instance slot + exact
+ * PropContactShadows slot, world AABB, floor height, tint) for every committed DESTRUCTIBLE_PROP_IDS prop, so
+ * DestructibleManager can hide broken props by zero-scaling their instance (and shadow) matrices.
  */
 import * as THREE from 'three';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 import type { PbrTextureSet } from '../engine/ProceduralTextures';
-import { PROPS, PROP_DEFS, KIT_IDS, KIT_CAP, type DecalInstance, type KitId, type PropInstance } from './CityProps';
+import { PROPS, PROP_DEFS, KIT_IDS, KIT_CAP, type DecalInstance, type KitId, type PropId, type PropInstance } from './CityProps';
+
+// =============================================================================================
+// 11B-1 destructible prop contract (shared with DestructibleManager / AudioEngine / CityBuilder)
+// =============================================================================================
+/** 11B-2 material class of a breaking prop (debris palette + AudioEngine.propBreak timbre). */
+export type PropBreakMaterial = 'CARDBOARD' | 'CERAMIC' | 'WOOD' | 'PLASTIC' | 'METAL' | 'ELECTRONIC';
+
+/** Street / alley props that can be shot, slid through or kicked apart (wall fixtures and cover stay solid). */
+export const DESTRUCTIBLE_PROP_IDS: ReadonlySet<PropId> = new Set<PropId>([
+  'BOXES', 'BOX_TOWER', 'BOX_PILE',
+  'POT_PLANT', 'PLANTER', 'PLANT_ON_BIN', 'SUCCULENTS',
+  'BINS', 'CRATES', 'TOTE_BUCKET', 'WIRE_RACK',
+  'CONES', 'PALLETS', 'STOOLS', 'UMBRELLA', 'CANISTERS',
+  'BIN_BAGS', 'BAG_MOUND', 'DRUMS', 'AFRAME',
+]);
+
+/**
+ * 11B-1 flat destructible street-prop record emitted by `CityPropMeshes.commit()` (one per committed instance of a
+ * DESTRUCTIBLE_PROP_IDS prop). `instanceIndex` is the instance slot inside `kitMesh(kitId)`; `shadowIndex` is the
+ * exact PropContactShadows instance slot (-1 when the prop emits no contact shadow). `worldPos` is the world AABB
+ * centre, `halfExtents` its half size, `floorY` the support height, `tint` the sRGB hex instance tint.
+ */
+export interface DestructiblePropRecord {
+  readonly propId: PropId;
+  readonly kitId: KitId;
+  readonly instanceIndex: number;
+  readonly shadowIndex: number;
+  readonly worldPos: THREE.Vector3;
+  readonly halfExtents: THREE.Vector3;
+  readonly floorY: number;
+  readonly tint: number;
+}
 
 /** Material classes (aPart). TINT* classes (6..10) multiply the per-instance tint. */
 const P = {
@@ -750,6 +786,8 @@ export interface PropKitStats {
   counts: Record<KitId, number>;
   decals: number;
   contactShadows: number;
+  /** 11B-1 destructible street-prop records (see DestructiblePropRecord). */
+  destructibles: DestructiblePropRecord[];
 }
 
 export class CityPropMeshes {
@@ -757,6 +795,16 @@ export class CityPropMeshes {
   private readonly byKit = new Map<KitId, THREE.InstancedMesh>();
   private readonly decals: THREE.InstancedMesh;
   private readonly contactShadows: THREE.InstancedMesh;
+
+  /** 11B-1: the InstancedMesh of one prop kit (instance slots match DestructiblePropRecord.instanceIndex). */
+  kitMesh(id: KitId): THREE.InstancedMesh {
+    return this.byKit.get(id) as THREE.InstancedMesh;
+  }
+
+  /** 11B-1: the PropContactShadows InstancedMesh (slots match DestructiblePropRecord.shadowIndex). */
+  get shadowMesh(): THREE.InstancedMesh {
+    return this.contactShadows;
+  }
 
   constructor(
     plaqueAtlas: THREE.Texture,
@@ -810,10 +858,16 @@ export class CityPropMeshes {
     extraShadows: readonly ContactShadowDesc[] = [],
   ): PropKitStats {
     const counts = Object.fromEntries(KIT_IDS.map((k) => [k, 0])) as Record<KitId, number>;
-    for (const p of props) {
+    // 11B-1: per props[] index → committed kit instance slot / PropContactShadows slot (-1 = none). commit() runs
+    // once per sector build, so these typed arrays are not a per-frame allocation.
+    const instSlot = new Int32Array(props.length).fill(-1);
+    const shadowSlot = new Int32Array(props.length).fill(-1);
+    for (let pi = 0; pi < props.length; pi++) {
+      const p = props[pi];
       const m = this.byKit.get(p.kit) as THREE.InstancedMesh;
       const i = counts[p.kit];
       if (i >= KIT_CAP[p.kit]) continue;
+      instSlot[pi] = i;
       _p.set(p.x, p.y, p.z);
       _q.setFromEuler(_e.set(0, p.yaw, 0));
       _s.setScalar(p.s);
@@ -882,11 +936,13 @@ export class CityPropMeshes {
         addShadow(p.x, p.z, p.yaw, def.w * p.s * 1.14, def.d * p.s * 1.38, 0.48);
       }
     }
-    for (const p of props) {
+    for (let pi = 0; pi < props.length; pi++) {
       if (sn >= PROPS.CAP.CONTACT_SHADOW) break;
+      const p = props[pi];
       if (p.y > 0.15) continue;
       if (p.kit === 'DEBRIS' || p.id === 'PALLETS' || p.id === 'DRUMS') {
         const def = PROP_DEFS[p.id];
+        shadowSlot[pi] = sn; // addShadow() writes exactly this slot (sn < cap is guaranteed by the break above)
         addShadow(p.x, p.z, p.yaw, def.w * p.s * 1.26, def.d * p.s * 1.26, 0.46);
       }
     }
@@ -899,6 +955,25 @@ export class CityPropMeshes {
       this.contactShadows.frustumCulled = true;
     }
 
-    return { counts, decals: n, contactShadows: sn };
+    // 11B-1 destructible records: only props that actually landed in a kit slot (capacity-dropped props get none).
+    const destructibles: DestructiblePropRecord[] = [];
+    for (let pi = 0; pi < props.length; pi++) {
+      const p = props[pi];
+      if (instSlot[pi] < 0 || !DESTRUCTIBLE_PROP_IDS.has(p.id)) continue;
+      destructibles.push({
+        propId: p.id,
+        kitId: p.kit,
+        instanceIndex: instSlot[pi],
+        // A capacity-dropped prop may still own a shadow quad; it is never referenced since it has no record.
+        shadowIndex: shadowSlot[pi],
+        worldPos: new THREE.Vector3((p.minX + p.maxX) / 2, (p.y0 + p.y1) / 2, (p.minZ + p.maxZ) / 2),
+        halfExtents: new THREE.Vector3((p.maxX - p.minX) / 2, (p.y1 - p.y0) / 2, (p.maxZ - p.minZ) / 2),
+        // Floor props: y0 === y (footprint at floor level); y0 stays correct for any raised support too.
+        floorY: p.y0,
+        tint: p.tint,
+      });
+    }
+
+    return { counts, decals: n, contactShadows: sn, destructibles };
   }
 }

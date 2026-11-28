@@ -71,6 +71,12 @@ export type ProjectileOwner = 'PLAYER' | 'ENEMY';
  */
 export interface ProjectileBreakables {
   onProjectileHit(collider: BoxCollider, point: THREE.Vector3, dir: THREE.Vector3, damage: number, sniper: boolean, owner: ProjectileOwner): boolean;
+  /**
+   * 11B-1: collider-less destructible props along this swept (sub-)step `start + dir * [0, len]` (`len` already
+   * clipped to the world / hitbox hit). Light props break and the round passes; a surviving heavy prop (bins / bags /
+   * drums) stops it — returns that distance, else -1. Called at ARRIVAL each fixed step (Bullet-Time accurate).
+   */
+  raycastProp?(start: THREE.Vector3, dir: THREE.Vector3, len: number, damage: number, sniper: boolean, byPlayer: boolean): number;
 }
 
 export interface ProjectileSpec {
@@ -1185,6 +1191,36 @@ export class EffectsPool {
           _segEnd.copy(_worldHit.hit ? _worldHit.point : _pB);
           this.trackGraze(i, _pA, _segEnd, _pD, graze, physics);
         }
+        // 11B-1: destructible props on the path up to the first world / hitbox hit (light ones break and let it pass).
+        if (brk && brk.raycastProp) {
+          const lim = tHit ? _targetHit.distance : _worldHit.hit ? _worldHit.distance : step;
+          const sniperP = this.pTag[i] === 1 || this.pDamage[i] >= 100;
+          const ts = brk.raycastProp(_pA, _pD, lim, this.pDamage[i], sniperP, owner === 'PLAYER');
+          _pD.set(this.pVel[o], this.pVel[o + 1], this.pVel[o + 2]).divideScalar(speed);
+          if (ts >= 0 && ts <= lim) {
+            // A heavy prop survived the hit: the round stops on it (spark, never a scorch decal on a breakable).
+            const im = this.impact;
+            im.owner = owner;
+            im.tag = this.pTag[i];
+            im.pierce = false;
+            im.damage = this.pDamage[i];
+            im.headMultiplier = this.pHead[i];
+            im.shieldMultiplier = this.pShield[i];
+            im.direction.copy(_pD);
+            im.point.copy(_pA).addScaledVector(_pD, ts);
+            im.normal.copy(_pD).negate();
+            im.kind = 'PROP';
+            im.target = null;
+            im.region = 'BODY';
+            im.travelled = this.pTravel[i] + ts;
+            this.burst(im.point, im.normal, BURST.SPARK);
+            this.pActive[i] = 0;
+            this.pTravel[i] = im.travelled;
+            this.endSmoke(i);
+            onImpact(im);
+            continue outer;
+          }
+        }
         const wk = _worldHit.hit && !tHit ? _worldHit.kind : null;
         const breakable = wk === 'GLASS' || wk === 'DOOR';
         if (breakable && brk && _worldHit.collider) {
@@ -1587,6 +1623,9 @@ function segmentSegmentDistance(p1: THREE.Vector3, q1: THREE.Vector3, p2: THREE.
 // =================================================================================================
 // 11A-3 / 11B-2 shared DestructDebris pool
 // =================================================================================================
+/** 11B-2 DestructDebris non-glass surface classes (spawn `surface`): material-matched roughness / metalness. */
+export const DEBRIS_SURFACE = { DEFAULT: 0, MATTE: 1, PLASTIC: 2, METAL: 3 } as const;
+
 /** 11A-3 / 11B-2 DestructDebris tuning (cap 200, simDt physics, scanline dissolve). */
 export const DEBRIS = {
   CAP: 200,
@@ -1715,6 +1754,8 @@ export class DestructDebris {
   private readonly scl = new Float32Array(DEBRIS.CAP * 3);
   private readonly col = new Float32Array(DEBRIS.CAP * 3);
   private readonly glass = new Uint8Array(DEBRIS.CAP);
+  /** 11B-2 DEBRIS_SURFACE class of non-glass chunks. */
+  private readonly surf = new Uint8Array(DEBRIS.CAP);
   private readonly floorY = new Float32Array(DEBRIS.CAP);
   private readonly solid = new Float32Array(DEBRIS.CAP);
   private readonly age = new Float32Array(DEBRIS.CAP);
@@ -1746,10 +1787,19 @@ export class DestructDebris {
           `#include <color_fragment>
           vec3 ddEdge = strandDissolve(vDDWorld, vDDis);
           bool ddGlass = vDDis.y > 0.5;
+          float ddSurf = floor(-vDDis.y + 0.5);
           if (ddGlass) diffuseColor.rgb = diffuseColor.rgb * 0.6 + 0.04;`,
         )
-        .replace('#include <roughnessmap_fragment>', '#include <roughnessmap_fragment>\nroughnessFactor = ddGlass ? 0.06 : 0.58;')
-        .replace('#include <metalnessmap_fragment>', '#include <metalnessmap_fragment>\nmetalnessFactor = ddGlass ? 0.85 : 0.45;')
+        // 11B-2 material-matched surfaces: 0 default steel-ish · 1 matte (cardboard / wood / terracotta / leaves) ·
+        // 2 plastic · 3 bare metal.
+        .replace(
+          '#include <roughnessmap_fragment>',
+          '#include <roughnessmap_fragment>\nroughnessFactor = ddGlass ? 0.06 : ddSurf > 2.5 ? 0.38 : ddSurf > 1.5 ? 0.46 : ddSurf > 0.5 ? 0.88 : 0.58;',
+        )
+        .replace(
+          '#include <metalnessmap_fragment>',
+          '#include <metalnessmap_fragment>\nmetalnessFactor = ddGlass ? 0.85 : ddSurf > 2.5 ? 0.82 : ddSurf > 0.5 ? 0.0 : 0.45;',
+        )
         .replace(
           '#include <emissivemap_fragment>',
           `#include <emissivemap_fragment>
@@ -1760,7 +1810,7 @@ export class DestructDebris {
           }`,
         );
     };
-    mat.customProgramCacheKey = () => (this.inject ? 'strand-debris-v1-lit' : 'strand-debris-v1');
+    mat.customProgramCacheKey = () => (this.inject ? 'strand-debris-v2-lit' : 'strand-debris-v2');
     this.mat = mat;
     this.mesh = new THREE.InstancedMesh(geo, mat, DEBRIS.CAP);
     this.mesh.name = 'DestructDebris';
@@ -1797,10 +1847,11 @@ export class DestructDebris {
   /**
    * Spawns one chunk (zero allocation). Position / velocity in world metres; (sx, sy, sz) = chunk size in metres
    * (the smallest component becomes the thin local Y axis); `color` sRGB hex; `floorY` = bounce plane; `life` =
-   * solid time before the dissolve (< 0 → random 1.4–2.2 s); `glowBoost` scales the dissolve edge emission.
+   * solid time before the dissolve (< 0 → random 1.4–2.2 s); `glowBoost` scales the dissolve edge emission;
+   * `surface` (11B-2, non-glass only) = DEBRIS_SURFACE class (material-matched roughness / metalness).
    * Recycles the oldest slot when all 200 are alive. Returns the slot.
    */
-  spawn(px: number, py: number, pz: number, vx: number, vy: number, vz: number, sx: number, sy: number, sz: number, color: number, isGlass: boolean, floorY: number, life = -1, glowBoost = 0): number {
+  spawn(px: number, py: number, pz: number, vx: number, vy: number, vz: number, sx: number, sy: number, sz: number, color: number, isGlass: boolean, floorY: number, life = -1, glowBoost = 0, surface = 0): number {
     let i = this.next;
     for (let k = 0; k < DEBRIS.CAP; k++) {
       const j = (this.next + k) % DEBRIS.CAP;
@@ -1852,6 +1903,7 @@ export class DestructDebris {
     this.ang[o + 1] = _dbAxis.y;
     this.ang[o + 2] = _dbAxis.z;
     this.glass[i] = isGlass ? 1 : 0;
+    this.surf[i] = isGlass ? 0 : surface;
     this.floorY[i] = floorY;
     this.solid[i] = life >= 0 ? life : DEBRIS.LIFE_MIN + dbRand() * (DEBRIS.LIFE_MAX - DEBRIS.LIFE_MIN);
     this.age[i] = 0;
@@ -1863,8 +1915,8 @@ export class DestructDebris {
   }
 
   /** Vector convenience wrapper of {@link spawn} (zero allocation). */
-  spawnV(pos: THREE.Vector3, vel: THREE.Vector3, scale: THREE.Vector3, color: number, isGlass: boolean, floorY: number, life = -1, glowBoost = 0): number {
-    return this.spawn(pos.x, pos.y, pos.z, vel.x, vel.y, vel.z, scale.x, scale.y, scale.z, color, isGlass, floorY, life, glowBoost);
+  spawnV(pos: THREE.Vector3, vel: THREE.Vector3, scale: THREE.Vector3, color: number, isGlass: boolean, floorY: number, life = -1, glowBoost = 0, surface = 0): number {
+    return this.spawn(pos.x, pos.y, pos.z, vel.x, vel.y, vel.z, scale.x, scale.y, scale.z, color, isGlass, floorY, life, glowBoost, surface);
   }
 
   /** Simulates (simDt) and uploads every live chunk. Called by EffectsPool.update(). */
@@ -1962,6 +2014,24 @@ export class DestructDebris {
         this.rot[r + 1] = _dbQ.y;
         this.rot[r + 2] = _dbQ.z;
         this.rot[r + 3] = _dbQ.w;
+      } else if (simDt > 0 && !this.sleep[i]) {
+        // 11B audit fix: beyond the 52 m physics skip a chunk never hangs in mid-air (a scoped 60 m+ shot): it jumps
+        // straight to its ballistic landing spot (the probed floor its launch velocity was fitted to) and lies flat.
+        const vy = this.vel[o + 1];
+        const fy = this.floorY[i];
+        const h = Math.max(0, this.pos[o + 1] - this.scl[o + 1] * 0.5 - fy);
+        const tl = (vy + Math.sqrt(vy * vy - 2 * DEBRIS.GRAVITY * h)) / -DEBRIS.GRAVITY;
+        this.pos[o] += this.vel[o] * tl;
+        this.pos[o + 2] += this.vel[o + 2] * tl;
+        this.pos[o + 1] = fy + this.scl[o + 1] * 0.5;
+        _dbQ.setFromAxisAngle(_dbY, this.seed[i] * Math.PI * 2);
+        this.vel[o] = this.vel[o + 1] = this.vel[o + 2] = 0;
+        this.ang[o] = this.ang[o + 1] = this.ang[o + 2] = 0;
+        this.sleep[i] = 1;
+        this.rot[r] = _dbQ.x;
+        this.rot[r + 1] = _dbQ.y;
+        this.rot[r + 2] = _dbQ.z;
+        this.rot[r + 3] = _dbQ.w;
       }
       _dbP.set(this.pos[o], this.pos[o + 1], this.pos[o + 2]);
       _dbS.set(this.scl[o], this.scl[o + 1], this.scl[o + 2]);
@@ -1969,7 +2039,8 @@ export class DestructDebris {
       this.mesh.setMatrixAt(n, _dbM);
       _dbC.setRGB(this.col[o], this.col[o + 1], this.col[o + 2]);
       this.mesh.setColorAt(n, _dbC);
-      this.disAttr.setXYZW(n, prog > 0 ? prog : 0, this.glass[i], this.seed[i], this.glow[i]);
+      // aDissolve.y: 1 = glass (cyan edge); 0 / -1 / -2 / -3 = DEBRIS_SURFACE class of a non-glass chunk (amber edge).
+      this.disAttr.setXYZW(n, prog > 0 ? prog : 0, this.glass[i] ? 1 : -this.surf[i], this.seed[i], this.glow[i]);
       n++;
     }
     this.mesh.count = n;

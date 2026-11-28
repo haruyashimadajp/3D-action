@@ -1,5 +1,6 @@
 /**
- * STRAND // PROTOCOL — 11A-2 / 11A-3 destructibles: kickable breach doors + shatterable tempered glass.
+ * STRAND // PROTOCOL — 11A-2 / 11A-3 destructibles (kickable breach doors + shatterable tempered glass) and 11B-1
+ * destructible street / interior props.
  *
  *  - 'InteractiveDoors': ONE persistent InstancedMesh (cap 32, +1 draw call). HERO §5.2 steel door leaf (162 tris)
  *    scaled per doorway (x = width / 1.04, y = height / 2.16). Three modes: quiet open (105° inward pivot about the
@@ -11,14 +12,26 @@
  *    non-uniform instance scale, zero double-draw / z-fighting with the pane surface).
  *  - Breaking anything is O(1): `physics.setColliderActive(colliderIndex, false)` + a zero instance matrix. Glass
  *    shards (22–30) and breach splinters (6) go into the shared `effects.debris` pool (+0 draw calls here).
- *  Zero per-frame heap allocations (module-scope scratch only).
+ *  - 11B-1 props (+0 draw calls): `setProps()` registers every DESTRUCTIBLE_PROP_IDS street record (CityPropMeshes
+ *    kits) + every destructible InteriorPropsKit record into pre-allocated SoA arrays (PROP_CAP) and an 8 m CSR 2D
+ *    hash grid (each entry in exactly one cell by centre; queries expand by the largest half extent). Props break
+ *    from swept player / enemy rounds (`raycastProp`, called per projectile step by EffectsPool — 1-HP props let the
+ *    round pass, 2-HP props stop it until destroyed), slides / hard sprints (`checkPlayerSlideBreak`, zero player
+ *    slowdown) and kicks (`kickBreak`). Breaking = zero instance matrix on the kit (+ its PropContactShadows slot),
+ *    a material-matched debris burst (PROP_DESTRUCTION table) whose every chunk is wall-capped and floor-probed by
+ *    the same `landShard()` helper the glass shards use, then `onPropBreak` (stealth noise at the PROP's centre).
+ *    Original instance / shadow matrices are snapshotted so `resetProps()` (also run by `setLevel`) restores them.
+ *  Zero per-frame heap allocations (module-scope scratch / pre-allocated typed arrays only).
  */
 import * as THREE from 'three';
 import type { BoxCollider, ColliderKind } from '../world/CityBuilder';
 import type { CityLightInjector } from '../world/CityAtmosphere';
 import type { PhysicsWorld, RayHit } from '../world/PhysicsWorld';
 import { createRayHit } from '../world/PhysicsWorld';
-import { type EffectsPool, type ProjectileBreakables, type ProjectileOwner, GLSL_DIGITAL_DISSOLVE } from './EffectsPool';
+import type { KitId, PropId } from '../world/CityProps';
+import { DESTRUCTIBLE_PROP_IDS, type DestructiblePropRecord, type PropBreakMaterial } from '../world/CityPropMeshes';
+import type { InteriorPropRecord } from '../world/InteriorBuilder';
+import { type EffectsPool, type ProjectileBreakables, type ProjectileOwner, BURST, DEBRIS_SURFACE, GLSL_DIGITAL_DISSOLVE } from './EffectsPool';
 
 // =================================================================================================
 // Canonical door contract (HERO §5.2 / §7 Phase 13 .glb swap-ready)
@@ -56,6 +69,98 @@ export const DOOR_CAP = 32;
 export const GLASS_CAP = 48;
 /** Glass shards per shattered pane (inclusive range). */
 export const GLASS_SHARDS = { MIN: 22, MAX: 30 } as const;
+
+// =================================================================================================
+// 11B-1 destructible props
+// =================================================================================================
+/**
+ * Registry capacity: destructible street kits (PLANTS 260 + STORAGE 360 + MISC 220 + DEBRIS 480 + SCRAP 200 = 1520,
+ * DUMPSTER / BENCH / FIXTURES never registered) + InteriorPropsKit 260 = 1780 ≤ 2048. Extra records are ignored.
+ */
+export const PROP_CAP = 2048;
+/** CSR 2D spatial hash cell size (m). */
+export const PROP_GRID_CELL_M = 8;
+/** Slide / hard-sprint break gate and player box (feet-based; radius + reach horizontally). */
+export const PROP_SLIDE = { SLIDE_SPEED: 6.5, SPRINT_SPEED: 10.5, RADIUS: 0.38, REACH: 0.12, H_SLIDE: 1.0, H_STAND: 1.8 } as const;
+/** Kick break: horizontal reach to the AABB centre, min forward dot, vertical band of the centre relative to the feet. */
+export const PROP_KICK = { REACH: 1.7, MIN_DOT: 0.35, Y0: -0.2, Y1: 2.0 } as const;
+/** Debris launch speed (m/s) along the impact / slide / kick direction: street vs (small) interior rooms. */
+export const PROP_DEBRIS_SPEED = { STREET_MIN: 3, STREET_MAX: 11, INTERIOR_MIN: 1.5, INTERIOR_MAX: 5 } as const;
+
+/**
+ * Debris look of a breaking prop: FLAP = flat damp corrugated cardboard; POT = terracotta shards + dark-green leaves;
+ * SHARD = tinted plastic shards; BARS = bent steel wire / tube; CANISTER = bent tinted steel plates; SPLINTER = long
+ * wood splinters; SCRAP = bent steel + glossy black bag scrap; RUST = rusted steel drum plates (+ spark burst);
+ * GLOW = glass / plastic / dark-steel electronics shards with cyan (glass) / amber edge sparks; DISH = ceramic
+ * crockery + glass bottle shards; FABRIC = tinted fabric / plastic hangers + steel rail bits; KITCHEN = steel +
+ * ceramic + glass.
+ */
+export type PropDebrisProfile = 'FLAP' | 'POT' | 'SHARD' | 'BARS' | 'CANISTER' | 'SPLINTER' | 'SCRAP' | 'RUST' | 'GLOW' | 'DISH' | 'FABRIC' | 'KITCHEN';
+const PROFILE_NAMES: readonly PropDebrisProfile[] = ['FLAP', 'POT', 'SHARD', 'BARS', 'CANISTER', 'SPLINTER', 'SCRAP', 'RUST', 'GLOW', 'DISH', 'FABRIC', 'KITCHEN'];
+const MAT_NAMES: readonly PropBreakMaterial[] = ['CARDBOARD', 'CERAMIC', 'WOOD', 'PLASTIC', 'METAL', 'ELECTRONIC'];
+
+export interface PropDestructionSpec {
+  /** Hit points vs bullets (2-HP props stop the round until destroyed; a sniper round is always lethal). */
+  readonly hp: 1 | 2;
+  /** Breaks when slid / hard-sprinted through (bullets and kicks break every registered prop). */
+  readonly slide: boolean;
+  /** Debris chunks (halved on LOW). */
+  readonly debris: number;
+  /** Stealth distraction radius (m) around the broken prop. */
+  readonly noise: number;
+  readonly mat: PropBreakMaterial;
+  readonly profile: PropDebrisProfile;
+  /** Extra BURST.SPARK at the impact. */
+  readonly spark: boolean;
+}
+
+const PD = (hp: 1 | 2, slide: boolean, debris: number, noise: number, mat: PropBreakMaterial, profile: PropDebrisProfile, spark = false): PropDestructionSpec => ({ hp, slide, debris, noise, mat, profile, spark });
+
+/**
+ * 11B-1 §1.1 destruction table (street PropIds; exactly the DESTRUCTIBLE_PROP_IDS set). Material mapping notes:
+ * CRATES stay PLASTIC (STORAGE kit moulded crates, debris uses the instance tint), WIRE_RACK = METAL; UMBRELLA =
+ * PLASTIC (nylon canopy shards); BIN_BAGS / BAG_MOUND = PLASTIC (bag scrap dominates the sound) with SCRAP debris.
+ */
+export const PROP_DESTRUCTION: Readonly<Partial<Record<PropId, PropDestructionSpec>>> = {
+  BOXES: PD(1, true, 10, 10, 'CARDBOARD', 'FLAP'),
+  BOX_TOWER: PD(1, true, 10, 10, 'CARDBOARD', 'FLAP'),
+  BOX_PILE: PD(1, true, 10, 10, 'CARDBOARD', 'FLAP'),
+  POT_PLANT: PD(1, true, 12, 12, 'CERAMIC', 'POT'),
+  PLANTER: PD(1, true, 12, 12, 'CERAMIC', 'POT'),
+  PLANT_ON_BIN: PD(1, true, 12, 12, 'CERAMIC', 'POT'),
+  SUCCULENTS: PD(1, true, 12, 12, 'CERAMIC', 'POT'),
+  BINS: PD(1, true, 10, 12, 'PLASTIC', 'SHARD'),
+  CRATES: PD(1, true, 10, 12, 'PLASTIC', 'SHARD'),
+  TOTE_BUCKET: PD(1, true, 10, 12, 'PLASTIC', 'SHARD'),
+  WIRE_RACK: PD(1, true, 10, 12, 'METAL', 'BARS'),
+  CONES: PD(1, true, 10, 14, 'PLASTIC', 'SHARD'),
+  PALLETS: PD(1, true, 10, 14, 'WOOD', 'SPLINTER'),
+  STOOLS: PD(1, true, 10, 14, 'METAL', 'BARS'),
+  UMBRELLA: PD(1, true, 10, 14, 'PLASTIC', 'SHARD'),
+  CANISTERS: PD(1, true, 10, 14, 'METAL', 'CANISTER'),
+  BIN_BAGS: PD(2, true, 14, 16, 'PLASTIC', 'SCRAP'),
+  BAG_MOUND: PD(2, true, 14, 16, 'PLASTIC', 'SCRAP'),
+  DRUMS: PD(2, false, 14, 18, 'METAL', 'RUST', true),
+  AFRAME: PD(1, true, 14, 18, 'ELECTRONIC', 'GLOW'),
+};
+
+/**
+ * Interior InteriorPropsKit variants (index = variant; null = indestructible v1 kitchen / v6 reception). Mapping:
+ * v0 counter place-setting = CERAMIC (DISH), v2 helmet pedestal = ELECTRONIC (GLOW), v3 jacket rack = PLASTIC
+ * (FABRIC), v4 desk rig = ELECTRONIC (GLOW), v5 kitchenette = METAL (KITCHEN), v7 pendant fan / lamp = ELECTRONIC.
+ */
+export const INTERIOR_PROP_DESTRUCTION: ReadonlyArray<PropDestructionSpec | null> = [
+  PD(1, true, 14, 18, 'CERAMIC', 'DISH'),
+  null,
+  PD(1, true, 14, 18, 'ELECTRONIC', 'GLOW'),
+  PD(1, true, 14, 18, 'PLASTIC', 'FABRIC'),
+  PD(1, true, 14, 18, 'ELECTRONIC', 'GLOW'),
+  PD(1, true, 14, 18, 'METAL', 'KITCHEN'),
+  null,
+  PD(1, true, 14, 18, 'ELECTRONIC', 'GLOW'),
+];
+
+export type PropKind = 'STREET' | 'INTERIOR';
 
 export type DoorState = 'CLOSED' | 'OPENING' | 'OPEN' | 'BREACHED' | 'GONE';
 
@@ -313,6 +418,13 @@ const _wallRay: RayHit = createRayHit();
 const FLOOR_PROBE_IGNORE: ReadonlySet<ColliderKind> = new Set<ColliderKind>(['GLASS', 'DOOR', 'WATER']);
 /** Breached slabs float on canal water when there is no solid floor under them. */
 const SLAB_PROBE_IGNORE: ReadonlySet<ColliderKind> = new Set<ColliderKind>(['DOOR', 'GLASS']);
+/** 11B-1 prop debris wall cap: intact glass / doors / cars / props and the map-edge barrier stop chunks (water ignored). */
+const PROP_WALL_IGNORE: ReadonlySet<ColliderKind> = new Set<ColliderKind>(['WATER']);
+/** 11B-1 prop debris floor probe: canal water counts as a floor (chunks rest on it and dissolve, never sink). */
+const PROP_FLOOR_IGNORE: ReadonlySet<ColliderKind> = new Set<ColliderKind>(['GLASS', 'DOOR']);
+/** 11B audit fix: kick line of sight (knee → prop centre); low props / counters / the ground never block the boot. */
+const KICK_LOS_IGNORE: ReadonlySet<ColliderKind> = new Set<ColliderKind>(['WATER', 'PROP', 'GROUND']);
+const PROP_KICK_KNEE_M = 0.6;
 const GLASS_COLORS = [0xd2f1fa, 0xaedfee, 0xe8fcff, 0xbfe8f4] as const;
 /** Breached-slab support points in canonical leaf space (8 leaf corners + lever tips + crash-bar housing corners). */
 const SLAB_SUPPORT: ReadonlyArray<readonly [number, number, number]> = [
@@ -321,10 +433,222 @@ const SLAB_SUPPORT: ReadonlyArray<readonly [number, number, number]> = [
   [0.236, 1.02, 0.1075], [0.402, 1.02, 0.1075],
   [0.46, 0.975, -0.1325], [0.46, 1.065, -0.1325], [-0.42, 0.985, -0.1275], [-0.42, 1.055, -0.1275],
 ];
+/** 11B-1 landShard() velocity in / out (written by the caller, scaled in place). */
+const _lv = new THREE.Vector3();
+/** 11B-1 prop query scratch (copies of the caller's vectors: hooks may reuse theirs mid-loop). */
+const _qDir = new THREE.Vector3();
+const _rS = new THREE.Vector3();
+const _rD = new THREE.Vector3();
+const _rHit = new THREE.Vector3();
+const _bDir = new THREE.Vector3();
+const _bN = new THREE.Vector3();
+const _bP = new THREE.Vector3();
+const _propHookPos = new THREE.Vector3();
+const _glassHit = new THREE.Vector3();
+/** Per-chunk style written by chunkStyle() (module scope, zero allocation). */
+const _chunk = { sx: 0, sy: 0, sz: 0, color: 0, glass: false, glow: 0, surface: 0 as number };
+/** InteriorPropsKit per-instance tint palette (linear RGB mirror of InteriorBuilder TINT_PALETTE) → sRGB hex. */
+const INTERIOR_TINT_HEX: readonly number[] = (
+  [
+    [0.42, 0.05, 0.05], [0.05, 0.05, 0.055], [0.05, 0.3, 0.32], [0.5, 0.32, 0.08],
+    [0.18, 0.22, 0.1], [0.12, 0.16, 0.3], [0.55, 0.52, 0.45], [0.28, 0.08, 0.22],
+  ] as const
+).map(([r, g, b]) => new THREE.Color().setRGB(r, g, b, THREE.LinearSRGBColorSpace).getHex());
+const LEAF_COLORS = [0x1f3a1c, 0x2a4a22, 0x173016] as const;
+const STEEL_COLORS = [0x6a6e74, 0x575c63, 0x7d8188] as const;
+const RUST_COLORS = [0x5a2a18, 0x6e3a20, 0x4a2416] as const;
+const ELEC_GLASS = [0x9fe8f4, 0x7fd4e6, 0xbff2ff] as const;
+const CERAMIC_COLORS = [0xd8d4cc, 0xc9c2b4, 0xe2ded6] as const;
+const F_SLIDE = 1;
+const F_SPARK = 2;
+const F_INTERIOR = 4;
+const HIT_CAP = 64;
 let _seed = 0x51ab3c7;
 function rand(): number {
   _seed = (Math.imul(_seed, 1664525) + 1013904223) >>> 0;
   return _seed / 4294967296;
+}
+/**
+ * Restores `orig[i]` into instance `slot` of `arr` only while that slot still holds the zero matrix (a slot rewritten
+ * by a newer district build is left alone). Returns true when restored.
+ */
+function restoreSlot(arr: Float32Array, slot: number, orig: Float32Array, i: number): boolean {
+  const o = slot * 16;
+  if (slot < 0 || o + 16 > arr.length) return false;
+  if (arr[o] !== 0 || arr[o + 5] !== 0 || arr[o + 10] !== 0 || arr[o + 12] !== 0 || arr[o + 13] !== 0 || arr[o + 14] !== 0) return false;
+  for (let k = 0; k < 16; k++) arr[o + k] = orig[i * 16 + k];
+  return true;
+}
+/** `hex` with its brightness jittered by ×(1 ± j) (sRGB hex out, zero allocation). */
+function shade(hex: number, j: number): number {
+  return _c.setHex(hex).multiplyScalar(1 - j + 2 * j * rand()).getHex();
+}
+/**
+ * Extra horizontal travel after the first floor contact of a NON-glass debris chunk, per unit of horizontal launch
+ * speed (s): DestructDebris keeps 62 % on each bounce (restitution 0.35, no bounce below 0.6 m/s) and then rolls
+ * out under exp(−5t) contact friction (∫ = v / 5). `vy` = launch vertical speed, `drop` = start height above floor.
+ */
+function skateFactor(vy: number, drop: number): number {
+  let v = Math.sqrt(vy * vy + 44 * Math.max(0, drop));
+  let h = 1;
+  let s = 0;
+  for (let k = 0; k < 4; k++) {
+    if (v <= 0.8) break;
+    h *= 0.62;
+    const vb = 0.35 * v;
+    if (vb < 0.6) break;
+    s += (h * 2 * vb) / 22;
+    v = vb;
+  }
+  return s + h / 5;
+}
+/** Writes the k-th chunk style of a debris profile into `_chunk` (size m, sRGB colour, glass / glow / surface). */
+function chunkStyle(profile: number, tint: number, k: number): void {
+  const r = rand();
+  _chunk.glass = false;
+  _chunk.glow = 0;
+  switch (PROFILE_NAMES[profile]) {
+    case 'FLAP': // flat damp corrugated cardboard flaps
+      _chunk.sx = 0.14 + rand() * 0.14;
+      _chunk.sy = 0.006 + rand() * 0.004;
+      _chunk.sz = 0.1 + rand() * 0.11;
+      _chunk.color = shade(k % 3 === 0 ? 0x4a3a2a : tint, 0.14);
+      _chunk.surface = DEBRIS_SURFACE.MATTE;
+      break;
+    case 'POT': // chunky terracotta (pot tint) + flat dark-green leaves
+      if (k % 5 < 3) {
+        _chunk.sx = 0.05 + rand() * 0.07;
+        _chunk.sy = 0.02 + rand() * 0.016;
+        _chunk.sz = 0.045 + rand() * 0.06;
+        _chunk.color = shade(tint, 0.12);
+      } else {
+        _chunk.sx = 0.06 + rand() * 0.07;
+        _chunk.sy = 0.004;
+        _chunk.sz = 0.035 + rand() * 0.05;
+        _chunk.color = LEAF_COLORS[k % 3];
+      }
+      _chunk.surface = DEBRIS_SURFACE.MATTE;
+      break;
+    case 'SHARD': // tinted moulded plastic shards (bins / crates / totes / cones / umbrella canopy)
+      _chunk.sx = 0.06 + rand() * 0.1;
+      _chunk.sy = 0.012 + rand() * 0.008;
+      _chunk.sz = 0.05 + rand() * 0.08;
+      _chunk.color = shade(tint, 0.12);
+      _chunk.surface = DEBRIS_SURFACE.PLASTIC;
+      break;
+    case 'BARS': // bent steel wire / tube bits (wire racks, stools) with some tinted seat / shelf pieces
+      if (k % 3 < 2) {
+        _chunk.sx = 0.14 + rand() * 0.18;
+        _chunk.sy = 0.014 + rand() * 0.008;
+        _chunk.sz = 0.02 + rand() * 0.016;
+        _chunk.color = STEEL_COLORS[k % 3];
+      } else {
+        _chunk.sx = 0.08 + rand() * 0.08;
+        _chunk.sy = 0.014 + rand() * 0.008;
+        _chunk.sz = 0.06 + rand() * 0.06;
+        _chunk.color = shade(tint, 0.1);
+      }
+      _chunk.surface = DEBRIS_SURFACE.METAL;
+      break;
+    case 'CANISTER': // bent tinted steel plates + bare steel
+      _chunk.sx = 0.08 + rand() * 0.1;
+      _chunk.sy = 0.01 + rand() * 0.008;
+      _chunk.sz = 0.06 + rand() * 0.08;
+      _chunk.color = k % 3 === 0 ? STEEL_COLORS[k % 3] : shade(tint, 0.12);
+      _chunk.surface = DEBRIS_SURFACE.METAL;
+      break;
+    case 'SPLINTER': // long thin wood splinters
+      _chunk.sx = 0.24 + rand() * 0.26;
+      _chunk.sy = 0.018 + rand() * 0.012;
+      _chunk.sz = 0.035 + rand() * 0.035;
+      _chunk.color = shade(tint, 0.16);
+      _chunk.surface = DEBRIS_SURFACE.MATTE;
+      break;
+    case 'SCRAP': // bent bin steel (tint) + glossy black bag scrap
+      if (k & 1) {
+        _chunk.sx = 0.09 + rand() * 0.09;
+        _chunk.sy = 0.03 + rand() * 0.03;
+        _chunk.sz = 0.07 + rand() * 0.08;
+        _chunk.color = shade(0x0c0d10, 0.2);
+        _chunk.surface = DEBRIS_SURFACE.PLASTIC;
+      } else {
+        _chunk.sx = 0.08 + rand() * 0.1;
+        _chunk.sy = 0.01 + rand() * 0.008;
+        _chunk.sz = 0.06 + rand() * 0.08;
+        _chunk.color = k % 4 === 0 ? STEEL_COLORS[k % 3] : shade(tint, 0.12);
+        _chunk.surface = DEBRIS_SURFACE.METAL;
+      }
+      break;
+    case 'RUST': // curved rusted drum plates (tint paint + rust)
+      _chunk.sx = 0.1 + rand() * 0.12;
+      _chunk.sy = 0.012 + rand() * 0.008;
+      _chunk.sz = 0.08 + rand() * 0.08;
+      _chunk.color = k % 2 === 0 ? RUST_COLORS[k % 3] : shade(tint, 0.14);
+      _chunk.surface = DEBRIS_SURFACE.METAL;
+      break;
+    case 'GLOW': // electronics: glass (cyan edge) / plastic housing / dark steel, glowing dissolve edges
+      _chunk.sx = 0.05 + rand() * 0.09;
+      _chunk.sy = 0.006 + rand() * 0.006;
+      _chunk.sz = 0.04 + rand() * 0.08;
+      if (k % 5 < 2) {
+        _chunk.glass = true;
+        _chunk.color = ELEC_GLASS[k % 3];
+      } else if (k % 5 < 4) {
+        _chunk.color = shade(tint, 0.12);
+        _chunk.surface = DEBRIS_SURFACE.PLASTIC;
+      } else {
+        _chunk.color = STEEL_COLORS[(k >> 1) % 3];
+        _chunk.surface = DEBRIS_SURFACE.METAL;
+      }
+      _chunk.glow = 0.6 + r * 0.6;
+      break;
+    case 'DISH': // ceramic crockery + glass bottle shards (+ tinted condiment plastic)
+      _chunk.sx = 0.035 + rand() * 0.05;
+      _chunk.sy = 0.008 + rand() * 0.008;
+      _chunk.sz = 0.03 + rand() * 0.045;
+      if (k % 4 === 3) {
+        _chunk.glass = true;
+        _chunk.color = GLASS_COLORS[k & 3];
+        _chunk.glow = 0.4 + r * 0.4;
+      } else {
+        _chunk.color = k % 4 === 2 ? shade(tint, 0.1) : CERAMIC_COLORS[k % 3];
+        _chunk.surface = k % 4 === 2 ? DEBRIS_SURFACE.PLASTIC : DEBRIS_SURFACE.MATTE;
+      }
+      break;
+    case 'FABRIC': // tinted fabric / plastic hangers + steel rail bits
+      if (k % 3 < 2) {
+        _chunk.sx = 0.1 + rand() * 0.12;
+        _chunk.sy = 0.005 + rand() * 0.004;
+        _chunk.sz = 0.07 + rand() * 0.1;
+        _chunk.color = shade(tint, 0.14);
+        _chunk.surface = DEBRIS_SURFACE.MATTE;
+      } else {
+        _chunk.sx = 0.12 + rand() * 0.14;
+        _chunk.sy = 0.012 + rand() * 0.006;
+        _chunk.sz = 0.016 + rand() * 0.01;
+        _chunk.color = STEEL_COLORS[k % 3];
+        _chunk.surface = DEBRIS_SURFACE.METAL;
+      }
+      _chunk.glow = 0.3 * r;
+      break;
+    default: // 'KITCHEN': stainless steel + ceramic + glass
+      _chunk.sx = 0.05 + rand() * 0.09;
+      _chunk.sy = 0.008 + rand() * 0.01;
+      _chunk.sz = 0.04 + rand() * 0.07;
+      if (k % 4 === 3) {
+        _chunk.glass = true;
+        _chunk.color = GLASS_COLORS[k & 3];
+      } else if (k % 4 === 2) {
+        _chunk.color = CERAMIC_COLORS[k % 3];
+        _chunk.surface = DEBRIS_SURFACE.MATTE;
+      } else {
+        _chunk.color = k % 3 === 0 ? shade(tint, 0.1) : STEEL_COLORS[k % 3];
+        _chunk.surface = DEBRIS_SURFACE.METAL;
+      }
+      _chunk.glow = 0.4 * r;
+      break;
+  }
+  if (_chunk.glass) _chunk.surface = DEBRIS_SURFACE.DEFAULT;
 }
 
 const S_CLOSED = 0;
@@ -347,6 +671,12 @@ export class DestructibleManager implements ProjectileBreakables {
   onDoorQuietOpen?: (door: number, pos: THREE.Vector3) => void;
   /** Glass shattered: lead plays SE + 26 m alert. `pos` is scratch (impact point). */
   onGlassShatter?: (pane: number, pos: THREE.Vector3) => void;
+  /**
+   * 11B-1 prop broken: `pos` = the PROP's world AABB centre (pooled scratch — copy, don't keep), `mat` = debris /
+   * audio material, `noiseRadius` = stealth distraction radius (m). The lead calls `enemies.onPlayerGunshot(pos,
+   * noiseRadius)` when `byPlayer` and `audio.propBreak(pos, mat)`.
+   */
+  onPropBreak?: (index: number, pos: THREE.Vector3, mat: PropBreakMaterial, noiseRadius: number, byPlayer: boolean) => void;
 
   private readonly effects: EffectsPool;
   private physics: PhysicsWorld | null = null;
@@ -378,6 +708,52 @@ export class DestructibleManager implements ProjectileBreakables {
   private readonly gBroken = new Uint8Array(GLASS_CAP);
   /** Doors currently animating (OPENING or BREACHED). */
   private animating = 0;
+  /** LOW quality: prop debris counts halved. */
+  private lite = false;
+
+  // ---- 11B-1 prop registry (SoA, PROP_CAP, allocated once) ----
+  private propN = 0;
+  private readonly pC = new Float32Array(PROP_CAP * 3);
+  private readonly pH = new Float32Array(PROP_CAP * 3);
+  private readonly pFloor = new Float32Array(PROP_CAP);
+  private readonly pHp = new Uint8Array(PROP_CAP);
+  private readonly pMaxHp = new Uint8Array(PROP_CAP);
+  private readonly pMat = new Uint8Array(PROP_CAP);
+  private readonly pNoise = new Float32Array(PROP_CAP);
+  private readonly pDebris = new Uint8Array(PROP_CAP);
+  private readonly pProfile = new Uint8Array(PROP_CAP);
+  private readonly pFlags = new Uint8Array(PROP_CAP);
+  private readonly pBroken = new Uint8Array(PROP_CAP);
+  private readonly pMesh = new Uint8Array(PROP_CAP);
+  private readonly pInst = new Int32Array(PROP_CAP);
+  private readonly pShadow = new Int32Array(PROP_CAP);
+  private readonly pTint = new Uint32Array(PROP_CAP);
+  private readonly pRec = new Int32Array(PROP_CAP);
+  /** Original instance / contact-shadow matrices (restored by resetProps). */
+  private readonly pOrigM = new Float32Array(PROP_CAP * 16);
+  private readonly pOrigS = new Float32Array(PROP_CAP * 16);
+  /** Registered meshes (pMesh indexes this list) and the PropContactShadows mesh. */
+  private propMeshes: THREE.InstancedMesh[] = [];
+  private propShadow: THREE.InstancedMesh | null = null;
+  /** Record index → entry index (−1 = not registered). Grow-only, rebuilt at setProps (level load). */
+  private streetMap = new Int32Array(0);
+  private interiorMap = new Int32Array(0);
+  private streetRecN = 0;
+  private interiorRecN = 0;
+  // ---- 8 m CSR grid (cellStart: nCells + 1 prefix sums, cellItems: entry ids) ----
+  private gMinX = 0;
+  private gMinZ = 0;
+  private gNx = 0;
+  private gNz = 0;
+  private cellStart = new Int32Array(1);
+  private readonly cellItems = new Int32Array(PROP_CAP);
+  private cellFill = new Int32Array(0);
+  /** Largest horizontal half extent of any entry (query expansion, no dedupe needed). */
+  private maxHalf = 0;
+  // ---- raycastProp hit scratch ----
+  private readonly hitI = new Int32Array(HIT_CAP);
+  private readonly hitT = new Float32Array(HIT_CAP);
+  private readonly hitDone = new Uint8Array(HIT_CAP);
 
   constructor(scene: THREE.Scene, effects: EffectsPool, inject: CityLightInjector) {
     this.effects = effects;
@@ -569,6 +945,8 @@ export class DestructibleManager implements ProjectileBreakables {
     this.lookup.clear();
     this.animating = 0;
     this.effects.debris.clear();
+    // 11B-1: a restarted district gets its props back (slots rewritten by a new district build are left alone).
+    this.resetProps();
     for (let i = 0; i < this.doorN; i++) {
       const d = doors[i];
       const c = colliders[d.colliderIndex];
@@ -612,11 +990,16 @@ export class DestructibleManager implements ProjectileBreakables {
     this.paneAttr.needsUpdate = true;
   }
 
-  /** LOW quality: the glass skips the per-fragment city-light loop and the rain streaks (STRAND_LITE). */
+  /**
+   * LOW quality: the glass skips the per-fragment city-light loop and the rain streaks (STRAND_LITE) and prop debris
+   * counts are halved. (11B fix: the old `lite !== 'STRAND_LITE' in defs` parsed as `(lite !== 'STRAND_LITE') in
+   * defs` → `'true' in defs`, always false, so STRAND_LITE was never toggled.)
+   */
   setQuality(preset: 'HIGH' | 'MEDIUM' | 'LOW'): void {
     const lite = preset === 'LOW';
+    this.lite = lite;
     const defs = (this.glassMat.defines ??= {}) as Record<string, string>;
-    if (lite !== 'STRAND_LITE' in defs) {
+    if (lite !== ('STRAND_LITE' in defs)) {
       if (lite) defs.STRAND_LITE = '';
       else delete defs.STRAND_LITE;
       this.glassMat.needsUpdate = true;
@@ -796,6 +1179,8 @@ export class DestructibleManager implements ProjectileBreakables {
     if (i < 0 || i >= this.glassN || this.gBroken[i]) return;
     const p = this.glass[i];
     this.gBroken[i] = 1;
+    // 11B: keep the impact point (crashThrough passes the `_sa` scratch, which landShard reuses per shard).
+    _glassHit.copy(hitPos);
     if (this.physics && p.colliderIndex >= 0) this.physics.setColliderActive(p.colliderIndex, false);
     this.glassMesh.setMatrixAt(i, _zeroMat);
     this.glassMesh.instanceMatrix.needsUpdate = true;
@@ -847,61 +1232,17 @@ export class DestructibleManager implements ProjectileBreakables {
       vx += ax * (ru * rk + lat);
       vz += az * (ru * rk + lat);
       vy += rv * rk + 0.4 + rand() * 2.2;
-      // 11A audit fix: every shard gets its own floor — one wall ray caps its horizontal flight (never through the
-      // room's back wall), one downward ray at its predicted landing spot (deck edge / street / towpath).
+      // 11A audit fix: every shard gets its own floor (wall-capped flight + two-pass landing probe, landShard()).
       const fy0 = back ? floorBack : floorFwd;
-      const tf = (vy + Math.sqrt(vy * vy + 44 * Math.max(0, py - fy0))) / 22;
-      const hsp = Math.sqrt(vx * vx + vz * vz);
-      let reach = hsp * tf;
-      if (this.physics && hsp > 0.05) {
-        _sa.set(px, py, pz);
-        _v.set(vx / hsp, 0, vz / hsp);
-        this.physics.raycast(_sa, _v, reach + 0.3, _ray, SLAB_PROBE_IGNORE);
-        if (_ray.hit && _ray.distance - 0.25 < reach) {
-          const k = Math.max(0, _ray.distance - 0.25) / Math.max(reach, 1e-3);
-          vx *= k;
-          vz *= k;
-          reach *= k;
-        }
-      }
-      let shardFloor = fy0;
-      if (this.physics) {
-        // Two passes: a shard dropping onto a higher surface (counter, rail, deck) lands sooner / shorter.
-        let f = fy0;
-        for (let pass = 0; pass < 2; pass++) {
-          const t2 = (vy + Math.sqrt(vy * vy + 44 * Math.max(0, py - f))) / 22;
-          const rr = Math.min(reach, hsp * t2);
-          const lx = hsp > 1e-3 ? px + (vx / hsp) * rr : px;
-          const lz = hsp > 1e-3 ? pz + (vz / hsp) * rr : pz;
-          _sb.set(lx, py + 0.3, lz);
-          this.physics.raycast(_sb, DOWN, 80, _ray, FLOOR_PROBE_IGNORE);
-          const nf = _ray.hit ? _ray.point.y : py - 60;
-          if (pass === 1 && nf < f - 0.2) {
-            // Short of the higher surface (counter / deck face): land on the lower floor at exactly this probed spot.
-            const t3 = (vy + Math.sqrt(vy * vy + 44 * Math.max(0, py - nf))) / 22;
-            const k = hsp > 1e-3 ? rr / Math.max(hsp * t3, 1e-3) : 1;
-            vx *= k;
-            vz *= k;
-            f = nf;
-            break;
-          }
-          f = nf;
-          if (pass === 1) {
-            // Range at this floor equals the probed spot.
-            const k = hsp > 1e-3 ? rr / Math.max(hsp * t2, 1e-3) : 1;
-            vx *= k;
-            vz *= k;
-          }
-        }
-        shardFloor = f;
-      }
+      _lv.set(vx, vy, vz);
+      const shardFloor = this.landShard(px, py, pz, fy0, false);
       debris.spawn(
         px,
         py,
         pz,
-        vx,
-        vy,
-        vz,
+        _lv.x,
+        _lv.y,
+        _lv.z,
         base * (0.6 + rand() * 0.9),
         0.008 + rand() * 0.008,
         base * (0.5 + rand() * 0.8),
@@ -911,7 +1252,7 @@ export class DestructibleManager implements ProjectileBreakables {
       );
     }
     if (this.onGlassShatter) {
-      _hookPos.copy(hitPos);
+      _hookPos.copy(_glassHit);
       this.onGlassShatter(i, _hookPos);
     }
   }
@@ -974,6 +1315,520 @@ export class DestructibleManager implements ProjectileBreakables {
   }
 
   // ===============================================================================================
+  // 11B-1 destructible props
+  // ===============================================================================================
+  /**
+   * Level-load registration (call after CityPropMeshes.commit() / InteriorPropsKit.end(), i.e. after the district
+   * build). Registers every street record whose propId is in DESTRUCTIBLE_PROP_IDS (dumpsters, benches, jersey
+   * barriers and wall fixtures are never registered: indestructible cover) and every interior record with
+   * `destructible === true`, snapshots their CURRENT instance / contact-shadow matrices and rebuilds the 8 m CSR grid.
+   * Before registering it first runs `resetProps()` on the previous registration, which only restores slots that
+   * still hold the zero matrix (same-district restart) — slots rewritten by a new district build are left untouched,
+   * so calling setProps on every spawn (new district or restart) is always safe. Allocates only here (grow-only
+   * maps / grid), never per frame. Records beyond PROP_CAP are ignored.
+   */
+  setProps(
+    street: readonly DestructiblePropRecord[],
+    interior: readonly InteriorPropRecord[],
+    kitMesh: (kit: KitId) => THREE.InstancedMesh,
+    shadowMesh: THREE.InstancedMesh | null,
+    interiorMesh: THREE.InstancedMesh | null,
+  ): void {
+    this.resetProps();
+    this.propMeshes = [];
+    this.propShadow = shadowMesh;
+    if (this.streetMap.length < street.length) this.streetMap = new Int32Array(street.length);
+    if (this.interiorMap.length < interior.length) this.interiorMap = new Int32Array(interior.length);
+    this.streetMap.fill(-1);
+    this.interiorMap.fill(-1);
+    this.streetRecN = street.length;
+    this.interiorRecN = interior.length;
+    let n = 0;
+    for (let r = 0; r < street.length && n < PROP_CAP; r++) {
+      const rec = street[r];
+      const spec = PROP_DESTRUCTION[rec.propId];
+      if (!spec || !DESTRUCTIBLE_PROP_IDS.has(rec.propId)) continue;
+      const mesh = kitMesh(rec.kitId);
+      if (!mesh || rec.instanceIndex < 0 || rec.instanceIndex >= mesh.count) continue;
+      this.addProp(n, spec, rec.worldPos, rec.halfExtents, rec.floorY, this.meshSlot(mesh), rec.instanceIndex, rec.shadowIndex, rec.tint, r, false);
+      this.streetMap[r] = n++;
+    }
+    if (interiorMesh) {
+      for (let r = 0; r < interior.length && n < PROP_CAP; r++) {
+        const rec = interior[r];
+        const spec = rec.destructible ? INTERIOR_PROP_DESTRUCTION[rec.variant] : null;
+        if (!spec || rec.instIndex < 0 || rec.instIndex >= interiorMesh.count) continue;
+        const t = rec.tint;
+        const tint = Number.isInteger(t) && t >= 0 && t < INTERIOR_TINT_HEX.length ? INTERIOR_TINT_HEX[t] : t;
+        this.addProp(n, spec, rec.worldPos, rec.halfExtents, rec.floorY, this.meshSlot(interiorMesh), rec.instIndex, -1, tint, r, true);
+        this.interiorMap[r] = n++;
+      }
+    }
+    this.propN = n;
+    this.buildPropGrid();
+  }
+
+  /**
+   * Restores every broken prop of the current registration (instance + contact-shadow matrix from the snapshot) and
+   * full HP. A slot is only rewritten while it still holds the zero matrix, so a district rebuilt in between is never
+   * corrupted. Also run by `setLevel()` (restart spawn). Zero allocation.
+   */
+  resetProps(): void {
+    for (let i = 0; i < this.propN; i++) {
+      this.pHp[i] = this.pMaxHp[i];
+      if (!this.pBroken[i]) continue;
+      this.pBroken[i] = 0;
+      const mesh = this.propMeshes[this.pMesh[i]];
+      if (mesh && restoreSlot(mesh.instanceMatrix.array as Float32Array, this.pInst[i], this.pOrigM, i)) mesh.instanceMatrix.needsUpdate = true;
+      const sh = this.pShadow[i];
+      if (sh >= 0 && this.propShadow && restoreSlot(this.propShadow.instanceMatrix.array as Float32Array, sh, this.pOrigS, i)) {
+        this.propShadow.instanceMatrix.needsUpdate = true;
+      }
+    }
+  }
+
+  /** Registered destructible props (street + interior). */
+  get propCount(): number {
+    return this.propN;
+  }
+  propBroken(i: number): boolean {
+    return this.pBroken[i] === 1;
+  }
+  propHp(i: number): number {
+    return i >= 0 && i < this.propN ? this.pHp[i] : 0;
+  }
+  propMaxHp(i: number): number {
+    return i >= 0 && i < this.propN ? this.pMaxHp[i] : 0;
+  }
+  propMaterial(i: number): PropBreakMaterial {
+    return MAT_NAMES[this.pMat[i]] ?? 'PLASTIC';
+  }
+  propNoiseRadius(i: number): number {
+    return this.pNoise[i];
+  }
+  propSlideBreakable(i: number): boolean {
+    return (this.pFlags[i] & F_SLIDE) !== 0;
+  }
+  propKind(i: number): PropKind {
+    return this.pFlags[i] & F_INTERIOR ? 'INTERIOR' : 'STREET';
+  }
+  /** Index into the street / interior record array this entry was registered from. */
+  propRecordIndex(i: number): number {
+    return this.pRec[i];
+  }
+  /** Registry entry of a record (−1 = not registered: indestructible / over capacity / out of range). */
+  propIndexOf(kind: PropKind, recordIndex: number): number {
+    if (kind === 'STREET') return recordIndex >= 0 && recordIndex < this.streetRecN ? this.streetMap[recordIndex] : -1;
+    return recordIndex >= 0 && recordIndex < this.interiorRecN ? this.interiorMap[recordIndex] : -1;
+  }
+  /** AABB centre / half extents of entry `i` → outs. */
+  propAabb(i: number, outCentre: THREE.Vector3, outHalf: THREE.Vector3): void {
+    const o = i * 3;
+    outCentre.set(this.pC[o], this.pC[o + 1], this.pC[o + 2]);
+    outHalf.set(this.pH[o], this.pH[o + 1], this.pH[o + 2]);
+  }
+
+  /**
+   * Grid query (tests / tools): every entry (intact only unless `includeBroken`) whose AABB footprint overlaps the
+   * XZ rectangle, via the CSR cells expanded by the largest half extent. Writes ids to `out` (up to its length) and
+   * returns the count. Equivalent to a brute-force scan over all entries. Zero allocation.
+   */
+  queryPropsXZ(x0: number, z0: number, x1: number, z1: number, out: Int32Array, includeBroken = false): number {
+    if (this.propN === 0 || this.gNx === 0) return 0;
+    const m = this.maxHalf;
+    const C = PROP_GRID_CELL_M;
+    const ix0 = Math.max(0, Math.floor((x0 - m - this.gMinX) / C));
+    const ix1 = Math.min(this.gNx - 1, Math.floor((x1 + m - this.gMinX) / C));
+    const iz0 = Math.max(0, Math.floor((z0 - m - this.gMinZ) / C));
+    const iz1 = Math.min(this.gNz - 1, Math.floor((z1 + m - this.gMinZ) / C));
+    let n = 0;
+    for (let iz = iz0; iz <= iz1; iz++) {
+      for (let ix = ix0; ix <= ix1; ix++) {
+        const c = iz * this.gNx + ix;
+        for (let k = this.cellStart[c], ke = this.cellStart[c + 1]; k < ke; k++) {
+          const e = this.cellItems[k];
+          if (!includeBroken && this.pBroken[e]) continue;
+          const o = e * 3;
+          if (this.pC[o] + this.pH[o] < x0 || this.pC[o] - this.pH[o] > x1 || this.pC[o + 2] + this.pH[o + 2] < z0 || this.pC[o + 2] - this.pH[o + 2] > z1) continue;
+          if (n < out.length) out[n] = e;
+          n++;
+        }
+      }
+    }
+    return n;
+  }
+
+  /**
+   * Breaks intact prop `i` in O(1): zero instance matrix (+ its PropContactShadows slot), material-matched debris
+   * burst along `dir` (every chunk wall-capped + floor-probed by landShard), BURST.SPARK for drums, then
+   * `onPropBreak` with the prop's AABB centre. `hitPos` (optional) only places the spark. Returns false when already
+   * broken / out of range. Zero allocation (the arguments are copied before any hook runs).
+   */
+  breakProp(i: number, hitPos: THREE.Vector3 | null, dir: THREE.Vector3, byPlayer = true): boolean {
+    if (i < 0 || i >= this.propN || this.pBroken[i]) return false;
+    this.pBroken[i] = 1;
+    this.pHp[i] = 0;
+    _bDir.copy(dir);
+    const o = i * 3;
+    const cx = this.pC[o], cy = this.pC[o + 1], cz = this.pC[o + 2];
+    const hx = this.pH[o], hy = this.pH[o + 1], hz = this.pH[o + 2];
+    if (hitPos) _bP.set(Math.max(cx - hx, Math.min(cx + hx, hitPos.x)), Math.max(cy - hy, Math.min(cy + hy, hitPos.y)), Math.max(cz - hz, Math.min(cz + hz, hitPos.z)));
+    else _bP.set(cx, cy, cz);
+    const mesh = this.propMeshes[this.pMesh[i]];
+    if (mesh) {
+      mesh.setMatrixAt(this.pInst[i], _zeroMat);
+      mesh.instanceMatrix.needsUpdate = true;
+    }
+    const sh = this.pShadow[i];
+    if (sh >= 0 && this.propShadow) {
+      this.propShadow.setMatrixAt(sh, _zeroMat);
+      this.propShadow.instanceMatrix.needsUpdate = true;
+    }
+    this.spawnPropDebris(i);
+    if (this.pFlags[i] & F_SPARK) {
+      const hl = Math.sqrt(_bDir.x * _bDir.x + _bDir.z * _bDir.z);
+      if (hl > 1e-4) _bN.set(-_bDir.x / hl, 0.6, -_bDir.z / hl).normalize();
+      else _bN.set(0, 1, 0);
+      this.effects.burst(_bP, _bN, BURST.SPARK);
+    }
+    if (this.onPropBreak) {
+      _propHookPos.set(cx, cy, cz);
+      this.onPropBreak(i, _propHookPos, MAT_NAMES[this.pMat[i]], this.pNoise[i], byPlayer);
+    }
+    return true;
+  }
+
+  /**
+   * Swept-projectile prop test (EffectsPool.updateProjectiles, per step; `len` clamped to the world hit distance).
+   * Light (1-HP) props hit before the nearest intact heavy (2-HP) prop break and the round passes through; the heavy
+   * prop takes 1 damage (sniper: lethal) — destroyed → the round passes on (lights beyond it in this segment break,
+   * a further heavy one is handled the same way); survived → the round STOPS there: returns that distance along the
+   * segment. Returns −1 when the round continues. No entry is hit twice per call. Zero allocation.
+   */
+  raycastProp(start: THREE.Vector3, dir: THREE.Vector3, len: number, damage: number, sniper: boolean, byPlayer = true): number {
+    if (this.propN === 0 || this.gNx === 0 || !(len > 0) || !(damage > 0)) return -1;
+    _rS.copy(start);
+    _rD.copy(dir);
+    const sx = _rS.x, sy = _rS.y, sz = _rS.z;
+    const dx = _rD.x, dy = _rD.y, dz = _rD.z;
+    const ex = sx + dx * len, ez = sz + dz * len;
+    const m = this.maxHalf;
+    const C = PROP_GRID_CELL_M;
+    const rx0 = Math.floor((Math.min(sx, ex) - m - this.gMinX) / C);
+    const rx1 = Math.floor((Math.max(sx, ex) + m - this.gMinX) / C);
+    const rz0 = Math.floor((Math.min(sz, ez) - m - this.gMinZ) / C);
+    const rz1 = Math.floor((Math.max(sz, ez) + m - this.gMinZ) / C);
+    if (rx1 < 0 || rz1 < 0 || rx0 >= this.gNx || rz0 >= this.gNz) return -1;
+    const ix0 = Math.max(0, rx0), ix1 = Math.min(this.gNx - 1, rx1);
+    const iz0 = Math.max(0, rz0), iz1 = Math.min(this.gNz - 1, rz1);
+    let nh = 0;
+    for (let iz = iz0; iz <= iz1; iz++) {
+      for (let ix = ix0; ix <= ix1; ix++) {
+        const c = iz * this.gNx + ix;
+        for (let k = this.cellStart[c], ke = this.cellStart[c + 1]; k < ke && nh < HIT_CAP; k++) {
+          const e = this.cellItems[k];
+          if (this.pBroken[e]) continue;
+          const t = this.slabT(e, sx, sy, sz, dx, dy, dz, len);
+          if (t < 0) continue;
+          this.hitI[nh] = e;
+          this.hitT[nh] = t;
+          this.hitDone[nh] = 0;
+          nh++;
+        }
+      }
+    }
+    if (nh === 0) return -1;
+    for (;;) {
+      let hT = Infinity;
+      let hk = -1;
+      for (let k = 0; k < nh; k++) {
+        if (this.hitDone[k] || this.pMaxHp[this.hitI[k]] < 2) continue;
+        if (this.hitT[k] < hT) {
+          hT = this.hitT[k];
+          hk = k;
+        }
+      }
+      for (let k = 0; k < nh; k++) {
+        if (this.hitDone[k] || this.pMaxHp[this.hitI[k]] >= 2 || this.hitT[k] > hT) continue;
+        this.hitDone[k] = 1;
+        const t = this.hitT[k];
+        _rHit.set(sx + dx * t, sy + dy * t, sz + dz * t);
+        this.breakProp(this.hitI[k], _rHit, _rD, byPlayer);
+      }
+      if (hk < 0) return -1;
+      this.hitDone[hk] = 1;
+      const e = this.hitI[hk];
+      if (this.pBroken[e]) continue;
+      const dmg = sniper ? this.pHp[e] : 1;
+      this.pHp[e] = Math.max(0, this.pHp[e] - dmg);
+      _rHit.set(sx + dx * hT, sy + dy * hT, sz + dz * hT);
+      if (this.pHp[e] === 0) {
+        this.breakProp(e, _rHit, _rD, byPlayer);
+        continue;
+      }
+      return hT;
+    }
+  }
+
+  /**
+   * Slide / hard-sprint break (call each fixed step with the feet position and velocity): active only when
+   * (sliding && horizontal speed ≥ 6.5) || speed ≥ 10.5. Breaks every intact slide-breakable prop (not DRUMS) whose
+   * AABB overlaps the player box (radius 0.38 + 0.12 reach, height 1.0 sliding / 1.8 otherwise) in the 3×3 cells
+   * around the player; debris flies along the velocity. NEVER touches the player velocity. Returns the number
+   * broken. Zero allocation.
+   */
+  checkPlayerSlideBreak(pos: THREE.Vector3, vel: THREE.Vector3, sliding: boolean): number {
+    if (this.propN === 0 || this.gNx === 0) return 0;
+    const s = Math.sqrt(vel.x * vel.x + vel.z * vel.z);
+    // 1 mm/s tolerance: a full 10.5 m/s run rebuilt from wish × RUN_SPEED can land at 10.4999… on some headings.
+    if (!((sliding && s >= PROP_SLIDE.SLIDE_SPEED - 1e-3) || s >= PROP_SLIDE.SPRINT_SPEED - 1e-3)) return 0;
+    const px = pos.x, py = pos.y, pz = pos.z;
+    _qDir.set(vel.x / s, 0, vel.z / s);
+    const R = PROP_SLIDE.RADIUS + PROP_SLIDE.REACH;
+    const H = sliding ? PROP_SLIDE.H_SLIDE : PROP_SLIDE.H_STAND;
+    const C = PROP_GRID_CELL_M;
+    const cx0 = Math.floor((px - this.gMinX) / C);
+    const cz0 = Math.floor((pz - this.gMinZ) / C);
+    let broken = 0;
+    for (let iz = Math.max(0, cz0 - 1); iz <= Math.min(this.gNz - 1, cz0 + 1); iz++) {
+      for (let ix = Math.max(0, cx0 - 1); ix <= Math.min(this.gNx - 1, cx0 + 1); ix++) {
+        const c = iz * this.gNx + ix;
+        for (let k = this.cellStart[c], ke = this.cellStart[c + 1]; k < ke; k++) {
+          const e = this.cellItems[k];
+          if (this.pBroken[e] || !(this.pFlags[e] & F_SLIDE)) continue;
+          const o = e * 3;
+          if (this.pC[o + 1] - this.pH[o + 1] > py + H || this.pC[o + 1] + this.pH[o + 1] < py) continue;
+          const qx = Math.max(this.pC[o] - this.pH[o], Math.min(this.pC[o] + this.pH[o], px)) - px;
+          const qz = Math.max(this.pC[o + 2] - this.pH[o + 2], Math.min(this.pC[o + 2] + this.pH[o + 2], pz)) - pz;
+          if (qx * qx + qz * qz > R * R) continue;
+          if (this.breakProp(e, null, _qDir, true)) broken++;
+        }
+      }
+    }
+    return broken;
+  }
+
+  /**
+   * Kick break (main calls it when a kick lands and no door was hit): breaks every intact prop (drums included —
+   * one kick is lethal for everything) whose AABB centre lies within `reach` horizontally in front of the feet
+   * (dot(fwd_xz, dir to centre) ≥ 0.35) and between feet − 0.2 and feet + 2.0 vertically, with a clear line from
+   * the knee (0.6 m) to the prop centre (walls / glass / doors block). `dryRun` only counts the candidates (main uses
+   * it to decide whether a kick starts). Returns the number broken / found. Zero allocation.
+   */
+  kickBreak(pos: THREE.Vector3, fwd: THREE.Vector3, reach: number = PROP_KICK.REACH, dryRun = false): number {
+    if (this.propN === 0 || this.gNx === 0) return 0;
+    const fl = Math.sqrt(fwd.x * fwd.x + fwd.z * fwd.z);
+    if (fl < 1e-6) return 0;
+    const fx = fwd.x / fl, fz = fwd.z / fl;
+    _qDir.set(fx, 0, fz);
+    const px = pos.x, py = pos.y, pz = pos.z;
+    const C = PROP_GRID_CELL_M;
+    const cx0 = Math.floor((px - this.gMinX) / C);
+    const cz0 = Math.floor((pz - this.gMinZ) / C);
+    const span = Math.ceil(reach / C);
+    let broken = 0;
+    for (let iz = Math.max(0, cz0 - span); iz <= Math.min(this.gNz - 1, cz0 + span); iz++) {
+      for (let ix = Math.max(0, cx0 - span); ix <= Math.min(this.gNx - 1, cx0 + span); ix++) {
+        const c = iz * this.gNx + ix;
+        for (let k = this.cellStart[c], ke = this.cellStart[c + 1]; k < ke; k++) {
+          const e = this.cellItems[k];
+          if (this.pBroken[e]) continue;
+          const o = e * 3;
+          const ty = this.pC[o + 1] - py;
+          if (ty < PROP_KICK.Y0 || ty > PROP_KICK.Y1) continue;
+          const tx = this.pC[o] - px;
+          const tz = this.pC[o + 2] - pz;
+          const d2 = tx * tx + tz * tz;
+          if (d2 > reach * reach) continue;
+          const d = Math.sqrt(d2);
+          if (d > 1e-3 && (tx * fx + tz * fz) / d < PROP_KICK.MIN_DOT) continue;
+          // 11B audit fix: the boot only reaches what it can touch — no kicks through walls, panes or doors.
+          if (this.physics) {
+            _sa.set(px, py + PROP_KICK_KNEE_M, pz);
+            _v.set(this.pC[o] - px, this.pC[o + 1] - _sa.y, this.pC[o + 2] - pz);
+            const l = _v.length();
+            if (l > 1e-3) {
+              _v.divideScalar(l);
+              this.physics.raycast(_sa, _v, l, _wallRay, KICK_LOS_IGNORE);
+              if (_wallRay.hit) continue;
+            }
+          }
+          if (dryRun) broken++;
+          else if (this.breakProp(e, null, _qDir, true)) broken++;
+        }
+      }
+    }
+    return broken;
+  }
+
+  /** Registers / finds `mesh` in the prop mesh list (level load only). */
+  private meshSlot(mesh: THREE.InstancedMesh): number {
+    let k = this.propMeshes.indexOf(mesh);
+    if (k < 0) {
+      k = this.propMeshes.length;
+      this.propMeshes.push(mesh);
+    }
+    return k;
+  }
+
+  /** Fills registry slot `n` and snapshots its instance / shadow matrices (level load only). */
+  private addProp(
+    n: number,
+    spec: PropDestructionSpec,
+    c: THREE.Vector3,
+    h: THREE.Vector3,
+    floorY: number,
+    meshSlot: number,
+    inst: number,
+    shadow: number,
+    tint: number,
+    rec: number,
+    interior: boolean,
+  ): void {
+    const o = n * 3;
+    this.pC[o] = c.x;
+    this.pC[o + 1] = c.y;
+    this.pC[o + 2] = c.z;
+    this.pH[o] = Math.abs(h.x);
+    this.pH[o + 1] = Math.abs(h.y);
+    this.pH[o + 2] = Math.abs(h.z);
+    this.pFloor[n] = floorY;
+    this.pHp[n] = spec.hp;
+    this.pMaxHp[n] = spec.hp;
+    this.pMat[n] = Math.max(0, MAT_NAMES.indexOf(spec.mat));
+    this.pNoise[n] = spec.noise;
+    this.pDebris[n] = spec.debris;
+    this.pProfile[n] = Math.max(0, PROFILE_NAMES.indexOf(spec.profile));
+    this.pFlags[n] = (spec.slide ? F_SLIDE : 0) | (spec.spark ? F_SPARK : 0) | (interior ? F_INTERIOR : 0);
+    this.pBroken[n] = 0;
+    this.pMesh[n] = meshSlot;
+    this.pInst[n] = inst;
+    this.pTint[n] = tint >>> 0;
+    this.pRec[n] = rec;
+    const src = this.propMeshes[meshSlot].instanceMatrix.array;
+    for (let k = 0; k < 16; k++) this.pOrigM[n * 16 + k] = src[inst * 16 + k];
+    const sm = this.propShadow;
+    if (shadow >= 0 && sm && shadow < sm.count) {
+      this.pShadow[n] = shadow;
+      const ss = sm.instanceMatrix.array;
+      for (let k = 0; k < 16; k++) this.pOrigS[n * 16 + k] = ss[shadow * 16 + k];
+    } else this.pShadow[n] = -1;
+  }
+
+  /** Count → prefix-sum → fill CSR build of the 8 m grid (level load only; grow-only buffers). */
+  private buildPropGrid(): void {
+    const n = this.propN;
+    this.maxHalf = 0;
+    if (n === 0) {
+      this.gNx = this.gNz = 0;
+      return;
+    }
+    let minX = Infinity, minZ = Infinity, maxX = -Infinity, maxZ = -Infinity;
+    for (let i = 0; i < n; i++) {
+      const o = i * 3;
+      minX = Math.min(minX, this.pC[o]);
+      maxX = Math.max(maxX, this.pC[o]);
+      minZ = Math.min(minZ, this.pC[o + 2]);
+      maxZ = Math.max(maxZ, this.pC[o + 2]);
+      this.maxHalf = Math.max(this.maxHalf, this.pH[o], this.pH[o + 2]);
+    }
+    const C = PROP_GRID_CELL_M;
+    const cx0 = Math.floor(minX / C) - 1, cx1 = Math.floor(maxX / C) + 1;
+    const cz0 = Math.floor(minZ / C) - 1, cz1 = Math.floor(maxZ / C) + 1;
+    this.gMinX = cx0 * C;
+    this.gMinZ = cz0 * C;
+    this.gNx = cx1 - cx0 + 1;
+    this.gNz = cz1 - cz0 + 1;
+    const cells = this.gNx * this.gNz;
+    if (this.cellStart.length < cells + 1) this.cellStart = new Int32Array(cells + 1);
+    if (this.cellFill.length < cells) this.cellFill = new Int32Array(cells);
+    this.cellStart.fill(0, 0, cells + 1);
+    for (let i = 0; i < n; i++) this.cellStart[this.cellOf(i) + 1]++;
+    for (let c = 1; c <= cells; c++) this.cellStart[c] += this.cellStart[c - 1];
+    for (let c = 0; c < cells; c++) this.cellFill[c] = this.cellStart[c];
+    for (let i = 0; i < n; i++) this.cellItems[this.cellFill[this.cellOf(i)]++] = i;
+  }
+
+  private cellOf(i: number): number {
+    const C = PROP_GRID_CELL_M;
+    const ix = Math.min(this.gNx - 1, Math.max(0, Math.floor((this.pC[i * 3] - this.gMinX) / C)));
+    const iz = Math.min(this.gNz - 1, Math.max(0, Math.floor((this.pC[i * 3 + 2] - this.gMinZ) / C)));
+    return iz * this.gNx + ix;
+  }
+
+  /** Segment (unit dir, [0, len]) vs entry AABB slab test: entry distance (0 when starting inside) or −1. */
+  private slabT(e: number, sx: number, sy: number, sz: number, dx: number, dy: number, dz: number, len: number): number {
+    const o = e * 3;
+    let t0 = 0;
+    let t1 = len;
+    for (let a = 0; a < 3; a++) {
+      const s = a === 0 ? sx : a === 1 ? sy : sz;
+      const d = a === 0 ? dx : a === 1 ? dy : dz;
+      const lo = this.pC[o + a] - this.pH[o + a];
+      const hi = this.pC[o + a] + this.pH[o + a];
+      if (Math.abs(d) < 1e-9) {
+        if (s < lo || s > hi) return -1;
+        continue;
+      }
+      let ta = (lo - s) / d;
+      let tb = (hi - s) / d;
+      if (ta > tb) {
+        const tt = ta;
+        ta = tb;
+        tb = tt;
+      }
+      if (ta > t0) t0 = ta;
+      if (tb < t1) t1 = tb;
+      if (t0 > t1) return -1;
+    }
+    return t0;
+  }
+
+  /** Material-matched debris burst of entry `i` along `_bDir` (each chunk landed by landShard). */
+  private spawnPropDebris(i: number): void {
+    const o = i * 3;
+    const cx = this.pC[o], cy = this.pC[o + 1], cz = this.pC[o + 2];
+    const hx = this.pH[o], hy = this.pH[o + 1], hz = this.pH[o + 2];
+    const fl = this.pFloor[i];
+    const interior = (this.pFlags[i] & F_INTERIOR) !== 0;
+    const lo = interior ? PROP_DEBRIS_SPEED.INTERIOR_MIN : PROP_DEBRIS_SPEED.STREET_MIN;
+    const hi = interior ? PROP_DEBRIS_SPEED.INTERIOR_MAX : PROP_DEBRIS_SPEED.STREET_MAX;
+    const dl = _bDir.length();
+    const hl = Math.sqrt(_bDir.x * _bDir.x + _bDir.z * _bDir.z);
+    // Steep / zero directions (shot from straight above): radial burst.
+    const radial = dl < 1e-6 || hl < 0.2 * dl;
+    const fx = radial ? 0 : _bDir.x / hl;
+    const fz = radial ? 0 : _bDir.z / hl;
+    const cnt = this.pDebris[i];
+    const n = this.lite ? Math.max(1, Math.ceil(cnt / 2)) : cnt;
+    const profile = this.pProfile[i];
+    const tint = this.pTint[i];
+    const debris = this.effects.debris;
+    for (let k = 0; k < n; k++) {
+      const px = cx + (rand() * 2 - 1) * hx * 0.8;
+      const py = Math.max(fl + 0.03, cy + (rand() * 2 - 1) * hy * 0.8);
+      const pz = cz + (rand() * 2 - 1) * hz * 0.8;
+      let dx = fx;
+      let dz = fz;
+      if (radial) {
+        const a = rand() * Math.PI * 2;
+        dx = Math.cos(a);
+        dz = Math.sin(a);
+      }
+      const sp = lo + rand() * (hi - lo);
+      // Cone spread (±~24°) + a little outward push from the prop centre + upward kick.
+      const lat = (rand() - 0.5) * sp * 0.9;
+      const vx = dx * sp - dz * lat + (px - cx) * 1.2;
+      const vz = dz * sp + dx * lat + (pz - cz) * 1.2;
+      const vy = interior ? 0.5 + rand() * 1.8 : 1.0 + rand() * 3.0;
+      _lv.set(vx, vy, vz);
+      const floor = this.landShard(px, py, pz, fl, true, PROP_WALL_IGNORE);
+      chunkStyle(profile, tint, k);
+      debris.spawn(px, py, pz, _lv.x, _lv.y, _lv.z, _chunk.sx, _chunk.sy, _chunk.sz, _chunk.color, _chunk.glass, floor, -1, _chunk.glow, _chunk.surface);
+    }
+  }
+
+  // ===============================================================================================
   // Per-frame
   // ===============================================================================================
   /** Animates quiet-open swings and breached slabs (simDt, Bullet-Time compatible). Zero allocation. */
@@ -1025,6 +1880,88 @@ export class DestructibleManager implements ProjectileBreakables {
     _sb.set(p.x + Math.sin(p.yaw) * off, p.y + 0.35, p.z + Math.cos(p.yaw) * off);
     this.physics.raycast(_sb, DOWN, 60, _ray, FLOOR_PROBE_IGNORE);
     return _ray.hit ? _ray.point.y : p.y - 60;
+  }
+
+  /**
+   * 11A audit fix, shared by glass shards and (11B-1) prop debris: one wall ray caps a chunk's horizontal flight
+   * (never through a wall), then a two-pass downward probe at its predicted landing spot picks the real surface it
+   * lands on (deck edge / counter / street / towpath). Velocity in / out via `_lv` (vx / vz scaled in place, vy
+   * untouched); returns the chunk's floor height. Glass passes `skate = false` + SLAB_PROBE_IGNORE (bit-identical to
+   * the 11A code: glass chunks bite on impact). Non-glass chunks (`skate = true`) keep 62 % per bounce and roll out,
+   * so their wall cap covers the post-landing skate (skateFactor) too, and one more probe at the predicted rest spot
+   * pulls them back onto the landing surface if the skate would carry them off a ledge / into a raised face.
+   */
+  private landShard(px: number, py: number, pz: number, fy0: number, skate: boolean, wallIgnore: ReadonlySet<ColliderKind> = SLAB_PROBE_IGNORE): number {
+    let vx = _lv.x;
+    const vy = _lv.y;
+    let vz = _lv.z;
+    const tf = (vy + Math.sqrt(vy * vy + 44 * Math.max(0, py - fy0))) / 22;
+    const hsp = Math.sqrt(vx * vx + vz * vz);
+    let reach = hsp * tf;
+    if (this.physics && hsp > 0.05) {
+      const total = skate ? reach + hsp * skateFactor(vy, py - fy0) : reach;
+      _sa.set(px, py, pz);
+      _v.set(vx / hsp, 0, vz / hsp);
+      this.physics.raycast(_sa, _v, total + 0.3, _ray, wallIgnore);
+      if (_ray.hit && _ray.distance - 0.25 < total) {
+        const k = Math.max(0, _ray.distance - 0.25) / Math.max(total, 1e-3);
+        vx *= k;
+        vz *= k;
+        reach *= k;
+      }
+    }
+    let shardFloor = fy0;
+    if (this.physics) {
+      // Two passes: a shard dropping onto a higher surface (counter, rail, deck) lands sooner / shorter.
+      let f = fy0;
+      for (let pass = 0; pass < 2; pass++) {
+        const t2 = (vy + Math.sqrt(vy * vy + 44 * Math.max(0, py - f))) / 22;
+        const rr = Math.min(reach, hsp * t2);
+        const lx = hsp > 1e-3 ? px + (vx / hsp) * rr : px;
+        const lz = hsp > 1e-3 ? pz + (vz / hsp) * rr : pz;
+        _sb.set(lx, py + 0.3, lz);
+        this.physics.raycast(_sb, DOWN, 80, _ray, skate ? PROP_FLOOR_IGNORE : FLOOR_PROBE_IGNORE);
+        // 11B audit fix: a prop chunk whose probe misses (past the ground collider) keeps the last known floor.
+        const nf = _ray.hit ? _ray.point.y : skate ? f : py - 60;
+        if (pass === 1 && nf < f - 0.2) {
+          // Short of the higher surface (counter / deck face): land on the lower floor at exactly this probed spot.
+          const t3 = (vy + Math.sqrt(vy * vy + 44 * Math.max(0, py - nf))) / 22;
+          const k = hsp > 1e-3 ? rr / Math.max(hsp * t3, 1e-3) : 1;
+          vx *= k;
+          vz *= k;
+          f = nf;
+          break;
+        }
+        f = nf;
+        if (pass === 1) {
+          // Range at this floor equals the probed spot.
+          const k = hsp > 1e-3 ? rr / Math.max(hsp * t2, 1e-3) : 1;
+          vx *= k;
+          vz *= k;
+        }
+      }
+      shardFloor = f;
+      if (skate) {
+        // Rest spot after bounces + roll-out: same surface (±0.12 m) or the skate is folded back into the flight.
+        const hs2 = Math.sqrt(vx * vx + vz * vz);
+        if (hs2 > 0.05) {
+          const t2 = (vy + Math.sqrt(vy * vy + 44 * Math.max(0, py - f))) / 22;
+          const s2 = skateFactor(vy, py - f);
+          const rest = hs2 * (t2 + s2);
+          _sb.set(px + (vx / hs2) * rest, Math.max(py, f + 0.05) + 0.3, pz + (vz / hs2) * rest);
+          this.physics.raycast(_sb, DOWN, 80, _ray, PROP_FLOOR_IGNORE);
+          const rf = _ray.hit ? _ray.point.y : f - 60;
+          if (Math.abs(rf - f) > 0.12) {
+            const k = t2 / Math.max(t2 + s2, 1e-3);
+            vx *= k;
+            vz *= k;
+          }
+        }
+      }
+    }
+    _lv.x = vx;
+    _lv.z = vz;
+    return shardFloor;
   }
 
   /**

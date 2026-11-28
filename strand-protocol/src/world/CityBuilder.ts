@@ -96,7 +96,7 @@ import {
   type KitId,
   type PropInstance,
 } from './CityProps';
-import { CityPropMeshes, type ContactShadowDesc } from './CityPropMeshes';
+import { CityPropMeshes, type ContactShadowDesc, type DestructiblePropRecord } from './CityPropMeshes';
 import { AnimatedEnvKit, ENV_CAP, ENV_DIMS, ENV_VARIANT, ElevatedTraffic, buildTrafficLanes, inTrafficLane, type CityLightInjector, type EnvInstance, type TrafficLane } from './CityAtmosphere';
 import { doorSafeOpenRad, type DoorSpec, type GlassSpec } from '../entities/DestructibleManager';
 import {
@@ -317,6 +317,8 @@ export interface SectorLayout {
   readonly interiors: readonly InteriorVolume[];
   /** 11A-1c InteriorPropsKit placements (11B destructible registry). */
   readonly interiorProps: readonly InteriorPropRecord[];
+  /** 11B-1 destructible street / alley prop records (CityPropMeshes.commit; cover + wall fixtures excluded). */
+  readonly destructibleProps: readonly DestructiblePropRecord[];
   /** 11A-2 kickable breach doors (DestructibleManager.setLevel). */
   readonly breachDoors: readonly DoorSpec[];
   /** 11A-3 destructible glass panes. */
@@ -1315,8 +1317,8 @@ export class CityBuilder {
   private readonly furnishings: THREE.InstancedMesh;
   /** 10A-1 consolidated guardrails (v0) + roof fences (v1) + antennas (v2) — 1 draw call (−2 calls). */
   private readonly steelFixtures: THREE.InstancedMesh;
-  private readonly acUnits: THREE.InstancedMesh;
-  private readonly ducts: THREE.InstancedMesh;
+  /** 11B-3 RoofMechKit: rooftop / balcony AC units (aInstVar 0) + exhaust ducts (aInstVar 1) in ONE draw call. */
+  private readonly roofMech: THREE.InstancedMesh;
   private readonly machineRooms: THREE.InstancedMesh;
   private readonly aviation: THREE.InstancedMesh;
   private readonly neonSigns: THREE.InstancedMesh;
@@ -1341,7 +1343,8 @@ export class CityBuilder {
   private readonly steam: THREE.InstancedMesh;
   private readonly gatePillar: THREE.Mesh;
   /** Phase 9B / 10A socket kits, clutter batches, graffiti decals and prop contact shadows (10 persistent draws). */
-  private readonly propMeshes: CityPropMeshes;
+  /** 9B / 10A prop kits (11B: DestructibleManager hides broken instances + their contact shadows). */
+  readonly propMeshes: CityPropMeshes;
 
   private layout: SectorLayout | null = null;
   /** Tower records of the current sector (facade probe). */
@@ -1413,8 +1416,7 @@ export class CityBuilder {
     steelFixGeo.setAttribute('aInstVar', new THREE.InstancedBufferAttribute(new Float32Array(CAP.STEEL_FIXTURES), 1));
     this.steelFixtures = this.makeInstanced(steelFixGeo, this.createSteelMaterial(true), CAP.STEEL_FIXTURES, 'SteelFixturesInstanced');
     this.steelFixtures.receiveShadow = true;
-    this.acUnits = this.makeInstanced(this.createAcGeometry(), machinery, CAP.AC, 'ACUnits');
-    this.ducts = this.makeInstanced(this.createDuctGeometry(), new THREE.MeshStandardMaterial({ color: 0x4a525e, roughness: 0.3, metalness: 0.9 }), CAP.DUCT, 'Ducts');
+    this.roofMech = this.createRoofMechKit(machinery);
     this.machineRooms = this.makeInstanced(this.createMachineRoomGeometry(), new THREE.MeshStandardMaterial({ color: 0x232934, roughness: 0.5, metalness: 0.55 }), CAP.MACHINE_ROOM, 'MachineRooms');
     this.aviation = this.createAviationLights();
     this.neonSigns = this.createNeonSigns();
@@ -1437,7 +1439,7 @@ export class CityBuilder {
       tex.archDetail,
     );
     this.persistent.add(
-      ...this.cars, this.lamps, this.vending, this.furnishings, this.steelFixtures, this.acUnits, this.ducts,
+      ...this.cars, this.lamps, this.vending, this.furnishings, this.steelFixtures, this.roofMech,
       this.machineRooms, this.aviation, this.neonSigns, this.megaBillboards, this.searchlights, this.beacons, this.halos, this.lampHalos, this.steam, this.gatePillar,
       this.lampCones, this.signals, this.carPools, this.blimpHull, this.blimpBanner, this.manholes,
       ...this.propMeshes.meshes,
@@ -2597,6 +2599,41 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
     ].map(stripUv));
   }
 
+  /**
+   * 11B-3 RoofMechKit (-1 draw call): the AC-unit and exhaust-duct geometries merged into one InstancedMesh. Per-vertex
+   * `aPart` (0 = AC unit, 1 = duct) vs per-instance `aInstVar` collapses the other part to the origin; AC units keep
+   * the `machinery` PBR maps (albedo / roughness / normal, metalness 0.55), ducts keep their former untextured
+   * 0x4a525e steel (roughness 0.30, metalness 0.90, no normal map). Ducts still scale along local X (length).
+   */
+  private createRoofMechKit(machinery: THREE.MeshStandardMaterial): THREE.InstancedMesh {
+    const tag = (g: THREE.BufferGeometry, part: number): THREE.BufferGeometry => {
+      const n = g.getAttribute('position').count;
+      g.setAttribute('aPart', new THREE.Float32BufferAttribute(new Float32Array(n).fill(part), 1));
+      return g;
+    };
+    const geo = mergeOrEmpty([tag(this.createAcGeometry(), 0), tag(this.createDuctGeometry(), 1)]);
+    geo.setAttribute('aInstVar', new THREE.InstancedBufferAttribute(new Float32Array(CAP.AC + CAP.DUCT), 1));
+    const mat = machinery;
+    const duct = new THREE.Color(0x4a525e);
+    const dv = `vec3(${duct.r.toFixed(5)}, ${duct.g.toFixed(5)}, ${duct.b.toFixed(5)})`;
+    mat.onBeforeCompile = (shader) => {
+      shader.vertexShader = shader.vertexShader
+        .replace('#include <common>', '#include <common>\nattribute float aPart;\nattribute float aInstVar;\nvarying float vMechDuct;')
+        .replace(
+          '#include <begin_vertex>',
+          '#include <begin_vertex>\nvMechDuct = aInstVar;\nif (abs(aPart - aInstVar) > 0.5) transformed = vec3(0.0);',
+        );
+      shader.fragmentShader = shader.fragmentShader
+        .replace('#include <common>', '#include <common>\nvarying float vMechDuct;')
+        .replace('#include <map_fragment>', `#include <map_fragment>\nif (vMechDuct > 0.5) diffuseColor.rgb = ${dv};`)
+        .replace('#include <roughnessmap_fragment>', '#include <roughnessmap_fragment>\nif (vMechDuct > 0.5) roughnessFactor = 0.30;')
+        .replace('#include <metalnessmap_fragment>', '#include <metalnessmap_fragment>\nif (vMechDuct > 0.5) metalnessFactor = 0.90;')
+        .replace('#include <normal_fragment_maps>', 'if (vMechDuct < 0.5) {\n#include <normal_fragment_maps>\n}');
+    };
+    mat.customProgramCacheKey = () => 'strand-roofmech-v1';
+    return this.makeInstanced(geo, mat, CAP.AC + CAP.DUCT, 'RoofMechKit');
+  }
+
   private createAcGeometry(): THREE.BufferGeometry {
     const body = new THREE.BoxGeometry(2.2, 1.3, 1.2);
     body.translate(0, 0.65 + 0.12, 0);
@@ -3547,7 +3584,7 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
     };
 
     // Instance counters & attributes
-    const counts = { ac: 0, duct: 0, fence: 0, ant: 0, room: 0, avi: 0, neon: 0, search: 0, beacon: 0, lamp: 0, vend: 0, kit: 0, rail: 0, steelFix: 0, mega: 0 };
+    const counts = { ac: 0, duct: 0, mech: 0, fence: 0, ant: 0, room: 0, avi: 0, neon: 0, search: 0, beacon: 0, lamp: 0, vend: 0, kit: 0, rail: 0, steelFix: 0, mega: 0 };
     // 10B-2 sign registry: padded world AABBs of every neon sign + Mega-Billboard (strict non-overlap guard).
     const signBoxes: Array<{ x0: number; y0: number; z0: number; x1: number; y1: number; z1: number; group: number }> = [];
     let signRejects = 0;
@@ -3588,6 +3625,7 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
     const neonStrip = this.neonSigns.geometry.getAttribute('aStrip') as THREE.InstancedBufferAttribute;
     const neonFormat = this.neonSigns.geometry.getAttribute('aFormat') as THREE.InstancedBufferAttribute;
     const steelFixVar = this.steelFixtures.geometry.getAttribute('aInstVar') as THREE.InstancedBufferAttribute;
+    const mechVar = this.roofMech.geometry.getAttribute('aInstVar') as THREE.InstancedBufferAttribute;
     const steamAttr = this.steam.geometry.getAttribute('aSteam') as THREE.InstancedBufferAttribute;
     const srng = createRng(0x51e7 + sector.index * 31 + loop * 977);
     const searchBase = this.searchlights.geometry.getAttribute('aBase') as THREE.InstancedBufferAttribute;
@@ -3773,6 +3811,11 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
       _scl.set(sx, sy, sz);
       _m4.compose(_pos, _quat, _scl);
       mesh.setMatrixAt(idx, _m4);
+    };
+    /** 11B-3 RoofMechKit instance: part 0 = AC unit (machinery PBR), 1 = exhaust duct (sx = length along local X). */
+    const placeMech = (part: 0 | 1, x: number, y: number, z: number, yaw: number, sx = 1, sy = 1, sz = 1): void => {
+      placeInstance(this.roofMech, counts.mech, x, y, z, yaw, sx, sy, sz);
+      mechVar.setX(counts.mech++, part);
     };
     /** 10C-3 StreetFurnishingsKit instance (variant 0 lantern string spanning `sx` × 4.2 m · 1 parasol, tint 0 / 1). */
     const addKit = (variant: number, x: number, y: number, z: number, yaw: number, sx = 1, tint = 0): boolean => {
@@ -5626,7 +5669,8 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
       }
       if (arng() < B.AC_CHANCE && counts.ac < CAP.AC) {
         const p = f.P3(a1 - 0.8, y, 0.42);
-        placeInstance(this.acUnits, counts.ac++, p.x, p.y, p.z, ax === 'x' ? Math.PI / 2 : 0, 0.5, 0.5, 0.5);
+        counts.ac++;
+        placeMech(0, p.x, p.y, p.z, ax === 'x' ? Math.PI / 2 : 0, 0.5, 0.5, 0.5);
       }
       if (arng() < B.LAMP_CHANCE) {
         const p = f.P3(along, y + 2.3, 0.05);
@@ -6977,7 +7021,8 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
         const rot = rng() < 0.5 ? 0 : Math.PI / 2;
         const r = tryPlace(b, rot === 0 ? 1.1 : 0.6, rot === 0 ? 0.6 : 1.1, 1.3);
         if (!r) continue;
-        placeInstance(this.acUnits, counts.ac++, (r.x0 + r.x1) / 2, b.roofY, (r.z0 + r.z1) / 2, rot);
+        counts.ac++;
+        placeMech(0, (r.x0 + r.x1) / 2, b.roofY, (r.z0 + r.z1) / 2, rot);
         colliders.push({ min: new THREE.Vector3(r.x0, b.roofY, r.z0), max: new THREE.Vector3(r.x1, b.roofY + 1.42, r.z1), kind: 'PROP', building: b.index });
       }
       // Exhaust duct.
@@ -6986,7 +7031,8 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
         const alongX = rng() < 0.5;
         const r = tryPlace(b, alongX ? len / 2 : 0.5, alongX ? 0.5 : len / 2, 1.4);
         if (r) {
-          placeInstance(this.ducts, counts.duct++, (r.x0 + r.x1) / 2, b.roofY, (r.z0 + r.z1) / 2, alongX ? 0 : Math.PI / 2, len, 1, 1);
+          counts.duct++;
+          placeMech(1, (r.x0 + r.x1) / 2, b.roofY, (r.z0 + r.z1) / 2, alongX ? 0 : Math.PI / 2, len, 1, 1);
           colliders.push({ min: new THREE.Vector3(r.x0, b.roofY, r.z0), max: new THREE.Vector3(r.x1, b.roofY + 1.5, r.z1), kind: 'PROP', building: b.index });
         }
       }
@@ -8555,8 +8601,8 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
     kitAttr.needsUpdate = true;
     commit(this.steelFixtures, counts.steelFix);
     steelFixVar.needsUpdate = true;
-    commit(this.acUnits, counts.ac);
-    commit(this.ducts, counts.duct);
+    commit(this.roofMech, counts.mech);
+    mechVar.needsUpdate = true;
     commit(this.machineRooms, counts.room);
     commit(this.aviation, counts.avi, false);
     aviPhase.needsUpdate = true;
@@ -8593,6 +8639,7 @@ vec2 strandSteelTriUv(vec3 p, vec3 n) {
       trafficLanes,
       interiors,
       interiorProps,
+      destructibleProps: kitStats.destructibles,
       breachDoors,
       glassPanes,
       skyNotches,

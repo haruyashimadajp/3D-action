@@ -73,7 +73,7 @@ import { EnemyManager, RICOCHET_TAG, type HitMarkerKind, type KillInfo, type Rad
 import { PlayerController } from './player/PlayerController';
 import { EquipmentManager } from './player/EquipmentManager';
 import { BOOT_KICK, ViewModelRenderer } from './player/ViewModelRenderer';
-import { DestructibleManager } from './entities/DestructibleManager';
+import { DestructibleManager, PROP_KICK } from './entities/DestructibleManager';
 import { HUD_MAX_AWARE, HUD_MAX_RADAR, HUD_MAX_TRACKS, HUD_MAX_WARNINGS, HudManager, SaveStore, formatTime, type HudFrame } from './ui/HudManager';
 
 // ---------------------------------------------------------------------------
@@ -305,6 +305,8 @@ const DOWN = new THREE.Vector3(0, -1, 0);
 const _lateLookDelta = { yaw: 0, pitch: 0 };
 /** 11A-2 interact scratch (zero per-frame allocations). */
 const _iFwd = new THREE.Vector3();
+/** `kickDoor` sentinel: the pending kick targets props (no door in view). */
+const KICK_PROPS = -2;
 const KICK_SHAKE: ShakeDef = { trauma: BOOT_KICK.TRAUMA, maxPitchYawDeg: 1.6, maxRollDeg: 1.2 };
 const _camRight = new THREE.Vector3();
 const _camUp = new THREE.Vector3();
@@ -586,6 +588,12 @@ class App {
       this.enemies.onPlayerGunshot(pos, 26);
     };
     this.player.crashProbe = (pos, delta, r, h, doors) => dm.crashThrough(pos, delta, r, h, doors);
+    // 11B-1 destructible props: material-matched break SE at the prop; player-caused breaks lure patrols to the
+    // BROKEN PROP's coordinates (impact-point distraction), never to the player's position.
+    dm.onPropBreak = (_prop, pos, mat, noise, byPlayer) => {
+      audio.propBreak(pos, mat);
+      if (byPlayer) this.enemies.onPlayerGunshot(pos, noise);
+    };
     this.hud.onFullscreen = () => this.input.toggleFullscreen(false);
     // The strand can bite straight into humanoids / drones / the boss (15 dmg + stagger, anchor follows).
     this.equipment.combat = {
@@ -858,6 +866,7 @@ class App {
     const layout = this.city.buildSector(index, this.loop);
     this.physics.setLayout(layout);
     this.destructibles.setLevel(this.physics, layout.colliders, layout.breachDoors, layout.glassPanes);
+    this.destructibles.setProps(layout.destructibleProps, layout.interiorProps, (k) => this.city.propMeshes.kitMesh(k), this.city.propMeshes.shadowMesh, this.city.interiorKit.mesh);
     this.effects.setIndoorVolumes(layout.interiors.map((iv) => iv.aabb));
     this.kickDoor = -1;
     this.attract.rebuild(layout);
@@ -954,7 +963,7 @@ class App {
     this.renderer.postFx.fade = 0;
     this.renderer.postFx.critical = 0;
     if (!restartSector) return;
-    // 11A: a restarted district gets its doors and glass back.
+    // 11A / 11B: a restarted district gets its doors, glass and props back (setLevel → resetProps).
     this.destructibles.setLevel(this.physics, this.layout.colliders, this.layout.breachDoors, this.layout.glassPanes);
     this.kickDoor = -1;
     this.setGateOpen(this.debugGate);
@@ -970,7 +979,14 @@ class App {
     const p = this.player;
     _iFwd.set(-Math.sin(p.yaw), 0, -Math.cos(p.yaw));
     const i = this.destructibles.nearestDoor(p.position, _iFwd);
-    if (i < 0) return;
+    if (i < 0) {
+      // 11B-1: no door in view — a kick still smashes breakable props in boot reach.
+      if (p.state !== 'CROUCHING' && this.kickablePropAhead() && this.viewModel.startKick()) {
+        this.audio.kickWhoosh();
+        this.kickDoor = KICK_PROPS;
+      }
+      return;
+    }
     if (p.state === 'CROUCHING') {
       this.destructibles.openDoorQuietly(i);
       return;
@@ -981,9 +997,15 @@ class App {
     }
   }
 
+  /** 11B-1: an intact destructible prop within boot reach in front of the player (same filter + line of sight as the kick). */
+  private kickablePropAhead(): boolean {
+    return this.destructibles.kickBreak(this.player.position, _iFwd, PROP_KICK.REACH, true) > 0;
+  }
+
   /** Per frame: contextual prompt + the kick's impact moment (breach the targeted door). */
   private updateInteract(frozen: boolean): void {
-    if (this.viewModel.consumeKickImpact() && this.kickDoor >= 0) {
+    const kickImpact = this.viewModel.consumeKickImpact();
+    if (kickImpact && this.kickDoor >= 0) {
       const p = this.player;
       _iFwd.set(-Math.sin(p.yaw), 0, -Math.cos(p.yaw));
       // Still in reach of the boot at the impact frame (the player may have stepped away during the 0.1 s windup).
@@ -991,6 +1013,11 @@ class App {
         this.destructibles.breachDoor(this.kickDoor, _iFwd);
         p.addTrauma(KICK_SHAKE);
       }
+      this.kickDoor = -1;
+    } else if (kickImpact && this.kickDoor === KICK_PROPS) {
+      const p = this.player;
+      _iFwd.set(-Math.sin(p.yaw), 0, -Math.cos(p.yaw));
+      if (this.destructibles.kickBreak(p.position, _iFwd) > 0) p.addTrauma(KICK_SHAKE);
       this.kickDoor = -1;
     }
     if (frozen || this.state !== 'PLAYING' || this.player.state === 'DEAD') {
@@ -1355,6 +1382,8 @@ class App {
     const cam = this.renderer.camera;
     this.equipment.fixedUpdate(dt, cam, this.clock.bulletTimeScale);
     this.player.fixedUpdate(dt, this.equipment.stepContext());
+    // 11B-1: sliding (≥ 6.5 m/s) / hard sprint (≥ 10.5 m/s) shatters props in the way — zero player slowdown.
+    if (this.deathTimer < 0) this.destructibles.checkPlayerSlideBreak(this.player.position, this.player.velocity, this.player.state === 'SLIDING');
     // 10D-1: expressway traffic never damages — a car brushing the player shoves them inward (0 HP, 0.6 s cooldown).
     const pp = this.player.position;
     if (this.deathTimer < 0 && Math.abs(pp.y - LEVEL.HIGHWAY_DECK_Y) < 2.2 && this.city.traffic.checkPlayerBump(pp, _bumpImpulse)) {
